@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-agent-harness"
+version = "1.0.0"
+description = "Production-grade, model-agnostic AI Agent Harness with LangGraph orchestration, sandboxed builds, and bulletproof persistence."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "AI Agent Harness Team" }
+]
+dependencies = [
+    "langgraph>=0.4.0",
+    "langgraph-checkpoint-sqlite>=2.0.0",
+    "aiofiles>=24.0.0",
+    "tree-sitter>=0.23.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.10.0",
+    "uuid7>=0.1.0",
+    "typing-extensions>=4.12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+]
+
+[project.scripts]
+harness = "harness.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["harness*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true

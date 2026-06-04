@@ -1,0 +1,48 @@
+{
+    "_comment": "AI Agent Harness per-project template. Global models go in ~/.harness/config.json.",
+    "build_command": "make build",
+    "allow_network": false,
+    "sandbox": {
+        "readonly_cache_mounts": [
+            "~/.cache/pip",
+            "~/.npm",
+            "~/.cache/go-build",
+            "~/.cargo/registry"
+        ],
+        "timeout_seconds": 300,
+        "pgid_kill_on_timeout": true
+    },
+    "token_budget": {
+        "hard_cap_usd": 2.00,
+        "context_window_threshold_pct": 0.85
+    },
+    "node_throttle": {
+        "max_patch_repair_iterations": 3
+    },
+    "model_routing": {
+        "_comment": "Point each role to a model key registered in ~/.harness/config.json.",
+        "planning_primary": "",
+        "planning_mode": "thinking_max",
+        "planning_fallback": "",
+        "patching_primary": "",
+        "patching_mode": "non_thinking",
+        "repair_primary": "",
+        "repair_mode": "thinking",
+        "ollama_local_model": "",
+        "ollama_local_backup": "",
+        "force_local_only": false
+    },
+    "persistence": {
+        "db_path": "~/.harness/checkpoints.db",
+        "ttl_days": 30
+    },
+    "languages": {
+        "tree_sitter_grammars": ["python", "rust", "typescript", "go", "c", "cpp"],
+        "structured_compiler_flags": {
+            "rust": "--error-format=json",
+            "gcc": "-fdiagnostics-format=json",
+            "clang": "-fdiagnostics-format=json",
+            "go": ""
+        }
+    }
+}
