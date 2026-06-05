@@ -6,6 +6,8 @@ Provides the following commands:
     harness resume  — Resume a crashed/interrupted session from its checkpoint.
     harness status  — Read-only inspection of a checkpointed session.
     harness purge   — Manually wipe all checkpoint data.
+
+Use `harness -h` or `harness <command> -h` for detailed help on each subcommand.
 """
 
 from __future__ import annotations
@@ -16,7 +18,6 @@ import json
 import logging
 import os
 import sys
-from pathlib import Path
 from typing import Any, Optional
 
 # Configure logging for the CLI
@@ -39,7 +40,7 @@ def discover_config(workspace_path: str) -> dict[str, Any]:
     Priority order:
         1. .harness_config.json in the workspace root (if it exists)
         2. ~/.harness/config.json (user-global defaults)
-        3. Hardcoded defaults in pyproject.toml / this module
+        3. harness/cli.json (shipped fallback defaults)
 
     Returns a merged configuration dictionary.
     """
@@ -54,10 +55,20 @@ def discover_config(workspace_path: str) -> dict[str, Any]:
             _deep_merge(config, global_config)
             logger.debug("[cli] Merged global config from %s", global_config_path)
         except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("[cli] Failed to read global config: %s", exc)
+            logger.error(
+                "[cli] Failed to parse global config at %s: %s\n"
+                "  This file must contain valid JSON. The harness cannot proceed without it.\n"
+                "  Fix the JSON syntax in this file and re-run.",
+                global_config_path, exc,
+            )
 
     # Layer 1: Workspace-local config (highest priority)
     workspace_config_path = os.path.join(workspace_path, ".harness_config.json")
+    if not os.path.isfile(workspace_config_path):
+        # Auto-generate from global config + fallback defaults.
+        fallback = _get_default_config()
+        _generate_workspace_config(workspace_config_path, config, fallback)
+
     if os.path.isfile(workspace_config_path):
         try:
             with open(workspace_config_path, "r", encoding="utf-8") as f:
@@ -71,11 +82,27 @@ def discover_config(workspace_path: str) -> dict[str, Any]:
 
 
 def _get_default_config() -> dict[str, Any]:
-    """Return hardcoded default configuration.
+    """Return fallback configuration loaded from harness/cli.json.
 
     Models are defined in ~/.harness/config.json (global, shared across projects).
     Per-project model routing lives in .harness_config.json.
+    Fallback defaults live in harness/cli.json (shipped with the package).
+    Users can edit cli.json instead of modifying Python source code.
     """
+    cli_json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cli.json")
+    if os.path.isfile(cli_json_path):
+        try:
+            with open(cli_json_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            logger.debug("[cli] Loaded fallback defaults from %s", cli_json_path)
+            # Remove comment keys (keys starting with _)
+            return {k: v for k, v in config.items() if not k.startswith("_")}
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("[cli] Failed to read cli.json fallback defaults: %s. Using hardcoded defaults.", exc)
+    else:
+        logger.warning("[cli] cli.json not found at %s. Using hardcoded defaults.", cli_json_path)
+
+    # Absolute fallback (should never be reached if cli.json is shipped correctly)
     return {
         "build_command": "make build",
         "allow_network": False,
@@ -131,12 +158,65 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> None:
             base[key] = value
 
 
+def _generate_workspace_config(
+    workspace_config_path: str,
+    global_config: dict[str, Any],
+    fallback_config: dict[str, Any],
+) -> None:
+    """
+    Auto-generate a .harness_config.json in the workspace when one is missing.
+
+    Builds the workspace config by extracting relevant fields from the
+    global config (~/.harness/config.json) and filling in remaining fields
+    from the built-in fallback defaults (harness/cli.json).
+    """
+    # Fields to pull from global config
+    workspace_config: dict[str, Any] = {
+        "_comment": (
+            "Auto-generated .harness_config.json. Generated because no per-project "
+            "configuration was found in this workspace. Values sourced from "
+            "~/.harness/config.json (global) and harness/cli.json (built-in defaults). "
+            "Modify this file to customize per-project settings."
+        ),
+        "build_command": fallback_config.get("build_command", "make build"),
+        "allow_network": fallback_config.get("allow_network", False),
+        "sandbox": fallback_config.get("sandbox", {}),
+        "token_budget": global_config.get("token_budget", fallback_config.get("token_budget", {})),
+        "node_throttle": fallback_config.get("node_throttle", {}),
+        "model_routing": global_config.get("model_routing", fallback_config.get("model_routing", {})),
+        "persistence": global_config.get("persistence", fallback_config.get("persistence", {})),
+        "languages": fallback_config.get("languages", {}),
+    }
+
+    # Strip _comment keys from nested dicts inherited from global config.
+    for key in ("token_budget", "model_routing", "persistence"):
+        if isinstance(workspace_config.get(key), dict):
+            workspace_config[key] = {
+                k: v for k, v in workspace_config[key].items() if not k.startswith("_")
+            }
+
+    try:
+        with open(workspace_config_path, "w", encoding="utf-8") as f:
+            json.dump(workspace_config, f, indent=4)
+        logger.warning(
+            "[cli] .harness_config.json not found in workspace. "
+            "Auto-generated one from global configuration + defaults. "
+            "Written to: %s",
+            workspace_config_path,
+        )
+    except OSError as exc:
+        logger.error(
+            "[cli] Failed to auto-generate .harness_config.json at %s: %s",
+            workspace_config_path, exc,
+        )
+
+
 def resolve_build_command(cli_build_cmd: Optional[str], config: dict[str, Any]) -> str:
     """
     Resolve the build command using hierarchical discovery:
         1. CLI flag --build-cmd (if provided)
         2. .harness_config.json 'build_command' key
-        3. Default: 'make build'
+        3. Default from cli.json: 'make build'
     """
     if cli_build_cmd:
         logger.info("[cli] Using build command from CLI flag: %s", cli_build_cmd)
@@ -224,23 +304,23 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
 
         if gate == "REQUIREMENTS":
             print(f"Requirements written to {file_label}. Please review the specification.")
-            print(f"Options:")
+            print("Options:")
             print(f"  [a] Approve & Proceed to {next_phase}")
-            print(f"  [e] Refine via text feedback")
-            print(f"  [m] Pause for manual local edits in IDE")
+            print("  [e] Refine via text feedback")
+            print("  [m] Pause for manual local edits in IDE")
         elif gate == "ARCHITECTURE":
             print(f"Technical layout blueprints written to {file_label}. Please review module boundaries.")
-            print(f"Options:")
-            print(f"  [a] Approve & Begin Coding/Patching")
-            print(f"  [e] Refine layout parameters")
-            print(f"  [m] Pause for manual edits")
+            print("Options:")
+            print("  [a] Approve & Begin Coding/Patching")
+            print("  [e] Refine layout parameters")
+            print("  [m] Pause for manual edits")
         elif gate == "DEPLOYMENT":
             print(f"Application fully compiled. Docker Composition written to {file_label}.")
-            print(f"Please review container network bridges and volumes before firing.")
-            print(f"Options:")
+            print("Please review container network bridges and volumes before firing.")
+            print("Options:")
             print(f"  [a] Approve & Execute Infrastructure {next_phase}")
-            print(f"  [e] Refine variables")
-            print(f"  [m] Pause for manual edits")
+            print("  [e] Refine variables")
+            print("  [m] Pause for manual edits")
         print()
 
         try:
@@ -286,7 +366,7 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
 
         elif choice == "m":
             print(f"[Manual] Edit the file at: {spec_path}")
-            print(f"[Manual] Make your changes in your editor (VS Code, Cursor, etc.).")
+            print("[Manual] Make your changes in your editor (VS Code, Cursor, etc.).")
             try:
                 input("[Manual] Press Enter when you are done editing... ")
             except (EOFError, KeyboardInterrupt):
@@ -325,8 +405,6 @@ def discovery_interview_loop(state: dict[str, Any]) -> dict[str, Any]:
     Type 'DONE' to attempt finalization. If critical unknowns remain, the loop
     refuses to exit and displays [CRITICAL UNKNOWN DETECTED].
     """
-    import json as _json
-    import sys as _sys
 
     gate = state.get("current_gate", "REQUIREMENTS")
     discovery_data = state.get("discovery_questions", {})
@@ -782,9 +860,9 @@ def interactive_review_loop(spec_path: str, gateway: Any) -> str:
         print(f"  Size: {spec_size:,} characters")
         print("=" * 72)
         print()
-        print(f"[A] Approve — Lock this specification and proceed to graph execution.")
-        print(f"[B] Refine — Provide additional notes to improve the specification.")
-        print(f"[C] Manual — Edit the file in your IDE, then press Enter to continue.")
+        print("[A] Approve — Lock this specification and proceed to graph execution.")
+        print("[B] Refine — Provide additional notes to improve the specification.")
+        print("[C] Manual — Edit the file in your IDE, then press Enter to continue.")
         print()
 
         try:
@@ -875,6 +953,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
         5. Compile the graph.
         6. Execute the graph with the provided prompt.
         7. Handle HITL breakpoints if triggered.
+
+    Examples:
+        harness run -r /path/to/repo -p "Add JWT authentication"
+        harness run -r ./myproject -p "Refactor the auth module" --manifest notes.txt
     """
     workspace_path = os.path.abspath(args.workspace)
     if not os.path.isdir(workspace_path):
@@ -903,7 +985,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
 
     # Initialize the LLM Gateway and inject it for graph nodes
     from harness.gateway import create_gateway_from_config
-    from harness.graph import set_gateway, compile_graph, run_graph
+    from harness.graph import set_gateway, run_graph
 
     gateway = create_gateway_from_config(config)
     set_gateway(gateway)
@@ -918,13 +1000,33 @@ async def cmd_run(args: argparse.Namespace) -> int:
     git_guardian.stash_if_dirty()
     git_guardian.create_patch_branch(session_id)
 
-    # --- Requirement Refinement Layer (--manifest) ---
+    # --- Requirement Refinement Layer (product_spec.txt auto-discovery or --manifest override) ---
     spec_override: Optional[str] = None
+
+    # Resolve the manifest file path:
+    #   1. --manifest flag (explicit override, highest priority)
+    #   2. Auto-discovered product_spec.txt in workspace root (convention)
+    #   3. None — proceed with prompt-only execution
+    manifest_path: Optional[str] = None
     if args.manifest:
-        logger.info("[requirements] Manifest mode: synthesizing specification from %s", args.manifest)
+        manifest_path = os.path.abspath(args.manifest)
+        if not os.path.isfile(manifest_path):
+            logger.error("[requirements] Explicit manifest file not found: %s", manifest_path)
+            return 1
+        logger.info("[requirements] Using explicit manifest: %s", manifest_path)
+    else:
+        # Auto-discovery: look for product_spec.txt in workspace root
+        manifest_file = config.get("manifest_file", "product_spec.txt")
+        auto_manifest = os.path.join(workspace_path, manifest_file)
+        if os.path.isfile(auto_manifest):
+            manifest_path = auto_manifest
+            logger.info("[requirements] Auto-discovered product spec: %s", manifest_path)
+
+    if manifest_path:
+        logger.info("[requirements] Synthesizing specification from %s", manifest_path)
         try:
             spec_path = await synthesize_requirements(
-                manifest_path=args.manifest,
+                manifest_path=manifest_path,
                 output_dir=args.output_dir,
                 gateway=gateway,
             )
@@ -934,6 +1036,9 @@ async def cmd_run(args: argparse.Namespace) -> int:
         except Exception as exc:
             logger.error("[requirements] Requirement refinement failed: %s", exc)
             return 1
+    else:
+        logger.info("[requirements] No product spec file found. Place '%s' at the workspace root with your product requirements, or use --manifest to specify an alternate file.",
+                     config.get("manifest_file", "product_spec.txt"))
 
     thread_id = args.thread_id if args.thread_id else session_id
 
@@ -962,7 +1067,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             checkpointer=checkpointer,
             thread_id=thread_id,
         )
-    except Exception as exc:
+    except Exception:
         logger.exception("Graph execution failed with unhandled exception.")
         git_guardian.rollback()
         git_guardian.pop_stash()
@@ -1004,6 +1109,10 @@ async def cmd_resume(args: argparse.Namespace) -> int:
 
     Restores a previously checkpointed session from SQLite and resumes
     graph execution from the exact checkpoint boundary.
+
+    Example:
+        harness resume --session-id my-session-abc123
+        harness resume --session-id my-session -r /path/to/repo
     """
     from harness.storage import AsyncSqliteSaver
 
@@ -1031,7 +1140,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
 
     # Initialize the LLM Gateway and inject it for graph nodes
     from harness.gateway import create_gateway_from_config
-    from harness.graph import set_gateway, compile_graph, run_graph
+    from harness.graph import set_gateway, run_graph
 
     gateway = create_gateway_from_config(config)
     set_gateway(gateway)
@@ -1053,7 +1162,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
             checkpointer=checkpointer,
             thread_id=args.session_id,
         )
-    except Exception as exc:
+    except Exception:
         logger.exception("Resume execution failed.")
         await checkpointer.close()
         return 1
@@ -1072,6 +1181,10 @@ async def cmd_status(args: argparse.Namespace) -> int:
     Reads the SQLite checkpoint database read-only and prints a clean
     text snapshot of the specified session's state without triggering
     any graph execution.
+
+    Examples:
+        harness status --session-id my-session
+        harness status --all
     """
     from harness.storage import AsyncSqliteSaver, inspect_session, list_all_sessions
 
@@ -1138,6 +1251,10 @@ async def cmd_purge(args: argparse.Namespace) -> int:
     Execute the `harness purge` subcommand.
 
     Wipes all checkpoint data from the SQLite database.
+
+    Examples:
+        harness purge --session-id my-session
+        harness purge --all
     """
     workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
     config = discover_config(workspace_path)
@@ -1179,7 +1296,24 @@ def build_parser() -> argparse.ArgumentParser:
     """Construct the full CLI argument parser with all subcommands."""
     parser = argparse.ArgumentParser(
         prog="harness",
-        description="AI Agent Harness — Production-grade, model-agnostic LangGraph agent for autonomous code generation.",
+        description=(
+            "AI Agent Harness — Production-grade, model-agnostic LangGraph agent\n"
+            "for autonomous code generation, sandboxed builds, and bulletproof persistence.\n\n"
+            "Quick Start:\n"
+            "  harness run -r /path/to/repo -p \"Your engineering task description\"\n"
+            "  harness -h                     Show this help\n"
+            "  harness run -h                 Show run subcommand help\n"
+            "  harness status --all           List all checkpointed sessions\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  harness run -r ./myproject -p \"Add JWT authentication\"\n"
+            "  harness run -r /path/to/repo -p \"Refactor logging\" --manifest notes.txt\n"
+            "  harness resume --session-id abc123\n"
+            "  harness status --session-id abc123\n"
+            "  harness purge --all\n"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -1196,9 +1330,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory to write SPEC_REQUIREMENTS.md (default: ./docs).",
     )
     run_parser.add_argument(
-        "--workspace", "-w",
+        "--workspace", "-w", "-r",
         required=True,
-        help="Absolute path to the target repository root.",
+        help="Absolute or relative path to the target repository root.",
     )
     run_parser.add_argument(
         "--prompt", "-p",
@@ -1241,7 +1375,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="The session/thread ID to resume.",
     )
     resume_parser.add_argument(
-        "--workspace", "-w",
+        "--workspace", "-w", "-r",
         default=None,
         help="Workspace path (auto-detected from checkpoint if omitted).",
     )
@@ -1282,9 +1416,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="List all checkpointed sessions.",
     )
     status_parser.add_argument(
-        "--workspace", "-w",
+        "--workspace", "-w", "-r",
         default=None,
-        help="Workspace path (for config discovery).",
+        help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
     # --- `harness purge` ---
@@ -1301,9 +1435,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Purge checkpoints for a specific session only.",
     )
     purge_parser.add_argument(
-        "--workspace", "-w",
+        "--workspace", "-w", "-r",
         default=None,
-        help="Workspace path (for config discovery).",
+        help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
     return parser

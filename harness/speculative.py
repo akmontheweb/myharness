@@ -22,15 +22,14 @@ import logging
 import os
 import shutil
 import subprocess
-import tempfile
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-logger = logging.getLogger(__name__)
-
 from harness.gateway import NodeRole
-from harness.patcher import process_llm_patch_output, PatchBlock, PatchResult
+from harness.patcher import process_llm_patch_output, PatchResult
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +143,11 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for i, result in enumerate(results):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 logger.warning("[speculative] Variant %d LLM call failed: %s", i, result)
                 variant_responses.append(None)
             else:
-                response, budget = result  # (LLMResponse, new_budget)
+                response, new_budget = result  # (LLMResponse, new_budget)
                 variant_responses.append(response)
                 logger.info("[speculative] Variant %d: %d tokens (in=%d out=%d)",
                              i, response.usage.input_tokens + response.usage.output_tokens,
@@ -292,7 +291,8 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
 
         # Update token tracker with the winner's LLM usage
         token_tracker = state.get("token_tracker", {})
-        token_tracker = gateway.aggregate_tokens(token_tracker, winner.llm_response.usage)
+        if winner.llm_response is not None:
+            token_tracker = gateway.aggregate_tokens(token_tracker, winner.llm_response.usage)
 
         logger.info("[speculative] Complete: %.2fs, winner=Variant %d.", elapsed, winner.index)
 

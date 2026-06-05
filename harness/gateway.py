@@ -21,8 +21,6 @@ import json
 import logging
 import os
 import random
-import re
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -84,6 +82,7 @@ class ModelSpec:
     output_cost_per_1m: float  # cost per 1M output tokens in USD
     cached_input_cost_per_1m: float = 0.0  # cached/prompt-cache discount
     api_base_url: str = ""
+    api_key: str = ""  # Optional: API key stored in config (env var takes precedence)
     supports_thinking: bool = False
     supports_cache: bool = False
 
@@ -155,6 +154,7 @@ def register_models_from_config(config_dict: dict[str, Any]) -> int:
                 output_cost_per_1m=spec_dict.get("output_cost_per_1m", 0.0),
                 cached_input_cost_per_1m=spec_dict.get("cached_input_cost_per_1m", 0.0),
                 api_base_url=spec_dict.get("api_base_url", ""),
+                api_key=spec_dict.get("api_key", ""),
                 supports_thinking=spec_dict.get("supports_thinking", False),
                 supports_cache=spec_dict.get("supports_cache", False),
             )
@@ -183,7 +183,8 @@ class BaseLLM(ABC):
 
     def __init__(self, spec: ModelSpec, api_key: Optional[str] = None):
         self.spec = spec
-        self.api_key = api_key or os.environ.get(f"{spec.provider.upper()}_API_KEY", "")
+        # Resolution order: explicit arg → env var → config file → empty
+        self.api_key = api_key or os.environ.get(f"{spec.provider.upper()}_API_KEY", "") or spec.api_key
         self._client: Optional[httpx.AsyncClient] = None
 
     @property
@@ -206,10 +207,12 @@ class BaseLLM(ABC):
 
     def _build_headers(self) -> dict[str, str]:
         """Construct provider-specific HTTP headers."""
-        return {
+        headers: dict[str, str] = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
         }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
     async def close(self) -> None:
         """Release the HTTP client."""
@@ -583,7 +586,7 @@ def create_provider(model_key: str, api_key: Optional[str] = None) -> BaseLLM:
             f"Unknown provider '{provider_name}' for model '{model_key}'. "
             f"Supported providers: {list(_provider_classes.keys())}"
         )
-    return cls(spec, api_key=api_key)
+    return cls(spec, api_key=api_key or spec.api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -887,12 +890,28 @@ class Gateway:
     def should_use_thinking(self, role: NodeRole) -> bool:
         """Determine if thinking/reasoning mode should be enabled for this role."""
         if role == NodeRole.PLANNING:
-            return "thinking" in self.config.planning_mode.lower()
+            return self.config.planning_mode.lower() == "thinking" or self.config.planning_mode.lower() == "thinking_max"
         elif role == NodeRole.PATCHING:
-            return "thinking" in self.config.patching_mode.lower()
+            return self.config.patching_mode.lower() == "thinking" or self.config.patching_mode.lower() == "thinking_max"
         elif role == NodeRole.REPAIR:
-            return "thinking" in self.config.repair_mode.lower()
+            return self.config.repair_mode.lower() == "thinking" or self.config.repair_mode.lower() == "thinking_max"
         return False
+
+    def _get_models_with_keys(self) -> list[tuple[str, ModelSpec]]:
+        """Return all registered non-Ollama models that have a resolvable API key."""
+        keyed: list[tuple[str, ModelSpec]] = []
+        for model_key, spec in _MODEL_REGISTRY.items():
+            if spec.provider == "ollama":
+                continue
+            # Check resolution order: env var → config api_key
+            key = os.environ.get(f"{spec.provider.upper()}_API_KEY", "") or spec.api_key
+            if key:
+                keyed.append((model_key, spec))
+        return keyed
+
+    def _get_ollama_models(self) -> list[str]:
+        """Return all registered Ollama model keys."""
+        return [key for key, spec in _MODEL_REGISTRY.items() if spec.provider == "ollama"]
 
     async def dispatch(
         self,
@@ -941,6 +960,72 @@ class Gateway:
             thinking = False
 
         provider = await self._get_provider(model_key)
+
+        # --- Smart API Key Resolution ---
+        if provider.spec.provider != "ollama" and not provider.api_key:
+            # The configured model has no key. Scan all registered models for keys.
+            keyed_models = self._get_models_with_keys()
+            ollama_models = self._get_ollama_models()
+
+            if len(keyed_models) == 1:
+                # Exactly one model has a key — auto-consolidate all roles to it
+                auto_model, auto_spec = keyed_models[0]
+                logger.warning(
+                    "[gateway] Configured model '%s' has no API key. "
+                    "Only one model with a key found ('%s'). Auto-consolidating all roles to it.",
+                    model_key, auto_model,
+                )
+                model_key = auto_model
+                provider = await self._get_provider(auto_model)
+            elif len(keyed_models) > 1:
+                # Multiple models have keys — tell user which one to configure
+                keyed_names = [name for name, _ in keyed_models]
+                raise RuntimeError(
+                    f"[API KEY MISSING]: No API key configured for '{model_key}'.\n"
+                    f"  However, {len(keyed_models)} other model(s) already have keys configured: {', '.join(keyed_names)}.\n"
+                    f"  To use '{model_key}', add its API key to ~/.harness/config.json or set the "
+                    f"{provider.spec.provider.upper()}_API_KEY environment variable.\n"
+                    f"  To use a different model that already has a key, update 'model_routing' in your config to "
+                    f"point to one of: {', '.join(keyed_names)}."
+                )
+            elif len(ollama_models) > 0:
+                # No remote models have keys, but Ollama is available — suggest it
+                raise RuntimeError(
+                    f"[API KEY MISSING]: No API key configured for '{model_key}', and no other remote "
+                    f"models have keys either.\n"
+                    f"  However, local Ollama model(s) are registered: {', '.join(ollama_models)}.\n"
+                    f"  To use local inference, set \"force_local_only\": true in your config's "
+                    f"model_routing section, or add an API key as described below.\n"
+                    f"\n"
+                    f"  To add an API key, either:\n"
+                    f"  1. Set the {provider.spec.provider.upper()}_API_KEY environment variable\n"
+                    f"  2. Add \"api_key\" to the model entry in ~/.harness/config.json"
+                )
+            else:
+                # No models have keys at all — standard error
+                env_var = f"{provider.spec.provider.upper()}_API_KEY"
+                raise RuntimeError(
+                    f"[API KEY MISSING]: No API key configured for '{model_key}'. "
+                    f"No other registered models have API keys either.\n"
+                    f"\n"
+                    f"  To fix this, you have two options:\n"
+                    f"\n"
+                    f"  1. Set the {env_var} environment variable:\n"
+                    f"     export {env_var}=\"your-api-key-here\"\n"
+                    f"\n"
+                    f"  2. Add \"api_key\" to the model entry in ~/.harness/config.json:\n"
+                    f"     {{\n"
+                    f"       \"models\": {{\n"
+                    f"         \"{model_key}\": {{\n"
+                    f"           \"provider\": \"{provider.spec.provider}\",\n"
+                    f"           \"model_id\": \"{provider.spec.model_id}\",\n"
+                    f"           \"api_key\": \"your-api-key-here\",\n"
+                    f"           ...\n"
+                    f"         }}\n"
+                    f"       }}\n"
+                    f"     }}"
+                )
+
         spec = provider.spec
 
         # --- Redact secrets from messages before transmission ---

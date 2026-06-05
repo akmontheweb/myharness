@@ -16,11 +16,11 @@ import json
 import logging
 import os
 import re
-from typing import Any, Optional
-
-logger = logging.getLogger(__name__)
+from typing import Optional
 
 from harness.sandbox import BaseLanguageParser, DiagnosticObject
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------

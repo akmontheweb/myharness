@@ -26,10 +26,9 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 import time as time_module
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -384,7 +383,7 @@ Design the optimal container architecture. Return ONLY a valid JSON object match
     except json.JSONDecodeError as exc:
         logger.warning("[deploy:compose] LLM returned invalid JSON: %s. Falling back.", exc)
         return _fallback_blueprint(telemetry)
-    except Exception as exc:
+    except Exception:
         logger.exception("[deploy:compose] Architecture synthesis failed.")
         return _fallback_blueprint(telemetry)
 
@@ -599,49 +598,47 @@ def _generate_compose_file(blueprint: dict[str, Any]) -> str:
     services = blueprint.get("services", {})
     volumes_cfg = blueprint.get("volumes", {})
     networks_cfg = blueprint.get("networks", {})
-    proxy = blueprint.get("proxy_service")
-
     lines = ['version: "3.9"', "", "services:"]
 
     for svc_name, svc_spec in services.items():
         lines.append(f"  {svc_name}:")
 
         if svc_spec.get("build_context"):
-            lines.append(f"    build:")
+            lines.append("    build:")
             lines.append(f"      context: {svc_spec.get('build_context', '.')}")
-            lines.append(f"      dockerfile: Dockerfile.{svc_name}" if svc_spec.get("build_context", ".") != "." else f"      dockerfile: Dockerfile")
+            lines.append(f"      dockerfile: Dockerfile.{svc_name}" if svc_spec.get("build_context", ".") != "." else "      dockerfile: Dockerfile")
         else:
             lines.append(f"    image: {svc_spec.get('base_image', 'alpine:3.20')}")
 
         if svc_spec.get("ports"):
+            lines.append("    ports:")
             for port_mapping in svc_spec["ports"]:
-                lines.append(f"    ports:")
                 lines.append(f'      - "{port_mapping}"')
 
         if svc_spec.get("environment_keys_needed"):
-            lines.append(f"    environment:")
+            lines.append("    environment:")
             for key in svc_spec["environment_keys_needed"]:
                 lines.append(f"      - {key}=${{{key}}}")
 
         if svc_spec.get("depends_on_services"):
-            lines.append(f"    depends_on:")
+            lines.append("    depends_on:")
             for dep in svc_spec["depends_on_services"]:
                 lines.append(f"      - {dep}")
 
         if svc_spec.get("volumes"):
-            lines.append(f"    volumes:")
+            lines.append("    volumes:")
             for vol in svc_spec["volumes"]:
                 lines.append(f"      - {vol}")
 
         if svc_spec.get("requires_healthcheck_cmd"):
             health_cmd = svc_spec["requires_healthcheck_cmd"]
-            lines.append(f"    healthcheck:")
+            lines.append("    healthcheck:")
             lines.append(f"      test: [\"CMD-SHELL\", \"{health_cmd}\"]")
-            lines.append(f"      interval: 10s")
-            lines.append(f"      timeout: 5s")
-            lines.append(f"      retries: 3")
+            lines.append("      interval: 10s")
+            lines.append("      timeout: 5s")
+            lines.append("      retries: 3")
 
-        lines.append(f"    networks:")
+        lines.append("    networks:")
         for net_name in networks_cfg:
             lines.append(f"      - {net_name}")
 
@@ -684,7 +681,7 @@ def _generate_caddyfile(blueprint: dict[str, Any]) -> str:
             lines.append("}")
             lines.append("")
 
-    if not any("reverse_proxy" in l for l in lines):
+    if not any("reverse_proxy" in line for line in lines):
         lines.append(":80 {")
         lines.append("    respond \"Caddy is running. No services configured.\" 200")
         lines.append("}")

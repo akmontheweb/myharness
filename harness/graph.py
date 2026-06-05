@@ -29,13 +29,12 @@ from typing import Any, Literal, Optional, Union
 from typing_extensions import TypedDict
 
 try:
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, Field  # noqa: F811
     _PYDANTIC_AVAILABLE = True
 except ImportError:
     _PYDANTIC_AVAILABLE = False
-    BaseModel = None  # type: ignore[assignment]
-    Field = None  # type: ignore[assignment]
-
+    BaseModel = object  # type: ignore[assignment,misc]
+    Field = None  # type: ignore[assignment,misc]
 logger = logging.getLogger(__name__)
 
 
@@ -666,7 +665,7 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     result = await executor.run(build_cmd)
 
     exit_code: int = result.exit_code
-    compiler_errors: list[DiagnosticObjectDict] = result.diagnostics
+    compiler_errors: list[Any] = [d.to_dict() for d in result.diagnostics]
     raw_log: str = result.raw_output
 
     logger.info(
@@ -751,9 +750,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     total_repairs - 1,
                     escalation_model,
                 )
-                # Use the escalation model by dispatching with a model override
-                role = NodeRole.REPAIR
-                thinking = True  # Always enable thinking on escalated repairs
+                # Escalated repair will use NodeRole.REPAIR with thinking mode enabled
             else:
                 logger.warning(
                     "[repair_node] Cheap model failed %d time(s), but no escalation model configured. "
@@ -1272,9 +1269,8 @@ async def write_spec_node(state: AgentState) -> dict[str, Any]:
     # Build the specification from the full conversation
     sections: list[str] = []
     sections.append(f"# {gate.capitalize()} Specification\n")
-    sections.append(f"*Auto-generated from exhaustive discovery process.*\n")
+    sections.append("*Auto-generated from exhaustive discovery process.*\n")
 
-    current_section = ""
     for msg in messages:
         role = msg.get("role", "")
         content = msg.get("content", "")
@@ -1417,9 +1413,13 @@ def route_after_discovery(state: AgentState) -> str:
     gate = state.get("current_gate", "REQUIREMENTS")
 
     if node_state.get("user_done_with_critical"):
-        # User tried to exit with critical unknowns
-        return "discovery_interview_loop" if gate == "REQUIREMENTS" else \
-               ("requirements_discovery_node" if gate == "REQUIREMENTS" else "architecture_discovery_node")
+        # User tried to exit with critical unknowns — route back to the correct discovery node
+        if gate == "DEPLOYMENT":
+            return "deployment_discovery_node"
+        elif gate == "ARCHITECTURE":
+            return "architecture_discovery_node"
+        else:
+            return "discovery_interview_loop"
 
     if complete or (not complete and critical == 0):
         return "write_spec_node"
@@ -1473,7 +1473,7 @@ def route_after_gatekeeper(state: AgentState) -> str:
 # 7. Route After HITL: Always Back to Compiler
 # ---------------------------------------------------------------------------
 
-def route_after_security_scan(state: AgentState) -> Literal["patching_node", "human_intervention_node", "deployment_node"]:
+def route_after_security_scan(state: AgentState) -> Literal["patching_node", "human_intervention_node", "deployment_discovery_node"]:
     """
     Conditional edge router executed after security_scan_node completes.
 
@@ -1567,7 +1567,7 @@ def route_after_repair(state: AgentState) -> Literal["compiler_node"]:
 # 11. Graph Builder — Assembles the Full StateGraph
 # ---------------------------------------------------------------------------
 
-def build_graph() -> "StateGraph":  # type: ignore[no-any-unimported]
+def build_graph() -> Any:
     """
     Construct and return the complete LangGraph StateGraph with all nodes,
     edges, and conditional routing logic.
@@ -1603,7 +1603,7 @@ def build_graph() -> "StateGraph":  # type: ignore[no-any-unimported]
         )
 
     # Create the graph bound to our AgentState type
-    graph = StateGraph(AgentState)  # type: ignore[arg-type]
+    graph = StateGraph(AgentState)
 
     # Register core graph nodes
     graph.add_node("planning_node", planning_node)
@@ -1740,12 +1740,12 @@ def build_graph() -> "StateGraph":  # type: ignore[no-any-unimported]
     from harness.deploy import deployment_node as _deployment_node
     graph.add_node("deployment_node", _deployment_node)
 
-    # Deployment conditional edges
+    # Deployment conditional edges — after deployment, either end (success) or route to repair/HITL
     graph.add_conditional_edges(
         "deployment_node",
-        route_after_deployment,
+        route_after_compiler,
         {
-            "__end__": END,
+            "security_scan_node": "security_scan_node",
             "repair_node": "repair_node",
             "human_intervention_node": "human_intervention_node",
         },
@@ -1855,7 +1855,7 @@ async def run_graph(
     logger.info("[run_graph] Starting graph execution. thread_id=%s session_id=%s", thread_id, session_id)
 
     # Execute the graph — ainvoke streams all state updates and returns final state
-    final_state: AgentState = await compiled_graph.ainvoke(initial_state, config)  # type: ignore[arg-type]
+    final_state: AgentState = await compiled_graph.ainvoke(initial_state, config)  # type: ignore[arg-type,return-value]
 
     logger.info("[run_graph] Graph execution complete. Final exit_code=%d", final_state.get("exit_code", -1))
-    return final_state  # type: ignore[return-value]
+    return final_state

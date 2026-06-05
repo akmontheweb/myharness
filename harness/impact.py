@@ -28,7 +28,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,7 @@ class DependencyGraph:
 
             ts_lang = tree_sitter.Language(grammar_module.language())
             parser = tree_sitter.Parser()
-            parser.set_language(ts_lang)
+            parser.language = ts_lang
 
             tree = parser.parse(source.encode("utf-8"))
             self._extract_symbols_from_ast(tree.root_node, lang, symbols)
@@ -473,13 +473,6 @@ class ImpactAnalyzer:
                 if len(symbols) > 5:
                     sym_list += f" ... and {len(symbols) - 5} more"
                 warning_parts.append(f"  - {rel} (references: {sym_list})")
-
-            # Summarize by modified file
-            for mf in modified_files:
-                rel_mf = os.path.relpath(mf, self._graph.workspace_path)
-                count = sum(1 for f, syms in impacted if any(mf.endswith(os.path.basename(f)) or f.endswith(os.path.basename(mf)) for f in [mf]))
-                if count > 0:
-                    pass  # Already listed above
 
             warning_parts.append(
                 f"\n  You must now verify these {len(impacted)} file(s) to ensure no "

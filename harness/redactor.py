@@ -107,7 +107,7 @@ def _is_high_entropy(value: str) -> bool:
 
 class RedactionResult:
     """Result of a redaction pass."""
-    def __init__(self):
+    def __init__(self) -> None:
         self.replacements: int = 0
         self.redacted_types: set[str] = set()
 

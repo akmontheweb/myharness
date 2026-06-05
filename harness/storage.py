@@ -15,17 +15,13 @@ This module implements:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
-import sqlite3
-import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, AsyncIterator, Optional, Sequence
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -456,7 +452,6 @@ async def inspect_session(
             return None
 
         checkpoint = json.loads(row["checkpoint"])
-        metadata = json.loads(row["metadata"])
 
         # Extract state fields from the checkpoint blob
         # The checkpoint contains channel_values which hold the AgentState fields

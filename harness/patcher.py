@@ -26,9 +26,8 @@ import logging
 import os
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -575,7 +574,7 @@ class TreeSitterPatcher(BasePatcher):
             )
 
         parser = tree_sitter.Parser()
-        parser.set_language(language)  # type: ignore[arg-type]
+        parser.language = language
         self._languages[language_name] = language
         self._parsers[language_name] = parser
         return parser
@@ -649,7 +648,7 @@ class TreeSitterPatcher(BasePatcher):
 
         try:
             parser = self._get_parser(lang)
-            tree = parser.parse(source.encode("utf-8"))  # type: ignore[union-attr]
+            tree = parser.parse(source.encode("utf-8"))
 
             # Find nodes whose text matches the search block
             search_bytes = search.encode("utf-8")
@@ -714,7 +713,7 @@ class TreeSitterPatcher(BasePatcher):
 
         try:
             parser = self._get_parser(lang)
-            tree = parser.parse(source.encode("utf-8"))  # type: ignore[union-attr]
+            tree = parser.parse(source.encode("utf-8"))
             matching = self._find_text_nodes(tree.root_node, search.encode("utf-8"))
 
             if len(matching) == 0:
@@ -771,7 +770,7 @@ class TreeSitterPatcher(BasePatcher):
 
         try:
             parser = self._get_parser(lang)
-            tree = parser.parse(source.encode("utf-8"))  # type: ignore[union-attr]
+            tree = parser.parse(source.encode("utf-8"))
 
             # Search for function/class definitions matching the anchor name
             node_types: tuple[str, ...]
@@ -1025,7 +1024,6 @@ async def process_llm_patch_output(
             modified_files.append(result.file)
 
     success_count = sum(1 for r in results if r.success)
-    fail_count = len(results) - success_count
     logger.info(
         "[patcher] Applied %d/%d patches successfully. Modified files: %s",
         success_count, len(results), modified_files,

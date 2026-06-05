@@ -1,0 +1,46 @@
+{
+    "_comment": "AI Agent Harness — built-in fallback defaults. Override per-project via .harness_config.json and globally via ~/.harness/config.json.",
+    "build_command": "make build",
+    "allow_network": false,
+    "sandbox": {
+        "backend": "auto",
+        "docker_image": "ubuntu:22.04",
+        "docker_memory_limit": "512m",
+        "docker_cpu_limit": "1.0",
+        "docker_pids_limit": 100,
+        "readonly_cache_mounts": [
+            "~/.cache/pip",
+            "~/.npm",
+            "~/.cache/go-build",
+            "~/.cargo/registry"
+        ],
+        "timeout_seconds": 300,
+        "pgid_kill_on_timeout": true
+    },
+    "token_budget": {
+        "hard_cap_usd": 2.00,
+        "context_window_threshold_pct": 0.85
+    },
+    "node_throttle": {
+        "max_patch_repair_iterations": 3
+    },
+    "models": {},
+    "model_routing": {
+        "planning_primary": "",
+        "planning_mode": "thinking_max",
+        "planning_fallback": "",
+        "patching_primary": "",
+        "patching_mode": "non_thinking",
+        "repair_primary": "",
+        "repair_fallback": "",
+        "repair_mode": "thinking",
+        "ollama_local_model": "",
+        "ollama_local_backup": "",
+        "force_local_only": false
+    },
+    "persistence": {
+        "db_path": "~/.harness/checkpoints.db",
+        "ttl_days": 30
+    },
+    "manifest_file": "product_spec.txt"
+}

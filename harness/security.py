@@ -20,14 +20,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -726,7 +725,7 @@ def _parse_gitleaks_json(stdout: str) -> list[dict[str, Any]]:
             "line": item.get("StartLine", item.get("line", 0)),
             "secret_type": item.get("RuleID", item.get("rule_id", "Unknown Secret")),
             "message": item.get("Description", item.get("description", "")),
-            "secret_hash": item.get("Secret", item.get("secret", ""))[:8] if item.get("Secret") else "",
+            "secret_hash": (item.get("Secret") or item.get("secret", "") or "")[:8],
         })
     return findings
 
@@ -955,7 +954,6 @@ def _findings_to_diagnostics(
         filepath = f.get("file", "unknown")
         line = f.get("line", 0)
         message = f.get("message", "")
-        severity = f.get("severity", "error")
 
         diagnostic_msg = (
             f"[SECURITY CRITICAL FAULT]: {secret_type} found in file {filepath}"
@@ -1023,16 +1021,24 @@ async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
         timeout_seconds=timeout_sec,
     )
 
-    secret_findings, sast_findings = await asyncio.gather(
+    raw_secret: object
+    raw_sast: object
+    raw_secret, raw_sast = await asyncio.gather(
         secrets_task, sast_task, return_exceptions=True
     )
 
-    if isinstance(secret_findings, Exception):
-        logger.warning("[security_scan_node] Secret scan exception: %s", secret_findings)
-        secret_findings = []
-    if isinstance(sast_findings, Exception):
-        logger.warning("[security_scan_node] SAST scan exception: %s", sast_findings)
-        sast_findings = []
+    secret_findings: list[dict[str, Any]] = []
+    sast_findings: list[dict[str, Any]] = []
+
+    if isinstance(raw_secret, Exception):
+        logger.warning("[security_scan_node] Secret scan exception: %s", raw_secret)
+    elif isinstance(raw_secret, list):
+        secret_findings = [f for f in raw_secret if isinstance(f, dict)]
+
+    if isinstance(raw_sast, Exception):
+        logger.warning("[security_scan_node] SAST scan exception: %s", raw_sast)
+    elif isinstance(raw_sast, list):
+        sast_findings = [f for f in raw_sast if isinstance(f, dict)]
 
     # Convert findings to diagnostics
     all_diagnostics: list[dict[str, Any]] = []

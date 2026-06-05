@@ -26,13 +26,10 @@ import re
 import shutil
 import signal
 import subprocess
-import sys
-import tempfile
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -417,6 +414,7 @@ async def _execute_subprocess_with_timeout(
         env.update(extra_env)
 
     # Create log streamer based on mode
+    streamer: Union[DiskLogStreamer, MemoryLogStreamer]
     if log_buffer_mode == "disk":
         streamer = DiskLogStreamer(
             max_size_mb=max_log_size_mb,
@@ -465,11 +463,11 @@ async def _execute_subprocess_with_timeout(
             except asyncio.TimeoutError:
                 return -1  # Sentinel for timeout
 
-        reader_tasks = [
+        reader_tasks: list[asyncio.Task[Any]] = [
             asyncio.create_task(_read_stdout()),
             asyncio.create_task(_read_stderr()),
         ]
-        wait_task = asyncio.create_task(_wait_with_timeout())
+        wait_task: asyncio.Task[int] = asyncio.create_task(_wait_with_timeout())
 
         done, pending = await asyncio.wait(
             [wait_task, *reader_tasks],
@@ -515,16 +513,18 @@ async def _execute_subprocess_with_timeout(
                 task.cancel()
 
     except FileNotFoundError:
+        await streamer.close()
         return 127, f"Command not found: {cmd[0]}", False
     except PermissionError:
+        await streamer.close()
         return 126, f"Permission denied: {cmd[0]}", False
     except Exception as exc:
         logger.exception("[sandbox] Unexpected subprocess error.")
+        await streamer.close()
         return 1, f"Subprocess error: {exc}", False
-    finally:
-        await streamer.close(keep_on_success=(exit_code == 0))
 
     full_output = await streamer.read_all()
+    await streamer.close(keep_on_success=(exit_code == 0))
     return exit_code, full_output, timed_out
 
 
@@ -663,6 +663,14 @@ class DiskLogStreamer:
         returns the full string (caller expects it for filtering).
         For extremely large logs, use read_filtered() instead.
         """
+        # Flush disk buffers to ensure all written data is visible
+        for fh in (self._stdout_file, self._stderr_file):
+            if fh is not None:
+                try:
+                    fh.flush()
+                except OSError:
+                    pass
+
         parts: list[str] = []
         for path in (self._stdout_path, self._stderr_path):
             if path and os.path.isfile(path):

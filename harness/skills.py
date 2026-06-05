@@ -24,13 +24,12 @@ Integration:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os as _os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Awaitable, Callable, Literal, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +212,7 @@ class SubAgentSkill(SkillBase):
                         return {"success": True, "modified_files": modified_files,
                                 "iterations": iteration + 1}
                     else:
-                        diag = "\n".join(d.get("message", "") for d in result.diagnostics[:5])
+                        diag = "\n".join(d.message for d in result.diagnostics[:5])
                         messages.append({"role": "user", "content": f"Build failed:\n{diag}\nPlease fix."})
 
             return {"success": True, "modified_files": modified_files,
@@ -486,7 +485,6 @@ async def generate_documentation(
         Result dict with success, file path, and metadata.
     """
     from harness.graph import get_gateway
-    from harness.patcher import process_llm_patch_output
 
     gateway = get_gateway()
     if gateway is None:

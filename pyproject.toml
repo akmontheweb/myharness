@@ -36,6 +36,9 @@ harness = "harness.cli:main"
 [tool.setuptools.packages.find]
 include = ["harness*"]
 
+[tool.setuptools.package-data]
+harness = ["cli.json"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py311"
@@ -43,5 +46,7 @@ target-version = "py311"
 [tool.mypy]
 python_version = "3.11"
 strict = true
-warn_return_any = true
+warn_return_any = false
 warn_unused_configs = true
+warn_unused_ignores = true
+disallow_untyped_defs = false

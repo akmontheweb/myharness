@@ -394,7 +394,7 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
 def _resolve_path(filepath: str, workspace_path: str) -> Optional[str]:
     """Resolve a filepath against the workspace."""
     if os.path.isabs(filepath):
-        return filepath
+        return filepath if os.path.exists(filepath) else None
     full = os.path.join(workspace_path, filepath)
     return full if os.path.exists(full) else None
 
