@@ -1119,22 +1119,141 @@ class Gateway:
 # 13. Gateway Factory from Config
 # ---------------------------------------------------------------------------
 
+def _validate_routing_keys(
+    model_routing: dict[str, Any],
+    registered_models: set[str],
+) -> None:
+    """
+    Validate that all model routing keys reference models that exist in the registry.
+
+    If a routing key references a non-existent model, provide a helpful error message
+    suggesting the closest matching registered model (fuzzy matching for typo detection).
+
+    Args:
+        model_routing: The model_routing section from config.
+        registered_models: Set of model keys currently in the registry.
+
+    Raises:
+        ValueError: If any routing key references an unregistered model.
+    """
+    routing_keys = [
+        ("planning_primary", model_routing.get("planning_primary", "")),
+        ("planning_fallback", model_routing.get("planning_fallback", "")),
+        ("patching_primary", model_routing.get("patching_primary", "")),
+        ("repair_primary", model_routing.get("repair_primary", "")),
+        ("repair_fallback", model_routing.get("repair_fallback", "")),
+        ("ollama_local_model", model_routing.get("ollama_local_model", "")),
+        ("ollama_local_backup", model_routing.get("ollama_local_backup", "")),
+    ]
+
+    errors: list[str] = []
+    for routing_field, model_key in routing_keys:
+        if not model_key:
+            continue  # Empty string means not configured — skip
+        if model_key not in registered_models:
+            # Find closest matching registered model using character-level similarity
+            suggestion = _find_closest_match(model_key, registered_models)
+            if suggestion:
+                errors.append(
+                    f"  - {routing_field}: '{model_key}' is not registered. "
+                    f"Did you mean '{suggestion}'?"
+                )
+            else:
+                errors.append(
+                    f"  - {routing_field}: '{model_key}' is not registered, "
+                    f"and no similar models were found in the registry."
+                )
+
+    if errors:
+        registered_list = "\n    ".join(sorted(registered_models)) if registered_models else "(none)"
+        raise ValueError(
+            f"Model routing references {len(errors)} unregistered model(s):\n"
+            + "\n".join(errors)
+            + f"\n\n  Registered models:\n    {registered_list}"
+            + "\n\n  Fix these typos in your .harness_config.json or ~/.harness/config.json"
+            + " model_routing section, or register the missing models."
+        )
+
+
+def _find_closest_match(target: str, candidates: set[str]) -> Optional[str]:
+    """
+    Find the closest matching string from a set of candidates using a simple
+    similarity heuristic (shared prefix length + character overlap ratio).
+
+    Returns the best match if the similarity score is above a threshold, else None.
+    """
+    if not candidates:
+        return None
+
+    target_lower = target.lower()
+    best_match: Optional[str] = None
+    best_score = 0.0
+
+    for candidate in candidates:
+        candidate_lower = candidate.lower()
+
+        # Compute a simple similarity score:
+        # 1. Shared prefix bonus (up to min length of both strings)
+        prefix_len = 0
+        for a, b in zip(target_lower, candidate_lower):
+            if a == b:
+                prefix_len += 1
+            else:
+                break
+
+        # 2. Character set overlap (Jaccard-like)
+        target_chars = set(target_lower)
+        candidate_chars = set(candidate_lower)
+        intersection = len(target_chars & candidate_chars)
+        union = len(target_chars | candidate_chars)
+        jaccard = intersection / union if union > 0 else 0.0
+
+        # 3. Shared substring bonus (sliding window of length 3)
+        substring_score = 0
+        window = 3
+        target_substrings = {target_lower[i:i+window] for i in range(max(0, len(target_lower) - window + 1))}
+        candidate_substrings = {candidate_lower[i:i+window] for i in range(max(0, len(candidate_lower) - window + 1))}
+        if target_substrings:
+            substring_score = len(target_substrings & candidate_substrings) / len(target_substrings)
+
+        # Combined score: prefix gets highest weight, then substring overlap, then Jaccard
+        max_prefix = max(len(target_lower), len(candidate_lower))
+        prefix_ratio = prefix_len / max_prefix if max_prefix > 0 else 0.0
+        score = (prefix_ratio * 0.5) + (substring_score * 0.3) + (jaccard * 0.2)
+
+        if score > best_score:
+            best_score = score
+            best_match = candidate
+
+    # Only suggest if similarity is reasonably high (> 0.4)
+    if best_score >= 0.4 and best_match is not None:
+        return best_match
+    return None
+
+
 def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
     """
     Build a Gateway instance from a .harness_config.json dictionary.
 
-    Also registers any models defined in the 'models' section of the config.
+    Also registers any models defined in the 'models' section of the config,
+    and validates that all routing keys reference registered models.
 
     Args:
         config_dict: Parsed JSON dict from .harness_config.json.
 
     Returns:
         Configured Gateway instance.
+
+    Raises:
+        ValueError: If routing keys reference unregistered models.
     """
     # Register models from the 'models' section
     register_models_from_config(config_dict)
 
     model_routing = config_dict.get("model_routing", {})
+
+    # Validate routing keys against registered models (catches typos early)
+    _validate_routing_keys(model_routing, set(_MODEL_REGISTRY.keys()))
     token_budget = config_dict.get("token_budget", {})
 
     gateway_config = GatewayConfig(

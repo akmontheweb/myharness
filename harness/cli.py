@@ -183,13 +183,14 @@ def _generate_workspace_config(
         "sandbox": fallback_config.get("sandbox", {}),
         "token_budget": global_config.get("token_budget", fallback_config.get("token_budget", {})),
         "node_throttle": fallback_config.get("node_throttle", {}),
+        "models": global_config.get("models", fallback_config.get("models", {})),
         "model_routing": global_config.get("model_routing", fallback_config.get("model_routing", {})),
         "persistence": global_config.get("persistence", fallback_config.get("persistence", {})),
         "languages": fallback_config.get("languages", {}),
     }
 
     # Strip _comment keys from nested dicts inherited from global config.
-    for key in ("token_budget", "model_routing", "persistence"):
+    for key in ("token_budget", "models", "model_routing", "persistence"):
         if isinstance(workspace_config.get(key), dict):
             workspace_config[key] = {
                 k: v for k, v in workspace_config[key].items() if not k.startswith("_")
