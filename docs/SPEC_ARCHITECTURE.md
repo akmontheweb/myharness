@@ -427,6 +427,44 @@ typing-extensions>=4.12.0
 
 **Rationale**: LangGraph's `StateGraph` requires a TypedDict schema. Pydantic provides validation, default values, and serialization that TypedDict cannot. The dual approach gives both.
 
+### 5.9 Docker-First Sandbox Selection
+
+**Decision**: Auto-detection now prioritizes Docker over unshare: `docker → unshare → bare`. Previously it was `unshare → docker → bare`.
+
+**Rationale**: Docker provides stronger isolation boundaries (containers vs namespaces) with built-in resource limits (memory, CPU, PID caps). The `unshare` backend is still available as a faster fallback when Docker is unreachable. User-specified backends (`"unshare"`, `"docker"`, `"bare"`) bypass auto-detection entirely.
+
+**Trade-off**: Slightly higher startup latency on container cold-start (~1-2s). The unshare backend remains the faster option on systems where Docker is unavailable or unnecessary.
+
+### 5.10 Gateway Typo Resilience
+
+**Decision**: When `_validate_routing_keys()` detects unregistered model names in config (likely typos), it no longer raises a blocking `ValueError`. Instead, it logs the error and auto-falls back to the configured `ollama_local_model` if available.
+
+**Rationale**: Stopping execution for a typo in `.harness_config.json` is unnecessarily disruptive. Ollama is configured as a zero-cost fallback — using it keeps the graph alive while alerting the developer to fix their config.
+
+### 5.11 Repair Prompt Fallback Triad
+
+**Decision**: The repair node now composes its prompt from three sources in priority order: (1) structured compiler diagnostics, (2) lintgate errors, (3) raw build output tail (last 2000 chars). If no structured diagnostics exist, the raw build output is appended.
+
+**Rationale**: Many build tools produce output that doesn't match any structured parser (Makefiles, shell scripts, custom build systems). The raw output fallback ensures the LLM always has context to generate a fix, even when diagnostic parsing produces zero results.
+
+### 5.12 Strict Format Reminders for Code Generation
+
+**Decision**: Both `patching_node` and `repair_node` inject a `[CRITICAL FORMAT INSTRUCTION]` message immediately before the LLM dispatch call. This message shows exact patch block templates and forbids markdown, explanations, or text outside blocks.
+
+**Rationale**: Smaller/faster models (used as `patching_primary`) often ignore the system prompt's format instructions when they're buried in a long initial prompt. A short, forceful reminder immediately before the call dramatically increases patch block compliance.
+
+### 5.13 Code Quality Standards in Prompts
+
+**Decision**: The system prompt (`messages[0]`) now includes a **Code Quality Standards** section (modularity, error handling, type hints, edge cases, production-ready code). Both format reminders include a one-line quality directive.
+
+**Rationale**: Autonomous code generation without quality guardrails produces fragile, throwaway code. Embedding quality expectations in every LLM call ensures generated code is modular, well-typed, and production-ready.
+
+### 5.14 HITL Raw Build Output Display
+
+**Decision**: When the HITL menu shows "No compiler errors captured" but `node_state.last_build_output` exists, it now displays the raw build output (last 2000 chars) instead of leaving the developer blind.
+
+**Rationale**: The developer needs to see what actually failed before choosing an action ([e] hint, [m] manual fix, [r] retry). Previously, with zero structured diagnostics, the HITL screen gave no actionable information.
+
 ---
 
 ## 6. Data Model Overview

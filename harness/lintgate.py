@@ -337,8 +337,8 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
                     else:
                         err_msg = stderr.decode("utf-8", errors="replace").strip() or stdout.decode("utf-8", errors="replace").strip()
                         if err_msg:
-                            lint_errors.append(f"{filepath}: {err_msg[:200]}")
-                            logger.warning("[lintgate_node] Lint failed for %s: %s", filepath, err_msg[:200])
+                            lint_errors.append(f"{filepath}: {err_msg[:500]}")
+                            logger.warning("[lintgate_node] Lint failed for %s: %s", filepath, err_msg[:500])
                 except asyncio.TimeoutError:
                     lint_errors.append(f"{filepath}: Linter timed out")
                     logger.warning("[lintgate_node] Linter timed out for %s", filepath)

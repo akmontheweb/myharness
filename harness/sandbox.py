@@ -1049,25 +1049,33 @@ def _auto_detect_backend(**kwargs: Any) -> SandboxBackend:
     """
     Auto-detect the best available backend.
 
-    Priority:
-        1. unshare (Linux kernel namespaces, zero deps)
-        2. docker   (container isolation, requires Docker daemon)
+    Priority (Docker-First strategy):
+        1. docker   (container isolation, strongest sandbox boundary)
+        2. unshare  (Linux kernel namespaces, zero deps)
         3. bare     (no isolation, always available)
+
+    User-requested explicit backends (e.g., "unshare" or "bare") bypass this
+    function entirely — see create_backend() for the override path.
     """
-    # Try unshare first (lightest weight)
+    # Tier 1: Try Docker first (strongest isolation)
+    docker = DockerBackend(**kwargs) if kwargs else DockerBackend()
+    if docker.is_available():
+        logger.info("[sandbox] Auto-detected backend: docker (container, image=%s).", docker.image)
+        return docker
+
+    # Tier 2: Fall back to unshare (Linux kernel namespaces)
     unshare = UnshareBackend()
     if unshare.is_available():
         logger.info("[sandbox] Auto-detected backend: unshare (Linux namespaces).")
         return unshare
 
-    # Try docker second
-    docker = DockerBackend(**kwargs) if kwargs else DockerBackend()
-    if docker.is_available():
-        logger.info("[sandbox] Auto-detected backend: docker (%s).", docker.image)
-        return docker
-
-    # Fall back to bare
-    logger.info("[sandbox] Auto-detected backend: bare (no isolation).")
+    # Tier 3: Bare fallback — always available, logs a diagnostic warning
+    logger.warning(
+        "[sandbox] No container or namespace isolation available. "
+        "Falling back to bare backend (NO isolation). "
+        "Builds will run directly on the host. "
+        "Install Docker or ensure unshare permissions for sandboxed execution."
+    )
     return BareBackend()
 
 

@@ -1,272 +1,317 @@
 # AI Agent Harness — Requirements Specification
 
-*Auto-generated from exhaustive codebase analysis.*
+*Auto-generated from exhaustive codebase analysis and architecture review.*
 
 ---
 
 ## 1. Executive Summary
 
-AI Agent Harness is a production-grade, model-agnostic LangGraph agent for autonomous code generation, sandboxed build execution, and bulletproof persistence. It transforms natural language engineering prompts into verified, compiler-passing code patches within an isolated execution environment, with human-in-the-loop gates at every architectural boundary.
+AI Agent Harness is a production-grade, model-agnostic autonomous coding agent built on LangGraph. It accepts natural language engineering tasks, generates code patches using LLMs, sandboxes build verification, and applies validated changes to the workspace — all under budget controls, security guardrails, and persistence boundaries.
+
+The system replaces manual edit-compile-fix cycles with an automated pipeline: planning → patching → linting → compilation → repair → deployment, with human-in-the-loop intervention points at every critical decision boundary.
 
 ---
 
 ## 2. Functional Requirements (FR)
 
-### FR-001: Multi-Provider LLM Gateway
-- **Description**: The system shall provide a model-agnostic gateway supporting DeepSeek, Anthropic, OpenAI, and Ollama providers with automatic model selection based on node role (planning, patching, repair).
-- **Priority**: Must Have
-- **Acceptance Criteria**:
-  - Given a configured `.harness_config.json` with model routing rules, When a graph node dispatches an LLM call, Then the correct provider and model is selected for the node's role
-  - Given prefix caching is enabled, When the system prompt is anchored at messages[0], Then downstream providers receive the cached prompt prefix with discounted token rates
-  - Given the budget remaining drops below $0.05, When a dispatch is attempted, Then the gateway automatically falls back to local Ollama inference
+### FR-001: Natural Language Task Acceptance
+- **Description:** The system must accept a natural language engineering task via CLI (`-p` / `--prompt` flag) and execute it against a specified workspace directory (`-r` / `--workspace` flag).
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a valid workspace path and task prompt, the system initiates graph execution
+  - Given a missing workspace path, the system exits with code 1 and an error message
+  - The task prompt is anchored as `messages[1]` (user role) in the AgentState
 
-### FR-002: Autonomous Code Patching via LLM
-- **Description**: The system shall parse LLM responses containing SEARCH/REPLACE blocks and apply them to workspace files using a hybrid tree-sitter AST-aware + text exact-match engine.
-- **Priority**: Must Have
-- **Acceptance Criteria**:
-  - Given an LLM response with `<<<REPLACE_BLOCK>>>`, `<<<CREATE_FILE>>>`, `<<<DELETE_BLOCK>>>`, or `<<<INSERT_AT_BLOCK>>>` tags, When processed by the patcher, Then files are modified exactly as specified
-  - Given a file with a registered tree-sitter grammar, When a replace block targets it, Then the AST-aware patcher is used (preserving surrounding formatting)
-  - Given a file without a tree-sitter grammar, When a patch is applied, Then the text exact-match fallback is used
-  - Given a patch search block matches 0 or >1 times, When applied, Then the operation fails with a clear error message
+### FR-002: Multi-Provider LLM Gateway
+- **Description:** The system must support dispatching LLM calls to multiple providers (DeepSeek, Anthropic, OpenAI, Ollama) through a unified interface, with per-node role model selection.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a GatewayConfig with planning_primary, patching_primary, repair_primary, the gateway routes calls to the correct provider per NodeRole
+  - Given a provider API error, the system retries with exponential backoff + jitter (up to 3 attempts)
+  - Given a budget below zero, the gateway refuses dispatch with a RuntimeError
+  - Given a typo in model routing config, the system logs a warning and falls back to Ollama if configured (Graceful Typo Resilience, v1.1+)
 
-### FR-003: Sandboxed Build Execution
-- **Description**: The system shall execute build commands inside isolated environments with pluggable backends (Linux unshare namespaces, Docker containers, or bare subprocess).
-- **Priority**: Must Have
-- **Acceptance Criteria**:
-  - Given the backend is configured as "auto", When the sandbox initializes, Then the best available backend is auto-detected (unshare → docker → bare)
-  - Given network is disabled (`allow_network: false`), When a build command runs, Then the process has no outbound network access
-  - Given a build times out after `timeout_seconds`, When the process group is killed, Then SIGTERM is sent followed by SIGKILL after 3 seconds
-  - Given compiler output contains structured errors, When the sandbox finishes, Then structured `DiagnosticObject` entries are extracted per language parser
+### FR-003: Token Budget Enforcement
+- **Description:** The system must enforce a hard dollar cap on LLM API spending per session, with cumulative tracking across all model calls.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a `hard_cap_usd` of $2.00, the system tracks cumulative cost in `token_tracker.total_cost_usd`
+  - Given cost exceeds the cap, the gateway raises RuntimeError on the next dispatch attempt
+  - Token costs are computed per each model's input/output pricing
 
-### FR-004: Automated Repair Loop
-- **Description**: The system shall automatically retry failed builds with LLM-generated repair patches, escalating from cheap models to expensive reasoning models on the final attempt.
-- **Priority**: Must Have
-- **Acceptance Criteria**:
-  - Given a build fails with exit code ≠ 0, When repairs remain under 3, Then the repair_node generates a fix patch and re-verifies
-  - Given repair attempts 1-2 fail, When attempt 3 is reached, Then the expensive fallback model is used with thinking mode enabled
-  - Given 3 repair attempts all fail, When the loop limit is hit, Then the human_intervention_node is triggered
-  - Given budget is exhausted at any point, When routing occurs, Then human_intervention_node takes priority over repair_node
+### FR-004: Code Generation via Structured Patch Blocks
+- **Description:** The patching node must generate code changes using a strict patch block syntax (CREATE_FILE, REPLACE_BLOCK, DELETE_BLOCK, INSERT_AT_BLOCK) that can be deterministically parsed and applied to disk.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given an LLM response containing `<<<CREATE_FILE>>>...<<<END_CREATE_FILE>>>` blocks, the patcher creates new files at the specified paths
+  - Given an LLM response containing `<<<REPLACE_BLOCK>>>...<<<END_REPLACE_BLOCK>>>` blocks, the patcher finds and replaces exact text matches
+  - SEARCH blocks failing to match uniquely produce a PatchResult with `success=False` and a descriptive error
+  - The `modified_files` list in AgentState tracks all successfully changed files
+  - A strict format reminder is injected before every patching/repair LLM call to ensure compliance (v1.1+)
 
-### FR-005: Human-in-the-Loop Intervention
-- **Description**: The system shall present interactive menus when repair limits or budget caps are reached, allowing developers to view diffs, inject hints, pause for manual edits, increase budget, or abandon.
-- **Priority**: Must Have
-- **Acceptance Criteria**:
-  - Given HITL is triggered, When the developer chooses [e] inject hint, Then the hint is appended to messages and the repair loop counter is reset
-  - Given HITL is triggered, When the developer chooses [m] manual edits, Then the harness pauses and waits for IDE edits before resuming compilation
-  - Given HITL is triggered, When the developer chooses [q] abandon, Then git rollback is attempted and the session ends
-  - Given HITL is triggered, When the developer chooses [b] increase budget, Then $2.00 is added to the remaining budget
+### FR-005: Sandboxed Build Verification
+- **Description:** Every patch application must be verified by executing the project's build command inside an isolated sandbox (Docker container, Linux namespaces, or bare).
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given `allow_network=False`, the sandbox has no outbound network access
+  - Build processes are terminated after `timeout_seconds` (default 300) via PGID-based signal escalation (SIGTERM → 3s → SIGKILL)
+  - Raw build output is captured via disk-buffered log streaming (500MB max)
+  - Structured compiler diagnostics (file, line, column, severity, error_code, message) are extracted from raw output
+  - Auto-detection prioritizes Docker over unshare over bare (Docker-First strategy, v1.1+)
 
-### FR-006: Three-Phase Exhaustive Discovery
-- **Description**: Before code generation, the system shall conduct exhaustive requirements, architecture, and deployment discovery using the planning LLM across 8+ structured sectors each.
-- **Priority**: Should Have
-- **Acceptance Criteria**:
-  - Given the requirements discovery node executes, When the LLM returns JSON questions, Then 8 sectors are covered (input validation, payload formatting, error handling, multi-user edge cases, security controls, business logic, data retention, hidden assumptions)
-  - Given critical questions remain unanswered, When the user types DONE, Then the system refuses to proceed and displays a warning
-  - Given a phase is approved at the human gatekeeper, When the gatekeeper routes forward, Then the next discovery phase begins (requirements → architecture → code generation)
+### FR-006: Automatic Repair Loop
+- **Description:** When the compiler_node returns a non-zero exit code, the system must enter a repair loop where the LLM analyzes diagnostics and generates fix patches, with a maximum of 3 attempts before escalating to human intervention.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given exit_code != 0 AND total_repairs < 3, the system routes to repair_node
+  - Given exit_code != 0 AND total_repairs >= 3, the system routes to human_intervention_node
+  - Repair attempts 1-2 use the repair_primary model; attempt 3 escalates to repair_fallback with thinking mode
+  - When no structured diagnostics exist, the raw build output (last 2000 chars) is included in the repair prompt (v1.1+)
+  - Lintgate errors are appended to the repair prompt context (v1.1+)
 
-### FR-007: Exhaustive Deployment Infrastructure Discovery
-- **Description**: The system shall cross-examine the user across 4 deployment-specific sectors (network topology, data/storage persistence, secrets/identity management, partial infrastructure sync) before generating container assets.
-- **Priority**: Should Have
-- **Acceptance Criteria**:
-  - Given the deployment discovery node executes, When the LLM generates questions, Then 4 deployment sectors are covered
-  - Given discovery is complete, When routing proceeds, Then `generate_deployment_spec_node` produces `DEPLOYMENT_BLUEPRINT.md`
+### FR-007: Human-in-the-Loop Intervention
+- **Description:** When repair limits are exceeded or budget is exhausted, the system must present an interactive menu to the developer with options to resume, inject hints, manually edit files, increase budget, or abandon.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given [v], the system displays active file diffs
+  - Given [r], the system clears HITL flags, resets the loop counter, and routes to compiler_node
+  - Given [e], the system appends the developer's hint as a user message and routes to repair_node
+  - Given [m], the system pauses for manual IDE edits, clears compiler errors, and routes to compiler_node
+  - Given [b], the system increases the budget by $2.00 and resets the loop counter
+  - Given [q], the system sets hitl_abandon flag, attempts git rollback, and routes to END
+  - When no structured diagnostics exist, raw build output is displayed in the HITL menu (v1.1+)
 
-### FR-008: Deterministic Lint & Format Gate
-- **Description**: The system shall run language-specific auto-formatters (ruff, gofmt, prettier, rustfmt, clang-format) on modified files after patching but before compilation.
-- **Priority**: Must Have
-- **Acceptance Criteria**:
-  - Given `.py` files are modified, When lintgate runs, Then `ruff format --quiet` is applied
-  - Given `.go` files are modified, When lintgate runs, Then `gofmt -w` is applied
-  - Given no formatter is installed for a file extension, When lintgate runs, Then the file is skipped with a debug log (no error raised)
+### FR-008: Checkpoint Persistence
+- **Description:** The system must persist LangGraph state checkpoints to disk via SQLite, enabling crash recovery and session resumption across process restarts.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a session, each graph node transition is checkpointed to SQLite
+  - Given `harness resume --session-id <id>`, the system restores state from the last checkpoint and continues execution
+  - Checkpoints older than 30 days are garbage-collected on startup
 
-### FR-009: Multi-Variant Speculative Compilation
-- **Description**: The system shall generate N parallel patches with diverse temperatures, compile each in an isolated git worktree, and select the first passing variant.
-- **Priority**: Could Have
-- **Acceptance Criteria**:
-  - Given `num_variants` is 3, When speculate_node runs, Then 3 LLM calls are made with temperature > 0
-  - Given at least one variant passes compilation, When selection occurs, Then the winner's files are copied back to the main workspace
-  - Given all variants fail, When speculation completes, Then the system falls back to sequential single-patch repair flow
+### FR-009: Session Inspection
+- **Description:** The system must provide a read-only `harness status` command that displays the current state of any checkpointed session without triggering graph execution.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `harness status --session-id <id>`, the system prints thread_id, current node, exit code, budget remaining, token cost, modified files, and loop counters
+  - Given `harness status --all`, the system lists all checkpointed sessions by thread_id
 
-### FR-010: Impact Analysis Warnings
-- **Description**: Before patches are applied, the system shall scan the dependency graph and warn about downstream files potentially affected by the modifications.
-- **Priority**: Should Have
-- **Acceptance Criteria**:
-  - Given file `core/auth.py` is modified, When impact analysis runs, Then files importing from `core/auth.py` are listed in a warning message
-  - Given the dependency graph has not been built, When `analyze()` is called, Then the graph is lazily built on first use
+### FR-010: Workspace Configuration Discovery
+- **Description:** The system must discover configuration hierarchically: workspace `.harness_config.json` → `~/.harness/config.json` → shipped `cli.json` fallback, with deep merging of nested dictionaries.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given no `.harness_config.json` exists in the workspace, the system auto-generates one from global + fallback configs
+  - Given a key exists in both workspace and global config, the workspace value takes precedence
+  - Nested dicts are deep-merged (shallow keys override, nested keys merge)
 
-### FR-011: Secret Redaction
-- **Description**: The system shall scan all outbound LLM messages for API keys, tokens, passwords, private keys, and connection strings, replacing them with hashed placeholders.
-- **Priority**: Must Have
-- **Acceptance Criteria**:
-  - Given a message contains `sk-proj-...`, When redaction runs, Then the key is replaced with `[REDACTED:OpenAI API key:sha256:xxxxxxxx]`
-  - Given the redaction mode is "mask", When a secret is found, Then it is replaced with `[REDACTED]`
-  - Given no secrets are present, When redaction runs, Then the text is returned unmodified
+### FR-011: Git Lifecycle Management
+- **Description:** Every harness session must operate on an isolated git patch branch, with automatic stashing of dirty state, commit on success, and rollback on failure.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a dirty workspace, pre-existing changes are stashed before branch creation
+  - A branch named `agent/patch-{session_id[:8]}` is created off the current HEAD
+  - On build success, all changes are committed with the session ID and exit code in the commit message
+  - On build failure or `[q]` abandon, the system performs `git checkout -- .`
 
-### FR-012: Token Budget Enforcement
-- **Description**: The system shall enforce a hard USD cap on LLM API calls, refusing dispatch when `budget_remaining_usd <= 0`.
-- **Priority**: Must Have
-- **Acceptance Criteria**:
-  - Given budget_remaining_usd is $0.00, When `gateway.dispatch()` is called, Then `RuntimeError` is raised
-  - Given budget_remaining_usd drops below $0.05, When dispatch is attempted, Then the gateway auto-switches to local Ollama
+### FR-012: Secret Redaction
+- **Description:** All messages sent to external LLM APIs must be scanned for secrets (API keys, tokens, JWT, credentials) and replaced with placeholders before transmission.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a message containing a GitHub token pattern (`ghp_`), the token is replaced with `[REDACTED:sha256:<hash>]`
+  - Given a message containing an OpenAI API key pattern (`sk-proj-`), the key is replaced with a placeholder
+  - The original content is excluded from the outbound request
+  - A `RedactionResult` tracks the count of replacements per call
 
-### FR-013: Git Lifecycle Management
-- **Description**: The system shall create isolated patch branches per session, commit on success, and rollback on failure.
-- **Priority**: Must Have
-- **Acceptance Criteria**:
-  - Given a session starts, When `create_patch_branch()` is called, Then a branch named `agent/patch-{session_id[:8]}` is created
-  - Given build exit code is 0, When the session completes, Then changes are committed and the original branch is restored
-  - Given build exit code ≠ 0, When the session completes, Then the working tree is rolled back and the patch branch is deleted
+### FR-013: Language-Aware Diagnostic Parsing
+- **Description:** Compiler output must be parsed into structured diagnostics using language-specific parsers (Rust JSON, GCC/Clang JSON, Go regex, Python traceback, generic fallback).
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given Rust compiler output with `--error-format=json`, structured DiagnosticObjects are extracted with file, line, column, severity, error_code, message
+  - Given Go compiler output (`file:line:col: message`), diagnostics are parsed via regex
+  - Given unrecognized compiler output, the generic parser (`file:line:col: severity: message`) is attempted
 
-### FR-014: Checkpoint Persistence
-- **Description**: The system shall persist LangGraph state to SQLite for crash recovery and cross-process resume.
-- **Priority**: Must Have
-- **Acceptance Criteria**:
-  - Given a graph executes with a checkpointer, When state transitions, Then checkpoints are saved to `~/.harness/checkpoints.db`
-  - Given checkpoints older than 30 days, When GC runs, Then those rows are deleted
-  - Given `harness status --session-id <id>` is run, When the checkpoint exists, Then a clean text summary is displayed without triggering any graph execution
+### FR-014: Pre-Build Lint Gate
+- **Description:** Modified files must be auto-formatted and optionally linted using deterministic local tools (ruff, gofmt, prettier, rustfmt) before the heavy compiler pipeline runs, to catch trivial issues without LLM cost.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given modified Python files, `ruff format --quiet` is run on each file
+  - Given modified Go files, `gofmt -w` is run on each file
+  - Lint errors are logged as warnings and included in the repair prompt context
+  - Lint gate failures do not block compilation
+  - Lint errors are truncated at 500 chars to preserve full diagnostic context (v1.1+)
 
-### FR-015: Command Whitelist Validation
-- **Description**: The system shall block dangerous shell commands (curl, wget, sudo, rm -rf /, etc.) before build execution.
-- **Priority**: Must Have
-- **Acceptance Criteria**:
-  - Given a build command contains `curl`, When validated, Then `ValueError` is raised with a security block message
-  - Given a build command is `make build`, When validated, Then the command passes
+### FR-015: Speculative Multi-Variant Compilation
+- **Description:** After patching, the system may generate N parallel variant patches (with temperature > 0) and compile them in isolated git worktrees, selecting the best variant by configurable strategy (first_success, fewest_changes, all_pass).
+- **Priority:** Could Have
+- **Acceptance Criteria:**
+  - Given strategy=`first_success`, the first variant with exit_code=0 is selected as winner
+  - Given strategy=`fewest_changes`, the passing variant with the fewest lines changed is selected
+  - Each variant is compiled in an isolated `git worktree`
 
-### FR-016: Security Scanning (SAST + Secrets)
-- **Description**: After compilation succeeds, the system shall run gitleaks (secret detection) and bandit/semgrep (SAST) in parallel, routing findings back to the repair loop.
-- **Priority**: Should Have
-- **Acceptance Criteria**:
-  - Given a security scan finds hardcoded secrets, When `compiler_errors` is populated, Then the router sends findings to `patching_node` for remediation
-  - Given 2 security fix attempts fail, When the attempt limit is reached, Then the router sends the session to HITL
+### FR-016: Deployment Orchestration
+- **Description:** After successful compilation and security scan, the system must generate container assets (Dockerfile, docker-compose.yml, Caddyfile) and optionally deploy via docker-compose with health check polling.
+- **Priority:** Could Have
+- **Acceptance Criteria:**
+  - Given workspace telemetry, a Docker Compose file is generated with per-service configurations
+  - Given a deployment blueprint, `docker-compose up --build -d` is executed
+  - Health checks poll `docker inspect` until containers report healthy or timeout (120s)
 
-### FR-017: Documentation Generation
-- **Description**: The system shall provide skill-based documentation generators for README, architecture, functional spec, requirements, and API reference documents.
-- **Priority**: Could Have
-- **Acceptance Criteria**:
-  - Given `register_builtin_skills()` is called, When skills are registered, Then 5 DocGenSkill instances plus 3 PipelineSkill instances are registered
-  - Given a docgen skill executes, When the LLM responds, Then the output is written to the specified file path
+### FR-017: Skip Discovery Mode
+- **Description:** The `--skip-discovery` / `-s` CLI flag must bypass the exhaustive requirements/architecture discovery phases and route directly to code generation.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `--skip-discovery`, the graph routes START → patching_node directly
+  - The system prompt (snapshot-based) is used as messages[0] without modification
+
+### FR-018: Memory Cleanse
+- **Description:** After successful compilation or human intervention resolution, verbose intermediate repair-loop messages must be compressed into a single structured summary to conserve context window tokens.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given compiler exit_code == 0, messages are cleansed, retaining system prompt + original planning message + final successful patch + compression summary
+  - The compression summary includes target file, repair iterations, and debug token cost
+
+### FR-019: Code Quality Standards Enforcement
+- **Description:** The system prompt must include explicit code quality standards (modularity, error handling, type hints, edge cases, production-readiness) and both patching/repair format reminders must include a quality directive.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Messages[0] includes a "Code Quality Standards" section with 8 quality rules
+  - Both patching_node and repair_node inject a one-line quality directive before LLM dispatch
+  - Generated code must be modular, self-contained, and include proper error handling
 
 ---
 
 ## 3. System Scope
 
-### In-Scope
-- Multi-provider LLM gateway (DeepSeek, Anthropic, OpenAI, Ollama)
-- Autonomous code patching with AST-aware + text fallback
-- Isolated sandbox build execution (unshare, Docker, bare)
-- Automated build repair with cross-model escalation
-- Human-in-the-loop intervention menus
-- Exhaustive requirements/architecture/deployment discovery
-- Deterministic pre-build linting and formatting
-- Multi-variant speculative compilation
-- Secret redaction before LLM transit
-- SAST + secret security scanning
-- Git branch lifecycle management
-- SQLite checkpoint persistence with TTL GC
-- Command whitelist security validation
-- Documentation skill generation
+### In Scope
+- Autonomous code generation and patching for any text-based language
+- Multi-provider LLM integration with budget tracking
+- Docker-first sandboxed build execution with unshare and bare fallbacks
+- Structured diagnostic parsing for Rust, C/C++, Go, Python, and generic compilers
+- Automatic repair loops with cross-model escalation and raw output fallback
+- Human-in-the-loop intervention menus with raw build output display
+- SQLite-based checkpoint persistence with resume capability
+- Read-only session status inspection
+- Git lifecycle management (isolated branches, stash, commit, rollback)
+- Secret redaction before API transit
+- Pre-build lint formatting (ruff, gofmt, prettier, rustfmt)
+- Configuration discovery with graceful fallback for typos
+- CLI with subcommand routing (run, resume, status, purge)
+- Optional discovery pipeline (requirements/architecture/deployment interviews)
+- Speculative multi-variant compilation
+- Code quality standards embedded in all LLM prompts
 
-### Out-of-Scope
-- IDE/editor integration (VS Code extension, etc.)
-- Real-time collaboration features
-- Kubernetes cluster deployment (only docker-compose)
-- Web UI dashboard
-- Multi-agent orchestration beyond the single-agent LangGraph
-- Payment/billing integration
+### Out of Scope
+- Real-time collaborative editing
+- Web UI or graphical interface (CLI only)
+- Windows sandbox isolation (Linux namespaces / Docker only)
+- Direct database or file system migrations (only code generation)
+- CI/CD pipeline integration (runs as standalone CLI tool)
+- Multi-repository or monorepo-aware analysis
+- Code review or pull request generation
+- IDE plugin integration
 
 ---
 
 ## 4. Technical Constraints
 
 ### Language & Runtime
-- **Language**: Python 3.11+
-- **Framework**: LangGraph ≥ 0.4.0 for state machine orchestration
-- **Persistence**: aiosqlite with WAL journal mode
-- **File I/O**: aiofiles ≥ 24.0 with sync fallback
-- **HTTP Client**: httpx ≥ 0.28 with async transport
+- **Language:** Python 3.11+
+- **Orchestration:** LangGraph ≥ 0.4.0
+- **Async:** asyncio throughout (aiofiles, httpx async client, aiosqlite)
+- **Type Safety:** TypedDict for LangGraph state; Pydantic for validation
 
-### Infrastructure
-- **Sandbox Backends**: Linux unshare namespaces (primary), Docker containers, bare subprocess
-- **Network**: Disabled by default in sandbox; toggleable via `allow_network` config
-- **Resource Limits**: Configurable memory, CPU, and PID limits for Docker backend
+### Platform
+- **Primary Target:** Linux (x86_64, aarch64)
+- **Sandbox Backend (Primary):** Docker container with resource limits (v1.1+ Docker-First)
+- **Sandbox Backend (Secondary):** Linux kernel namespaces via `unshare(2)` 
+- **Sandbox Backend (Tertiary):** Bare subprocess with diagnostic warning
+- **macOS Support:** Docker backend only (no `unshare` on macOS)
+- **File System:** ext4 / APFS / NTFS for workspace; `~/.harness/` for persistence
 
 ### Performance Targets
-- **Build Timeout**: 300 seconds default, configurable
-- **LLM Retry**: 5 attempts max with exponential backoff + jitter
-- **Context Window**: 85% threshold triggering aggressive truncation
-- **Log Buffer**: Disk-buffered by default with 500MB max, supports in-memory mode
+- **LLM Latency:** Gateway dispatch completes within API provider SLA (typically 2-60s)
+- **Build Execution:** Sandbox runs with configurable timeout (default 300s)
+- **Log Streaming:** Supports build output up to 500MB via disk-buffered streaming
+- **Persistence:** WAL-mode SQLite supports concurrent read/write with < 50ms latency
 
-### Security
-- **Secrets**: Strip/hash API keys, tokens, private keys before API transmission
-- **Commands**: Whitelist-only validation; curl, wget, sudo blocked
-- **Git**: Isolated patch branches, automatic rollback on failure
-- **Network**: Namespace-level network isolation in sandbox
+### Security Requirements
+- No secrets transmitted to external APIs (redaction enforced before every call)
+- No outbound network access from sandbox unless explicitly enabled (`--allow-network`)
+- Sandbox process containment via PID namespaces and PGID-based termination
+- Command validation for whitelist/blocklist before sandbox execution
+- Git isolation: all changes on temporary branches, no direct main/master mutation
 
 ---
 
 ## 5. Explicit Edge Cases
 
 ### Error States
-- **Budget Exhausted**: Gateway raises RuntimeError; router sends to HITL node
-- **Model Not Registered**: `create_provider()` raises ValueError with available providers listed
-- **Context Window Exceeded**: Aggressive truncation keeping system prompt + last message; raises if still over threshold
-- **API Rate Limited (429)**: Exponential backoff with Retry-After header support
-- **Server Error (5xx)**: Exponential backoff up to max_retries
-- **Tree-Sitter Unavailable**: Graceful fallback to TextPatcher with debug log
-- **Docker Not Installed**: Falls back to unshare or bare backend
-- **Unshare Permission Denied**: Falls back to bare backend
-- **Empty LLM Response**: Raised as RuntimeError in synthesis workflows
-- **Invalid JSON from LLM**: Caught with fallback blueprint generation / error state
-- **File Not Found (patching)**: PatchResult with clear error, operation skipped
-- **Duplicate Search Match**: PatchResult failure with count reported
-- **Build Timed Out**: SIGTERM → 3s wait → SIGKILL escalation
-- **Corrupt JSON in diagnostics**: Graceful skip of bad line, continue parsing
+| Condition | System Behavior |
+|-----------|----------------|
+| LLM API returns 5xx | Gateway retries with exponential backoff + jitter (3 attempts) |
+| LLM API returns 4xx (auth) | Gateway logs error, returns RuntimeError to graph node |
+| Budget exhausted mid-execution | Gateway refuses dispatch; node returns budget_exhausted flag; router sends to HITL |
+| Build command not found | Sandbox returns exit code 127; structured diagnostic generated |
+| Build times out (default 300s) | PGID SIGTERM → 3s → SIGKILL; BuildResult.timed_out = True |
+| Patch SEARCH block not found | TextPatcher returns PatchResult(success=False) with closest-match context |
+| Patch file already exists (CREATE_FILE) | PatchResult(success=False, error="File already exists") |
+| SQLite database locked | WAL mode + busy_timeout=5000ms handles concurrent access |
+| Secret redactor false positive | Placeholder masks content; developer can inspect original in local logs |
+| Git rollback fails (no git repo) | Warning logged; session proceeds without git lifecycle management |
+| Discovery interview receives EOF | Current state saved; system exits gracefully with non-zero code |
+| HITL menu receives EOF/KeyboardInterrupt | Session abandoned; git rollback attempted |
+| Build produces no structured diagnostics | Raw build output displayed in HITL menu and included in repair prompt |
+| Typo in model routing config | Logger.error with suggestion; auto-falls back to Ollama if configured |
 
 ### Boundary Conditions
-- **Max Repair Iterations**: 3 (routes to HITL on 4th failure)
-- **Max Security Fix Attempts**: 2
-- **Max Discovery Rounds**: No hard limit; user types DONE to finalize
-- **Max Files Scanned (impact)**: 500
-- **Max Log Size (disk mode)**: 500MB before truncation
-- **Max Variants (speculative)**: Configurable, default 3
-- **Budget Hard Cap**: Default $2.00 USD
-- **Context Window Threshold**: 85% of model limit
-- **TTL for Checkpoints**: 30 days
+| Condition | Limit |
+|-----------|-------|
+| Maximum repair loop iterations | 3 (configurable via `node_throttle.max_patch_repair_iterations`) |
+| Maximum security fix attempts | 2 |
+| Default budget cap | $2.00 (configurable via `token_budget.hard_cap_usd`) |
+| Context window threshold | 85% of model's context_window (configurable) |
+| Maximum sandbox build output | 500MB disk-buffered |
+| Maximum session TTL | 30 days (configurable via `persistence.ttl_days`) |
+| Maximum log tail fallback | Last 50 lines (when no critical patterns match) |
+| System prompt max depth | 4 directory levels, 50 files per directory |
+| Speculative variants | 3 parallel worktrees |
+| Raw output in repair prompt | Last 2000 chars |
+| Lint error truncation | 500 chars |
 
 ### Recovery Scenarios
-- **Process Crash During Graph Execution**: Checkpointer restores from last saved checkpoint
-- **Network Partition During LLM Call**: Exponential backoff retry up to 5 attempts
-- **Partial Patch Application**: HybridPatcher stops at first failure to prevent cascading errors
-- **Cached Sessions**: `harness resume --session-id` picks up from exact checkpoint boundary
-- **Memory Cleanse on Success**: Verbose debugging messages compressed into summary to preserve context budget
+| Scenario | Recovery |
+|----------|----------|
+| Process crash mid-execution | Checkpoint stored after every node; `harness resume --session-id <id>` restores |
+| Power loss / reboot | SQLite WAL journal replays on next connection |
+| LLM returns unusable response | Node catches exception, logs error, routes to next node or HITL |
+| Docker daemon unreachable | Sandbox auto-falls-back to UnshareBackend → BareBackend |
+| tree-sitter grammar not installed | HybridPatcher auto-falls-back to TextPatcher |
+| aiofiles not installed | All file operations fall back to sync `open()` |
 
 ---
 
 ## 6. Non-Functional Requirements
 
-### NFR-001: Reliability
-- Graph state is persisted to SQLite on every transition
-- WAL journal mode prevents corruption on crash
-- Automatic 30-day TTL garbage collection prevents unbounded DB growth
+### Reliability (NFR-001)
+- **Target:** 99% of session completions within 3 repair attempts or successful HITL resolution
+- **Measurement:** Track repair_loop_limit HITL triggers vs successful compilations per session
+- **Graceful Degradation:** Docker → unshare → bare sandbox chain; remote LLM → local Ollama fallback
 
-### NFR-002: Model Agnosticism
-- No provider is hardcoded as default
-- All models must be explicitly registered via config
-- Provider-specific response parsing is abstracted behind `BaseLLM` interface
+### Scalability (NFR-002)
+- **Target:** Support workspaces up to 10,000 files without system prompt bloat
+- **Implementation:** Directory tree snapshot limited to 4 levels depth, 50 files per directory
 
-### NFR-003: Observability
-- Structured logging at DEBUG/INFO/WARNING/ERROR levels
-- Per-node logging with `[node_name]` prefixes
-- Token tracking aggregated per-model in state
-- Build output streamed to disk with line-by-line filtering
+### Observability (NFR-003)
+- **Target:** All node transitions, LLM calls, and build executions logged with structured data
+- **Log Levels:** DEBUG (full LLM responses), INFO (node transitions + costs), WARNING (recoverable errors), ERROR (unrecoverable)
+- **Token Tracking:** Per-model input/output/cached token counts + USD cost aggregated in state
 
-### NFR-004: Configurability
-- Hierarchical config discovery: workspace `.harness_config.json` → `~/.harness/config.json` → `cli.json` fallback
-- Deep merge semantics for nested config keys
-- CLI flags override config values
+### Maintainability (NFR-004)
+- **Target:** Adding a new LLM provider requires only a new Provider class implementing `dispatch()` 
+- **Target:** Adding a new language parser requires only a new class with `parse_diagnostics()` and registration in `parser_registry`
+- **Target:** Adding a new formatter requires only a `FormatterSpec` entry in the defaults dict
 
-### NFR-005: Extensibility
-- Pluggable sandbox backends via `SandboxBackend` ABC
-- Pluggable LLM providers via `BaseLLM` ABC
-- Pluggable skill registry for tools, pipelines, and sub-agents
-- Pluggable diagnostic parser registry per compiler/language
+### Security (NFR-005)
+- **Target:** Zero credentials in any external network call
+- **Target:** All sandboxed processes die on timeout; no orphan processes
+- **Target:** Workspace never mutated on the original branch; all changes isolated to patch branches

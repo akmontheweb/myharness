@@ -1166,12 +1166,33 @@ def _validate_routing_keys(
 
     if errors:
         registered_list = "\n    ".join(sorted(registered_models)) if registered_models else "(none)"
-        raise ValueError(
-            f"Model routing references {len(errors)} unregistered model(s):\n"
-            + "\n".join(errors)
-            + f"\n\n  Registered models:\n    {registered_list}"
-            + "\n\n  Fix these typos in your .harness_config.json or ~/.harness/config.json"
-            + " model_routing section, or register the missing models."
+        ollama_model = model_routing.get("ollama_local_model", "")
+
+        if ollama_model:
+            # Auto-fall back: point all misconfigured routing keys to local Ollama
+            logger.error(
+                "Model routing references %d unregistered model(s):\n%s\n\n"
+                "  Registered models:\n    %s\n\n"
+                "  Auto-falling back to local Ollama model '%s' for these roles. "
+                "Fix the typos in .harness_config.json to restore remote model routing.",
+                len(errors),
+                "\n".join(errors),
+                registered_list,
+                ollama_model,
+            )
+            # Return — no exception. The caller will proceed with Ollama as ultimate fallback.
+            return
+
+        # No Ollama configured — log the error but don't crash;
+        # individual dispatch calls will handle missing providers gracefully.
+        logger.error(
+            "Model routing references %d unregistered model(s):\n%s\n\n"
+            "  Registered models:\n    %s\n\n"
+            "  No ollama_local_model configured for auto-fallback. "
+            "Dispatch will fail at runtime. Fix the typos in .harness_config.json.",
+            len(errors),
+            "\n".join(errors),
+            registered_list,
         )
 
 

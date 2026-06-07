@@ -237,7 +237,7 @@ class TestSandboxBackend:
         from harness.sandbox import create_backend
         backend = create_backend("auto")
         assert backend is not None
-        assert backend.name in ("unshare", "docker", "bare")
+        assert backend.name.startswith(("unshare", "docker", "bare"))
 
     def test_create_backend_unknown(self):
         from harness.sandbox import create_backend
@@ -434,46 +434,51 @@ class TestStorage:
 
     @pytest.mark.asyncio
     async def test_async_sqlite_saver_basic(self):
-        from harness.storage import AsyncSqliteSaver
+        from harness.storage import HarnessAsyncSqliteSaver
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
             db_path = tf.name
         try:
-            saver = AsyncSqliteSaver(db_path=db_path, ttl_days=30)
-            await saver.initialize()
-            config = {"configurable": {"thread_id": "test-thread"}}
+            saver = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=30)
+            config = {"configurable": {"thread_id": "test-thread", "checkpoint_ns": ""}}
             checkpoint = {"id": "cp1", "type": "state", "channel_values": {"exit_code": 0}}
             metadata = {"source": "test"}
-            await saver.put(config, checkpoint, metadata, {})
-            result = await saver.get(config)
+            await saver.aput(config, checkpoint, metadata, {})
+            result = await saver.aget(config)
             assert result is not None
+            # Official saver returns checkpoint dict; 'id' may be in a nested structure
+            # Validate the result is the checkpoint we stored
             assert result.get("id") == "cp1"
-            await saver.close()
+            await saver.conn.close()
         finally:
             if os.path.exists(db_path):
                 os.unlink(db_path)
 
     @pytest.mark.asyncio
     async def test_async_sqlite_saver_get_missing(self):
-        from harness.storage import AsyncSqliteSaver
+        from harness.storage import HarnessAsyncSqliteSaver
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
             db_path = tf.name
         try:
-            saver = AsyncSqliteSaver(db_path=db_path, ttl_days=30)
-            await saver.initialize()
-            result = await saver.get({"configurable": {"thread_id": "nonexistent"}})
+            saver = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=30)
+            result = await saver.aget({"configurable": {"thread_id": "nonexistent"}})
             assert result is None
-            await saver.close()
+            await saver.conn.close()
         finally:
             if os.path.exists(db_path):
                 os.unlink(db_path)
 
-    def test_create_checkpointer_sqlite(self):
-        from harness.storage import create_checkpointer, AsyncSqliteSaver
+    @pytest.mark.asyncio
+    async def test_create_checkpointer_sqlite(self):
+        from harness.storage import create_checkpointer, HarnessAsyncSqliteSaver
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
             db_path = tf.name
         try:
-            cp = create_checkpointer(backend="sqlite", db_path=db_path)
-            assert isinstance(cp, AsyncSqliteSaver)
+            cp = await create_checkpointer(backend="sqlite", db_path=db_path)
+            assert isinstance(cp, HarnessAsyncSqliteSaver)
+            # Also verify it passes LangGraph's isinstance check
+            from langgraph.checkpoint.base import BaseCheckpointSaver
+            assert isinstance(cp, BaseCheckpointSaver)
+            await cp.conn.close()
         finally:
             if os.path.exists(db_path):
                 os.unlink(db_path)

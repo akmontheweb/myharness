@@ -106,6 +106,7 @@ class AgentState(TypedDict, total=False):
     spec_requirements_path: str
     spec_architecture_path: str
     deployment_blueprint_path: str
+    skip_discovery: bool
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +157,7 @@ if _PYDANTIC_AVAILABLE:
         session_id: str = ""
         exit_code: int = -1
         node_state: dict[str, Any] = Field(default_factory=dict)
+        skip_discovery: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +173,7 @@ def create_initial_state(
     budget_usd: float = 2.00,
     session_id: str = "",
     spec_override: Optional[str] = None,
+    skip_discovery: bool = False,
 ) -> AgentState:
     """
     Construct the initial graph state with anchored system prompt at messages[0]
@@ -207,6 +210,7 @@ def create_initial_state(
         session_id=session_id,
         exit_code=-1,
         node_state={},
+        skip_discovery=skip_discovery,
     )
 
 
@@ -225,6 +229,23 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
     except ImportError:
         pass
 
+    # --- Two-Tier Skills System ---
+    # Tier 1: Harness skills (harness/skills/*.md) — universal agent standards
+    harness_skills = _load_skills_markdown(
+        os.path.join(os.path.dirname(__file__), "skills"),
+        max_file_chars=4000,
+    )
+    if harness_skills:
+        harness_skills = f"## Agent Skills & Standards\n{harness_skills}\n"
+
+    # Tier 2: Project skills ({workspace_path}/skills/*.md) — per-project conventions
+    project_skills = _load_skills_markdown(
+        os.path.join(workspace_path, "skills"),
+        max_file_chars=3000,
+    )
+    if project_skills:
+        project_skills = f"## Project Skills & Conventions\n{project_skills}\n"
+
     return f"""You are an expert software engineer with deep knowledge of the codebase below.
 
 ## Repository Root
@@ -232,7 +253,7 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
 
 ## Directory Structure (snapshot at invocation)
 {tree}
-
+{harness_skills if harness_skills else ""}{project_skills if project_skills else ""}
 ## Build Command
 {build_command}
 
@@ -285,6 +306,16 @@ content:
 <<<END_INSERT_AT_BLOCK>>>
 ```
 
+## Code Quality Standards
+- Write modular, self-contained functions/classes with single responsibility.
+- Include proper error handling: try/except, input validation, graceful fallbacks.
+- Add type hints (Python), type annotations (TypeScript), or equivalent in the target language.
+- Use meaningful variable/function names; include docstrings and inline comments.
+- Follow the principle of least surprise — never modify unrelated code or files.
+- Handle edge cases: empty inputs, None/null values, network failures, timeouts.
+- Write production-ready code: no debug print statements, no hardcoded secrets or credentials.
+- Prefer composition over inheritance; keep coupling loose and interfaces clean.
+
 ## Rules
 - Never remove or alter existing comments unless instructed.
 - Preserve existing indentation and code style.
@@ -325,6 +356,40 @@ def _snapshot_directory_tree(path: str, max_depth: int = 4, max_files_per_dir: i
     except (OSError, PermissionError) as exc:
         lines.append(f"[Error reading directory: {exc}]")
     return "\n".join(lines)
+
+
+def _load_skills_markdown(skills_dir: str, max_file_chars: int = 4000) -> str:
+    """
+    Scan a skills/ directory for .md files and return their concatenated content.
+
+    Each file's content is truncated to ``max_file_chars`` to prevent system
+    prompt bloat. Files are sorted alphabetically for deterministic ordering.
+
+    Args:
+        skills_dir: Absolute path to the skills directory.
+        max_file_chars: Maximum characters to read per skill file.
+
+    Returns:
+        Concatenated markdown content, or empty string if no skills found.
+    """
+    if not os.path.isdir(skills_dir):
+        return ""
+    parts: list[str] = []
+    try:
+        for fname in sorted(os.listdir(skills_dir)):
+            if not fname.endswith(".md"):
+                continue
+            fpath = os.path.join(skills_dir, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as sf:
+                    content = sf.read(max_file_chars)
+                if content.strip():
+                    parts.append(content)
+            except OSError:
+                logger.warning("[graph] Could not read skills file: %s", fpath)
+    except OSError:
+        return ""
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +626,45 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
         messages = list(state.get("messages", []))
         budget = state.get("budget_remaining_usd", 2.00)
 
+        # Inject a format reminder to ensure the LLM outputs patch blocks
+        _FORMAT_REMINDER = """[CRITICAL FORMAT INSTRUCTION]
+You MUST respond using ONLY the patch block syntax below. Do NOT include any explanations,
+markdown code fences, or text outside the blocks. Your entire response must be parseable
+as one or more patch blocks.
+
+Valid blocks:
+<<<CREATE_FILE>>>
+file: path/to/file.ext
+content:
+<complete file contents>
+<<<END_CREATE_FILE>>>
+
+<<<REPLACE_BLOCK>>>
+file: path/to/file.ext
+search:
+<exact lines to find>
+replace:
+<exact replacement lines>
+<<<END_REPLACE_BLOCK>>>
+
+<<<DELETE_BLOCK>>>
+file: path/to/file.ext
+search:
+<exact lines to delete>
+<<<END_DELETE_BLOCK>>>
+
+<<<INSERT_AT_BLOCK>>>
+file: path/to/file.ext
+anchor: <function or class name>
+placement: before|after
+content:
+<lines to insert>
+<<<END_INSERT_AT_BLOCK>>>
+
+Quality: Write modular, production-ready code with proper error handling, type hints, and docstrings. Handle edge cases.
+Generate your patches NOW. Only the blocks above. No other text."""
+        messages.append({"role": "user", "content": _FORMAT_REMINDER})
+
         response, new_budget = await gateway.dispatch(
             messages=list(messages),
             role=NodeRole.PATCHING,
@@ -728,6 +832,19 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     errors: list[DiagnosticObjectDict] = state.get("compiler_errors", [])
     error_summary = _format_diagnostics_for_repair(errors)
 
+    # Include lintgate errors from the previous compiler run
+    lintgate_state = state.get("node_state", {}).get("lintgate", {})
+    lint_errors_list: list[str] = lintgate_state.get("lint_errors", [])
+    if lint_errors_list:
+        lint_summary = "\n## Lint Gate Errors\n" + "\n".join(f"  - {e}" for e in lint_errors_list)
+        error_summary += lint_summary
+
+    # If no structured diagnostics, include the raw build output so the LLM can see the actual error
+    if not errors:
+        raw_output = state.get("node_state", {}).get("last_build_output", "")
+        if raw_output:
+            error_summary += f"\n## Raw Build Output (last 2000 chars)\n```\n{raw_output[-2000:]}\n```"
+
     try:
         from harness.gateway import NodeRole
         from harness.patcher import process_llm_patch_output
@@ -773,7 +890,31 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 f"The build failed with the following errors. Generate precise SEARCH/REPLACE "
                 f"patches to fix them.\n\n{error_summary}"
             )
+        # Append the repair prompt first
         messages.append(MessageDict(role="user", content=repair_prompt))
+        # Then append the strict format reminder (same as patching_node)
+        _REPAIR_FORMAT_REMINDER = """[CRITICAL FORMAT INSTRUCTION]
+You MUST respond using ONLY the patch block syntax below. Do NOT include any explanations,
+markdown code fences, or text outside the blocks. Your entire response must be parseable
+as one or more patch blocks.
+
+<<<REPLACE_BLOCK>>>
+file: path/to/file.ext
+search:
+<exact lines to find>
+replace:
+<exact replacement lines>
+<<<END_REPLACE_BLOCK>>>
+
+<<<CREATE_FILE>>>
+file: path/to/file.ext
+content:
+<complete file contents>
+<<<END_CREATE_FILE>>>
+
+Quality: Write modular, production-ready code with proper error handling, type hints, and docstrings. Handle edge cases.
+Generate your fix patches NOW. Only the blocks above. No other text."""
+        messages.append({"role": "user", "content": _REPAIR_FORMAT_REMINDER})
 
         if use_escalation and escalation_model:
             # Override the model selection by using force_local or a direct provider lookup
@@ -875,8 +1016,9 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
         [b] Increase budget (+$2.00)
         [q] Abandon and git rollback
 
-    The actual menu loop runs in the CLI layer (harness/cli.py).
-    This node sets a flag indicating that HITL interaction is required.
+    Delegates to the CLI layer's hitl_menu_loop for actual user interaction.
+    The menu blocks until the developer makes a choice, then returns an
+    updated state dict with routing signals.
     """
     logger.info("[human_intervention_node] Triggering HITL breakpoint...")
 
@@ -892,14 +1034,22 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
     elif state.get("exit_code", -1) != 0:
         trigger_reason = "persistent_build_failure"
 
-    return {
-        "node_state": {
-            "current_node": "human_intervention",
-            "hitl_trigger": trigger_reason,
-            "hitl_active": True,
-            "hitl_awaiting_input": True,
-        },
-    }
+    # Inject trigger reason into state so the menu can display it
+    state_dict = dict(state)
+    state_dict["node_state"] = dict(state_dict.get("node_state", {}))
+    state_dict["node_state"]["current_node"] = "human_intervention"
+    state_dict["node_state"]["hitl_trigger"] = trigger_reason
+    state_dict["node_state"]["hitl_active"] = True
+    state_dict["node_state"]["hitl_awaiting_input"] = True
+
+    # Delegate to the CLI layer's interactive menu loop.
+    # This blocks on stdin until the developer makes a choice.
+    from harness.cli import hitl_menu_loop
+
+    updated_state = hitl_menu_loop(state_dict)
+
+    # Extract the node_state back — hitl_menu_loop returns a full state dict
+    return updated_state
 
 
 # ---------------------------------------------------------------------------
@@ -1652,8 +1802,25 @@ def build_graph() -> Any:
     #   gatekeeper: approve → patching_node
     # =====================================================================
 
+    # =====================================================================
+    # START routing: if skip_discovery, jump directly to patching_node
+    # =====================================================================
+    def route_after_start(state: AgentState) -> Literal["requirements_discovery_node", "patching_node"]:
+        if state.get("skip_discovery", False):
+            logger.info("[router] --skip-discovery active. Routing START → patching_node.")
+            return "patching_node"
+        return "requirements_discovery_node"
+
+    graph.add_conditional_edges(
+        START,
+        route_after_start,
+        {
+            "requirements_discovery_node": "requirements_discovery_node",
+            "patching_node": "patching_node",
+        },
+    )
+
     # Requirements discovery loop
-    graph.add_edge(START, "requirements_discovery_node")
     graph.add_edge("requirements_discovery_node", "discovery_interview_loop")
     graph.add_conditional_edges(
         "discovery_interview_loop",
@@ -1661,7 +1828,10 @@ def build_graph() -> Any:
         {
             "requirements_discovery_node": "requirements_discovery_node",
             "architecture_discovery_node": "architecture_discovery_node",
+            "deployment_discovery_node": "deployment_discovery_node",
             "write_spec_node": "write_spec_node",
+            # Self-loop: user typed DONE with critical unknowns → re-display menu
+            "discovery_interview_loop": "discovery_interview_loop",
         },
     )
 
@@ -1706,8 +1876,9 @@ def build_graph() -> Any:
         },
     )
 
-    # After repair, go to lintgate first, then compiler (format repair patches too)
-    graph.add_edge("repair_node", "lintgate_node")
+    # After repair, go directly to compiler (skip lintgate to avoid reformatting
+    # the file between repair attempts, which would break SEARCH/REPLACE matching).
+    graph.add_edge("repair_node", "compiler_node")
 
     # =====================================================================
     # Deployment discovery pipeline (after security scan clean):
@@ -1803,6 +1974,7 @@ async def run_graph(
     checkpointer: Any = None,
     thread_id: Optional[str] = None,
     spec_override: Optional[str] = None,
+    skip_discovery: bool = False,
 ) -> AgentState:
     """
     Execute the full agent graph from start to finish.
@@ -1839,6 +2011,7 @@ async def run_graph(
         budget_usd=budget_usd,
         session_id=session_id,
         spec_override=spec_override,
+        skip_discovery=skip_discovery,
     )
 
     # Compile graph with checkpointer

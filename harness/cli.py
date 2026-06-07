@@ -529,6 +529,11 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
         error_text = "\n".join(error_lines)
         if len(errors) > 5:
             error_text += f"\n  ... and {len(errors) - 5} more errors."
+    else:
+        # No structured diagnostics — show raw build output instead
+        raw_output = node_state.get("last_build_output", "")
+        if raw_output:
+            error_text = f"[No structured diagnostics. Raw build output (last 2000 chars):]\n{raw_output[-2000:]}"
 
     # Format diffs summary
     diffs_text = "No files modified."
@@ -572,12 +577,14 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             print("-------------------------")
 
         elif choice == "r":
-            # Resume: clear HITL flags, route to compiler_node for re-validation
+            # Resume: clear HITL flags, reset loop counter to allow one more repair attempt
             node_state["hitl_active"] = False
             node_state["hitl_awaiting_input"] = False
             node_state["hitl_resolved"] = True
             state["node_state"] = node_state
-            logger.info("[HITL] Developer chose to resume. Routing to compiler_node.")
+            # Reset total_repairs to 2 so route_after_compiler allows one more repair_node pass
+            state["loop_counter"] = {"patching": 0, "repair": 0, "compiler": 0, "total_repairs": 2}
+            logger.info("[HITL] Developer chose to resume. Loop counter reset to 2. Routing to compiler_node.")
             return state
 
         elif choice == "e":
@@ -621,10 +628,12 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             return state
 
         elif choice == "b":
-            # Increase budget by $2.00
+            # Increase budget by $2.00 and reset loop counter for a fresh attempt
             budget_remaining += 2.00
             state["budget_remaining_usd"] = budget_remaining
-            print(f"[HITL] Budget increased by $2.00. New budget: ${budget_remaining:.2f}")
+            # Reset loop counter to give the repair loop a full fresh cycle
+            state["loop_counter"] = {"patching": 0, "repair": 0, "compiler": 0, "total_repairs": 0}
+            print(f"[HITL] Budget increased by $2.00. New budget: ${budget_remaining:.2f}. Loop counter reset.")
             continue  # Stay in the menu loop
 
         elif choice == "q":
@@ -973,9 +982,8 @@ async def cmd_run(args: argparse.Namespace) -> int:
     ttl_days = persistence_cfg.get("ttl_days", 30)
 
     # Initialize checkpointer
-    from harness.storage import AsyncSqliteSaver, generate_session_id
-    checkpointer = AsyncSqliteSaver(db_path=db_path, ttl_days=ttl_days)
-    await checkpointer.initialize()
+    from harness.storage import HarnessAsyncSqliteSaver, generate_session_id
+    checkpointer = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=ttl_days)
 
     session_id = generate_session_id(args.session_id)
 
@@ -1067,12 +1075,13 @@ async def cmd_run(args: argparse.Namespace) -> int:
             session_id=session_id,
             checkpointer=checkpointer,
             thread_id=thread_id,
+            skip_discovery=args.skip_discovery,
         )
     except Exception:
         logger.exception("Graph execution failed with unhandled exception.")
         git_guardian.rollback()
         git_guardian.pop_stash()
-        await checkpointer.close()
+        await checkpointer.conn.close()
         return 1
 
     exit_code = final_state.get("exit_code", -1)
@@ -1099,7 +1108,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     logger.info("  Session ID:     %s", session_id)
     logger.info("=" * 60)
 
-    await checkpointer.close()
+    await checkpointer.conn.close()
 
     return 0 if exit_code == 0 else 1
 
@@ -1115,7 +1124,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         harness resume --session-id my-session-abc123
         harness resume --session-id my-session -r /path/to/repo
     """
-    from harness.storage import AsyncSqliteSaver
+    from harness.storage import HarnessAsyncSqliteSaver
 
     workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
     config = discover_config(workspace_path)
@@ -1123,15 +1132,14 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     db_path = persistence_cfg.get("db_path", "~/.harness/checkpoints.db")
     ttl_days = persistence_cfg.get("ttl_days", 30)
 
-    checkpointer = AsyncSqliteSaver(db_path=db_path, ttl_days=ttl_days)
-    await checkpointer.initialize()
+    checkpointer = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=ttl_days)
 
     # Verify that the thread exists
     config_for_get = {"configurable": {"thread_id": args.session_id}}
-    existing = await checkpointer.get(config_for_get)
+    existing = await checkpointer.aget(config_for_get)
     if existing is None:
         logger.error("No checkpoint found for session '%s'.", args.session_id)
-        await checkpointer.close()
+        await checkpointer.conn.close()
         return 1
 
     build_command = resolve_build_command(args.build_cmd, config)
@@ -1165,13 +1173,13 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         )
     except Exception:
         logger.exception("Resume execution failed.")
-        await checkpointer.close()
+        await checkpointer.conn.close()
         return 1
 
     exit_code = final_state.get("exit_code", -1)
     logger.info("[resume] Session '%s' completed with exit code %d.", args.session_id, exit_code)
 
-    await checkpointer.close()
+    await checkpointer.conn.close()
     return 0 if exit_code == 0 else 1
 
 
@@ -1187,7 +1195,7 @@ async def cmd_status(args: argparse.Namespace) -> int:
         harness status --session-id my-session
         harness status --all
     """
-    from harness.storage import AsyncSqliteSaver, inspect_session, list_all_sessions
+    from harness.storage import HarnessAsyncSqliteSaver, inspect_session, list_all_sessions
 
     workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
     config = discover_config(workspace_path)
@@ -1196,8 +1204,7 @@ async def cmd_status(args: argparse.Namespace) -> int:
     ttl_days = persistence_cfg.get("ttl_days", 30)
 
     # Run GC on startup
-    checkpointer = AsyncSqliteSaver(db_path=db_path, ttl_days=ttl_days)
-    await checkpointer.initialize()
+    checkpointer = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=ttl_days)
 
     if args.all:
         # List all sessions
@@ -1209,18 +1216,18 @@ async def cmd_status(args: argparse.Namespace) -> int:
             print("-" * 80)
             for s in sessions:
                 print(f"{s.thread_id:<40} {s.updated_at:<20} {s.created_at:<20}")
-        await checkpointer.close()
+        await checkpointer.conn.close()
         return 0
 
     if not args.session_id:
         logger.error("Please provide --session-id or use --all to list all sessions.")
-        await checkpointer.close()
+        await checkpointer.conn.close()
         return 1
 
     summary = await inspect_session(db_path, args.session_id)
     if summary is None:
         print(f"No checkpoint found for session '{args.session_id}'.")
-        await checkpointer.close()
+        await checkpointer.conn.close()
         return 1
 
     print("=" * 60)
@@ -1243,7 +1250,7 @@ async def cmd_status(args: argparse.Namespace) -> int:
     print(f"  Updated:            {summary.updated_at}")
     print("=" * 60)
 
-    await checkpointer.close()
+    await checkpointer.conn.close()
     return 0
 
 
@@ -1263,29 +1270,25 @@ async def cmd_purge(args: argparse.Namespace) -> int:
     db_path = persistence_cfg.get("db_path", "~/.harness/checkpoints.db")
     ttl_days = persistence_cfg.get("ttl_days", 30)
 
-    from harness.storage import AsyncSqliteSaver
-
-    checkpointer = AsyncSqliteSaver(db_path=db_path, ttl_days=ttl_days)
-    await checkpointer._connect()
+    from harness.storage import HarnessAsyncSqliteSaver, purge_checkpoints
 
     if args.all:
         print("WARNING: This will delete ALL checkpoint data permanently.")
         confirm = input("Type 'yes' to confirm: ").strip()
         if confirm.lower() != "yes":
             print("Purge cancelled.")
-            await checkpointer.close()
             return 0
-        deleted = await checkpointer.purge_all()
+        deleted = await purge_checkpoints(db_path)
         print(f"Purged {deleted} rows from the checkpoint database.")
     elif args.session_id:
-        await checkpointer.delete_thread(args.session_id)
+        checkpointer = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=ttl_days)
+        await checkpointer.adelete_thread(args.session_id)
         print(f"Purged all checkpoints for session '{args.session_id}'.")
+        await checkpointer.conn.close()
     else:
         logger.error("Please specify --all to purge everything or --session-id to purge a specific session.")
-        await checkpointer.close()
         return 1
 
-    await checkpointer.close()
     return 0
 
 
@@ -1366,6 +1369,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Enable debug-level logging.",
+    )
+    run_parser.add_argument(
+        "--skip-discovery", "-s",
+        action="store_true",
+        default=False,
+        help="Skip requirements/architecture discovery phases and go directly to code generation.",
     )
 
     # --- `harness resume` ---
