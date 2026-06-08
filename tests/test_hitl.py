@@ -6,6 +6,7 @@ import os
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Optional
 
 import pytest
 
@@ -27,7 +28,6 @@ def _make_server(response_body: bytes = b'{"answer": "ok"}',
                  response_status: int = 200,
                  captured: Optional[list] = None) -> HTTPServer:
     """Spin up a localhost HTTP server that records requests and returns a fixed reply."""
-    from typing import Optional as Opt
 
     class _Handler(BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802

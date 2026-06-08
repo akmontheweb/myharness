@@ -34,6 +34,11 @@ dev = [
     "ruff>=0.8.0",
     "mypy>=1.13.0",
     "pre-commit>=3.7.0",
+    # Required by tests/test_harness.py to construct LangGraph checkpoint
+    # blobs for the GC regression test. The runtime code in storage.py
+    # treats msgpack as optional and falls back to JSON if it's absent,
+    # but the test needs to encode a backdated 'ts' inside the blob.
+    "msgpack>=1.0.0",
 ]
 
 [project.scripts]
