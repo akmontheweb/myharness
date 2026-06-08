@@ -839,6 +839,17 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 node_state["hitl_awaiting_input"] = False
                 state["node_state"] = node_state
                 _attempt_git_rollback(workspace_path)
+                try:
+                    from harness.observability import log_failure
+                    log_failure(
+                        "hitl_gate_blocked",
+                        trigger=trigger,
+                        session_id=state.get("session_id", ""),
+                        loop_counter=loop_counter.get("total_repairs", 0),
+                        modified_files=len(modified_files),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 logger.info("[HITL] Session abandoned. Git rollback attempted.")
                 return state
             else:

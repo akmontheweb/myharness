@@ -1154,6 +1154,17 @@ def _auto_detect_backend(**kwargs: Any) -> SandboxBackend:
         )
         return BareBackend()
 
+    try:
+        from harness.observability import log_failure
+        log_failure(
+            "sandbox_start_failed",
+            reason="auto_detect_no_backend",
+            docker_available=False,
+            unshare_available=False,
+            unsafe_bare_opt_in=False,
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never mask the real error
+        pass
     raise RuntimeError(
         "Sandbox auto-detect failed: neither Docker nor unshare is available, "
         "and bare-fallback is not opted-in. Install Docker, ensure `unshare` "

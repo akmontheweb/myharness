@@ -149,6 +149,6 @@ PR across Python 3.11 / 3.12 / 3.13. To bypass the local hook intentionally
 
 ## Contributing
 
-A `CONTRIBUTING.md` covering the test layout, commit-message convention, and
-the "don't add features beyond the task" rule is coming. For now, read the
-`docs/SPEC_*` files before opening a PR.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the test layout,
+commit-message convention, pre-commit gate behavior, SemVer policy, and
+the scope rules the project enforces on PRs.

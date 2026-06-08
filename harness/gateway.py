@@ -1200,6 +1200,16 @@ class Gateway:
         """
         # Financial guardrail
         if budget_remaining_usd <= 0.0:
+            try:
+                from harness.observability import log_failure
+                log_failure(
+                    "token_budget_exhausted",
+                    hard_cap_usd=self.config.hard_cap_usd,
+                    budget_remaining_usd=budget_remaining_usd,
+                    role=role.name if hasattr(role, "name") else str(role),
+                )
+            except Exception:  # noqa: BLE001 — telemetry must not mask the guardrail
+                pass
             raise RuntimeError(
                 f"[GUARDRAIL EXHAUSTED]: Active session hit the ${self.config.hard_cap_usd:.2f} threshold. "
                 f"Budget remaining: ${budget_remaining_usd:.4f}"

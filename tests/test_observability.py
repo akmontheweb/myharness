@@ -143,6 +143,41 @@ class TestEmitEvent:
             assert events[0]["model"] == "x:y"
             assert events[0]["cost_usd"] == 0.01
 
+    def test_log_failure_emits_error_level_with_event_field(self):
+        from harness.observability import configure_logging, log_failure
+        with tempfile.TemporaryDirectory() as log_dir:
+            path = configure_logging(session_id="fail-test", log_dir=log_dir, level="DEBUG")
+            log_failure(
+                "sandbox_start_failed",
+                reason="auto_detect_no_backend",
+                docker_available=False,
+            )
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            with open(path) as f:
+                lines = [json.loads(l) for l in f if l.strip()]
+            events = [l for l in lines if l.get("event") == "sandbox_start_failed"]
+            assert len(events) >= 1
+            assert events[0]["level"] == "ERROR"
+            assert events[0]["reason"] == "auto_detect_no_backend"
+            assert events[0]["docker_available"] is False
+
+    def test_log_failure_token_budget_exhausted(self):
+        from harness.observability import configure_logging, log_failure
+        with tempfile.TemporaryDirectory() as log_dir:
+            path = configure_logging(session_id="budget-test", log_dir=log_dir, level="DEBUG")
+            log_failure(
+                "token_budget_exhausted",
+                hard_cap_usd=2.0,
+                budget_remaining_usd=-0.01,
+            )
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            with open(path) as f:
+                events = [json.loads(l) for l in f if l.strip() and "token_budget_exhausted" in l]
+            assert len(events) >= 1
+            assert events[0]["hard_cap_usd"] == 2.0
+
     def test_emit_with_langsmith_enabled(self, monkeypatch):
         """emit_event should handle LangSmith integration if available."""
         from harness.observability import configure_logging, emit_event

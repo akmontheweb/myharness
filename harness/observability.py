@@ -86,11 +86,10 @@ _event_logger = logging.getLogger("harness.events")
 
 def emit_event(name: str, **fields: Any) -> None:
     """
-    Emit a structured event record.
+    Emit a structured event record (INFO level — successful / observational).
 
-    Events are logged at INFO level to the ``harness.events`` logger.
-    Because they carry a ``event`` field in the JSON output they are
-    trivially grep-able in the per-session JSONL file:
+    Events are logged to the ``harness.events`` logger with an ``event``
+    field, so they are trivially grep-able in the per-session JSONL file:
 
         jq 'select(.event == "llm_call")' ~/.harness/logs/<session>.jsonl
 
@@ -99,6 +98,33 @@ def emit_event(name: str, **fields: Any) -> None:
         fields: Arbitrary key-value payload merged into the JSON record.
     """
     _event_logger.info("", extra={"event": name, **fields})
+
+
+def log_failure(name: str, **fields: Any) -> None:
+    """
+    Emit a structured failure event (ERROR level).
+
+    Mirror of ``emit_event`` for failure paths. Pre-existing failures used
+    ad-hoc ``logger.error("...")`` strings, which meant grepping for
+    failures required scanning by message fragment instead of by an
+    event name. Standardising on ``log_failure(name, **fields)`` makes
+    failure modes a first-class catalogue:
+
+        jq 'select(.event == "sandbox_start_failed")' ~/.harness/logs/<session>.jsonl
+
+    Canonical failure names currently emitted:
+      - sandbox_start_failed     — sandbox auto-detect could not find a backend
+      - token_budget_exhausted   — gateway refused dispatch (hard_cap_usd hit)
+      - hitl_gate_blocked        — developer chose abandon at a HITL gate
+
+    Args:
+        name:   Short snake_case event name. Use the suffix ``_failed``,
+                ``_exhausted``, or ``_blocked`` so the catalogue stays
+                scannable. Add new names to the list above when wiring
+                a new failure site.
+        fields: Arbitrary key-value payload merged into the JSON record.
+    """
+    _event_logger.error("", extra={"event": name, **fields})
 
 
 # ---------------------------------------------------------------------------
