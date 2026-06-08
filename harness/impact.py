@@ -203,6 +203,20 @@ class DependencyGraph:
         for imp in imports:
             self._dependents.setdefault(imp, set()).add(filepath)
 
+    # Map harness language tag → tree_sitter_language_pack grammar name.
+    # Anything not listed here falls back to regex extraction.
+    _GRAMMAR_NAMES: dict[str, str] = {
+        "python": "python",
+        "javascript": "javascript",
+        "jsx": "javascript",
+        "typescript": "typescript",
+        "tsx": "tsx",
+        "java": "java",
+        "go": "go",
+        "rust": "rust",
+        "dart": "dart",
+    }
+
     def _try_tree_sitter_extract(
         self,
         filepath: str,
@@ -210,31 +224,35 @@ class DependencyGraph:
         lang: str,
         symbols: set[str],
     ) -> bool:
-        """Try to extract symbols from a file using tree-sitter AST. Returns True on success."""
+        """Try to extract symbols from a file using tree-sitter AST.
+
+        Uses tree_sitter_language_pack to resolve grammars at runtime so a
+        single dependency covers every language in the stack. If the pack
+        isn't installed or the requested grammar isn't bundled, the caller
+        falls back to the regex extractor.
+        """
+        grammar_name = self._GRAMMAR_NAMES.get(lang)
+        if grammar_name is None:
+            return False
+
         try:
-            # Lazy import to avoid hard dependency
-            import tree_sitter_python
+            import tree_sitter
+            from tree_sitter_language_pack import get_language
+        except ImportError as exc:
+            logger.debug(
+                "[impact] tree_sitter_language_pack not installed for %s: %s",
+                filepath, exc,
+            )
+            return False
 
-            grammar_map: dict[str, Any] = {
-                "python": tree_sitter_python,
-            }
-            try:
-                import tree_sitter
-            except ImportError:
-                return False
-
-            grammar_module = grammar_map.get(lang)
-            if grammar_module is None:
-                return False
-
-            ts_lang = tree_sitter.Language(grammar_module.language())
+        try:
+            ts_lang = get_language(grammar_name)  # type: ignore[arg-type]
             parser = tree_sitter.Parser()
             parser.language = ts_lang
-
             tree = parser.parse(source.encode("utf-8"))
             self._extract_symbols_from_ast(tree.root_node, lang, symbols)
             return True
-        except (ImportError, Exception) as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("[impact] Tree-sitter extraction failed for %s: %s", filepath, exc)
             return False
 
@@ -264,15 +282,48 @@ class DependencyGraph:
                             symbols.add(sub.text.decode("utf-8"))
                             break
             elif lang in ("typescript", "tsx", "javascript", "jsx"):
-                if child.type in ("function_declaration", "class_declaration", "method_definition"):
+                if child.type in (
+                    "function_declaration", "class_declaration", "method_definition",
+                    "interface_declaration", "type_alias_declaration", "enum_declaration",
+                    "generator_function_declaration",
+                ):
+                    for sub in child.children:
+                        # JS uses `identifier`, TS uses `type_identifier` for
+                        # class/interface/type-alias names.
+                        if sub.type in ("identifier", "type_identifier"):
+                            symbols.add(sub.text.decode("utf-8"))
+                            break
+            elif lang == "rust":
+                if child.type in ("function_item", "struct_item", "trait_item", "impl_item", "enum_item"):
+                    for sub in child.children:
+                        if sub.type in ("identifier", "type_identifier"):
+                            symbols.add(sub.text.decode("utf-8"))
+                            break
+            elif lang == "go":
+                if child.type in ("function_declaration", "method_declaration", "type_declaration"):
+                    for sub in child.children:
+                        if sub.type in ("identifier", "field_identifier", "type_identifier", "type_spec"):
+                            # type_spec wraps an identifier — drill one level
+                            if sub.type == "type_spec":
+                                for inner in sub.children:
+                                    if inner.type == "type_identifier":
+                                        symbols.add(inner.text.decode("utf-8"))
+                                        break
+                            else:
+                                symbols.add(sub.text.decode("utf-8"))
+                            break
+            elif lang == "java":
+                if child.type in ("class_declaration", "interface_declaration", "method_declaration",
+                                   "enum_declaration", "record_declaration"):
                     for sub in child.children:
                         if sub.type == "identifier":
                             symbols.add(sub.text.decode("utf-8"))
                             break
-            elif lang == "rust":
-                if child.type in ("function_item", "struct_item", "trait_item", "impl_item"):
+            elif lang == "dart":
+                if child.type in ("class_definition", "function_signature", "method_signature",
+                                   "enum_declaration", "mixin_declaration", "extension_declaration"):
                     for sub in child.children:
-                        if sub.type == "identifier":
+                        if sub.type in ("identifier", "type_identifier"):
                             symbols.add(sub.text.decode("utf-8"))
                             break
 
@@ -575,6 +626,7 @@ _EXTENSION_TO_TREE_SITTER: dict[str, str] = {
     ".hpp": "cpp",
     ".hxx": "cpp",
     ".java": "java",
+    ".dart": "dart",
 }
 
 

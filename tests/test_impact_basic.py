@@ -152,3 +152,90 @@ class TestImpactAnalyzerBasics:
             analyzer = ImpactAnalyzer(tmpdir)
             result = analyzer.analyze(modified_files=["test.py"])
             assert isinstance(result, ImpactResult)
+
+
+# ---------------------------------------------------------------------------
+# Tree-sitter grammar dispatch — one test per language in the stack.
+# Locks in that the language pack resolves the right grammar and that
+# _extract_symbols_from_ast recognizes the canonical declaration shapes
+# for each language.
+# ---------------------------------------------------------------------------
+
+class TestTreeSitterDispatch:
+    """Verify Bug 4 is properly fixed for every language in the stack."""
+
+    def _extract(self, lang, source):
+        graph = DependencyGraph(workspace_path="/tmp")
+        symbols: set[str] = set()
+        ok = graph._try_tree_sitter_extract(f"sample.{lang}", source, lang, symbols)
+        return ok, symbols
+
+    def test_python_grammar_extracts_function(self):
+        ok, symbols = self._extract("python", "def my_fn():\n    pass\n\nclass MyCls:\n    pass\n")
+        assert ok is True
+        assert "my_fn" in symbols
+        assert "MyCls" in symbols
+
+    def test_javascript_grammar_extracts_function_and_class(self):
+        ok, symbols = self._extract(
+            "javascript",
+            "function foo() { return 1; }\nclass Bar { baz() {} }\n",
+        )
+        assert ok is True
+        assert "foo" in symbols
+        assert "Bar" in symbols
+
+    def test_typescript_grammar_extracts_typed_declarations(self):
+        ok, symbols = self._extract(
+            "typescript",
+            "function add(a: number, b: number): number { return a + b; }\n"
+            "class Repo<T> { items: T[] = []; }\n",
+        )
+        assert ok is True
+        assert "add" in symbols
+        assert "Repo" in symbols
+
+    def test_java_grammar_extracts_class_and_method(self):
+        ok, symbols = self._extract(
+            "java",
+            "public class UserService {\n  public String greet(String name) { return name; }\n}\n",
+        )
+        assert ok is True
+        assert "UserService" in symbols
+        assert "greet" in symbols
+
+    def test_go_grammar_extracts_function_and_struct(self):
+        ok, symbols = self._extract(
+            "go",
+            "package main\n\nfunc HelloWorld() {}\n\ntype User struct {\n  Name string\n}\n",
+        )
+        assert ok is True
+        assert "HelloWorld" in symbols
+        assert "User" in symbols
+
+    def test_rust_grammar_extracts_function_and_struct(self):
+        ok, symbols = self._extract(
+            "rust",
+            "pub fn handler() -> u32 { 0 }\n\npub struct Config { pub port: u16 }\n",
+        )
+        assert ok is True
+        assert "handler" in symbols
+        assert "Config" in symbols
+
+    def test_dart_grammar_extracts_class(self):
+        ok, symbols = self._extract(
+            "dart",
+            "class CounterWidget extends StatelessWidget {\n"
+            "  Widget build(BuildContext context) => Text('x');\n"
+            "}\n",
+        )
+        assert ok is True
+        assert "CounterWidget" in symbols
+
+    def test_unknown_language_returns_false(self):
+        # Languages not in _GRAMMAR_NAMES (e.g. C/C++ that we haven't wired
+        # AST extraction for yet) return False so the caller uses regex.
+        graph = DependencyGraph(workspace_path="/tmp")
+        symbols: set[str] = set()
+        ok = graph._try_tree_sitter_extract("sample.c", "int main() {}", "c", symbols)
+        assert ok is False

@@ -16,6 +16,12 @@ dependencies = [
     "langgraph-checkpoint-sqlite>=2.0.0",
     "aiofiles>=24.0.0",
     "tree-sitter>=0.23.0",
+    # tree-sitter-language-pack bundles grammars for 165+ languages in a
+    # single wheel, including Python, JavaScript, TypeScript, TSX, Java,
+    # Go, Rust, Dart, Swift, etc. Using one package avoids dependency
+    # churn from upgrading 6+ individual grammar packages and gives us
+    # Dart coverage (which doesn't have a standalone PyPI distribution).
+    "tree-sitter-language-pack>=1.8.0",
     "httpx>=0.28.0",
     "uuid7>=0.1.0",
     "typing-extensions>=4.12.0",
