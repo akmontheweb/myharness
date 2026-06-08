@@ -239,3 +239,36 @@ class TestTreeSitterDispatch:
         symbols: set[str] = set()
         ok = graph._try_tree_sitter_extract("sample.c", "int main() {}", "c", symbols)
         assert ok is False
+
+
+class TestFlutterProjectDetection:
+    """_is_flutter_project decides whether the graph should skip the
+    docker-compose deploy pipeline (M-1 routing)."""
+
+    def test_flutter_scaffold_detected(self):
+        import os
+        from harness.impact import _is_flutter_project
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "pubspec.yaml"), "w") as f:
+                f.write("name: my_app\n")
+            os.makedirs(os.path.join(tmpdir, "lib"))
+            assert _is_flutter_project(tmpdir) is True
+
+    def test_missing_pubspec_not_flutter(self):
+        import os
+        from harness.impact import _is_flutter_project
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, "lib"))
+            assert _is_flutter_project(tmpdir) is False
+
+    def test_missing_lib_not_flutter(self):
+        import os
+        from harness.impact import _is_flutter_project
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "pubspec.yaml"), "w") as f:
+                f.write("name: my_app\n")
+            assert _is_flutter_project(tmpdir) is False
+
+    def test_nonexistent_path_not_flutter(self):
+        from harness.impact import _is_flutter_project
+        assert _is_flutter_project("/nonexistent_xyz_path") is False

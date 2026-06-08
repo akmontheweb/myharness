@@ -604,6 +604,34 @@ class ImpactAnalyzer:
 
 
 # ---------------------------------------------------------------------------
+# Project-type detection — used by the graph router to decide whether
+# the workspace should run through the docker-compose deployment pipeline
+# or skip it (mobile / pure library projects).
+# ---------------------------------------------------------------------------
+
+def _is_flutter_project(workspace_path: str) -> bool:
+    """Return True when the workspace looks like a Flutter project.
+
+    Heuristic: ``pubspec.yaml`` at the root AND a ``lib/`` directory. The
+    Flutter scaffolding always produces both. Pure Dart server projects
+    also have these, which is fine — the deploy pipeline doesn't fit
+    them either.
+
+    Used by ``harness.graph.route_after_compiler`` to send Flutter
+    builds straight to END after a successful test run instead of
+    routing them through ``security_scan_node`` → ``deployment_node``,
+    which would try to ``docker compose up`` a mobile artifact and fail.
+    """
+    try:
+        return (
+            os.path.isfile(os.path.join(workspace_path, "pubspec.yaml"))
+            and os.path.isdir(os.path.join(workspace_path, "lib"))
+        )
+    except (OSError, TypeError):
+        return False
+
+
+# ---------------------------------------------------------------------------
 # 4. Language Extension Mapping for Tree-Sitter
 # ---------------------------------------------------------------------------
 

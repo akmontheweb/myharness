@@ -2126,6 +2126,21 @@ class TestSecurityScanRouting:
             state["budget_remaining_usd"] = 0.0
             assert route_after_security_scan(state) == "human_intervention_node"
 
+    def test_route_after_security_scan_flutter_skips_deploy(self):
+        # M-1: Flutter projects with a clean security scan end after the
+        # scan rather than entering the docker-compose pipeline.
+        import os
+        from harness.graph import route_after_security_scan
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Make it look like a Flutter project
+            with open(os.path.join(tmpdir, "pubspec.yaml"), "w") as f:
+                f.write("name: my_app\n")
+            os.makedirs(os.path.join(tmpdir, "lib"))
+            state = _make_state(tmpdir)
+            state["budget_remaining_usd"] = 1.0
+            state["compiler_errors"] = []
+            assert route_after_security_scan(state) == "__end__"
+
 
 # ===========================================================================
 # DEPLOY TESTS

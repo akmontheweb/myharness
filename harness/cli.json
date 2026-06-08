@@ -11,8 +11,13 @@
         "readonly_cache_mounts": [
             "~/.cache/pip",
             "~/.npm",
+            "~/.cache/yarn",
+            "~/.pnpm-store",
             "~/.cache/go-build",
-            "~/.cargo/registry"
+            "~/.cargo/registry",
+            "~/.m2",
+            "~/.gradle",
+            "~/.pub-cache"
         ],
         "timeout_seconds": 300,
         "pgid_kill_on_timeout": true

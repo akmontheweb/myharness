@@ -1698,12 +1698,16 @@ def route_after_gatekeeper(state: AgentState) -> str:
 # 7. Route After HITL: Always Back to Compiler
 # ---------------------------------------------------------------------------
 
-def route_after_security_scan(state: AgentState) -> Literal["patching_node", "human_intervention_node", "deployment_discovery_node"]:
+def route_after_security_scan(state: AgentState) -> Literal["patching_node", "human_intervention_node", "deployment_discovery_node", "__end__"]:
     """
     Conditional edge router executed after security_scan_node completes.
 
     Decision matrix:
-        No security findings                    → deployment_node (proceed to container deployment)
+        No security findings AND Flutter project → END (mobile builds don't
+                                                  fit the docker-compose deploy
+                                                  pipeline; user picks up the
+                                                  artifact from build/app/outputs/)
+        No security findings                    → deployment_discovery_node
         Security findings AND sec_attempts < 2  → patching_node (fix the vulnerability)
         Security findings AND sec_attempts >= 2 → human_intervention_node
         budget_remaining <= 0                   → human_intervention_node
@@ -1725,6 +1729,16 @@ def route_after_security_scan(state: AgentState) -> Literal["patching_node", "hu
 
     # If no compiler_errors populated, security scan passed
     if not compiler_errors:
+        # Mobile short-circuit (M-1): Flutter projects don't fit the
+        # docker-compose deployment model. Skip deployment_* and end after
+        # the security scan passes. iOS builds need macOS anyway and would
+        # fail in the Linux sandbox; Android artifacts live in
+        # build/app/outputs/ for the user to pick up.
+        from harness.impact import _is_flutter_project
+        workspace_path = state.get("workspace_path", "")
+        if workspace_path and _is_flutter_project(workspace_path):
+            logger.info("[router] Flutter project detected. Skipping deploy pipeline (M-1). Routing to END.")
+            return "__end__"
         logger.info("[router] Security scan clean. Routing to deployment discovery.")
         return "deployment_discovery_node"
 
@@ -1951,7 +1965,7 @@ def build_graph() -> Any:
     # Register deployment discovery node
     graph.add_node("deployment_discovery_node", deployment_discovery_node)
 
-    # Route security_scan clean → deployment discovery
+    # Route security_scan clean → deployment discovery (or END for Flutter)
     graph.add_conditional_edges(
         "security_scan_node",
         route_after_security_scan,
@@ -1959,6 +1973,7 @@ def build_graph() -> Any:
             "deployment_discovery_node": "deployment_discovery_node",
             "patching_node": "patching_node",
             "human_intervention_node": "human_intervention_node",
+            "__end__": END,
         },
     )
 

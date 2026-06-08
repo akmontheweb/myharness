@@ -6,8 +6,13 @@
         "readonly_cache_mounts": [
             "~/.cache/pip",
             "~/.npm",
+            "~/.cache/yarn",
+            "~/.pnpm-store",
             "~/.cache/go-build",
-            "~/.cargo/registry"
+            "~/.cargo/registry",
+            "~/.m2",
+            "~/.gradle",
+            "~/.pub-cache"
         ],
         "timeout_seconds": 300,
         "pgid_kill_on_timeout": true
@@ -37,7 +42,10 @@
         "ttl_days": 30
     },
     "languages": {
-        "tree_sitter_grammars": ["python", "rust", "typescript", "go", "c", "cpp"],
+        "tree_sitter_grammars": [
+            "python", "rust", "typescript", "tsx", "javascript", "go",
+            "c", "cpp", "java", "dart"
+        ],
         "structured_compiler_flags": {
             "rust": "--error-format=json",
             "gcc": "-fdiagnostics-format=json",

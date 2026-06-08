@@ -220,6 +220,13 @@ _DEFAULT_FORMATTERS: dict[str, FormatterSpec] = {
         args=["-i"],
         install_hint="Download from https://github.com/google/google-java-format/releases",
     ),
+    ".dart": FormatterSpec(
+        command="dart",
+        args=["format"],
+        linter_command="dart",
+        linter_args=["analyze"],
+        install_hint="Install Dart/Flutter from https://flutter.dev/docs/get-started/install",
+    ),
     ".sh": FormatterSpec(
         command="shfmt",
         args=["-w"],
