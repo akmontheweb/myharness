@@ -18,6 +18,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -118,20 +119,86 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
 
     async def _run_gc(self) -> int:
         """
-        Delete checkpoint rows that have no associated writes (orphaned data).
+        Delete checkpoint rows for threads whose latest checkpoint is older
+        than ``self._ttl_days``.
 
-        The official langgraph-checkpoint-sqlite schema does not include
-        ``created_at`` columns, so TTL-based GC is not available. Instead,
-        this is a safe no-op that logs readiness for GC extension.
+        LangGraph stores an ISO 8601 ``ts`` field inside the msgpack-encoded
+        checkpoint blob; we deserialize the latest row per thread, compare
+        its timestamp to ``now - ttl_days``, and bulk-delete expired threads
+        from both ``checkpoints`` and ``writes`` in a single transaction.
 
-        Returns:
-            0 (no rows deleted).
+        Returns the total number of rows deleted across both tables.
+        Setting ``ttl_days <= 0`` disables GC.
         """
-        # The official schema (checkpoints + writes) has no timestamp columns.
-        # TTL-based GC requires schema migration to add created_at columns.
-        # This method exists as a hook for future GC strategies.
-        logger.debug("[storage] GC hook: official schema has no timestamps — GC skipped.")
-        return 0
+        ttl_days = getattr(self, "_ttl_days", 0)
+        if ttl_days is None or ttl_days <= 0:
+            return 0
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=ttl_days)
+
+        try:
+            cursor = await self.conn.execute(
+                """SELECT c.thread_id, c.checkpoint
+                   FROM checkpoints c
+                   INNER JOIN (
+                       SELECT thread_id, MAX(checkpoint_id) AS max_cp_id
+                       FROM checkpoints
+                       GROUP BY thread_id
+                   ) AS latest ON c.thread_id = latest.thread_id
+                              AND c.checkpoint_id = latest.max_cp_id"""
+            )
+            rows = await cursor.fetchall()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[storage] GC scan failed (%s); skipping.", e)
+            return 0
+
+        expired_threads: list[str] = []
+        for thread_id, blob in rows:
+            cp = _deserialize_checkpoint_blob(blob)
+            ts_value = cp.get("ts", "") if isinstance(cp, dict) else ""
+            if not ts_value or not isinstance(ts_value, str):
+                continue
+            try:
+                dt = datetime.fromisoformat(ts_value.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            if dt < cutoff:
+                expired_threads.append(thread_id)
+
+        if not expired_threads:
+            logger.debug("[storage] GC: no expired threads (TTL=%d days).", ttl_days)
+            return 0
+
+        placeholders = ",".join("?" * len(expired_threads))
+        try:
+            cursor = await self.conn.execute(
+                f"DELETE FROM writes WHERE thread_id IN ({placeholders})",
+                expired_threads,
+            )
+            deleted = cursor.rowcount or 0
+            cursor = await self.conn.execute(
+                f"DELETE FROM checkpoints WHERE thread_id IN ({placeholders})",
+                expired_threads,
+            )
+            deleted += cursor.rowcount or 0
+            await self.conn.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[storage] GC delete failed (%s); rolling back.", e)
+            try:
+                await self.conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            return 0
+
+        logger.info(
+            "[storage] TTL GC: removed %d rows across %d expired threads (TTL=%d days).",
+            deleted,
+            len(expired_threads),
+            ttl_days,
+        )
+        return deleted
 
     @property
     def db_path(self) -> str:
@@ -226,13 +293,22 @@ def _deserialize_checkpoint_blob(blob: Any) -> dict[str, Any]:
     if isinstance(blob, (bytes, bytearray)):
         try:
             import msgpack
-            return msgpack.unpackb(blob, raw=False)
-        except (ImportError, msgpack.exceptions.UnpackException, ValueError):
-            # Try decoding as UTF-8 JSON text as fallback
+        except ImportError:
+            msgpack = None  # type: ignore[assignment]
+
+        if msgpack is not None:
             try:
-                return json.loads(blob.decode("utf-8", errors="replace"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                return {}
+                return msgpack.unpackb(blob, raw=False)
+            except Exception as e:  # noqa: BLE001
+                # msgpack.exceptions.UnpackException or any decode failure —
+                # don't crash on a single corrupt row; fall through to JSON.
+                logger.debug("[storage] msgpack unpack failed (%s); trying JSON.", e)
+
+        # Fallback: try decoding as UTF-8 JSON text (legacy format)
+        try:
+            return json.loads(blob.decode("utf-8", errors="replace"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
 
     # Plain text JSON path (legacy / backwards-compat)
     if isinstance(blob, str):

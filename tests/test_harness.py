@@ -483,6 +483,74 @@ class TestStorage:
             if os.path.exists(db_path):
                 os.unlink(db_path)
 
+    def test_deserialize_blob_resilient_when_msgpack_unavailable(self, monkeypatch):
+        # Regression: previously `except (..., msgpack.exceptions.X, ...)` referenced
+        # msgpack after a failed import, raising NameError instead of falling back.
+        import sys
+        monkeypatch.setitem(sys.modules, "msgpack", None)
+        from harness.storage import _deserialize_checkpoint_blob
+        # Non-JSON, non-msgpack bytes — should return {} without raising.
+        assert _deserialize_checkpoint_blob(b"\x80\x81\xff") == {}
+        # A JSON byte payload still decodes via the fallback.
+        assert _deserialize_checkpoint_blob(b'{"a":1}') == {"a": 1}
+
+    @pytest.mark.asyncio
+    async def test_run_gc_deletes_expired_threads(self):
+        # Regression: _run_gc was a no-op despite TTL contract. Verify expired
+        # threads (older than ttl_days) are removed on saver init.
+        import aiosqlite
+        import msgpack
+        from datetime import datetime, timezone, timedelta
+        from harness.storage import HarnessAsyncSqliteSaver
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+            db_path = tf.name
+        try:
+            saver = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=30)
+            config = {"configurable": {"thread_id": "expired-thread", "checkpoint_ns": ""}}
+            await saver.aput(config, {"id": "cp1", "type": "state", "channel_values": {}}, {"source": "test"}, {})
+            await saver.conn.close()
+
+            # Backdate the ts inside the stored msgpack blob to 60 days ago.
+            old_ts = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat().replace("+00:00", "Z")
+            async with aiosqlite.connect(db_path) as conn:
+                cursor = await conn.execute("SELECT checkpoint FROM checkpoints LIMIT 1")
+                row = await cursor.fetchone()
+                assert row is not None
+                unpacked = msgpack.unpackb(row[0], raw=False)
+                unpacked["ts"] = old_ts
+                await conn.execute(
+                    "UPDATE checkpoints SET checkpoint = ? WHERE thread_id = ?",
+                    (msgpack.packb(unpacked, use_bin_type=True), "expired-thread"),
+                )
+                await conn.commit()
+
+            # Reopen — GC should reap the expired thread.
+            saver2 = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=30)
+            assert await saver2.aget(config) is None
+            await saver2.conn.close()
+        finally:
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+
+    @pytest.mark.asyncio
+    async def test_run_gc_disabled_when_ttl_nonpositive(self):
+        from harness.storage import HarnessAsyncSqliteSaver
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+            db_path = tf.name
+        try:
+            saver = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=0)
+            config = {"configurable": {"thread_id": "keep-me", "checkpoint_ns": ""}}
+            await saver.aput(config, {"id": "cp1", "type": "state", "channel_values": {}}, {"source": "test"}, {})
+            await saver.conn.close()
+            # Reopen with ttl_days=0 — GC must not touch anything.
+            saver2 = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=0)
+            assert await saver2.aget(config) is not None
+            await saver2.conn.close()
+        finally:
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+
 
 # ===========================================================================
 # LINTGATE TESTS
@@ -671,6 +739,56 @@ class TestGateway:
         assert gateway.should_use_thinking(NodeRole.PLANNING) is True
         assert gateway.should_use_thinking(NodeRole.PATCHING) is False
         assert gateway.should_use_thinking(NodeRole.REPAIR) is True
+
+    def test_openai_compute_cost_applies_cached_discount(self):
+        # Regression: OpenAIProvider.compute_cost previously ignored
+        # cached_tokens and billed all input_tokens at the full rate.
+        from harness.gateway import OpenAIProvider, ModelSpec, TokenUsage
+        spec = ModelSpec(
+            provider="openai", model_id="gpt-4o-test",
+            context_window=128000,
+            input_cost_per_1m=10.0,
+            output_cost_per_1m=30.0,
+            cached_input_cost_per_1m=2.50,
+        )
+        provider = OpenAIProvider(spec)
+        usage = TokenUsage(
+            input_tokens=1_000_000, output_tokens=0, cached_tokens=800_000,
+            model_name="gpt-4o-test",
+        )
+        # 200k uncached @ $10/M + 800k cached @ $2.50/M = $2.00 + $2.00 = $4.00
+        # Previous broken behavior: 1M @ $10/M = $10.00
+        assert abs(provider.compute_cost(usage) - 4.00) < 1e-6
+
+    @pytest.mark.asyncio
+    async def test_gateway_fails_closed_when_redactor_missing(self, monkeypatch):
+        # Regression: previously `except ImportError: pass` allowed unredacted
+        # messages out when harness.redactor was unavailable.
+        import sys
+        from harness.gateway import Gateway, GatewayConfig, NodeRole, register_model, ModelSpec
+
+        # Register a fake Ollama model so dispatch gets past provider selection.
+        register_model(
+            "ollama:redactor-test",
+            ModelSpec(
+                provider="ollama", model_id="redactor-test",
+                context_window=4096, input_cost_per_1m=0.0, output_cost_per_1m=0.0,
+                api_base_url="http://127.0.0.1:11434/v1",
+            ),
+        )
+
+        # Force `from harness.redactor import redact_messages` to fail at the
+        # exact line in gateway.dispatch().
+        monkeypatch.setitem(sys.modules, "harness.redactor", None)
+
+        gateway = Gateway(GatewayConfig(planning_primary="ollama:redactor-test"))
+
+        with pytest.raises(RuntimeError, match="redactor unavailable"):
+            await gateway.dispatch(
+                messages=[{"role": "user", "content": "hi"}],
+                role=NodeRole.PLANNING,
+                budget_remaining_usd=1.0,
+            )
 
 
 # ===========================================================================

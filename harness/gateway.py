@@ -479,9 +479,15 @@ class OpenAIProvider(BaseLLM):
 
     def compute_cost(self, usage: TokenUsage) -> float:
         spec = self.spec
-        input_cost = (usage.input_tokens / 1_000_000) * spec.input_cost_per_1m
+        # OpenAI's prompt_tokens_details.cached_tokens are billed at the
+        # discounted cached rate; subtract them from input_tokens so they
+        # aren't double-charged at the full rate.
+        cached = usage.cached_tokens
+        uncached_input = max(0, usage.input_tokens - cached)
+        input_cost = (uncached_input / 1_000_000) * spec.input_cost_per_1m
+        cached_cost = (cached / 1_000_000) * spec.cached_input_cost_per_1m
         output_cost = (usage.output_tokens / 1_000_000) * spec.output_cost_per_1m
-        return input_cost + output_cost
+        return input_cost + cached_cost + output_cost
 
 
 # ---------------------------------------------------------------------------
@@ -1029,11 +1035,19 @@ class Gateway:
         spec = provider.spec
 
         # --- Redact secrets from messages before transmission ---
+        # Fail-closed: if the redactor cannot be loaded (missing module,
+        # syntax error in the file, broken install), refuse to send rather
+        # than ship raw messages — silent skip would mean secrets in
+        # outbound API calls. The redactor is a hard dependency of the
+        # gateway's security contract.
         try:
             from harness.redactor import redact_messages
-            messages = redact_messages(messages)
-        except ImportError:
-            pass  # Redactor not installed — messages go out as-is
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                f"Refusing to dispatch: secret redactor unavailable ({e!r}). "
+                f"Fix harness.redactor before retrying."
+            ) from e
+        messages = redact_messages(messages)
 
         # Anchor system prompt at messages[0] for prefix caching
         messages = ensure_prefix_cache_anchor(list(messages))
