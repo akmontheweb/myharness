@@ -63,6 +63,38 @@ class CheckpointSummary:
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver as _OfficialAsyncSqliteSaver  # noqa: E402
 
 
+async def _configure_sqlite_pragmas(conn: Any, db_path: str) -> None:
+    """
+    Set crash-safety pragmas on a freshly-opened aiosqlite connection and
+    verify they took effect.
+
+    PRAGMA journal_mode=WAL fails silently on some configurations (network
+    filesystems, read-only mounts) — we read the result back and downgrade
+    synchronous mode if WAL didn't apply, to keep durability honest.
+    """
+    # WAL: enables concurrent readers + crash-recoverable writes. Returns
+    # the *actual* journal mode in use, which may differ from requested.
+    cur = await conn.execute("PRAGMA journal_mode=WAL;")
+    row = await cur.fetchone()
+    actual_mode = (row[0] if row else "").lower() if row else ""
+    if actual_mode != "wal":
+        logger.warning(
+            "[storage] PRAGMA journal_mode=WAL did not take effect at %s "
+            "(got %r). Falling back to synchronous=FULL for durability.",
+            db_path, actual_mode,
+        )
+        # If WAL isn't available, we can't rely on NORMAL's looser fsync.
+        await conn.execute("PRAGMA synchronous=FULL;")
+    else:
+        await conn.execute("PRAGMA synchronous=NORMAL;")
+
+    # Allow short waits for writer locks before raising SQLITE_BUSY.
+    await conn.execute("PRAGMA busy_timeout=5000;")
+    # Foreign keys are off by default but cheap to enforce.
+    await conn.execute("PRAGMA foreign_keys=ON;")
+    await conn.commit()
+
+
 class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
     """
     Thin wrapper around the official langgraph-checkpoint-sqlite AsyncSqliteSaver
@@ -96,9 +128,7 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
             os.makedirs(db_dir, exist_ok=True)
 
         conn = await aiosqlite.connect(expanded_path)
-        await conn.execute("PRAGMA journal_mode=WAL;")
-        await conn.execute("PRAGMA synchronous=NORMAL;")
-        await conn.execute("PRAGMA busy_timeout=5000;")
+        await _configure_sqlite_pragmas(conn, expanded_path)
 
         instance = cls(conn)
         await instance.setup()
@@ -111,7 +141,7 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
         await instance._run_gc()
 
         logger.info(
-            "[storage] HarnessAsyncSqliteSaver initialised at %s (WAL mode, TTL=%d days).",
+            "[storage] HarnessAsyncSqliteSaver initialised at %s (TTL=%d days).",
             expanded_path,
             ttl_days,
         )
@@ -223,9 +253,7 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
             os.makedirs(db_dir, exist_ok=True)
 
         conn = await aiosqlite.connect(expanded_path)
-        await conn.execute("PRAGMA journal_mode=WAL;")
-        await conn.execute("PRAGMA synchronous=NORMAL;")
-        await conn.execute("PRAGMA busy_timeout=5000;")
+        await _configure_sqlite_pragmas(conn, expanded_path)
 
         instance = cls(conn)
         await instance.setup()

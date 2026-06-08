@@ -798,6 +798,32 @@ class TestStorage:
                 os.unlink(db_path)
 
     @pytest.mark.asyncio
+    async def test_wal_mode_actually_enabled(self):
+        # Regression: PRAGMA journal_mode=WAL was set but never verified.
+        # Confirm it actually takes effect on a real disk-backed SQLite file
+        # and the verification reads back the active mode.
+        import aiosqlite
+        from harness.storage import HarnessAsyncSqliteSaver
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+            db_path = tf.name
+        try:
+            saver = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=30)
+            cur = await saver.conn.execute("PRAGMA journal_mode;")
+            row = await cur.fetchone()
+            assert row is not None
+            assert row[0].lower() == "wal", f"expected WAL mode, got {row[0]!r}"
+            # Connect a second time and ensure WAL is sticky for the file
+            await saver.conn.close()
+            async with aiosqlite.connect(db_path) as conn:
+                cur2 = await conn.execute("PRAGMA journal_mode;")
+                row2 = await cur2.fetchone()
+                assert row2 is not None
+                assert row2[0].lower() == "wal"
+        finally:
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+
+    @pytest.mark.asyncio
     async def test_run_gc_disabled_when_ttl_nonpositive(self):
         from harness.storage import HarnessAsyncSqliteSaver
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
