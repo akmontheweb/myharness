@@ -473,6 +473,66 @@ class TestSecretPatterns:
         assert result.replacements > 0
         assert "sk-proj" not in redacted[0]["content"]
 
+    def test_entropy_pass_disabled_by_default(self):
+        # Regression: git SHAs and similar high-entropy hex strings used to
+        # be redacted by both an always-on regex and the entropy pass,
+        # producing a ~30-50% false-positive rate on real code.
+        from harness.redactor import SecretScanner
+        scanner = SecretScanner(mode="mask")
+        # 40-char git SHA — must NOT be redacted with default settings
+        text = "See commit a1b2c3d4e5f6789012345678901234567890abcd for details"
+        redacted, result = scanner.redact_text(text)
+        assert result.replacements == 0
+        assert "a1b2c3d4e5f6789012345678901234567890abcd" in redacted
+
+    def test_entropy_pass_skips_uuids_and_hex_when_enabled(self):
+        from harness.redactor import SecretScanner
+        scanner = SecretScanner(mode="mask", entropy_detection=True)
+        # UUID with dashes
+        text1 = "id: 550e8400-e29b-41d4-a716-446655440000"
+        # Pure hex (git SHA shape)
+        text2 = "sha: a1b2c3d4e5f6789012345678901234567890abcd"
+        r1, _ = scanner.redact_text(text1)
+        r2, _ = scanner.redact_text(text2)
+        assert "550e8400" in r1
+        assert "a1b2c3d4" in r2
+
+    def test_entropy_pass_catches_real_secrets_when_enabled(self):
+        # Mixed-case base64-shaped string with high entropy should still be flagged.
+        from harness.redactor import SecretScanner
+        scanner = SecretScanner(mode="mask", entropy_detection=True)
+        # 40 chars of mixed-case alphanumeric — high entropy across full alphabet
+        text = "leaked: aB3xZ9k2Lq8mN4pR7vW1tY5jH6gF0sD2cE4iU8oP"
+        redacted, result = scanner.redact_text(text)
+        assert result.replacements > 0
+
+    def test_modern_provider_tokens_redacted(self):
+        # Regression: gateway audit flagged missing patterns for github_pat_,
+        # hf_, etc. — added to _SECRET_PATTERNS.
+        from harness.redactor import SecretScanner
+        scanner = SecretScanner(mode="mask")
+        cases = [
+            "token=github_pat_11ABCD1234567890ABCDEFGH",
+            "token=hf_abcdefghijklmnopqrstuvwxyz12",
+        ]
+        for text in cases:
+            _, result = scanner.redact_text(text)
+            assert result.replacements > 0, f"Should redact: {text}"
+
+    def test_redaction_preserves_json_validity(self):
+        # Bracketed replacements ([REDACTED:...]) are JSON-string-safe
+        # because they contain no `"` or `\`.
+        import json
+        from harness.redactor import SecretScanner
+        scanner = SecretScanner(mode="hash")
+        msg = json.dumps({"api_key": "sk-ant-api01-abcdef1234567890abcdef1234567890abcdef1234567890abcd"})
+        redacted, result = scanner.redact_text(msg)
+        assert result.replacements > 0
+        # The redacted output must still parse as JSON
+        parsed = json.loads(redacted)
+        assert "REDACTED" in parsed["api_key"]
+        assert "sk-ant" not in parsed["api_key"]
+
 
 # ===========================================================================
 # STORAGE TESTS

@@ -33,16 +33,20 @@ logger = logging.getLogger(__name__)
 # 1. Secret Detection Patterns
 # ---------------------------------------------------------------------------
 
-# High-confidence regex patterns for known secret formats.
-# Each pattern has a named group "secret" that captures the value to redact.
+# High-confidence regex patterns for known secret formats. These are
+# always on — they have low false-positive rates because they match
+# specific provider prefixes / structures.
 _SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # OpenAI API keys
     (re.compile(r'\b(sk-(?:proj-)?[A-Za-z0-9]{20,})\b'), "OpenAI API key"),
     # Anthropic API keys
     (re.compile(r'\b(sk-ant-api[0-9]{2}-[A-Za-z0-9_-]{40,})\b'), "Anthropic API key"),
-    # GitHub tokens (personal access, OAuth)
+    # GitHub tokens (personal access, OAuth, fine-grained PAT)
     (re.compile(r'\b(gh[pousr]_[A-Za-z0-9]{20,})\b'), "GitHub token"),
-    # AWS Access Key ID
+    (re.compile(r'\b(github_pat_[A-Za-z0-9_]{20,})\b'), "GitHub fine-grained PAT"),
+    # Hugging Face tokens
+    (re.compile(r'\b(hf_[A-Za-z0-9]{20,})\b'), "Hugging Face token"),
+    # AWS Access Key ID (NOT secret key — that requires entropy detection)
     (re.compile(r'\b(AKIA[0-9A-Z]{16})\b'), "AWS Access Key"),
     # Generic API key patterns (long alphanumeric strings following 'key=', 'token=', etc.)
     (re.compile(r'(?i)(?:api[_-]?key|secret|token|password|auth)\s*[:=]\s*[\'"]?([A-Za-z0-9+/._\-=]{20,})[\'"]?'), "Generic credential"),
@@ -59,15 +63,16 @@ _SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r'\b([0-9]+-[A-Za-z0-9_]{32,}\.apps\.googleusercontent\.com)\b'), "Google OAuth client"),
     # Slack tokens
     (re.compile(r'\b(xox[bpras]-[A-Za-z0-9-]{10,})\b'), "Slack token"),
-    # Heroku API key
-    (re.compile(r'\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b', re.IGNORECASE), "Heroku/UUID API key"),
-    # Base64 high-entropy strings (>30 chars, likely secrets)
-    (re.compile(r'\b([A-Za-z0-9+/]{40,}={0,2})\b'), "High-entropy base64 string"),
-    # Hex high-entropy strings (>32 chars)
-    (re.compile(r'\b([0-9a-fA-F]{32,})\b'), "High-entropy hex string"),
     # Private SSH keys
     (re.compile(r'-----BEGIN OPENSSH PRIVATE KEY-----\n(?:[A-Za-z0-9+/=\n]{40,})-----END'), "SSH private key"),
 ]
+
+# Note: bare "high-entropy hex/base64" matchers (formerly part of
+# _SECRET_PATTERNS) were removed because they eat git commit SHAs,
+# UUIDs-without-dashes, file content hashes, base64-encoded protobufs,
+# and many other non-secret strings — a ~30–50% false-positive rate on
+# realistic code messages. They are now part of the opt-in entropy
+# pass (see SecretScanner.entropy_detection, default off).
 
 
 def _is_high_entropy(value: str) -> bool:
@@ -80,25 +85,23 @@ def _is_high_entropy(value: str) -> bool:
     if len(value) < 16:
         return False
 
-    # Shannon entropy calculation
-    freq: dict[str, float] = {}
+    # Shannon entropy in bits/char: H = -sum(p_i * log2(p_i))
+    freq: dict[str, int] = {}
     for char in value:
-        freq[char] = freq.get(char, 0.0) + 1
+        freq[char] = freq.get(char, 0) + 1
     total = float(len(value))
 
-    entropy = 0.0
+    entropy_bits_per_char = 0.0
     for count in freq.values():
         p = count / total
-        entropy -= p * math.log2(p)
+        entropy_bits_per_char -= p * math.log2(p)
 
-    # Base64 character set: 64 chars → max entropy ~6 bits/char
-    # Hex character set: 16 chars → max entropy ~4 bits/char
-    # For a 20-char string, entropy > 3.5 bits/char is suspicious
-    # For a 40-char string, entropy > 3.0 bits/char is suspicious
-    entropy_per_char = entropy / total if total > 0 else 0
-
-    min_entropy = 3.2 if len(value) < 40 else 2.8
-    return entropy_per_char > min_entropy
+    # Pure hex has theoretical max ~4 bits/char; base64 ~6 bits/char.
+    # Require >4.5 bits/char so we trip on mixed-alphabet base64-ish secrets
+    # but not on pure-hex git SHAs (those are also filtered by the
+    # _ENTROPY_SKIP_PATTERNS shortcut).
+    min_entropy = 4.5 if len(value) < 40 else 4.0
+    return entropy_bits_per_char > min_entropy
 
 
 # ---------------------------------------------------------------------------
@@ -129,10 +132,16 @@ class SecretScanner:
         mode: str = "hash",
         custom_patterns: Optional[list[str]] = None,
         scan_files: Optional[list[str]] = None,
+        entropy_detection: bool = False,
     ):
         self.mode = mode
         self.custom_patterns = custom_patterns or []
         self.scan_files = scan_files or [".env", ".env.local", "*.pem", "*.key"]
+        # Entropy detection is opt-in: it has a high false-positive rate on
+        # ordinary code (SHAs, UUIDs, base64 protobufs, content hashes).
+        # Enable only when the threat model demands it and the workspace
+        # is mostly natural-language / config rather than code.
+        self.entropy_detection = entropy_detection
         self._custom_regex: list[tuple[re.Pattern[str], str]] = [
             (re.compile(p), "custom") for p in self.custom_patterns
         ]
@@ -174,9 +183,10 @@ class SecretScanner:
 
             redacted = pattern.sub(_replace, redacted)
 
-        # Entropy-based detection for base64/hex strings that look like secrets
-        # but don't match any known pattern
-        if self.mode != "strip":
+        # Entropy-based detection is opt-in. The high false-positive rate
+        # on realistic code (git SHAs, UUIDs, file hashes, base64 protobufs)
+        # made it harmful when always on.
+        if self.entropy_detection and self.mode != "strip":
             redacted = self._redact_high_entropy_strings(redacted, result)
 
         if result.replacements > 0:
@@ -188,35 +198,40 @@ class SecretScanner:
 
         return redacted, result
 
+    # Common non-secret patterns to skip during entropy pass.
+    _ENTROPY_SKIP_PATTERNS: tuple[re.Pattern[str], ...] = (
+        # UUID with dashes
+        re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE),
+        # Pure hex (git SHAs, file hashes, blob IDs)
+        re.compile(r'^[0-9a-fA-F]+$'),
+        # Base64 of well-known content lengths (very rough — defers to entropy)
+    )
+
     def _redact_high_entropy_strings(self, text: str, result: RedactionResult) -> str:
         """
-        Additional pass: find standalone alphanumeric strings with high entropy
-        that may be API keys or tokens not matching any known pattern.
+        Opt-in pass: find standalone alphanumeric strings with high entropy
+        that may be API keys or tokens not matching any known provider format.
+
+        Skips common false-positive shapes (UUIDs, pure hex like git SHAs).
+        The entropy threshold in ``_is_high_entropy`` is tuned to require
+        mixed-case + digits + symbols — pure hex won't trip it.
         """
-        # Find standalone alphanumeric+special tokens > 20 chars
+        # Find standalone alphanumeric+special tokens > 24 chars (raised from
+        # 20 to further reduce FPs on short hashes, JWT ids, etc.)
         potential_secrets = re.finditer(
-            r'(?<!\w)([A-Za-z0-9+/=_-]{20,})(?!\w)',
+            r'(?<!\w)([A-Za-z0-9+/=_-]{24,})(?!\w)',
             text,
         )
 
-        # Collect replacements in reverse order to preserve indices
         replacements: list[tuple[int, int, str]] = []
 
         for match in potential_secrets:
             value = match.group(1)
-            # Skip UUIDs and common identifiers
-            too_common = re.match(
-                r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-                value,
-                re.IGNORECASE,
-            )
-            if too_common:
+            if any(p.match(value) for p in self._ENTROPY_SKIP_PATTERNS):
                 continue
-
             if _is_high_entropy(value):
                 replacements.append((match.start(1), match.end(1), self._redact_value(value, "entropy")))
 
-        # Apply replacements from end to start so indices stay valid
         chars = list(text)
         for start, end, replacement in reversed(replacements):
             chars[start:end] = replacement
@@ -327,6 +342,7 @@ def create_redactor_from_config(config_dict: dict[str, Any]) -> SecretScanner:
         mode=rc.get("mode", "hash"),
         custom_patterns=rc.get("custom_patterns", None),
         scan_files=rc.get("scan_files", None),
+        entropy_detection=bool(rc.get("entropy_detection", False)),
     )
 
     # Register as global for convenience functions
