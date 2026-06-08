@@ -1,17 +1,57 @@
 """Tests for harness/hitl.py — pluggable HITL transport."""
+import hashlib
+import hmac
 import json
 import os
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
 from harness.hitl import (
     FileChannel,
+    HttpChannel,
     StdinChannel,
     get_channel,
     reset_channel,
     set_channel,
 )
+
+
+# ---------------------------------------------------------------------------
+# Minimal in-process HTTP server for webhook tests
+# ---------------------------------------------------------------------------
+
+def _make_server(response_body: bytes = b'{"answer": "ok"}',
+                 response_status: int = 200,
+                 captured: Optional[list] = None) -> HTTPServer:
+    """Spin up a localhost HTTP server that records requests and returns a fixed reply."""
+    from typing import Optional as Opt
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            if captured is not None:
+                captured.append({
+                    "path": self.path,
+                    "headers": dict(self.headers),
+                    "body": json.loads(body) if body else {},
+                })
+            self.send_response(response_status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(response_body)
+
+        def log_message(self, *args, **kwargs):
+            pass  # silence test output
+
+    server = HTTPServer(("127.0.0.1", 0), _Handler)
+    return server
+
+
+from typing import Optional  # keep this import at top; re-ordered here for clarity
 
 
 @pytest.fixture(autouse=True)
@@ -182,3 +222,140 @@ class TestGetChannel:
             ch = get_channel()
             with pytest.raises(RuntimeError, match="No pre-recorded answer"):
                 ch.confirm("Are you sure?")
+
+    def test_webhook_env_selects_http_channel(self, monkeypatch):
+        monkeypatch.setenv("HARNESS_HITL_WEBHOOK_URL", "http://127.0.0.1:19999/hitl")
+        ch = get_channel()
+        assert isinstance(ch, HttpChannel)
+
+    def test_webhook_takes_priority_over_file(self, monkeypatch):
+        monkeypatch.setenv("HARNESS_HITL_WEBHOOK_URL", "http://127.0.0.1:19999/hitl")
+        monkeypatch.setenv("HARNESS_HITL_FILE", "/some/file.json")
+        ch = get_channel()
+        assert isinstance(ch, HttpChannel)
+
+
+# ---------------------------------------------------------------------------
+# HttpChannel
+# ---------------------------------------------------------------------------
+
+class TestHttpChannel:
+
+    def _serve(self, response_body=b'{"answer": "a"}', status=200):
+        captured: list = []
+        server = _make_server(response_body, status, captured)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        port = server.server_address[1]
+        url = f"http://127.0.0.1:{port}"
+        return server, url, captured
+
+    def test_prompt_sends_correct_payload_and_returns_answer(self):
+        server, url, captured = self._serve(b'{"answer": "b"}')
+        try:
+            ch = HttpChannel(url)
+            result = ch.prompt("Choose option", ["a", "b", "c"], default="a")
+            assert result == "b"
+            assert len(captured) == 1
+            assert captured[0]["body"]["type"] == "prompt"
+            assert captured[0]["body"]["message"] == "Choose option"
+            assert captured[0]["body"]["options"] == ["a", "b", "c"]
+        finally:
+            server.shutdown()
+
+    def test_confirm_true_on_yes_answer(self):
+        server, url, _ = self._serve(b'{"answer": "yes"}')
+        try:
+            ch = HttpChannel(url)
+            assert ch.confirm("Are you sure?") is True
+        finally:
+            server.shutdown()
+
+    def test_confirm_false_on_no_answer(self):
+        server, url, _ = self._serve(b'{"answer": "no"}')
+        try:
+            ch = HttpChannel(url)
+            assert ch.confirm("Are you sure?") is False
+        finally:
+            server.shutdown()
+
+    def test_notes_returns_text(self):
+        server, url, _ = self._serve(b'{"answer": "retry with smaller batches"}')
+        try:
+            ch = HttpChannel(url)
+            result = ch.notes("Enter hint")
+            assert result == "retry with smaller batches"
+        finally:
+            server.shutdown()
+
+    def test_wait_for_edit_unblocks_on_200(self):
+        server, url, _ = self._serve(b'{"answer": "done"}')
+        try:
+            ch = HttpChannel(url)
+            ch.wait_for_manual_edit("/workspace/foo.py")  # must return
+        finally:
+            server.shutdown()
+
+    def test_request_body_type_for_wait_is_wait_for_edit(self):
+        server, url, captured = self._serve(b'{"answer": "ok"}')
+        try:
+            ch = HttpChannel(url)
+            ch.wait_for_manual_edit("/workspace/main.py")
+            assert captured[0]["body"]["type"] == "wait_for_edit"
+        finally:
+            server.shutdown()
+
+    def test_hmac_signature_header_sent_when_secret_set(self):
+        server, url, captured = self._serve(b'{"answer": "a"}')
+        secret = "my-secret-key"
+        try:
+            ch = HttpChannel(url, secret=secret)
+            ch.prompt("Choose", ["a"], default="a")
+            assert "X-Harness-Signature" in captured[0]["headers"]
+            sig = captured[0]["headers"]["X-Harness-Signature"]
+            assert sig.startswith("sha256=")
+            # Verify the HMAC is correct
+            body_bytes = json.dumps({
+                "type": "prompt",
+                "message": "Choose",
+                "options": ["a"],
+                "default": "a",
+            }, ensure_ascii=False).encode("utf-8")
+            expected = "sha256=" + hmac.new(
+                secret.encode(), body_bytes, hashlib.sha256
+            ).hexdigest()
+            assert sig == expected
+        finally:
+            server.shutdown()
+
+    def test_no_signature_header_without_secret(self):
+        server, url, captured = self._serve(b'{"answer": "a"}')
+        try:
+            ch = HttpChannel(url, secret=None)
+            ch.prompt("Choose", ["a"], default="a")
+            assert "X-Harness-Signature" not in captured[0]["headers"]
+        finally:
+            server.shutdown()
+
+    def test_falls_back_to_default_on_server_error(self):
+        # 500 response → fallback to default, no exception raised
+        server, url, _ = self._serve(b'{"error": "boom"}', status=500)
+        try:
+            ch = HttpChannel(url, max_retries=0)
+            result = ch.prompt("Choose", ["a", "b"], default="a")
+            assert result == "a"
+        finally:
+            server.shutdown()
+
+    def test_falls_back_to_default_on_bad_json(self):
+        server, url, _ = self._serve(b"not json at all", status=200)
+        try:
+            ch = HttpChannel(url, max_retries=0)
+            result = ch.confirm("Proceed?", default=False)
+            assert result is False  # default, not an exception
+        finally:
+            server.shutdown()
+
+    def test_is_interactive_true(self):
+        ch = HttpChannel("http://127.0.0.1:9999")
+        assert ch.is_interactive() is True

@@ -6,13 +6,19 @@ deploy previews, purge confirmations, discovery Q&A — are routed through a
 HitlChannel so the I/O surface can be swapped without touching call sites.
 
 Built-in implementations:
-  StdinChannel  — current stdin/print behaviour (default when no HARNESS_HITL_FILE)
+  StdinChannel  — current stdin/print behaviour (default when neither
+                  HARNESS_HITL_WEBHOOK_URL nor HARNESS_HITL_FILE is set).
   FileChannel   — pre-recorded answers loaded from a JSON file specified by
                   the HARNESS_HITL_FILE environment variable. Used for scripted
                   integration tests and CI runs without a TTY.
+  HttpChannel   — POSTs each prompt to a webhook URL (HARNESS_HITL_WEBHOOK_URL)
+                  and reads the JSON reply. Enables IDE plugins, agent-servers,
+                  and any integration that wants to drive the harness over HTTP.
 
-Extension path: implement HitlChannel and register it via set_channel().
-A webhook implementation, for example, is a single new file.
+Environment variable priority in get_channel():
+  HARNESS_HITL_WEBHOOK_URL → HttpChannel
+  HARNESS_HITL_FILE        → FileChannel
+  (default)                → StdinChannel
 
 Usage in call sites::
 
@@ -26,12 +32,17 @@ Usage in call sites::
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
 import sys
+import time
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -238,7 +249,161 @@ class FileChannel(HitlChannel):
 
 
 # ---------------------------------------------------------------------------
-# 4. Module-level channel registry
+# 4. HttpChannel — HTTP webhook transport
+# ---------------------------------------------------------------------------
+
+class HttpChannel(HitlChannel):
+    """
+    HTTP webhook HITL channel.
+
+    Sends each prompt to a remote HTTP endpoint and reads the response.
+    Designed for IDE plugins, agent-server orchestrators, and any integration
+    that needs to drive the harness over a network interface.
+
+    Configuration (via environment variables):
+        HARNESS_HITL_WEBHOOK_URL      — Required. HTTP/HTTPS endpoint to POST to.
+        HARNESS_HITL_WEBHOOK_SECRET   — Optional. HMAC-SHA256 signing key. When
+                                        set, a ``X-Harness-Signature`` header
+                                        (``sha256=<hex>``) is added to each
+                                        request so the server can verify origin.
+        HARNESS_HITL_WEBHOOK_TIMEOUT  — Optional. Request timeout in seconds
+                                        (default 30). Increase for slow human
+                                        review workflows.
+        HARNESS_HITL_WEBHOOK_RETRIES  — Optional. Number of retries on transient
+                                        errors (default 2).
+
+    Request format (POST, Content-Type: application/json):
+        {
+          "type":    "prompt" | "confirm" | "notes" | "wait_for_edit",
+          "message": "<prompt text>",
+          "options": ["a", "b", "c"],   // only for "prompt" type
+          "default": "a"                 // null if no default
+        }
+
+    Expected response (HTTP 200, Content-Type: application/json):
+        { "answer": "<string>" }
+
+    For "confirm" the answer is interpreted as truthy when it equals
+    "y", "yes", "true", or "1" (case-insensitive).
+    For "wait_for_edit" the answer is ignored — any 200 response unblocks.
+
+    If the server returns a non-200 status or the request fails, an error
+    is logged and the ``default`` value is used as a fallback.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        secret: Optional[str] = None,
+        timeout: float = 30.0,
+        max_retries: int = 2,
+    ) -> None:
+        self.url = url
+        self._secret = secret
+        self.timeout = timeout
+        self.max_retries = max_retries
+        logger.info("[hitl:http] Webhook channel configured → %s", url)
+
+    def is_interactive(self) -> bool:
+        return True  # a human is on the other end of the webhook
+
+    def _build_payload(self, type_: str, message: str,
+                       options: Optional[list[str]] = None,
+                       default: Optional[str] = None) -> bytes:
+        body: dict[str, Any] = {
+            "type": type_,
+            "message": message,
+            "options": options or [],
+            "default": default,
+        }
+        return json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+    def _sign(self, body: bytes) -> str:
+        """Return ``sha256=<hex>`` HMAC signature for the body."""
+        assert self._secret is not None
+        sig = hmac.new(
+            self._secret.encode("utf-8"), body, hashlib.sha256
+        ).hexdigest()
+        return f"sha256={sig}"
+
+    def _post(self, payload: bytes, default_answer: str) -> str:
+        """
+        POST ``payload`` to the webhook URL and return the ``answer`` string.
+        Retries on transient network errors; returns ``default_answer`` on failure.
+        """
+        headers = {"Content-Type": "application/json"}
+        if self._secret:
+            headers["X-Harness-Signature"] = self._sign(payload)
+
+        last_err: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                req = urllib.request.Request(
+                    self.url,
+                    data=payload,
+                    headers=headers,
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    raw = resp.read().decode("utf-8")
+                    data = json.loads(raw)
+                    return str(data.get("answer", default_answer))
+            except urllib.error.HTTPError as exc:
+                logger.warning(
+                    "[hitl:http] Webhook returned HTTP %d on attempt %d/%d.",
+                    exc.code, attempt + 1, self.max_retries + 1,
+                )
+                last_err = exc
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+                logger.warning(
+                    "[hitl:http] Webhook error on attempt %d/%d: %s",
+                    attempt + 1, self.max_retries + 1, exc,
+                )
+                last_err = exc
+
+            if attempt < self.max_retries:
+                time.sleep(min(2 ** attempt, 8))  # brief backoff between retries
+
+        logger.error(
+            "[hitl:http] Webhook failed after %d attempt(s): %s. Using default: %r.",
+            self.max_retries + 1, last_err, default_answer,
+        )
+        return default_answer
+
+    def prompt(
+        self,
+        message: str,
+        options: list[str],
+        default: Optional[str] = None,
+    ) -> str:
+        effective_default = default if default is not None else (options[0] if options else "")
+        payload = self._build_payload("prompt", message, options, effective_default)
+        answer = self._post(payload, effective_default)
+        logger.info("[hitl:http] prompt %r → %r", message[:60], answer)
+        return answer
+
+    def confirm(self, message: str, default: bool = False) -> bool:
+        default_str = "y" if default else "n"
+        payload = self._build_payload("confirm", message, None, default_str)
+        answer = self._post(payload, default_str)
+        result = answer.lower() in ("y", "yes", "true", "1")
+        logger.info("[hitl:http] confirm %r → %s", message[:60], result)
+        return result
+
+    def notes(self, message: str) -> str:
+        payload = self._build_payload("notes", message, None, "")
+        answer = self._post(payload, "")
+        logger.info("[hitl:http] notes → %d chars", len(answer))
+        return answer
+
+    def wait_for_manual_edit(self, filepath: str) -> None:
+        payload = self._build_payload("wait_for_edit", filepath, None, "done")
+        self._post(payload, "done")
+        logger.info("[hitl:http] wait_for_manual_edit %s — unblocked.", filepath)
+
+
+# ---------------------------------------------------------------------------
+# 5. Module-level channel registry
 # ---------------------------------------------------------------------------
 
 _channel: Optional[HitlChannel] = None
@@ -250,16 +415,33 @@ def get_channel() -> HitlChannel:
 
     Selection order:
       1. A channel explicitly installed via set_channel().
-      2. FileChannel when HARNESS_HITL_FILE env var is set.
-      3. StdinChannel (default).
+      2. HttpChannel  when HARNESS_HITL_WEBHOOK_URL is set.
+      3. FileChannel  when HARNESS_HITL_FILE is set.
+      4. StdinChannel (default).
     """
     global _channel
     if _channel is not None:
         return _channel
+
+    webhook_url = os.environ.get("HARNESS_HITL_WEBHOOK_URL", "").strip()
+    if webhook_url:
+        secret = os.environ.get("HARNESS_HITL_WEBHOOK_SECRET", "").strip() or None
+        try:
+            timeout = float(os.environ.get("HARNESS_HITL_WEBHOOK_TIMEOUT", "30"))
+        except ValueError:
+            timeout = 30.0
+        try:
+            retries = int(os.environ.get("HARNESS_HITL_WEBHOOK_RETRIES", "2"))
+        except ValueError:
+            retries = 2
+        _channel = HttpChannel(webhook_url, secret=secret, timeout=timeout, max_retries=retries)
+        return _channel
+
     hitl_file = os.environ.get("HARNESS_HITL_FILE", "").strip()
     if hitl_file:
         _channel = FileChannel(hitl_file)
         return _channel
+
     _channel = StdinChannel()
     return _channel
 
