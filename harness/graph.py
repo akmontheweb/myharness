@@ -186,6 +186,11 @@ def create_initial_state(
     """
     if spec_override:
         system_prompt = spec_override
+        # When a user-approved spec already exists (from pre-flight --manifest
+        # refinement), skip the graph's discovery pipeline completely. Otherwise
+        # write_spec_node would overwrite the approved SPEC_REQUIREMENTS.md with
+        # a minimal conversation-history compilation.
+        skip_discovery = True
     else:
         system_prompt = _build_system_prompt(workspace_path, build_command)
     return AgentState(
@@ -1556,11 +1561,16 @@ def route_after_discovery(state: AgentState) -> str:
         discovery_complete == false AND critical > 0 → loop back to discovery node
         discovery_complete == false AND no critical → write_spec_node (non-critical only)
         user typed 'DONE' with critical remaining → alert + loop back
+        user typed 'SUSPEND' → save & quit (route to END)
     """
     node_state = state.get("node_state", {})
     complete = node_state.get("discovery_complete", False)
     critical = node_state.get("discovery_critical_remaining", 0)
     gate = state.get("current_gate", "REQUIREMENTS")
+
+    if node_state.get("hitl_suspend"):
+        logger.info("[router] Discovery: developer chose to suspend. Routing to END.")
+        return "__end__"
 
     if node_state.get("user_done_with_critical"):
         # User tried to exit with critical unknowns — route back to the correct discovery node
@@ -1595,9 +1605,14 @@ def route_after_gatekeeper(state: AgentState) -> str:
         - "approve" → proceed to next phase
         - "refine"  → loop back to the current phase's generator
         - "manual"  → proceed (manual edits done)
+        - "suspend" → save & quit (route to END)
     """
     gate = state.get("current_gate", "")
     action = state.get("node_state", {}).get("gatekeeper_action", "approve")
+
+    if action == "suspend":
+        logger.info("[router] Gatekeeper: developer chose to suspend. Routing to END.")
+        return "__end__"
 
     if action == "refine":
         # Route back to the corresponding discovery node for re-generation
@@ -1673,12 +1688,17 @@ def route_after_security_scan(state: AgentState) -> Literal["patching_node", "hu
 def route_after_hitl(state: AgentState) -> Literal["compiler_node", "__end__"]:
     """
     After human intervention, always route back to compiler_node for re-validation.
-    The only exception is if the developer chose to abandon ([q]).
+    Exceptions:
+        - Developer chose to abandon ([q]) → END with git rollback
+        - Developer chose to suspend ([s]) → END without rollback
 
     Note: Memory cleanse for HITL resolution is handled inside
     compiler_node when exit_code == 0 after the re-validation build passes.
     """
     node_state: dict[str, Any] = state.get("node_state", {})
+    if node_state.get("hitl_suspend", False):
+        logger.info("[router] HITL: Developer chose to suspend. Routing to END.")
+        return "__end__"
     if node_state.get("hitl_abandon", False):
         logger.info("[router] HITL: Developer chose to abandon. Routing to END.")
         return "__end__"
@@ -1832,6 +1852,7 @@ def build_graph() -> Any:
             "write_spec_node": "write_spec_node",
             # Self-loop: user typed DONE with critical unknowns → re-display menu
             "discovery_interview_loop": "discovery_interview_loop",
+            "__end__": END,
         },
     )
 
