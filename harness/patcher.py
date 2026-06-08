@@ -263,6 +263,40 @@ async def _awrite(filepath: str, content: str) -> None:
 # 5. BasePatcher ABC
 # ---------------------------------------------------------------------------
 
+def _safe_resolve(workspace_root: str, filepath: str) -> str:
+    """
+    Resolve an LLM-supplied ``filepath`` against ``workspace_root`` and reject
+    anything that would land outside the workspace.
+
+    Guards against:
+      - empty / None paths
+      - absolute paths (``/etc/passwd``)
+      - parent-traversal (``../../etc/passwd``)
+      - symlinks pointing outside the workspace (via realpath)
+      - Windows mixed-drive joins
+
+    Returns the absolute, real (symlink-resolved) path on success.
+    Raises ``ValueError`` on any rejection.
+    """
+    if not filepath:
+        raise ValueError("filepath must be non-empty")
+    if os.path.isabs(filepath):
+        raise ValueError(f"absolute path rejected: {filepath!r}")
+
+    workspace_real = os.path.realpath(workspace_root)
+    candidate = os.path.realpath(os.path.join(workspace_real, filepath))
+
+    try:
+        common = os.path.commonpath([candidate, workspace_real])
+    except ValueError as e:
+        raise ValueError(f"unresolvable path: {filepath!r}") from e
+
+    if common != workspace_real:
+        raise ValueError(f"path escapes workspace: {filepath!r} -> {candidate}")
+
+    return candidate
+
+
 class BasePatcher(ABC):
     """
     Abstract base for all file modification engines.
@@ -273,6 +307,26 @@ class BasePatcher(ABC):
         - delete_block(path, search) → PatchResult
         - insert_at_block(path, anchor, placement, content) → PatchResult
     """
+
+    workspace_root: str  # set by concrete subclasses
+
+    def _resolve_safe(
+        self, filepath: str, op: "OperationType"
+    ) -> tuple[Optional[str], Optional["PatchResult"]]:
+        """
+        Resolve ``filepath`` against ``self.workspace_root`` with traversal
+        protection. Returns ``(absolute_path, None)`` on success or
+        ``(None, PatchResult)`` carrying an error to propagate.
+        """
+        try:
+            return _safe_resolve(self.workspace_root, filepath), None
+        except ValueError as exc:
+            return None, PatchResult(
+                success=False,
+                file=filepath,
+                operation=op,
+                error=f"path traversal rejected: {exc}",
+            )
 
     @abstractmethod
     async def create_file(self, filepath: str, content: str) -> PatchResult:
@@ -318,14 +372,10 @@ class TextPatcher(BasePatcher):
     def __init__(self, workspace_root: str):
         self.workspace_root = os.path.abspath(workspace_root)
 
-    def _resolve(self, filepath: str) -> str:
-        """Resolve a relative filepath against the workspace root."""
-        if os.path.isabs(filepath):
-            return filepath
-        return os.path.join(self.workspace_root, filepath)
-
     async def create_file(self, filepath: str, content: str) -> PatchResult:
-        full_path = self._resolve(filepath)
+        full_path, _err = self._resolve_safe(filepath, OperationType.CREATE_FILE)
+        if _err is not None:
+            return _err
         if os.path.exists(full_path):
             return PatchResult(
                 success=False,
@@ -355,7 +405,9 @@ class TextPatcher(BasePatcher):
             )
 
     async def replace_block(self, filepath: str, search: str, replace: str) -> PatchResult:
-        full_path = self._resolve(filepath)
+        full_path, _err = self._resolve_safe(filepath, OperationType.REPLACE_BLOCK)
+        if _err is not None:
+            return _err
         if not os.path.isfile(full_path):
             return PatchResult(
                 success=False,
@@ -405,7 +457,9 @@ class TextPatcher(BasePatcher):
             return PatchResult(success=False, file=filepath, operation=OperationType.REPLACE_BLOCK, error=str(exc))
 
     async def delete_block(self, filepath: str, search: str) -> PatchResult:
-        full_path = self._resolve(filepath)
+        full_path, _err = self._resolve_safe(filepath, OperationType.DELETE_BLOCK)
+        if _err is not None:
+            return _err
         if not os.path.isfile(full_path):
             return PatchResult(
                 success=False,
@@ -454,7 +508,9 @@ class TextPatcher(BasePatcher):
     async def insert_at_block(
         self, filepath: str, anchor: str, placement: Placement, content: str
     ) -> PatchResult:
-        full_path = self._resolve(filepath)
+        full_path, _err = self._resolve_safe(filepath, OperationType.INSERT_AT_BLOCK)
+        if _err is not None:
+            return _err
         if not os.path.isfile(full_path):
             return PatchResult(
                 success=False,
@@ -531,11 +587,6 @@ class TreeSitterPatcher(BasePatcher):
         self._parsers: dict[str, Any] = {}  # Language → tree-sitter Parser
         self._languages: dict[str, Any] = {}  # Language → tree-sitter Language
 
-    def _resolve(self, filepath: str) -> str:
-        if os.path.isabs(filepath):
-            return filepath
-        return os.path.join(self.workspace_root, filepath)
-
     def _get_parser(self, language_name: str) -> Any:
         """
         Lazily load a tree-sitter parser for the given language.
@@ -606,7 +657,9 @@ class TreeSitterPatcher(BasePatcher):
 
     async def create_file(self, filepath: str, content: str) -> PatchResult:
         # CREATE_FILE is purely text-based regardless — no AST parsing needed for new files
-        full_path = self._resolve(filepath)
+        full_path, _err = self._resolve_safe(filepath, OperationType.CREATE_FILE)
+        if _err is not None:
+            return _err
         if os.path.exists(full_path):
             return PatchResult(
                 success=False,
@@ -635,7 +688,9 @@ class TreeSitterPatcher(BasePatcher):
         and replace only that node's text, preserving all surrounding formatting.
         Falls back to text search if AST parsing fails.
         """
-        full_path = self._resolve(filepath)
+        full_path, _err = self._resolve_safe(filepath, OperationType.REPLACE_BLOCK)
+        if _err is not None:
+            return _err
         lang = get_language_for_file(filepath)
         if lang is None:
             text_patcher = TextPatcher(self.workspace_root)
@@ -700,7 +755,9 @@ class TreeSitterPatcher(BasePatcher):
 
     async def delete_block(self, filepath: str, search: str) -> PatchResult:
         """AST-aware delete: locate and remove the target node."""
-        full_path = self._resolve(filepath)
+        full_path, _err = self._resolve_safe(filepath, OperationType.DELETE_BLOCK)
+        if _err is not None:
+            return _err
         lang = get_language_for_file(filepath)
         if lang is None:
             text_patcher = TextPatcher(self.workspace_root)
@@ -757,7 +814,9 @@ class TreeSitterPatcher(BasePatcher):
         before or after it, using tree-sitter to identify block boundaries
         rather than fragile line numbers or substring matching.
         """
-        full_path = self._resolve(filepath)
+        full_path, _err = self._resolve_safe(filepath, OperationType.INSERT_AT_BLOCK)
+        if _err is not None:
+            return _err
         lang = get_language_for_file(filepath)
         if lang is None:
             text_patcher = TextPatcher(self.workspace_root)

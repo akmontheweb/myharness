@@ -127,6 +127,64 @@ class TestTextPatcher:
             assert "already exists" in result.error.lower()
 
     @pytest.mark.asyncio
+    async def test_path_traversal_create_file_rejected(self):
+        # Regression: LLM-supplied paths like "../../etc/passwd" previously
+        # joined unchecked and let CREATE_FILE write outside the workspace.
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as outer:
+            workspace = os.path.join(outer, "ws")
+            os.makedirs(workspace)
+            patcher = TextPatcher(workspace)
+            result = await patcher.create_file("../escape.txt", "pwned")
+            assert not result.success
+            assert "path traversal" in result.error.lower()
+            # No file written anywhere in the outer dir
+            assert not os.path.exists(os.path.join(outer, "escape.txt"))
+
+    @pytest.mark.asyncio
+    async def test_absolute_path_create_file_rejected(self):
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            patcher = TextPatcher(tmpdir)
+            result = await patcher.create_file("/tmp/escape.txt", "pwned")
+            assert not result.success
+            assert "path traversal" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_path_traversal_replace_block_rejected(self):
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as outer:
+            workspace = os.path.join(outer, "ws")
+            os.makedirs(workspace)
+            # Create a file outside the workspace
+            outside = os.path.join(outer, "secret.txt")
+            with open(outside, "w") as f:
+                f.write("original\n")
+            patcher = TextPatcher(workspace)
+            result = await patcher.replace_block("../secret.txt", "original", "pwned")
+            assert not result.success
+            assert "path traversal" in result.error.lower()
+            # The file outside the workspace is unchanged
+            with open(outside) as f:
+                assert f.read() == "original\n"
+
+    def test_safe_resolve_helper(self):
+        from harness.patcher import _safe_resolve
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Normal nested path passes
+            ok = _safe_resolve(tmpdir, "sub/dir/file.py")
+            assert ok.startswith(os.path.realpath(tmpdir))
+            # Traversal raises
+            with pytest.raises(ValueError, match="escapes workspace"):
+                _safe_resolve(tmpdir, "../../etc/passwd")
+            # Absolute raises
+            with pytest.raises(ValueError, match="absolute path"):
+                _safe_resolve(tmpdir, "/etc/passwd")
+            # Empty raises
+            with pytest.raises(ValueError, match="non-empty"):
+                _safe_resolve(tmpdir, "")
+
+    @pytest.mark.asyncio
     async def test_replace_block(self):
         from harness.patcher import TextPatcher
         with tempfile.TemporaryDirectory() as tmpdir:
