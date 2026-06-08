@@ -128,6 +128,25 @@ Run `harness doctor` first — it tells you which subsystem is unhappy.
 
 Logs are written to `~/.harness/logs/<session-id>.log` and stderr.
 
+## Platform support
+
+| Platform | `docker` backend | `unshare` backend | `bare` backend | CI coverage |
+|----------|------------------|-------------------|----------------|-------------|
+| Linux (Ubuntu 22.04+) | ✓ supported | ✓ supported | ✓ opt-in via `HARNESS_ALLOW_UNSAFE_SANDBOX=true` | ✓ Python 3.11 / 3.12 / 3.13 |
+| macOS (Intel + Apple Silicon) | ✓ likely (Docker Desktop), untested | ✗ not available (`unshare` is Linux-only) | ✓ opt-in, untested | ✗ not in CI |
+| Windows + WSL2 | ✓ likely (Docker Desktop), untested | ? depends on WSL2 kernel config | ✗ path handling untested | ✗ not in CI |
+| Windows (native) | ✗ not supported | ✗ not supported | ✗ not supported | ✗ |
+
+Linux is the only platform covered by the CI matrix and the only one the
+project actively tests. macOS and WSL2 are best-effort — the Docker
+backend is portable and likely works, but nothing is guaranteed until
+the matrix grows. File an issue if you hit a regression on either; we'll
+take patches that don't compromise the Linux path.
+
+The `bare` backend (zero isolation) is opt-in everywhere and runs
+LLM-generated build commands directly on the host. Never enable it
+outside a disposable VM.
+
 ## Architecture
 
 See [`docs/SPEC_ARCHITECTURE.md`](docs/SPEC_ARCHITECTURE.md) for the module

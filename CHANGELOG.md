@@ -13,6 +13,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ## [Unreleased]
 
 ### Added
+- **Tier 4** — Platform support matrix in `README.md`. Documents which
+  platforms (Linux / macOS / WSL2 / Windows) are CI-tested vs
+  best-effort vs unsupported, per sandbox backend (`docker` / `unshare` /
+  `bare`). T4.1 (web dashboard) is intentionally deferred — the audit
+  itself flagged it as out of scope for v1.x.
 - **Tier 2** — `CONTRIBUTING.md` covering pre-commit gate behavior, test
   layout, commit-message convention, SemVer policy, and the scope rules
   the project enforces on PRs.
