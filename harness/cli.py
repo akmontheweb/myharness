@@ -309,12 +309,14 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
             print(f"  [a] Approve & Proceed to {next_phase}")
             print("  [e] Refine via text feedback")
             print("  [m] Pause for manual local edits in IDE")
+            print("  [s] Save & Quit (resume later)")
         elif gate == "ARCHITECTURE":
             print(f"Technical layout blueprints written to {file_label}. Please review module boundaries.")
             print("Options:")
             print("  [a] Approve & Begin Coding/Patching")
             print("  [e] Refine layout parameters")
             print("  [m] Pause for manual edits")
+            print("  [s] Save & Quit (resume later)")
         elif gate == "DEPLOYMENT":
             print(f"Application fully compiled. Docker Composition written to {file_label}.")
             print("Please review container network bridges and volumes before firing.")
@@ -322,10 +324,11 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
             print(f"  [a] Approve & Execute Infrastructure {next_phase}")
             print("  [e] Refine variables")
             print("  [m] Pause for manual edits")
+            print("  [s] Save & Quit (resume later)")
         print()
 
         try:
-            choice = input(f"[HITL:{gate_label}] Select action [a/e/m]: ").strip().lower()
+            choice = input(f"[HITL:{gate_label}] Select action [a/e/m/s]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print("\n[Gatekeeper] Input interrupted. Aborting.")
             sys.exit(1)
@@ -391,8 +394,26 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
                 "node_state": {"gatekeeper_action": "manual", "current_gate": gate},
             }
 
+        elif choice == "s":
+            session_id = state.get("session_id", "")
+            print()
+            print("=" * 60)
+            print("Session saved to checkpoint.")
+            print(f"Resume later with:")
+            print(f"  harness resume --session-id {session_id}")
+            if workspace and workspace != os.getcwd():
+                print(f"  harness resume --session-id {session_id} -r {workspace}")
+            print("=" * 60)
+            print()
+            logger.info("[gatekeeper] %s suspended by developer. Session: %s", gate_label, session_id)
+            return {
+                "messages": messages,
+                "loop_counter": loop_counter,
+                "node_state": {"gatekeeper_action": "suspend", "current_gate": gate},
+            }
+
         else:
-            print(f"[Gatekeeper] Unknown option: '{choice}'. Please choose a, e, or m.")
+            print(f"[Gatekeeper] Unknown option: '{choice}'. Please choose a, e, m, or s.")
 
 
 def discovery_interview_loop(state: dict[str, Any]) -> dict[str, Any]:
@@ -446,13 +467,29 @@ def discovery_interview_loop(state: dict[str, Any]) -> dict[str, Any]:
     if critical_remaining > 0:
         print(f"[CRITICAL]: {critical_remaining} critical question(s) remain unanswered.")
     print("-" * 80)
-    print("Type your answers (referencing question numbers if preferred) or type 'DONE' to finalize.")
+    print("Type your answers (referencing question numbers if preferred), 'DONE' to finalize, or 'SUSPEND' to save & quit.")
     print("-" * 80)
 
     try:
         response = input("User Response > ").strip()
     except (EOFError, KeyboardInterrupt):
         print("\n[Discovery] Input interrupted. Saving current state.")
+        return {"messages": messages, "node_state": node_state}
+
+    if response.upper() == "SUSPEND":
+        session_id = state.get("session_id", "")
+        workspace = state.get("workspace_path", "")
+        print()
+        print("=" * 60)
+        print("Session saved to checkpoint.")
+        print(f"Resume later with:")
+        print(f"  harness resume --session-id {session_id}")
+        if workspace and workspace != os.getcwd():
+            print(f"  harness resume --session-id {session_id} -r {workspace}")
+        print("=" * 60)
+        print()
+        logger.info("[discovery] %s phase suspended by developer. Session: %s", phase_label, session_id)
+        node_state["hitl_suspend"] = True
         return {"messages": messages, "node_state": node_state}
 
     if response.upper() == "DONE":
@@ -558,6 +595,7 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
         print("  [e] Inject manual hint instruction string for the repair node")
         print("  [m] Pause for manual edits (notifies harness to wait while you fix files in your IDE)")
         print("  [b] Increase session budget limit (+ $2.00)")
+        print("  [s] Save & Quit (resume later)")
         print("  [q] Abandon session and execute Git rollback")
         print()
 
@@ -636,6 +674,24 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             print(f"[HITL] Budget increased by $2.00. New budget: ${budget_remaining:.2f}. Loop counter reset.")
             continue  # Stay in the menu loop
 
+        elif choice == "s":
+            session_id = state.get("session_id", "")
+            print()
+            print("=" * 60)
+            print("Session saved to checkpoint.")
+            print(f"Resume later with:")
+            print(f"  harness resume --session-id {session_id}")
+            if workspace_path and workspace_path != os.getcwd():
+                print(f"  harness resume --session-id {session_id} -r {workspace_path}")
+            print("=" * 60)
+            print()
+            logger.info("[HITL] Session suspended by developer. Session: %s", session_id)
+            node_state["hitl_suspend"] = True
+            node_state["hitl_active"] = False
+            node_state["hitl_awaiting_input"] = False
+            state["node_state"] = node_state
+            return state
+
         elif choice == "q":
             # Abandon: set abandon flag, route to END
             print("[HITL] Abandoning session...")
@@ -653,7 +709,7 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 continue
 
         else:
-            print(f"[HITL] Unknown option: '{choice}'. Please choose from [v/r/e/m/b/q].")
+            print(f"[HITL] Unknown option: '{choice}'. Please choose from [v/r/e/m/b/s/q].")
 
 
 # ---------------------------------------------------------------------------
@@ -1034,9 +1090,13 @@ async def cmd_run(args: argparse.Namespace) -> int:
     if manifest_path:
         logger.info("[requirements] Synthesizing specification from %s", manifest_path)
         try:
+            # Resolve output_dir relative to the workspace, not the CWD where harness was invoked
+            output_dir = args.output_dir
+            if not os.path.isabs(output_dir):
+                output_dir = os.path.join(workspace_path, output_dir)
             spec_path = await synthesize_requirements(
                 manifest_path=manifest_path,
-                output_dir=args.output_dir,
+                output_dir=output_dir,
                 gateway=gateway,
             )
             logger.info("[requirements] Specification synthesized. Entering review loop.")
@@ -1212,10 +1272,10 @@ async def cmd_status(args: argparse.Namespace) -> int:
         if not sessions:
             print("No checkpointed sessions found.")
         else:
-            print(f"{'SESSION ID':<40} {'UPDATED':<20} {'CREATED':<20}")
-            print("-" * 80)
+            print(f"{'SESSION ID':<40} {'UPDATED':<20} {'CREATED':<20} {'WORKSPACE':<40}")
+            print("-" * 100)
             for s in sessions:
-                print(f"{s.thread_id:<40} {s.updated_at:<20} {s.created_at:<20}")
+                print(f"{s.thread_id:<40} {s.updated_at:<20} {s.created_at:<20} {s.workspace_path:<40}")
         await checkpointer.conn.close()
         return 0
 
@@ -1248,6 +1308,7 @@ async def cmd_status(args: argparse.Namespace) -> int:
     print(f"  Is Active:          {summary.is_active}")
     print(f"  Created:            {summary.created_at}")
     print(f"  Updated:            {summary.updated_at}")
+    print(f"  Workspace:          {summary.workspace_path}")
     print("=" * 60)
 
     await checkpointer.conn.close()

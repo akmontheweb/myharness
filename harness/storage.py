@@ -43,6 +43,7 @@ class CheckpointSummary:
     created_at: str = ""
     updated_at: str = ""
     is_active: bool = False
+    workspace_path: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +209,66 @@ def generate_session_id(user_provided: Optional[str] = None) -> str:
 # 4. Status Inspector — Read-Only Session Snapshot
 # ---------------------------------------------------------------------------
 
+def _deserialize_checkpoint_blob(blob: Any) -> dict[str, Any]:
+    """
+    Deserialize a checkpoint column BLOB from the SQLite store.
+
+    LangGraph's AsyncSqliteSaver stores checkpoints as msgpack-encoded
+    binary blobs (via JsonPlusSerializer). Falls back to JSON for
+    backwards compatibility with any legacy text-based rows.
+
+    Returns an empty dict on failure.
+    """
+    if blob is None:
+        return {}
+
+    # msgpack binary path (LangGraph canonical format)
+    if isinstance(blob, (bytes, bytearray)):
+        try:
+            import msgpack
+            return msgpack.unpackb(blob, raw=False)
+        except (ImportError, msgpack.exceptions.UnpackException, ValueError):
+            # Try decoding as UTF-8 JSON text as fallback
+            try:
+                return json.loads(blob.decode("utf-8", errors="replace"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return {}
+
+    # Plain text JSON path (legacy / backwards-compat)
+    if isinstance(blob, str):
+        try:
+            return json.loads(blob)
+        except json.JSONDecodeError:
+            return {}
+
+    return {}
+
+
+def _format_checkpoint_ts(ts_value: Any) -> str:
+    """
+    Convert a LangGraph checkpoint 'ts' value into a human-readable local
+    datetime string.
+
+    The ``ts`` field is an ISO 8601 UTC string (e.g. "2026-06-08T14:30:00.000000Z").
+    Returns a string like "2026-06-08 10:30:00" in the local timezone.
+    Falls back to "(unknown)" if the value cannot be parsed.
+    """
+    if not ts_value or not isinstance(ts_value, str):
+        return "(unknown)"
+
+    try:
+        from datetime import datetime, timezone as dt_timezone
+        # Strip trailing 'Z' and parse ISO 8601 UTC
+        cleaned = ts_value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(cleaned)
+        # If the parsed datetime is timezone-aware, convert to local
+        if dt.tzinfo is not None and dt.tzinfo.utcoffset(dt) is not None:
+            dt = dt.astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return "(unknown)"
+
+
 async def inspect_session(
     db_path: str,
     thread_id: str,
@@ -247,7 +308,7 @@ async def inspect_session(
             logger.warning("[storage] No checkpoint found for thread '%s'.", thread_id)
             return None
 
-        checkpoint = json.loads(row["checkpoint"])
+        checkpoint = _deserialize_checkpoint_blob(row["checkpoint"])
 
         # Extract state fields from the checkpoint blob
         channel_values = checkpoint.get("channel_values", {})
@@ -286,6 +347,18 @@ async def inspect_session(
         elif isinstance(node_state, str):
             current_node = node_state
 
+        # Extract timestamps from the LangGraph checkpoint "ts" field (ISO 8601)
+        ts_value = checkpoint.get("ts", "")
+        created_fmt = _format_checkpoint_ts(ts_value)
+        # The latest checkpoint's ts is both created and updated time
+        updated_fmt = created_fmt
+
+        # Extract workspace_path from channel_values
+        workspace_path = state.get("workspace_path", "")
+        if isinstance(workspace_path, dict):
+            workspace_path = workspace_path.get("value", "")
+        workspace_path = str(workspace_path) if workspace_path else ""
+
         return CheckpointSummary(
             thread_id=row["thread_id"],
             session_id=thread_id,
@@ -295,15 +368,19 @@ async def inspect_session(
             total_cost_usd=float(total_cost) if total_cost is not None else 0.0,
             modified_files=list(modified_files) if modified_files else [],
             loop_counters=dict(loop_counters) if loop_counters else {},
-            created_at="(checkpoint_id based)",
-            updated_at="(checkpoint_id based)",
+            created_at=created_fmt,
+            updated_at=updated_fmt,
             is_active=exit_code not in (0, -1) and exit_code != 0,
+            workspace_path=workspace_path,
         )
 
 
 async def list_all_sessions(db_path: str, limit: int = 50) -> list[CheckpointSummary]:
     """
     List summaries of all checkpointed sessions, ordered by most recently updated.
+
+    Reads the latest checkpoint JSON blob for each thread to extract
+    created/updated timestamps and workspace path.
 
     Args:
         db_path: Path to the checkpoints SQLite database.
@@ -321,21 +398,49 @@ async def list_all_sessions(db_path: str, limit: int = 50) -> list[CheckpointSum
     summaries: list[CheckpointSummary] = []
     async with aiosqlite.connect(expanded_path) as db:
         db.row_factory = aiosqlite.Row
+        # Subquery: for each thread_id, get the row with the largest checkpoint_id
         cursor = await db.execute(
-            """SELECT thread_id, MAX(checkpoint_id) AS latest_checkpoint_id
-               FROM checkpoints
-               GROUP BY thread_id
-               ORDER BY latest_checkpoint_id DESC
+            """SELECT c.thread_id, c.checkpoint_id, c.checkpoint
+               FROM checkpoints c
+               INNER JOIN (
+                   SELECT thread_id, MAX(checkpoint_id) AS max_cp_id
+                   FROM checkpoints
+                   GROUP BY thread_id
+               ) AS latest ON c.thread_id = latest.thread_id
+                          AND c.checkpoint_id = latest.max_cp_id
+               ORDER BY c.checkpoint_id DESC
                LIMIT ?""",
             (limit,),
         )
         rows = await cursor.fetchall()
         for row in rows:
+            created_at = "(unknown)"
+            updated_at = "(unknown)"
+            workspace_path = ""
+
+            try:
+                cp = _deserialize_checkpoint_blob(row["checkpoint"])
+                # Extract timestamp from the LangGraph "ts" field
+                ts_value = cp.get("ts", "")
+                created_at = _format_checkpoint_ts(ts_value)
+                updated_at = created_at  # same for latest checkpoint
+
+                # Extract workspace_path from channel_values
+                channel_values = cp.get("channel_values", {})
+                if isinstance(channel_values, dict):
+                    wp = channel_values.get("workspace_path", "")
+                    if isinstance(wp, dict):
+                        wp = wp.get("value", "")
+                    workspace_path = str(wp) if wp else ""
+            except Exception:
+                pass  # use fallback values
+
             summaries.append(CheckpointSummary(
                 thread_id=row["thread_id"],
                 session_id=row["thread_id"],
-                created_at="(checkpoint_id based)",
-                updated_at="(checkpoint_id based)",
+                created_at=created_at,
+                updated_at=updated_at,
+                workspace_path=workspace_path,
             ))
     return summaries
 
