@@ -1154,7 +1154,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         git_guardian.commit_all_changes(session_id, modified_files, exit_code)
         git_guardian.restore_original_branch()
     else:
-        git_guardian.rollback()
+        git_guardian.rollback(modified_files)
 
     git_guardian.pop_stash()
 

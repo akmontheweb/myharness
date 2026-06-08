@@ -27,7 +27,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -156,13 +156,19 @@ class GitGuardian:
 
     def commit_all_changes(self, session_id: str, modified_files: list[str], exit_code: int) -> bool:
         """
-        Stage and commit all changes made during the harness session.
+        Stage and commit changes made during the harness session.
 
-        Commit message includes session metadata.
+        Only files in ``modified_files`` are staged — using ``git add -A``
+        would also stage user-introduced or stray files unrelated to the
+        harness's patches. ``git add -A -- <paths>`` stages additions,
+        modifications, and deletions scoped to those paths.
+
+        If ``modified_files`` is empty but the working tree is dirty, the
+        commit is refused: those changes are not the harness's to commit.
 
         Args:
             session_id: The harness session ID.
-            modified_files: List of files that were modified.
+            modified_files: List of files the harness modified (relative to workspace).
             exit_code: The final build exit code.
 
         Returns True on success.
@@ -174,8 +180,16 @@ class GitGuardian:
             logger.debug("[gitguardian] No changes to commit.")
             return True
 
-        # Stage all changes
-        result = self._git("add", "-A")
+        if not modified_files:
+            logger.warning(
+                "[gitguardian] Working tree is dirty but modified_files is empty. "
+                "Refusing to `git add -A` (would commit user files). Skipping commit."
+            )
+            return False
+
+        # Stage only the files the harness actually modified.
+        # `-A -- <paths>` covers additions, modifications, and deletions.
+        result = self._git("add", "-A", "--", *modified_files)
         if result.returncode != 0:
             logger.warning("[gitguardian] git add failed: %s", result.stderr.strip())
             return False
@@ -200,22 +214,44 @@ class GitGuardian:
         logger.info("[gitguardian] Committed %d file(s) on branch '%s'.", len(modified_files), self._patch_branch)
         return True
 
-    def rollback(self) -> bool:
+    def rollback(self, modified_files: Optional[Sequence[str]] = None) -> bool:
         """
         Clean rollback: restore working tree to HEAD, switch back to original branch,
         and delete the patch branch.
 
+        ``git checkout -- .`` only restores **tracked** files — any new file
+        the LLM created during the session (e.g. ``.env``, leaked secrets,
+        scratch files) would otherwise remain in the workspace after
+        rollback. To handle this, callers should pass ``modified_files``
+        and any file in that list that is not tracked by git is removed
+        before the checkout.
+
+        If ``modified_files`` is None (e.g. unexpected crash before the
+        graph populated state), a warning is logged and untracked LLM
+        files may remain — we don't blanket-`git clean` because that
+        would also remove the user's own untracked work.
+
         This is called when:
             - The harness abandons (HITL [q])
             - 3 repair attempts fail without resolution
+            - An unhandled exception aborts graph execution
 
         Returns True on success.
         """
         if not self.is_git_repo() or not self._branch_created:
             return False
 
-        # Force-clean the working tree
         logger.info("[gitguardian] Rolling back changes on branch '%s'.", self._patch_branch)
+
+        if modified_files:
+            self._remove_untracked_llm_files(modified_files)
+        else:
+            logger.warning(
+                "[gitguardian] Rollback called without modified_files; "
+                "any LLM-created untracked files will remain in the workspace."
+            )
+
+        # Restore tracked files to HEAD
         self._git("checkout", "--", ".")
 
         # Switch back to original branch
@@ -234,6 +270,44 @@ class GitGuardian:
 
         self._branch_created = False
         return True
+
+    def _remove_untracked_llm_files(self, modified_files: Sequence[str]) -> None:
+        """
+        Delete files from ``modified_files`` that are not tracked by git.
+
+        These are files the LLM CREATE_FILE'd during the session — git
+        checkout doesn't know about them and would leave them behind on
+        rollback, defeating the workspace-restoration contract.
+        """
+        for filepath in modified_files:
+            # Resolve relative to workspace and stay inside it (defense in depth
+            # against modified_files containing traversal — the patcher now
+            # rejects these, but rollback runs even on patcher-rejected runs).
+            if os.path.isabs(filepath):
+                abs_path = filepath
+            else:
+                abs_path = os.path.join(self.workspace_path, filepath)
+            abs_real = os.path.realpath(abs_path)
+            ws_real = os.path.realpath(self.workspace_path)
+            try:
+                common = os.path.commonpath([abs_real, ws_real])
+            except ValueError:
+                continue
+            if common != ws_real:
+                logger.warning("[gitguardian] Skipping path outside workspace: %s", filepath)
+                continue
+
+            # `git ls-files --error-unmatch -- <path>` exits non-zero if untracked.
+            result = self._git("ls-files", "--error-unmatch", "--", filepath)
+            if result.returncode == 0:
+                continue  # tracked — checkout will handle it
+
+            if os.path.isfile(abs_real):
+                try:
+                    os.remove(abs_real)
+                    logger.info("[gitguardian] Removed untracked LLM-created file: %s", filepath)
+                except OSError as e:
+                    logger.warning("[gitguardian] Failed to remove %s: %s", filepath, e)
 
     def restore_original_branch(self) -> bool:
         """

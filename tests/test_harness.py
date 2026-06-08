@@ -1075,6 +1075,115 @@ class TestGatekeeperRouting:
             assert route_after_gatekeeper(state) == "deployment_node"
 
 
+class TestGitGuardianLifecycle:
+    """Regression tests for git lifecycle fixes: scoped add + untracked cleanup."""
+
+    @staticmethod
+    def _git_init(workspace: str) -> None:
+        import subprocess
+        subprocess.run(["git", "init", "-q", "--initial-branch=main"], cwd=workspace, check=True)
+        subprocess.run(["git", "config", "user.email", "t@t"], cwd=workspace, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=workspace, check=True)
+        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=workspace, check=True)
+        # Initial commit so HEAD exists
+        readme = os.path.join(workspace, "README.md")
+        with open(readme, "w") as f:
+            f.write("initial\n")
+        subprocess.run(["git", "add", "README.md"], cwd=workspace, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=workspace, check=True)
+
+    def test_commit_refuses_when_modified_files_empty(self):
+        # Regression: previously `git add -A` would stage any stray file the
+        # LLM dropped (or pre-existing user dirt) and commit it.
+        from harness.security import GitGuardian
+        with tempfile.TemporaryDirectory() as ws:
+            self._git_init(ws)
+            # Create a stray file the harness didn't touch
+            with open(os.path.join(ws, "stray.txt"), "w") as f:
+                f.write("not the harness's\n")
+            gg = GitGuardian(ws)
+            gg.create_patch_branch("sess1")
+            ok = gg.commit_all_changes("sess1", [], exit_code=0)
+            assert ok is False
+            # The stray file is still untracked, not committed
+            import subprocess
+            status = subprocess.run(["git", "status", "--porcelain"], cwd=ws, capture_output=True, text=True)
+            assert "?? stray.txt" in status.stdout
+
+    def test_commit_scopes_to_modified_files_only(self):
+        from harness.security import GitGuardian
+        with tempfile.TemporaryDirectory() as ws:
+            self._git_init(ws)
+            # Stray file (user-introduced)
+            with open(os.path.join(ws, "stray.txt"), "w") as f:
+                f.write("not the harness's\n")
+            # Harness-created file
+            with open(os.path.join(ws, "patch.py"), "w") as f:
+                f.write("print('hi')\n")
+            gg = GitGuardian(ws)
+            gg.create_patch_branch("sess1")
+            ok = gg.commit_all_changes("sess1", ["patch.py"], exit_code=0)
+            assert ok is True
+            # patch.py is committed; stray.txt is still untracked
+            import subprocess
+            ls = subprocess.run(["git", "ls-tree", "HEAD"], cwd=ws, capture_output=True, text=True)
+            assert "patch.py" in ls.stdout
+            assert "stray.txt" not in ls.stdout
+            status = subprocess.run(["git", "status", "--porcelain"], cwd=ws, capture_output=True, text=True)
+            assert "?? stray.txt" in status.stdout
+
+    def test_rollback_removes_untracked_llm_files(self):
+        # Regression: `git checkout -- .` only restores tracked files. Any
+        # file the LLM created during the session (e.g. leaked secrets,
+        # scratch files) would persist after rollback unless removed.
+        from harness.security import GitGuardian
+        with tempfile.TemporaryDirectory() as ws:
+            self._git_init(ws)
+            gg = GitGuardian(ws)
+            gg.create_patch_branch("sess1")
+            # LLM creates a fresh file
+            llm_file = os.path.join(ws, "leaked.env")
+            with open(llm_file, "w") as f:
+                f.write("API_KEY=secret\n")
+            assert os.path.exists(llm_file)
+            # User's own untracked file — must survive rollback
+            user_file = os.path.join(ws, "my-notes.txt")
+            with open(user_file, "w") as f:
+                f.write("my work\n")
+
+            ok = gg.rollback(modified_files=["leaked.env"])
+            assert ok is True
+            assert not os.path.exists(llm_file), "LLM-created untracked file should be removed"
+            assert os.path.exists(user_file), "user's untracked file must not be removed"
+
+    def test_rollback_without_modified_files_warns_but_succeeds(self):
+        from harness.security import GitGuardian
+        with tempfile.TemporaryDirectory() as ws:
+            self._git_init(ws)
+            gg = GitGuardian(ws)
+            gg.create_patch_branch("sess1")
+            # Should not raise; degraded behavior is OK for the crash-path call.
+            assert gg.rollback() is True
+
+    def test_rollback_rejects_paths_outside_workspace(self):
+        # Defense in depth: even if modified_files somehow contains a
+        # traversal entry, the cleanup must not delete files outside.
+        from harness.security import GitGuardian
+        with tempfile.TemporaryDirectory() as outer:
+            ws = os.path.join(outer, "ws")
+            os.makedirs(ws)
+            self._git_init(ws)
+            # File outside workspace
+            sentinel = os.path.join(outer, "outside.txt")
+            with open(sentinel, "w") as f:
+                f.write("preserve me\n")
+
+            gg = GitGuardian(ws)
+            gg.create_patch_branch("sess1")
+            gg.rollback(modified_files=["../outside.txt"])
+            assert os.path.exists(sentinel)
+
+
 class TestSecurityScanRouting:
 
     def test_route_after_security_scan_clean(self):
