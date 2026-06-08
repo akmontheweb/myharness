@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Literal, Optional
 
 from typing_extensions import TypedDict
@@ -175,19 +176,31 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
     except ImportError:
         pass
 
-    # --- Two-Tier Skills System ---
-    # Tier 1: Harness skills (harness/skills/*.md) — universal agent standards
+    # --- Two-Tier Skills System (language-aware filtering) ---
+    # Detect the workspace's stack so we only inject skills the LLM will
+    # actually use. A pure FastAPI project doesn't need the Angular skill
+    # in its system prompt; trimming saves ~2-3 KB per call and reduces
+    # noise in the prompt.
+    from harness.impact import _detect_workspace_stack
+    workspace_tags = _detect_workspace_stack(workspace_path)
+
+    # Tier 1: Harness skills (harness/skills/*.md) — agent standards +
+    # stack-specific skills filtered by `applies_to:` frontmatter.
     harness_skills = _load_skills_markdown(
         os.path.join(os.path.dirname(__file__), "skills"),
         max_file_chars=4000,
+        workspace_tags=workspace_tags,
     )
     if harness_skills:
         harness_skills = f"## Agent Skills & Standards\n{harness_skills}\n"
 
-    # Tier 2: Project skills ({workspace_path}/skills/*.md) — per-project conventions
+    # Tier 2: Project skills ({workspace_path}/skills/*.md) — per-project
+    # conventions. Same filter applies so user-supplied skills can also
+    # opt-in via frontmatter; skills without frontmatter always load.
     project_skills = _load_skills_markdown(
         os.path.join(workspace_path, "skills"),
         max_file_chars=3000,
+        workspace_tags=workspace_tags,
     )
     if project_skills:
         project_skills = f"## Project Skills & Conventions\n{project_skills}\n"
@@ -317,19 +330,65 @@ def _snapshot_directory_tree(path: str, max_depth: int = 4, max_files_per_dir: i
     return "\n".join(lines)
 
 
-def _load_skills_markdown(skills_dir: str, max_file_chars: int = 4000) -> str:
+_APPLIES_TO_RE = re.compile(
+    r'^---\s*\n\s*applies_to\s*:\s*\[([^\]]*)\]\s*\n---\s*\n',
+    re.MULTILINE,
+)
+
+
+def _parse_skill_frontmatter(content: str) -> tuple[Optional[set[str]], str]:
+    """Extract the ``applies_to:`` tag list from a skill file's frontmatter.
+
+    Recognises the minimal form::
+
+        ---
+        applies_to: [tag1, tag2]
+        ---
+
+        ... rest of the skill ...
+
+    Returns ``(tags, body)`` where ``tags`` is ``None`` when no frontmatter
+    is present (skill loads unconditionally) or a set of tag strings when
+    the frontmatter declares them. ``body`` is the markdown content with
+    the frontmatter stripped.
+
+    This is a deliberately tiny hand-rolled parser — we don't want a YAML
+    dependency for a one-field schema.
+    """
+    m = _APPLIES_TO_RE.match(content)
+    if not m:
+        return None, content
+    tag_blob = m.group(1)
+    tags = {t.strip() for t in tag_blob.split(",") if t.strip()}
+    body = content[m.end():]
+    return tags, body
+
+
+def _load_skills_markdown(
+    skills_dir: str,
+    max_file_chars: int = 4000,
+    workspace_tags: Optional[set[str]] = None,
+) -> str:
     """
     Scan a skills/ directory for .md files and return their concatenated content.
 
     Each file's content is truncated to ``max_file_chars`` to prevent system
     prompt bloat. Files are sorted alphabetically for deterministic ordering.
 
+    When ``workspace_tags`` is provided, skills with an ``applies_to:``
+    frontmatter are loaded only if at least one of their declared tags
+    appears in ``workspace_tags``. Skills with no frontmatter (e.g. the
+    universal ``agent-standards.md``) always load.
+
     Args:
         skills_dir: Absolute path to the skills directory.
         max_file_chars: Maximum characters to read per skill file.
+        workspace_tags: Tags returned by ``impact._detect_workspace_stack``.
+                        ``None`` disables filtering (legacy behavior).
 
     Returns:
-        Concatenated markdown content, or empty string if no skills found.
+        Concatenated markdown content (frontmatter stripped), or empty
+        string if no skills match.
     """
     if not os.path.isdir(skills_dir):
         return ""
@@ -342,10 +401,26 @@ def _load_skills_markdown(skills_dir: str, max_file_chars: int = 4000) -> str:
             try:
                 with open(fpath, "r", encoding="utf-8", errors="replace") as sf:
                     content = sf.read(max_file_chars)
-                if content.strip():
-                    parts.append(content)
             except OSError:
                 logger.warning("[graph] Could not read skills file: %s", fpath)
+                continue
+
+            applies_to, body = _parse_skill_frontmatter(content)
+
+            # Filter by workspace tags when both sides have something to say.
+            # Skills with no frontmatter (applies_to is None) load
+            # unconditionally — that's the "universal skill" pattern used by
+            # agent-standards.md and any user-supplied project skill.
+            if workspace_tags is not None and applies_to is not None:
+                if not (applies_to & workspace_tags):
+                    logger.debug(
+                        "[graph] Skipping skill %s (applies_to=%s, workspace=%s)",
+                        fname, sorted(applies_to), sorted(workspace_tags),
+                    )
+                    continue
+
+            if body.strip():
+                parts.append(body)
     except OSError:
         return ""
     return "\n".join(parts)

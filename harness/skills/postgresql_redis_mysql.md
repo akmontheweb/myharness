@@ -1,3 +1,7 @@
+---
+applies_to: [postgres, redis, mysql]
+---
+
 ## Databases — PostgreSQL, Redis, MySQL
 
 ### When this skill applies

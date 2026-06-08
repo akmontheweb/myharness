@@ -1,3 +1,7 @@
+---
+applies_to: [react]
+---
+
 ## Frontend — React
 
 ### When this skill applies

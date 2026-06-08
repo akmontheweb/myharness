@@ -1,3 +1,7 @@
+---
+applies_to: [angular]
+---
+
 ## Frontend — Angular
 
 ### When this skill applies

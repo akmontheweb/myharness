@@ -1,3 +1,7 @@
+---
+applies_to: [django]
+---
+
 ## Python — Django
 
 ### When this skill applies

@@ -1,3 +1,7 @@
+---
+applies_to: [fastapi]
+---
+
 ## Python — FastAPI
 
 ### When this skill applies

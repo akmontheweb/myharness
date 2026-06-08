@@ -1,3 +1,7 @@
+---
+applies_to: [flutter, dart]
+---
+
 ## Mobile — Flutter (Dart)
 
 ### When this skill applies

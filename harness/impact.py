@@ -24,6 +24,7 @@ Data structures:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -629,6 +630,139 @@ def _is_flutter_project(workspace_path: str) -> bool:
         )
     except (OSError, TypeError):
         return False
+
+
+def _detect_workspace_stack(workspace_path: str) -> set[str]:
+    """Return the set of stack tags applicable to this workspace.
+
+    Used by ``harness.graph._load_skills_markdown`` to filter shipped
+    skill files by their ``applies_to:`` frontmatter, so the LLM
+    system prompt only includes stack-relevant guidance.
+
+    Detection scans manifest files and their declared dependencies. The
+    returned tag taxonomy:
+        Languages:           python, node, java, dart, go, rust
+        Backend frameworks:  fastapi, django, spring, express, nest, fastify
+        Frontend frameworks: react, vue, angular
+        Mobile:              flutter
+        Databases:           postgres, redis, mysql
+        Build tools:         maven, gradle
+
+    Detection is best-effort and silent — unparseable manifests just
+    don't contribute tags. Returns an empty set for non-directory
+    inputs so callers can chain ``_detect_workspace_stack(...) or set()``.
+    """
+    tags: set[str] = set()
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return tags
+
+    def _read(relpath: str) -> str:
+        try:
+            with open(os.path.join(workspace_path, relpath), encoding="utf-8", errors="replace") as f:
+                # Cap reads at 256 KB — manifests are tiny, anything bigger
+                # is probably a wrong file or an attack vector.
+                return f.read(256 * 1024)
+        except OSError:
+            return ""
+
+    def _exists(relpath: str) -> bool:
+        return os.path.isfile(os.path.join(workspace_path, relpath))
+
+    # Flutter (pubspec.yaml + lib/) — also tagged dart for the Dart skill.
+    if _is_flutter_project(workspace_path):
+        tags.update({"flutter", "dart"})
+    elif _exists("pubspec.yaml"):
+        # Pure Dart project (server-side, CLI tool, etc.)
+        tags.add("dart")
+
+    # Django — manage.py is the canonical signal.
+    if _exists("manage.py"):
+        tags.update({"python", "django"})
+
+    # Go / Rust / Java build tools.
+    if _exists("go.mod"):
+        tags.add("go")
+    if _exists("Cargo.toml"):
+        tags.add("rust")
+    if _exists("pom.xml"):
+        tags.update({"java", "maven"})
+    if _exists("build.gradle") or _exists("build.gradle.kts"):
+        tags.update({"java", "gradle"})
+
+    # Python manifests — scan content for frameworks and DB drivers.
+    py_content_parts: list[str] = []
+    for fname in ("requirements.txt", "pyproject.toml", "setup.py", "Pipfile", "Pipfile.lock"):
+        if _exists(fname):
+            tags.add("python")
+            py_content_parts.append(_read(fname).lower())
+    py_blob = "\n".join(py_content_parts)
+    if py_blob:
+        if "fastapi" in py_blob:
+            tags.add("fastapi")
+        if "django" in py_blob:
+            tags.add("django")
+        if any(pkg in py_blob for pkg in ("psycopg", "asyncpg")):
+            tags.add("postgres")
+        if "pgvector" in py_blob:
+            tags.add("postgres")
+        # Match "redis" as a word boundary so we don't get fooled by
+        # "redirect" or "rediscover" in unrelated package names.
+        if re.search(r'\bredis\b', py_blob):
+            tags.add("redis")
+        if any(pkg in py_blob for pkg in ("pymysql", "mysql-connector", "mysqlclient", "aiomysql")):
+            tags.add("mysql")
+
+    # Node.js — parse package.json declared deps.
+    pkg_content = _read("package.json")
+    if pkg_content:
+        tags.add("node")
+        try:
+            data = json.loads(pkg_content)
+            deps: dict[str, Any] = {}
+            for key in ("dependencies", "devDependencies", "peerDependencies"):
+                if isinstance(data.get(key), dict):
+                    deps.update(data[key])
+            if "react" in deps or "next" in deps:
+                tags.add("react")
+            if "vue" in deps or "nuxt" in deps:
+                tags.add("vue")
+            if "@angular/core" in deps:
+                tags.add("angular")
+            if "express" in deps:
+                tags.add("express")
+            if "@nestjs/core" in deps:
+                tags.add("nest")
+            if "fastify" in deps:
+                tags.add("fastify")
+            # DB clients
+            if "pg" in deps or "postgres" in deps or "@vercel/postgres" in deps:
+                tags.add("postgres")
+            if "redis" in deps or "ioredis" in deps:
+                tags.add("redis")
+            if "mysql" in deps or "mysql2" in deps or "mariadb" in deps:
+                tags.add("mysql")
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Java/Spring — scan pom.xml or build.gradle for spring-boot deps.
+    java_blob = "\n".join(_read(f) for f in ("pom.xml", "build.gradle", "build.gradle.kts"))
+    if "spring-boot" in java_blob.lower():
+        tags.update({"java", "spring"})
+
+    # docker-compose.yml service hints for databases not declared in any
+    # manifest (common when the app talks to a sidecar by URL only).
+    compose_blob = "\n".join(
+        _read(f) for f in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
+    ).lower()
+    if compose_blob:
+        if "postgres" in compose_blob or "postgis" in compose_blob:
+            tags.add("postgres")
+        if "redis:" in compose_blob or "redis/" in compose_blob:
+            tags.add("redis")
+        if "mysql" in compose_blob or "mariadb" in compose_blob:
+            tags.add("mysql")
+
+    return tags
 
 
 # ---------------------------------------------------------------------------

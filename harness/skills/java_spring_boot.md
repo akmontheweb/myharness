@@ -1,3 +1,7 @@
+---
+applies_to: [spring]
+---
+
 ## Java — Spring Boot
 
 ### When this skill applies

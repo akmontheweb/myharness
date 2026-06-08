@@ -272,3 +272,128 @@ class TestFlutterProjectDetection:
     def test_nonexistent_path_not_flutter(self):
         from harness.impact import _is_flutter_project
         assert _is_flutter_project("/nonexistent_xyz_path") is False
+
+
+class TestWorkspaceStackDetector:
+    """_detect_workspace_stack drives language-aware skill filtering."""
+
+    def test_empty_workspace_yields_no_tags(self):
+        import os
+        from harness.impact import _detect_workspace_stack
+        with tempfile.TemporaryDirectory() as tmp:
+            assert _detect_workspace_stack(tmp) == set()
+
+    def test_nonexistent_path_yields_no_tags(self):
+        from harness.impact import _detect_workspace_stack
+        assert _detect_workspace_stack("/nonexistent_xyz_path") == set()
+
+    def test_fastapi_workspace_detected(self):
+        import os
+        from harness.impact import _detect_workspace_stack
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "pyproject.toml"), "w") as f:
+                f.write('dependencies = ["fastapi>=0.115", "psycopg[binary]>=3.2"]')
+            tags = _detect_workspace_stack(tmp)
+            assert "python" in tags
+            assert "fastapi" in tags
+            assert "postgres" in tags
+            # Should NOT pick up django for a fastapi project
+            assert "django" not in tags
+
+    def test_django_workspace_detected_by_manage_py(self):
+        import os
+        from harness.impact import _detect_workspace_stack
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "manage.py"), "w") as f:
+                f.write("#!/usr/bin/env python\n")
+            tags = _detect_workspace_stack(tmp)
+            assert "python" in tags
+            assert "django" in tags
+
+    def test_flutter_workspace_detected(self):
+        import os
+        from harness.impact import _detect_workspace_stack
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "pubspec.yaml"), "w") as f:
+                f.write("name: my_app\n")
+            os.makedirs(os.path.join(tmp, "lib"))
+            tags = _detect_workspace_stack(tmp)
+            assert "flutter" in tags
+            assert "dart" in tags
+
+    def test_spring_boot_workspace_detected(self):
+        import os
+        from harness.impact import _detect_workspace_stack
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "pom.xml"), "w") as f:
+                f.write(
+                    '<project><dependencies>'
+                    '<dependency><artifactId>spring-boot-starter-web</artifactId></dependency>'
+                    '</dependencies></project>'
+                )
+            tags = _detect_workspace_stack(tmp)
+            assert "java" in tags
+            assert "spring" in tags
+            assert "maven" in tags
+
+    def test_react_node_workspace_detected(self):
+        import json
+        import os
+        from harness.impact import _detect_workspace_stack
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = {
+                "name": "my-app",
+                "dependencies": {"react": "^18.0.0", "react-dom": "^18.0.0"},
+                "devDependencies": {"vite": "^5.0.0"},
+            }
+            with open(os.path.join(tmp, "package.json"), "w") as f:
+                json.dump(pkg, f)
+            tags = _detect_workspace_stack(tmp)
+            assert "node" in tags
+            assert "react" in tags
+            assert "vue" not in tags
+            assert "angular" not in tags
+
+    def test_angular_workspace_detected(self):
+        import json
+        import os
+        from harness.impact import _detect_workspace_stack
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = {"dependencies": {"@angular/core": "^17.0.0"}}
+            with open(os.path.join(tmp, "package.json"), "w") as f:
+                json.dump(pkg, f)
+            tags = _detect_workspace_stack(tmp)
+            assert "angular" in tags
+            assert "react" not in tags
+
+    def test_express_with_redis_detected(self):
+        import json
+        import os
+        from harness.impact import _detect_workspace_stack
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = {"dependencies": {"express": "^4.0.0", "ioredis": "^5.0.0"}}
+            with open(os.path.join(tmp, "package.json"), "w") as f:
+                json.dump(pkg, f)
+            tags = _detect_workspace_stack(tmp)
+            assert "express" in tags
+            assert "redis" in tags
+
+    def test_docker_compose_postgres_detected(self):
+        import os
+        from harness.impact import _detect_workspace_stack
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "docker-compose.yml"), "w") as f:
+                f.write("services:\n  db:\n    image: postgres:16\n")
+            tags = _detect_workspace_stack(tmp)
+            assert "postgres" in tags
+
+    def test_redis_word_boundary_not_fooled_by_redirect(self):
+        # Make sure the word-boundary regex doesn't mark a workspace as
+        # using Redis just because it has "redirect" in its deps.
+        import os
+        from harness.impact import _detect_workspace_stack
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "requirements.txt"), "w") as f:
+                f.write("django-redirect-urls==1.0.0\n")
+            tags = _detect_workspace_stack(tmp)
+            assert "redis" not in tags

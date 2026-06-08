@@ -1,3 +1,7 @@
+---
+applies_to: [vue]
+---
+
 ## Frontend — Vue 3
 
 ### When this skill applies
