@@ -1002,6 +1002,80 @@ class TestAgentState:
             assert result == {}
 
 
+class TestDiscoveryNodes:
+    """Regression: discovery nodes used to hardcode budget=2.00 and write_spec
+    used to swallow OSError silently."""
+
+    @pytest.mark.asyncio
+    async def test_requirements_discovery_skips_when_budget_exhausted(self):
+        from harness.graph import requirements_discovery_node
+        from harness.graph import set_gateway
+        from harness.gateway import Gateway, GatewayConfig
+
+        # Configure a gateway so get_gateway() returns non-None
+        set_gateway(Gateway(GatewayConfig()))
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                state = _make_state(tmpdir)
+                state["budget_remaining_usd"] = 0.0
+                result = await requirements_discovery_node(state)
+                assert result["node_state"]["discovery_complete"] is True
+                assert result["node_state"]["error"] == "budget exhausted"
+                assert result["budget_remaining_usd"] == 0.0
+        finally:
+            set_gateway(None)
+
+    @pytest.mark.asyncio
+    async def test_architecture_discovery_skips_when_budget_exhausted(self):
+        from harness.graph import architecture_discovery_node
+        from harness.graph import set_gateway
+        from harness.gateway import Gateway, GatewayConfig
+
+        set_gateway(Gateway(GatewayConfig()))
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                state = _make_state(tmpdir)
+                state["budget_remaining_usd"] = 0.0
+                result = await architecture_discovery_node(state)
+                assert result["node_state"]["discovery_complete"] is True
+                assert result["node_state"]["error"] == "budget exhausted"
+        finally:
+            set_gateway(None)
+
+    @pytest.mark.asyncio
+    async def test_deployment_discovery_skips_when_budget_exhausted(self):
+        from harness.graph import deployment_discovery_node
+        from harness.graph import set_gateway
+        from harness.gateway import Gateway, GatewayConfig
+
+        set_gateway(Gateway(GatewayConfig()))
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                state = _make_state(tmpdir)
+                state["budget_remaining_usd"] = 0.0
+                result = await deployment_discovery_node(state)
+                assert result["node_state"]["discovery_complete"] is True
+        finally:
+            set_gateway(None)
+
+    @pytest.mark.asyncio
+    async def test_write_spec_propagates_oserror(self):
+        # Regression: write_spec used to log OSError but still return spec_written=True.
+        from harness.graph import write_spec_node
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir)
+            state["current_gate"] = "REQUIREMENTS"
+            # Make the docs dir a regular file so open() will fail with OSError
+            docs = os.path.join(tmpdir, "docs")
+            with open(docs, "w") as f:
+                f.write("blocker\n")
+            result = await write_spec_node(state)
+            ns = result["node_state"]
+            assert ns["spec_written"] is False
+            assert "spec_write_error" in ns
+            assert result["spec_requirements_path"] == ""
+
+
 class TestDiscoveryRouting:
 
     def test_route_after_discovery_complete(self):

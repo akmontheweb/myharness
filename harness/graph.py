@@ -1199,9 +1199,20 @@ Return ONLY valid JSON. No markdown, no explanation, no code blocks."""
     messages.append({"role": "user", "content": prompt})
 
     from harness.gateway import NodeRole
+
+    current_budget = state.get("budget_remaining_usd", 0.0)
+    if current_budget <= 0:
+        logger.warning("[reqs_disc] Budget exhausted ($%.4f); skipping discovery.", current_budget)
+        return {
+            "messages": messages,
+            "node_state": {"discovery_complete": True, "error": "budget exhausted"},
+            "budget_remaining_usd": current_budget,
+        }
+
     try:
         response, budget = await gateway.dispatch(
-            messages=list(messages), role=NodeRole.PLANNING, budget_remaining_usd=2.00,
+            messages=list(messages), role=NodeRole.PLANNING,
+            budget_remaining_usd=current_budget,
         )
         content = response.content.strip()
         # Strip code fences if present
@@ -1217,13 +1228,14 @@ Return ONLY valid JSON. No markdown, no explanation, no code blocks."""
 
         messages.append({"role": "assistant", "content": json.dumps(discovery_data)})
 
-        logger.info("[reqs_disc] Round %d: %d questions across %d modules (%d critical). Complete=%s",
-                     question_count + 1, total_questions, len(modules), critical_count, complete)
+        logger.info("[reqs_disc] Round %d: %d questions across %d modules (%d critical). Complete=%s budget=$%.4f",
+                     question_count + 1, total_questions, len(modules), critical_count, complete, budget)
 
         return {
             "messages": messages,
             "discovery_questions": discovery_data,
             "current_gate": "REQUIREMENTS",
+            "budget_remaining_usd": budget,
             "node_state": {
                 "current_node": "requirements_discovery",
                 "discovery_complete": complete,
@@ -1236,6 +1248,7 @@ Return ONLY valid JSON. No markdown, no explanation, no code blocks."""
         return {
             "messages": messages,
             "node_state": {"discovery_complete": True, "error": str(exc)},
+            "budget_remaining_usd": current_budget,
         }
 
 
@@ -1292,9 +1305,20 @@ Output JSON with same schema as requirements discovery."""
     messages.append({"role": "user", "content": prompt})
 
     from harness.gateway import NodeRole
+
+    current_budget = state.get("budget_remaining_usd", 0.0)
+    if current_budget <= 0:
+        logger.warning("[arch_disc] Budget exhausted ($%.4f); skipping discovery.", current_budget)
+        return {
+            "messages": messages,
+            "node_state": {"discovery_complete": True, "error": "budget exhausted"},
+            "budget_remaining_usd": current_budget,
+        }
+
     try:
         response, budget = await gateway.dispatch(
-            messages=list(messages), role=NodeRole.PLANNING, budget_remaining_usd=2.00,
+            messages=list(messages), role=NodeRole.PLANNING,
+            budget_remaining_usd=current_budget,
         )
         content = response.content.strip()
         if content.startswith("```"):
@@ -1309,13 +1333,14 @@ Output JSON with same schema as requirements discovery."""
 
         messages.append({"role": "assistant", "content": json.dumps(discovery_data)})
 
-        logger.info("[arch_disc] Round %d: %d questions (%d critical). Complete=%s",
-                     question_count + 1, total_q, critical_count, complete)
+        logger.info("[arch_disc] Round %d: %d questions (%d critical). Complete=%s budget=$%.4f",
+                     question_count + 1, total_q, critical_count, complete, budget)
 
         return {
             "messages": messages,
             "discovery_questions": discovery_data,
             "current_gate": "ARCHITECTURE",
+            "budget_remaining_usd": budget,
             "node_state": {
                 "current_node": "architecture_discovery",
                 "discovery_complete": complete,
@@ -1325,7 +1350,11 @@ Output JSON with same schema as requirements discovery."""
         }
     except Exception as exc:
         logger.exception("[arch_disc] Discovery failed: %s", exc)
-        return {"messages": messages, "node_state": {"discovery_complete": True, "error": str(exc)}}
+        return {
+            "messages": messages,
+            "node_state": {"discovery_complete": True, "error": str(exc)},
+            "budget_remaining_usd": current_budget,
+        }
 
 
 async def deployment_discovery_node(state: AgentState) -> dict[str, Any]:
@@ -1372,9 +1401,20 @@ Return ONLY valid JSON. No markdown, no explanation, no code blocks."""
     messages.append({"role": "user", "content": prompt})
 
     from harness.gateway import NodeRole
+
+    current_budget = state.get("budget_remaining_usd", 0.0)
+    if current_budget <= 0:
+        logger.warning("[deploy_disc] Budget exhausted ($%.4f); skipping discovery.", current_budget)
+        return {
+            "messages": messages,
+            "node_state": {"discovery_complete": True, "error": "budget exhausted"},
+            "budget_remaining_usd": current_budget,
+        }
+
     try:
         response, budget = await gateway.dispatch(
-            messages=list(messages), role=NodeRole.PLANNING, budget_remaining_usd=2.00,
+            messages=list(messages), role=NodeRole.PLANNING,
+            budget_remaining_usd=current_budget,
         )
         content = response.content.strip()
         if content.startswith("```"):
@@ -1389,13 +1429,14 @@ Return ONLY valid JSON. No markdown, no explanation, no code blocks."""
 
         messages.append({"role": "assistant", "content": json.dumps(discovery_data)})
 
-        logger.info("[deploy_disc] Round %d: %d questions (%d critical). Complete=%s",
-                     question_count + 1, total_q, critical_count, complete)
+        logger.info("[deploy_disc] Round %d: %d questions (%d critical). Complete=%s budget=$%.4f",
+                     question_count + 1, total_q, critical_count, complete, budget)
 
         return {
             "messages": messages,
             "discovery_questions": discovery_data,
             "current_gate": "DEPLOYMENT",
+            "budget_remaining_usd": budget,
             "node_state": {
                 "current_node": "deployment_discovery",
                 "discovery_complete": complete,
@@ -1405,7 +1446,11 @@ Return ONLY valid JSON. No markdown, no explanation, no code blocks."""
         }
     except Exception as exc:
         logger.exception("[deploy_disc] Discovery failed: %s", exc)
-        return {"messages": messages, "node_state": {"discovery_complete": True, "error": str(exc)}}
+        return {
+            "messages": messages,
+            "node_state": {"discovery_complete": True, "error": str(exc)},
+            "budget_remaining_usd": current_budget,
+        }
 
 
 async def write_spec_node(state: AgentState) -> dict[str, Any]:
@@ -1417,7 +1462,28 @@ async def write_spec_node(state: AgentState) -> dict[str, Any]:
     gate = state.get("current_gate", "REQUIREMENTS")
     workspace = state.get("workspace_path", os.getcwd())
     output_dir = os.path.join(workspace, "docs")
-    os.makedirs(output_dir, exist_ok=True)
+
+    if gate == "REQUIREMENTS":
+        path_key = "spec_requirements_path"
+    elif gate == "ARCHITECTURE":
+        path_key = "spec_architecture_path"
+    else:
+        path_key = "deployment_blueprint_path"
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as exc:
+        # docs/ exists but is not a directory, or perms blocked creation.
+        logger.error("[write_spec] Cannot create %s: %s", output_dir, exc)
+        return {
+            path_key: "",
+            "current_gate": gate,
+            "node_state": {
+                "current_node": "write_spec",
+                "spec_written": False,
+                "spec_write_error": f"makedirs failed: {exc}",
+            },
+        }
 
     messages = state.get("messages", [])
 
@@ -1453,20 +1519,28 @@ async def write_spec_node(state: AgentState) -> dict[str, Any]:
 
     if gate == "REQUIREMENTS":
         spec_path = os.path.join(output_dir, "SPEC_REQUIREMENTS.md")
-        path_key = "spec_requirements_path"
     elif gate == "ARCHITECTURE":
         spec_path = os.path.join(output_dir, "SPEC_ARCHITECTURE.md")
-        path_key = "spec_architecture_path"
     else:
         spec_path = os.path.join(output_dir, "DEPLOYMENT_BLUEPRINT.md")
-        path_key = "deployment_blueprint_path"
 
     try:
         with open(spec_path, "w", encoding="utf-8") as f:
             f.write(spec_content)
         logger.info("[write_spec] %s written (%d chars).", spec_path, len(spec_content))
     except OSError as exc:
-        logger.error("[write_spec] Failed: %s", exc)
+        # Don't silently claim success — the gatekeeper that follows will try
+        # to read this path. Propagate the failure so routing can react.
+        logger.error("[write_spec] Failed to write %s: %s", spec_path, exc)
+        return {
+            path_key: "",
+            "current_gate": gate,
+            "node_state": {
+                "current_node": "write_spec",
+                "spec_written": False,
+                "spec_write_error": str(exc),
+            },
+        }
 
     return {
         path_key: spec_path,
@@ -1526,24 +1600,34 @@ Output as clean Markdown."""
                 {"role": "system", "content": "You are a DevOps architect. Output clean Markdown."},
                 {"role": "user", "content": prompt},
             ]
-            response, budget = await gateway.dispatch(
-                messages=messages, role=NodeRole.PLANNING, budget_remaining_usd=2.00,
-            )
-            content = response.content.strip()
+            current_budget = state.get("budget_remaining_usd", 0.0)
+            if current_budget <= 0:
+                logger.warning("[deployment_spec] Budget exhausted; falling back to deterministic blueprint.")
+                content = f"# DEPLOYMENT_BLUEPRINT.md\n\nWorkspace: {workspace}\n\nTelemetry: {json.dumps(telemetry, indent=2, default=str)}\n\n(LLM blueprint skipped — budget exhausted.)"
+                budget = current_budget
+            else:
+                response, budget = await gateway.dispatch(
+                    messages=messages, role=NodeRole.PLANNING,
+                    budget_remaining_usd=current_budget,
+                )
+                content = response.content.strip()
         else:
             content = f"# DEPLOYMENT_BLUEPRINT.md\n\nWorkspace: {workspace}\n\nTelemetry: {json.dumps(telemetry, indent=2, default=str)}"
+            budget = state.get("budget_remaining_usd", 0.0)
 
         with open(blueprint_path, "w", encoding="utf-8") as f:
             f.write(content)
         logger.info("[deployment_spec] DEPLOYMENT_BLUEPRINT.md written (%d chars).", len(content))
     except Exception as exc:
         logger.warning("[deployment_spec] Failed: %s", exc)
+        budget = state.get("budget_remaining_usd", 0.0)
         with open(blueprint_path, "w", encoding="utf-8") as f:
             f.write(f"# DEPLOYMENT_BLUEPRINT.md\n\nError: {exc}")
 
     return {
         "deployment_blueprint_path": blueprint_path,
         "current_gate": "DEPLOYMENT",
+        "budget_remaining_usd": budget,
         "node_state": {"current_node": "generate_deployment_spec"},
     }
 
