@@ -50,5 +50,9 @@
         "log_dir": "~/.harness/logs",
         "json_stderr": false,
         "langsmith": false
+    },
+    "lintgate": {
+        "_comment": "Lintgate behaviour. format_modified_files=false (default) skips the auto-formatter on pre-existing files to avoid clobbering user style outside the patch region. Linters still run on all modified files.",
+        "format_modified_files": false
     }
 }

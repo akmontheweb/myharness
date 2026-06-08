@@ -28,7 +28,7 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -1055,6 +1055,7 @@ async def process_llm_patch_output(
     llm_output: str,
     workspace_root: str,
     existing_modified_files: Optional[list[str]] = None,
+    allowed_paths: Optional["Iterable[str]"] = None,
 ) -> tuple[list[PatchResult], list[str]]:
     """
     Parse LLM output for patch blocks, apply them using the hybrid patcher,
@@ -1067,6 +1068,12 @@ async def process_llm_patch_output(
         llm_output: The full text response from the LLM containing patch blocks.
         workspace_root: Absolute path to the repository root.
         existing_modified_files: List of files already modified in this session.
+        allowed_paths: Optional iterable of workspace-relative paths or
+            directory prefixes. When supplied, any patch block targeting a
+            file outside this allowlist is rejected with a PatchResult
+            error. When None (default), there is no restriction beyond the
+            standard traversal guard — preserves backward compatibility for
+            top-level patching_node / repair_node callers.
 
     Returns:
         A tuple of (list of PatchResult, updated modified_files list).
@@ -1079,11 +1086,40 @@ async def process_llm_patch_output(
         logger.warning("[patcher] No patch blocks found in LLM output.")
         return [], existing_modified_files or []
 
-    # Apply all blocks using the hybrid patcher
-    patcher = HybridPatcher(workspace_root)
-    results = await patcher.apply_all(blocks)
+    # If an allowlist is configured, partition blocks into allowed/rejected
+    # *before* applying. Rejected blocks become failure PatchResults so the
+    # caller can see what the LLM tried to do.
+    results: list[PatchResult] = []
+    blocks_to_apply: list[PatchBlock] = []
 
-    # Track modified files
+    if allowed_paths is not None:
+        from harness.trust import is_path_allowed
+        allowed_list = list(allowed_paths)
+        for block in blocks:
+            if is_path_allowed(block.file, workspace_root, allowed_list):
+                blocks_to_apply.append(block)
+            else:
+                results.append(PatchResult(
+                    success=False,
+                    file=block.file,
+                    operation=block.operation,
+                    error=(
+                        f"path not in skill allowlist: {block.file!r} "
+                        f"(allowed: {allowed_list})"
+                    ),
+                ))
+                logger.warning(
+                    "[patcher] Skill allowlist rejected patch to %s", block.file
+                )
+    else:
+        blocks_to_apply = list(blocks)
+
+    # Apply the allowed blocks using the hybrid patcher
+    if blocks_to_apply:
+        patcher = HybridPatcher(workspace_root)
+        results.extend(await patcher.apply_all(blocks_to_apply))
+
+    # Track modified files (only successful ones)
     modified_files = list(existing_modified_files or [])
     for result in results:
         if result.success and result.file not in modified_files:

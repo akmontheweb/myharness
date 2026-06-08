@@ -330,6 +330,59 @@ print("hello")
             assert results[0].success
             assert "hello.py" in modified
 
+    @pytest.mark.asyncio
+    async def test_process_llm_patch_output_respects_allowlist(self):
+        # Regression: a SubAgentSkill could previously patch any file in
+        # the workspace. With allowed_paths set, patches outside the
+        # allowlist must be rejected but not crash.
+        from harness.patcher import process_llm_patch_output
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llm_output = """<<<CREATE_FILE>>>
+file: src/auth/login.py
+content:
+def login(): pass
+<<<END_CREATE_FILE>>>
+
+<<<CREATE_FILE>>>
+file: docs/secret_plans.md
+content:
+do something unrelated
+<<<END_CREATE_FILE>>>"""
+            results, modified = await process_llm_patch_output(
+                llm_output, tmpdir,
+                allowed_paths=["src/auth/"],
+            )
+            # Both blocks parsed → 2 results
+            assert len(results) == 2
+            # Only the auth file was actually applied
+            allowed_results = [r for r in results if r.success]
+            assert len(allowed_results) == 1
+            assert "src/auth/login.py" in allowed_results[0].file
+            # The disallowed file was rejected with a clear message
+            rejected = [r for r in results if not r.success]
+            assert len(rejected) == 1
+            assert "allowlist" in rejected[0].error.lower()
+            assert "src/auth/login.py" in modified
+            assert "docs/secret_plans.md" not in modified
+            # Nothing got written to disk for the rejected path
+            assert not os.path.exists(os.path.join(tmpdir, "docs", "secret_plans.md"))
+
+    @pytest.mark.asyncio
+    async def test_process_llm_patch_output_no_allowlist_unrestricted(self):
+        # Backward-compat: when allowed_paths is None, behaviour is unchanged.
+        from harness.patcher import process_llm_patch_output
+        with tempfile.TemporaryDirectory() as tmpdir:
+            llm_output = """<<<CREATE_FILE>>>
+file: anywhere/file.py
+content:
+x = 1
+<<<END_CREATE_FILE>>>"""
+            results, modified = await process_llm_patch_output(
+                llm_output, tmpdir, allowed_paths=None,
+            )
+            assert results[0].success
+            assert "anywhere/file.py" in modified
+
 
 # ===========================================================================
 # SANDBOX TESTS
@@ -907,6 +960,45 @@ class TestLintGate:
         from harness.lintgate import _resolve_path
         result = _resolve_path("/nonexistent_xyz_file.txt", "/workspace")
         assert result is None
+
+    def test_classify_files_by_git_status_distinguishes_new_vs_modified(self):
+        # Regression: lintgate used to format every modified file, including
+        # files that existed before this session — clobbering user style
+        # outside the patch region. The classifier now tells lintgate which
+        # files are safe to fully rewrite.
+        import subprocess
+        from harness.lintgate import _classify_files_by_git_status
+        with tempfile.TemporaryDirectory() as ws:
+            subprocess.run(["git", "-C", ws, "init", "-q"], check=True)
+            subprocess.run(["git", "-C", ws, "config", "user.email", "t@t"], check=True)
+            subprocess.run(["git", "-C", ws, "config", "user.name", "t"], check=True)
+            subprocess.run(["git", "-C", ws, "config", "commit.gpgsign", "false"], check=True)
+            # Pre-existing file, committed
+            pre = os.path.join(ws, "existing.py")
+            with open(pre, "w") as f:
+                f.write("x = 1\n")
+            subprocess.run(["git", "-C", ws, "add", "-A"], check=True)
+            subprocess.run(["git", "-C", ws, "commit", "-qm", "init"], check=True)
+            # Modify it + add a new file (simulates an LLM patch round)
+            with open(pre, "a") as f:
+                f.write("y = 2\n")
+            new = os.path.join(ws, "new_file.py")
+            with open(new, "w") as f:
+                f.write("z = 3\n")
+
+            created, preexisting = _classify_files_by_git_status(
+                ["existing.py", "new_file.py"], ws
+            )
+            assert "new_file.py" in created
+            assert "existing.py" in preexisting
+
+    def test_classify_files_fallback_when_not_a_git_repo(self):
+        # Non-git workspace → treat every file as pre-existing (safe default).
+        from harness.lintgate import _classify_files_by_git_status
+        with tempfile.TemporaryDirectory() as ws:
+            created, preexisting = _classify_files_by_git_status(["a.py", "b.py"], ws)
+            assert created == set()
+            assert preexisting == {"a.py", "b.py"}
 
     @pytest.mark.asyncio
     async def test_lintgate_node_no_files(self):

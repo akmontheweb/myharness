@@ -1227,6 +1227,8 @@ async def cmd_run(args: argparse.Namespace) -> int:
             # Discovery runs only when --discover is explicitly passed.
             # --skip-discovery (old flag) is a no-op now but kept for compat.
             skip_discovery=not getattr(args, "discover", False),
+            lintgate_config=config.get("lintgate", {}),
+            deployment_config=config.get("deployment", {}),
         )
     except Exception:
         logger.exception("Graph execution failed with unhandled exception.")

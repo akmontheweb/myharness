@@ -52,6 +52,55 @@ class TestSafeResolve:
 
 
 # ---------------------------------------------------------------------------
+# 1b. is_path_allowed (skill allowlist)
+# ---------------------------------------------------------------------------
+
+class TestIsPathAllowed:
+
+    def test_none_allowlist_permits_anything(self):
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            assert is_path_allowed("src/main.py", ws, None) is True
+
+    def test_empty_allowlist_permits_anything(self):
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            assert is_path_allowed("src/main.py", ws, []) is True
+
+    def test_exact_file_match(self):
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            assert is_path_allowed("src/main.py", ws, ["src/main.py"]) is True
+            assert is_path_allowed("src/other.py", ws, ["src/main.py"]) is False
+
+    def test_directory_prefix_with_trailing_slash(self):
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            assert is_path_allowed("src/auth/login.py", ws, ["src/auth/"]) is True
+
+    def test_directory_prefix_without_trailing_slash(self):
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            assert is_path_allowed("src/auth/login.py", ws, ["src/auth"]) is True
+
+    def test_unrelated_file_rejected(self):
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            assert is_path_allowed("src/db/conn.py", ws, ["src/auth/"]) is False
+
+    def test_multiple_entries_any_match(self):
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            assert is_path_allowed("docs/api.md", ws, ["src/", "docs/"]) is True
+
+    def test_traversal_rejected_even_when_listed(self):
+        # Defense: allowlist entries cannot grant access outside the workspace.
+        from harness.trust import is_path_allowed
+        with tempfile.TemporaryDirectory() as ws:
+            assert is_path_allowed("../../etc/passwd", ws, ["../../etc/"]) is False
+
+
+# ---------------------------------------------------------------------------
 # 2. Identifier validators
 # ---------------------------------------------------------------------------
 

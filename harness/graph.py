@@ -2020,6 +2020,8 @@ async def run_graph(
     thread_id: Optional[str] = None,
     spec_override: Optional[str] = None,
     skip_discovery: bool = False,
+    lintgate_config: Optional[dict[str, Any]] = None,
+    deployment_config: Optional[dict[str, Any]] = None,
 ) -> AgentState:
     """
     Execute the full agent graph from start to finish.
@@ -2058,6 +2060,14 @@ async def run_graph(
         spec_override=spec_override,
         skip_discovery=skip_discovery,
     )
+
+    # Per-node config sections — read by lintgate_node and deployment_node
+    # respectively. These are free-form dicts on the state; nodes consult
+    # them via state.get("lintgate_config", {}) etc.
+    if lintgate_config is not None:
+        initial_state["lintgate_config"] = lintgate_config  # type: ignore[typeddict-unknown-key]
+    if deployment_config is not None:
+        initial_state["deployment_config"] = deployment_config  # type: ignore[typeddict-unknown-key]
 
     # Compile graph with checkpointer
     compiled_graph = compile_graph(checkpointer=checkpointer)

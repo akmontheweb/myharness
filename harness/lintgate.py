@@ -22,10 +22,73 @@ import asyncio
 import logging
 import os
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _classify_files_by_git_status(
+    files: list[str], workspace_path: str
+) -> tuple[set[str], set[str]]:
+    """
+    Partition ``files`` into (created_in_session, pre_existing) sets using
+    ``git status --porcelain``.
+
+    A file is considered "created in this session" if git reports it as
+    untracked (``??``) or staged-as-new (``A``). Anything else — modified
+    (``M``), renamed, or absent from the status output — is treated as
+    pre-existing: the formatter must not rewrite the whole file because
+    the user owns the style outside the patch region.
+
+    Falls back to ``(set(), set(files))`` if git status fails or the
+    workspace isn't a git repo — when in doubt, treat every file as
+    pre-existing and skip aggressive formatting.
+    """
+    created: set[str] = set()
+    pre_existing: set[str] = set()
+    try:
+        result = subprocess.run(
+            ["git", "-C", workspace_path, "status", "--porcelain", "--untracked-files=all"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.debug("[lintgate] git status failed; treating all files as pre-existing.")
+            return set(), set(files)
+
+        # Parse `XY <path>` lines from porcelain output.
+        # X = staged status, Y = working-tree status. `??` = untracked.
+        # New file in this session shows as `?? path` (untracked) or `A path`
+        # (already added). Anything else (M, R, D...) means it existed before.
+        new_paths: set[str] = set()
+        for line in result.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            xy = line[:2]
+            path = line[3:].strip()
+            # Handle renames "R old -> new"
+            if " -> " in path:
+                path = path.split(" -> ", 1)[1]
+            if xy.strip() in ("??", "A", "AM", "A "):
+                new_paths.add(path)
+
+        # Normalise both sides relative to workspace
+        for f in files:
+            rel = os.path.relpath(f, workspace_path) if os.path.isabs(f) else f
+            rel = rel.replace(os.sep, "/")
+            if rel in new_paths or f in new_paths:
+                created.add(f)
+            else:
+                pre_existing.add(f)
+        return created, pre_existing
+
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        logger.debug("[lintgate] git status unavailable (%s); treating all files as pre-existing.", e)
+        return set(), set(files)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +295,12 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
     modified_files: list[str] = list(state.get("modified_files", []))
     workspace_path: str = state.get("workspace_path", os.getcwd())
 
+    # Config: whether to format pre-existing files (default off — clobbers
+    # user style in untouched regions of large files). Linting still runs
+    # on all files since it's read-only.
+    lintgate_cfg = state.get("lintgate_config", {}) or {}
+    format_modified = bool(lintgate_cfg.get("format_modified_files", False))
+
     if not modified_files:
         logger.info("[lintgate_node] No modified files to check.")
         return {
@@ -245,12 +314,40 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
             }
         }
 
+    # Classify files as created-this-session vs pre-existing. The formatter
+    # only runs on created files by default; pre-existing files get the
+    # linter (read-only) but not the rewriter.
+    created_files, preexisting_files = _classify_files_by_git_status(
+        modified_files, workspace_path
+    )
+    if preexisting_files and not format_modified:
+        logger.info(
+            "[lintgate_node] Skipping formatter on %d pre-existing file(s) "
+            "(set lintgate.format_modified_files=true to override): %s",
+            len(preexisting_files),
+            sorted(preexisting_files)[:5],
+        )
+
+    # Files eligible for the rewriter
+    files_to_format = (
+        modified_files if format_modified else sorted(created_files)
+    )
+
     # Group files by extension → formatter
     grouped: dict[str, list[str]] = {}
-    for filepath in modified_files:
+    for filepath in files_to_format:
         ext = os.path.splitext(filepath)[1].lower()
         if ext in _DEFAULT_FORMATTERS:
             grouped.setdefault(ext, []).append(filepath)
+
+    # Lint-only grouping for files we won't format
+    lint_only_grouped: dict[str, list[str]] = {}
+    for filepath in modified_files:
+        if filepath in files_to_format:
+            continue  # already in grouped
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext in _DEFAULT_FORMATTERS:
+            lint_only_grouped.setdefault(ext, []).append(filepath)
 
     if not grouped:
         logger.info("[lintgate_node] No registered formatters for modified file types.")
@@ -346,6 +443,37 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
                 except Exception as exc:
                     lint_errors.append(f"{filepath}: {exc}")
                     logger.warning("[lintgate_node] Lint error for %s: %s", filepath, exc)
+
+    # --- Lint-only pass for pre-existing files (no formatting, read-only) ---
+    for ext, files in lint_only_grouped.items():
+        spec = _DEFAULT_FORMATTERS[ext]
+        if not (spec.linter_command and is_tool_available(spec.linter_command)):
+            continue
+        for filepath in files:
+            full_path = _resolve_path(filepath, workspace_path)
+            if not full_path or not os.path.isfile(full_path):
+                continue
+            logger.info("[lintgate_node] Lint-only check on pre-existing %s (no format).", filepath)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    spec.linter_command,
+                    *spec.linter_args,
+                    full_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+                if proc.returncode == 0:
+                    files_linted.append(filepath)
+                else:
+                    err_msg = stderr.decode("utf-8", errors="replace").strip() or stdout.decode("utf-8", errors="replace").strip()
+                    if err_msg:
+                        lint_errors.append(f"{filepath}: {err_msg[:500]}")
+                        logger.warning("[lintgate_node] Lint-only failed for %s: %s", filepath, err_msg[:500])
+            except asyncio.TimeoutError:
+                lint_errors.append(f"{filepath}: Linter timed out")
+            except Exception as exc:
+                lint_errors.append(f"{filepath}: {exc}")
 
     total_checked = len(modified_files)
     total_formatted = len(files_formatted)

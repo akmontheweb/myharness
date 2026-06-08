@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +61,55 @@ def safe_resolve(workspace_root: str, filepath: str) -> str:
         raise ValueError(f"path escapes workspace: {filepath!r} -> {candidate}")
 
     return candidate
+
+
+def is_path_allowed(
+    filepath: str,
+    workspace_root: str,
+    allowed_paths: Optional["Iterable[str]"],
+) -> bool:
+    """
+    Check whether ``filepath`` falls within the optional allowlist.
+
+    Each entry in ``allowed_paths`` is treated as a workspace-relative
+    file path or directory prefix. A file matches if its resolved
+    workspace-relative form equals an allowlist entry exactly, or starts
+    with an allowlist entry that ends in ``/`` (or matches a directory).
+
+    Returns:
+      - True when ``allowed_paths`` is None or empty (no restriction).
+      - True when the file is inside at least one allowlist entry.
+      - False otherwise.
+
+    The function never raises — invalid inputs simply return False. Callers
+    that need a hard error should call ``safe_resolve`` first.
+    """
+    if not allowed_paths:
+        return True
+
+    try:
+        resolved = safe_resolve(workspace_root, filepath)
+    except ValueError:
+        return False  # path escapes workspace — not allowed regardless
+
+    workspace_real = os.path.realpath(workspace_root)
+    rel = os.path.relpath(resolved, workspace_real).replace(os.sep, "/")
+
+    for entry in allowed_paths:
+        if not isinstance(entry, str) or not entry:
+            continue
+        e = entry.strip().lstrip("./").replace(os.sep, "/")
+        if not e:
+            continue
+        # Exact file match
+        if rel == e:
+            return True
+        # Directory prefix: "src/" or "src/auth"
+        prefix = e if e.endswith("/") else e + "/"
+        if rel.startswith(prefix):
+            return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------

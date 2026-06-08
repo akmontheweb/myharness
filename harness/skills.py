@@ -158,11 +158,25 @@ class SubAgentSkill(SkillBase):
         system_prompt: str,
         model_override: str = "",
         max_iterations: int = 3,
+        allowed_paths: Optional[list[str]] = None,
     ):
+        """
+        Args:
+            allowed_paths: Optional list of workspace-relative file paths
+                or directory prefixes. When supplied, the sub-agent's
+                generated patches are restricted to these paths. Patches
+                targeting any other file are rejected. When None (default),
+                no restriction is applied — useful for trusted, broad-scope
+                skills like a general refactoring agent, but RECOMMENDED to
+                set for narrowly-scoped skills so an LLM can't drift into
+                unrelated files. Per-call override available via
+                ``execute(allowed_paths=...)``.
+        """
         super().__init__(schema)
         self.system_prompt = system_prompt
         self.model_override = model_override
         self.max_iterations = max_iterations
+        self.allowed_paths = allowed_paths
 
     async def execute(self, **kwargs: Any) -> Any:
         from harness.graph import get_gateway
@@ -173,12 +187,16 @@ class SubAgentSkill(SkillBase):
         workspace_path = kwargs.get("workspace_path", "")
         build_command = kwargs.get("build_command", "")
         state = kwargs.get("state", {})
+        # Per-call override beats constructor allowlist
+        allowed_paths = kwargs.get("allowed_paths", self.allowed_paths)
 
         gateway = get_gateway()
         if gateway is None:
             return {"error": "No gateway configured.", "success": False}
 
-        logger.info("[skills:subagent] '%s' starting.", self.schema.name)
+        logger.info("[skills:subagent] '%s' starting (allowed_paths=%s).",
+                     self.schema.name,
+                     "<unrestricted>" if allowed_paths is None else list(allowed_paths))
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": task},
@@ -197,7 +215,9 @@ class SubAgentSkill(SkillBase):
 
                 if workspace_path and response.content:
                     patch_results, modified_files = await process_llm_patch_output(
-                        response.content, workspace_path, existing_modified_files=[],
+                        response.content, workspace_path,
+                        existing_modified_files=[],
+                        allowed_paths=allowed_paths,
                     )
                 else:
                     modified_files = []
