@@ -1028,6 +1028,7 @@ class Gateway:
         role: NodeRole,
         budget_remaining_usd: float,
         force_local: bool = False,
+        model_override: Optional[str] = None,
         **llm_kwargs: Any,
     ) -> tuple[LLMResponse, float]:
         """
@@ -1038,6 +1039,11 @@ class Gateway:
             role: Which graph node is making the call.
             budget_remaining_usd: Current remaining budget. If <= 0, the call is refused.
             force_local: If True, force local Ollama inference.
+            model_override: Optional model key to use for this call only,
+                bypassing `select_model(role)`. Use this for one-shot
+                escalation (e.g., repair attempt 3 → reasoning model) instead
+                of mutating gateway.config, which would race in concurrent
+                dispatches and leak state on exception.
             **llm_kwargs: Additional parameters passed to the provider's chat_completion.
 
         Returns:
@@ -1053,8 +1059,11 @@ class Gateway:
                 f"Budget remaining: ${budget_remaining_usd:.4f}"
             )
 
-        # Select model + provider
-        model_key = self.select_model(role, force_local=force_local)
+        # Select model + provider — explicit override wins over role-based routing.
+        if model_override:
+            model_key = model_override
+        else:
+            model_key = self.select_model(role, force_local=force_local)
         thinking = self.should_use_thinking(role)
 
         # If budget is low and not forcing local, fall back to ollama to preserve budget

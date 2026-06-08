@@ -885,6 +885,96 @@ class TestGateway:
         assert gateway.should_use_thinking(NodeRole.PATCHING) is False
         assert gateway.should_use_thinking(NodeRole.REPAIR) is True
 
+    @pytest.mark.asyncio
+    async def test_dispatch_model_override_doesnt_mutate_config(self, monkeypatch):
+        # Regression: repair_node used to swap gateway.config.repair_primary
+        # to escalate to the reasoning model, restoring in `finally`. That
+        # leaks state on exception and races concurrent dispatches.
+        # Verify model_override is honored without touching config.
+        import sys
+        from harness.gateway import Gateway, GatewayConfig, NodeRole, register_model, ModelSpec
+
+        register_model(
+            "ollama:override-test-primary",
+            ModelSpec(provider="ollama", model_id="primary",
+                      context_window=4096, input_cost_per_1m=0.0, output_cost_per_1m=0.0,
+                      api_base_url="http://127.0.0.1:11434/v1"),
+        )
+        register_model(
+            "ollama:override-test-escalation",
+            ModelSpec(provider="ollama", model_id="escalation",
+                      context_window=4096, input_cost_per_1m=0.0, output_cost_per_1m=0.0,
+                      api_base_url="http://127.0.0.1:11434/v1"),
+        )
+        # Force the redactor import to fail so dispatch short-circuits cheap
+        # and lets us assert which model_key was selected before raising.
+        monkeypatch.setitem(sys.modules, "harness.redactor", None)
+
+        gateway = Gateway(GatewayConfig(repair_primary="ollama:override-test-primary"))
+        config_before = gateway.config.repair_primary
+
+        # Capture which provider key was resolved
+        seen: dict = {}
+        original = gateway._get_provider
+
+        async def spy_get_provider(model_key):
+            seen["model_key"] = model_key
+            return await original(model_key)
+
+        gateway._get_provider = spy_get_provider  # type: ignore[assignment]
+
+        try:
+            await gateway.dispatch(
+                messages=[{"role": "user", "content": "x"}],
+                role=NodeRole.REPAIR,
+                budget_remaining_usd=1.0,
+                model_override="ollama:override-test-escalation",
+            )
+        except RuntimeError:
+            pass  # expected — redactor fail-closed will fire post-provider-selection
+
+        assert seen["model_key"] == "ollama:override-test-escalation"
+        # Config must remain untouched
+        assert gateway.config.repair_primary == config_before
+
+
+class TestGatekeeperAutoApprove:
+    """Regression: human_gatekeeper_node ignored HARNESS_AUTO_APPROVE and CI."""
+
+    def test_helper_respects_env_vars(self, monkeypatch):
+        from harness.cli import _gatekeeper_auto_approves
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("HARNESS_AUTO_APPROVE", raising=False)
+        # When stdin IS a tty and no env vars → interactive
+        import sys
+        if sys.stdin.isatty():
+            assert _gatekeeper_auto_approves() is False
+        # HARNESS_AUTO_APPROVE bypasses
+        monkeypatch.setenv("HARNESS_AUTO_APPROVE", "true")
+        assert _gatekeeper_auto_approves() is True
+        monkeypatch.delenv("HARNESS_AUTO_APPROVE")
+        # CI bypasses
+        monkeypatch.setenv("CI", "true")
+        assert _gatekeeper_auto_approves() is True
+
+    def test_gatekeeper_auto_approves_in_ci(self, monkeypatch):
+        from harness.cli import human_gatekeeper_node
+        monkeypatch.setenv("HARNESS_AUTO_APPROVE", "true")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, "docs"))
+            spec_path = os.path.join(tmpdir, "docs", "SPEC_REQUIREMENTS.md")
+            with open(spec_path, "w") as f:
+                f.write("# spec\n")
+            state = {
+                "current_gate": "REQUIREMENTS",
+                "workspace_path": tmpdir,
+                "spec_requirements_path": spec_path,
+                "messages": [],
+                "loop_counter": {},
+            }
+            result = human_gatekeeper_node(state)
+            assert result["node_state"]["gatekeeper_action"] == "approve"
+
     def test_anthropic_compute_cost_doesnt_double_charge_cache(self):
         # Regression: previously the provider summed cache_read +
         # cache_creation into cached_tokens, then subtracted that sum

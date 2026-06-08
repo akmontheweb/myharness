@@ -235,6 +235,24 @@ def resolve_build_command(cli_build_cmd: Optional[str], config: dict[str, Any]) 
 # 2. HITL Interactive Menu Loop
 # ---------------------------------------------------------------------------
 
+def _gatekeeper_auto_approves() -> bool:
+    """
+    True when the gatekeeper should skip interactive approval — set in CI
+    or when the user opted in via HARNESS_AUTO_APPROVE, or when stdin is
+    not a TTY (a piped invocation has no way to answer the prompt).
+
+    Unlike the deploy preview gate (which fails closed on non-TTY because
+    LLM-generated containers are about to launch), the spec/architecture
+    gatekeeper has lower blast radius — a non-TTY here just means CI, so
+    auto-approve is safe.
+    """
+    return (
+        os.environ.get("CI", "").lower() == "true"
+        or os.environ.get("HARNESS_AUTO_APPROVE", "").lower() == "true"
+        or not sys.stdin.isatty()
+    )
+
+
 def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
     """
     Adaptive three-phase HITL gatekeeper node.
@@ -282,6 +300,21 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
     else:
         logger.warning("[gatekeeper] Unknown gate: %s. Proceeding.", gate)
         return {"node_state": {"gatekeeper_action": "approve", "current_gate": gate}}
+
+    # Non-interactive auto-approval. The spec lists CI / HARNESS_AUTO_APPROVE
+    # as supported, but the gatekeeper was previously blocking on input()
+    # even when those were set — making CI runs hang forever waiting on
+    # stdin. Honor the env vars here as well as a non-TTY stdin.
+    if _gatekeeper_auto_approves():
+        logger.info(
+            "[gatekeeper] %s auto-approved (non-interactive: CI / HARNESS_AUTO_APPROVE / no TTY).",
+            gate_label,
+        )
+        return {
+            "messages": messages,
+            "loop_counter": loop_counter,
+            "node_state": {"gatekeeper_action": "approve", "current_gate": gate},
+        }
 
     while True:
         spec_content = ""

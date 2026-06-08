@@ -921,19 +921,16 @@ Quality: Write modular, production-ready code with proper error handling, type h
 Generate your fix patches NOW. Only the blocks above. No other text."""
         messages.append({"role": "user", "content": _REPAIR_FORMAT_REMINDER})
 
+        # Use the non-mutating model_override path so concurrent dispatches
+        # don't see each other's transient config mutations and exceptions
+        # don't leave gateway.config in an inconsistent state.
         if use_escalation and escalation_model:
-            # Override the model selection by using force_local or a direct provider lookup
-            # We dispatch with the escalation model by temporarily overriding the config
-            original_repair = gateway.config.repair_primary
-            gateway.config.repair_primary = escalation_model
-            try:
-                response, new_budget = await gateway.dispatch(
-                    messages=list(messages),
-                    role=NodeRole.REPAIR,
-                    budget_remaining_usd=budget,
-                )
-            finally:
-                gateway.config.repair_primary = original_repair  # Restore for subsequent calls
+            response, new_budget = await gateway.dispatch(
+                messages=list(messages),
+                role=NodeRole.REPAIR,
+                budget_remaining_usd=budget,
+                model_override=escalation_model,
+            )
         else:
             response, new_budget = await gateway.dispatch(
                 messages=list(messages),
