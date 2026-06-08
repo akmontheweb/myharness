@@ -298,6 +298,165 @@ class PythonParser(BaseLanguageParser):
         return diagnostics
 
 
+class JavaParser(BaseLanguageParser):
+    """
+    Parses Java compiler output from javac, Gradle, and Maven.
+
+    Three input formats are supported (whichever ``mvn``/``gradle``/``javac``
+    happens to emit):
+
+        Maven:    [ERROR] /path/File.java:[42,17] cannot find symbol
+        Gradle:   /path/File.java:42: error: cannot find symbol
+        javac:    /path/File.java:42: error: cannot find symbol
+
+    Maven and the others differ only by the optional ``[ERROR]`` prefix and
+    the ``[L,C]`` bracketed coordinates.
+    """
+
+    _MAVEN_PATTERN = re.compile(
+        r'^\s*(?:\[(?P<sev>ERROR|WARNING)\]\s+)?(?P<file>.+?\.java):\[(?P<line>\d+),(?P<col>\d+)\]\s+(?P<msg>.+)$'
+    )
+    _JAVAC_PATTERN = re.compile(
+        r'^\s*(?P<file>.+?\.java):(?P<line>\d+):\s+(?P<sev>error|warning|note):\s+(?P<msg>.+)$'
+    )
+
+    @staticmethod
+    def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
+        diagnostics: list[DiagnosticObject] = []
+        lines = raw_output.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            m = JavaParser._MAVEN_PATTERN.match(line)
+            if m:
+                severity = "warning" if (m.group("sev") or "").upper() == "WARNING" else "error"
+                context, next_i = _collect_context_lines(
+                    lines, i + 1, JavaParser._MAVEN_PATTERN,
+                )
+                diagnostics.append(DiagnosticObject(
+                    file=m.group("file"),
+                    line=int(m.group("line")),
+                    column=int(m.group("col")),
+                    severity=severity,
+                    error_code="",
+                    message=m.group("msg"),
+                    semantic_context=context,
+                ))
+                i = next_i
+                continue
+
+            m = JavaParser._JAVAC_PATTERN.match(line)
+            if m:
+                sev_raw = (m.group("sev") or "error").lower()
+                severity = "warning" if sev_raw == "warning" else "error"
+                context, next_i = _collect_context_lines(
+                    lines, i + 1, JavaParser._JAVAC_PATTERN,
+                )
+                diagnostics.append(DiagnosticObject(
+                    file=m.group("file"),
+                    line=int(m.group("line")),
+                    column=0,  # javac/Gradle omit column in this short form
+                    severity=severity,
+                    error_code="",
+                    message=m.group("msg"),
+                    semantic_context=context,
+                ))
+                i = next_i
+                continue
+
+            i += 1
+        return diagnostics
+
+
+class TypeScriptParser(BaseLanguageParser):
+    """
+    Parses TypeScript compiler (``tsc``) output.
+
+    tsc uses a parens-coordinate format that no other parser handles:
+        src/foo.ts(42,17): error TS2304: Cannot find name 'bar'.
+
+    ESLint and other JS/TS linters use the ``file:L:C:`` form that the
+    GenericParser already handles, so this parser focuses on the tsc
+    variant specifically.
+    """
+
+    _PATTERN = re.compile(
+        r'^\s*(?P<file>.+?\.(?:ts|tsx|d\.ts))\((?P<line>\d+),(?P<col>\d+)\):\s+'
+        r'(?P<sev>error|warning)\s+(?P<code>TS\d+):\s+(?P<msg>.+)$'
+    )
+
+    @staticmethod
+    def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
+        diagnostics: list[DiagnosticObject] = []
+        lines = raw_output.splitlines()
+        i = 0
+        while i < len(lines):
+            m = TypeScriptParser._PATTERN.match(lines[i])
+            if not m:
+                i += 1
+                continue
+            context, next_i = _collect_context_lines(
+                lines, i + 1, TypeScriptParser._PATTERN,
+            )
+            diagnostics.append(DiagnosticObject(
+                file=m.group("file"),
+                line=int(m.group("line")),
+                column=int(m.group("col")),
+                severity=m.group("sev"),
+                error_code=m.group("code"),
+                message=m.group("msg"),
+                semantic_context=context,
+            ))
+            i = next_i
+        return diagnostics
+
+
+class DartParser(BaseLanguageParser):
+    """
+    Parses ``dart analyze`` and ``flutter analyze`` output.
+
+    Dart uses a bullet-separated form that no other parser handles:
+        error • Undefined name 'bar' • lib/foo.dart:42:17 • undefined_identifier
+        warning • Unused import: 'package:foo' • lib/foo.dart:3:8 • unused_import
+
+    The ordering of fields is ``severity • message • file:L:C • rule_name``.
+    Also handles ``flutter test`` failure lines:
+        00:01 +5 -1: ExampleTest.shouldDoX [E]
+            Test failed. See exception logs above.
+    """
+
+    _ANALYZE_PATTERN = re.compile(
+        r'^\s*(?P<sev>error|warning|info|hint)\s*•\s*(?P<msg>.+?)\s*•\s*'
+        r'(?P<file>[^•]+?\.dart):(?P<line>\d+):(?P<col>\d+)\s*•\s*(?P<code>\S+)\s*$'
+    )
+
+    @staticmethod
+    def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
+        diagnostics: list[DiagnosticObject] = []
+        for line in raw_output.splitlines():
+            m = DartParser._ANALYZE_PATTERN.match(line)
+            if not m:
+                continue
+            sev_raw = m.group("sev").lower()
+            # Dart's "hint"/"info" are non-fatal; collapse to "warning" so
+            # downstream code only ever sees error/warning. Anything else
+            # (rare) drops to error to surface it loudly.
+            if sev_raw in ("warning", "info", "hint"):
+                severity = "warning"
+            else:
+                severity = "error"
+            diagnostics.append(DiagnosticObject(
+                file=m.group("file").strip(),
+                line=int(m.group("line")),
+                column=int(m.group("col")),
+                severity=severity,
+                error_code=m.group("code"),
+                message=m.group("msg").strip(),
+                semantic_context="",
+            ))
+        return diagnostics
+
+
 class GenericParser(BaseLanguageParser):
     """
     Fallback generic diagnostic parser for compilers without structured output.
@@ -344,7 +503,10 @@ class GenericParser(BaseLanguageParser):
 # Parser Registry
 # ---------------------------------------------------------------------------
 
-# Maps compiler names to their parser classes
+# Maps compiler names to their parser classes. Detection uses substring
+# matching against the lowercased build_command, so order doesn't matter
+# but longer/more specific names should win over shorter ones (e.g.
+# "ts-node" before "ts" — handled by exclusive prefixes here).
 _PARSER_REGISTRY: dict[str, type[BaseLanguageParser]] = {
     "rustc": RustParser,
     "cargo": RustParser,
@@ -355,6 +517,22 @@ _PARSER_REGISTRY: dict[str, type[BaseLanguageParser]] = {
     "go": GoParser,
     "python": PythonParser,
     "pytest": PythonParser,
+    # Java toolchain — Maven, Gradle, javac all share JavaParser since it
+    # handles both bracketed-Maven and javac short-form on the same input.
+    "mvn": JavaParser,
+    "maven": JavaParser,
+    "gradle": JavaParser,
+    "gradlew": JavaParser,
+    "javac": JavaParser,
+    # TypeScript toolchain — tsc and frameworks that ultimately run tsc.
+    "tsc": TypeScriptParser,
+    "ts-node": TypeScriptParser,
+    "vite": TypeScriptParser,
+    "next": TypeScriptParser,
+    "tsx": TypeScriptParser,
+    # Dart / Flutter — analyzer output is identical between the two.
+    "dart": DartParser,
+    "flutter": DartParser,
 }
 
 # Maps file extensions to parser classes
@@ -369,6 +547,10 @@ _EXTENSION_PARSER_MAP: dict[str, type[BaseLanguageParser]] = {
     ".go": GoParser,
     ".py": PythonParser,
     ".pyi": PythonParser,
+    ".java": JavaParser,
+    ".ts": TypeScriptParser,
+    ".tsx": TypeScriptParser,
+    ".dart": DartParser,
 }
 
 
