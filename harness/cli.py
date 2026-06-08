@@ -419,11 +419,12 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
             print("  [s] Save & Quit (resume later)")
         print()
 
-        try:
-            choice = input(f"[HITL:{gate_label}] Select action [a/e/m/s]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n[Gatekeeper] Input interrupted. Aborting.")
-            sys.exit(1)
+        from harness.hitl import get_channel as _get_channel
+        choice = _get_channel().prompt(
+            f"[HITL:{gate_label}] Select action",
+            ["a", "e", "m", "s"],
+            default="a",
+        )
 
         if choice == "a":
             logger.info("[gatekeeper] %s approved by developer.", gate_label)
@@ -434,11 +435,8 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
             }
 
         elif choice == "e":
-            try:
-                notes = input(f"[Refine:{gate_label}] Enter additional notes/feedback:\n").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\n[Refine] Input interrupted.")
-                continue
+            from harness.hitl import get_channel as _get_channel
+            notes = _get_channel().notes(f"[Refine:{gate_label}] Enter additional notes/feedback")
 
             if not notes:
                 print("[Refine] No notes provided. Returning to menu.")
@@ -463,10 +461,8 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
         elif choice == "m":
             print(f"[Manual] Edit the file at: {spec_path}")
             print("[Manual] Make your changes in your editor (VS Code, Cursor, etc.).")
-            try:
-                input("[Manual] Press Enter when you are done editing... ")
-            except (EOFError, KeyboardInterrupt):
-                print("\n[Manual] Input interrupted. Reading current file state.")
+            from harness.hitl import get_channel as _get_channel
+            _get_channel().wait_for_manual_edit(spec_path)
 
             # Reload the manually edited file into messages[0] (system prompt)
             if os.path.isfile(spec_path):
@@ -562,11 +558,8 @@ def discovery_interview_loop(state: dict[str, Any]) -> dict[str, Any]:
     print("Type your answers (referencing question numbers if preferred), 'DONE' to finalize, or 'SUSPEND' to save & quit.")
     print("-" * 80)
 
-    try:
-        response = input("User Response > ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n[Discovery] Input interrupted. Saving current state.")
-        return {"messages": messages, "node_state": node_state}
+    from harness.hitl import get_channel as _get_channel
+    response = _get_channel().notes("User Response")
 
     if response.upper() == "SUSPEND":
         session_id = state.get("session_id", "")
@@ -691,14 +684,12 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
         print("  [q] Abandon session and execute Git rollback")
         print()
 
-        try:
-            choice = input("[HITL] Select action: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n[HITL] Input interrupted. Aborting session.")
-            node_state["hitl_abandon"] = True
-            node_state["hitl_active"] = False
-            state["node_state"] = node_state
-            return state
+        from harness.hitl import get_channel as _get_channel
+        choice = _get_channel().prompt(
+            "[HITL] Select action",
+            ["v", "r", "e", "m", "b", "s", "q"],
+            default="r",
+        )
 
         if choice == "v":
             print()
@@ -719,11 +710,8 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
 
         elif choice == "e":
             # Inject hint: append user string as a user message, reset loop counter to 1
-            try:
-                hint = input("[HITL] Enter hint/instruction for the repair node: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\n[HITL] Input interrupted.")
-                continue
+            from harness.hitl import get_channel as _get_channel
+            hint = _get_channel().notes("[HITL] Enter hint/instruction for the repair node")
             if hint:
                 messages = state.get("messages", [])
                 messages.append({"role": "user", "content": f"[HITL Hint]: {hint}"})
@@ -742,11 +730,8 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             print("[HITL] Pausing for manual IDE edits...")
             print(f"[HITL] Workspace: {workspace_path}")
             print("[HITL] Make your changes in your editor, then press Enter to continue.")
-            try:
-                input("[HITL] Press Enter when you are done editing... ")
-            except (EOFError, KeyboardInterrupt):
-                print("\n[HITL] Input interrupted.")
-                continue
+            from harness.hitl import get_channel as _get_channel
+            _get_channel().wait_for_manual_edit(workspace_path)
             # Reset loop counter and clear compiler errors since manual fix was applied
             state["loop_counter"] = {"patching": 0, "repair": 0, "compiler": 0, "total_repairs": 0}
             state["compiler_errors"] = []
@@ -787,8 +772,11 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
         elif choice == "q":
             # Abandon: set abandon flag, route to END
             print("[HITL] Abandoning session...")
-            confirm = input("[HITL] Confirm abandon? This will attempt a git rollback. (y/N): ").strip().lower()
-            if confirm == "y":
+            from harness.hitl import get_channel as _get_channel
+            confirmed = _get_channel().confirm(
+                "[HITL] Confirm abandon? This will attempt a git rollback.", default=False
+            )
+            if confirmed:
                 node_state["hitl_abandon"] = True
                 node_state["hitl_active"] = False
                 node_state["hitl_awaiting_input"] = False
@@ -1024,11 +1012,12 @@ def interactive_review_loop(spec_path: str, gateway: Any) -> str:
         print("[C] Manual — Edit the file in your IDE, then press Enter to continue.")
         print()
 
-        try:
-            choice = input("[Requirements] Select action [A/B/C]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n[Requirements] Input interrupted. Aborting.")
-            sys.exit(1)
+        from harness.hitl import get_channel as _get_channel
+        choice = _get_channel().prompt(
+            "[Requirements] Select action",
+            ["a", "b", "c"],
+            default="a",
+        )
 
         if choice == "a":
             # Approve: return the current content as the locked spec
@@ -1037,11 +1026,8 @@ def interactive_review_loop(spec_path: str, gateway: Any) -> str:
 
         elif choice == "b":
             # Refine: get feedback, send to LLM, overwrite, loop
-            try:
-                notes = input("[Refine] Enter additional notes/feedback for the specification:\n").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\n[Refine] Input interrupted.")
-                continue
+            from harness.hitl import get_channel as _get_channel
+            notes = _get_channel().notes("[Refine] Enter additional notes/feedback for the specification")
 
             if not notes:
                 print("[Refine] No notes provided. Returning to menu.")
@@ -1061,10 +1047,8 @@ def interactive_review_loop(spec_path: str, gateway: Any) -> str:
             # Manual: pause for IDE edits, then read from disk
             print(f"[Manual] Edit the file at: {spec_path}")
             print("[Manual] Make your changes in your editor (VS Code, Cursor, etc.).")
-            try:
-                input("[Manual] Press Enter when you are done editing... ")
-            except (EOFError, KeyboardInterrupt):
-                print("\n[Manual] Input interrupted. Reading current file state.")
+            from harness.hitl import get_channel as _get_channel
+            _get_channel().wait_for_manual_edit(spec_path)
 
             spec_content = _read_spec_file(spec_path)
             if spec_content:
@@ -1439,8 +1423,9 @@ async def cmd_purge(args: argparse.Namespace) -> int:
 
     if args.all:
         print("WARNING: This will delete ALL checkpoint data permanently.")
-        confirm = input("Type 'yes' to confirm: ").strip()
-        if confirm.lower() != "yes":
+        from harness.hitl import get_channel as _get_channel
+        confirmed = _get_channel().confirm("Type 'yes' to confirm purge of all checkpoint data", default=False)
+        if not confirmed:
             print("Purge cancelled.")
             return 0
         deleted = await purge_checkpoints(db_path)

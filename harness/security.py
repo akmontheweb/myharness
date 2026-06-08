@@ -694,30 +694,16 @@ class HITLGate:
 
         print()
 
-        while True:
-            try:
-                choice = input("[HITL Gate] Approve these changes? [y]es / [n]o / [v]iew full content: ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print("\n[HITL Gate] Input interrupted. Denying by default.")
-                return False
-
-            if choice in ("y", "yes"):
-                logger.info("[hitl_gate] Developer approved sensitive operation(s).")
-                return True
-            elif choice in ("n", "no"):
-                logger.warning("[hitl_gate] Developer denied sensitive operation(s).")
-                return False
-            elif choice == "v":
-                print()
-                print("--- Full LLM Response ---")
-                if llm_content:
-                    print(llm_content[:5000])
-                    if len(llm_content) > 5000:
-                        print(f"\n... ({len(llm_content) - 5000} more characters)")
-                print("--- End ---")
-                print()
-            else:
-                print("Please enter [y]es, [n]o, or [v]iew.")
+        from harness.hitl import get_channel as _get_channel
+        confirmed = _get_channel().confirm(
+            "[HITL Gate] Approve these changes?", default=False
+        )
+        if confirmed:
+            logger.info("[hitl_gate] Developer approved sensitive operation(s).")
+            return True
+        else:
+            logger.warning("[hitl_gate] Developer denied sensitive operation(s).")
+            return False
 
     def check_and_prompt(self, content: str, context: str = "") -> bool:
         """

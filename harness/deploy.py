@@ -109,25 +109,15 @@ def _read_preview(workspace_path: str, generated_files: list[str]) -> str:
 async def _prompt_deploy_approval(preview: str) -> bool:
     """
     Show the deploy preview and require explicit confirmation before any
-    `docker-compose up` runs. Returns True iff the user approved.
+    `docker-compose up` runs.
 
-    Auto-approves when CI=true or HARNESS_AUTO_APPROVE=true (the user has
-    opted in to non-interactive deploys). Fails closed on a non-TTY
-    without that opt-in — silently proceeding would let any piped input
-    bypass the gate.
+    Routing:
+    - HARNESS_AUTO_APPROVE / CI → auto-approve (opt-in, logged as warning).
+    - Non-TTY without opt-in → fail closed.
+    - Interactive TTY → prompt via HitlChannel.
     """
-    if _auto_approve_deploy():
-        logger.warning(
-            "[deployment_node] Auto-approving deploy preview (CI/HARNESS_AUTO_APPROVE set)."
-        )
-        return True
-
-    if not sys.stdin.isatty():
-        logger.error(
-            "[deployment_node] Refusing deploy: no TTY for interactive approval and "
-            "HARNESS_AUTO_APPROVE is not set. Re-run interactively or set the env var."
-        )
-        return False
+    from harness.hitl import get_channel as _get_channel
+    channel = _get_channel()
 
     print("\n" + "=" * 72, file=sys.stderr)
     print(" DEPLOY PREVIEW — LLM-generated containers about to be launched", file=sys.stderr)
@@ -135,15 +125,21 @@ async def _prompt_deploy_approval(preview: str) -> bool:
     print(preview, file=sys.stderr)
     print("=" * 72, file=sys.stderr)
 
-    loop = asyncio.get_event_loop()
-    try:
-        answer = await loop.run_in_executor(
-            None, lambda: input("Proceed with `docker-compose up --build -d`? [y/N]: ").strip().lower()
+    if not channel.is_interactive():
+        if _auto_approve_deploy():
+            logger.warning(
+                "[deployment_node] Auto-approving deploy preview (CI/HARNESS_AUTO_APPROVE set)."
+            )
+            return True
+        logger.error(
+            "[deployment_node] Refusing deploy: no TTY for interactive approval and "
+            "HARNESS_AUTO_APPROVE is not set. Re-run interactively or set the env var."
         )
-    except (EOFError, KeyboardInterrupt):
-        print("\n[deployment_node] Deploy declined (input interrupted).", file=sys.stderr)
         return False
-    return answer in ("y", "yes")
+
+    return channel.confirm(
+        "Proceed with `docker-compose up --build -d`?", default=False
+    )
 
 
 # ---------------------------------------------------------------------------
