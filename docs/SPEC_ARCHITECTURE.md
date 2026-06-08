@@ -421,11 +421,11 @@ typing-extensions>=4.12.0
 
 **Rationale**: The harness must never corrupt the developer's working state. Stashing pre-existing changes + isolated branches + automatic rollback provides defense-in-depth against accidental destruction.
 
-### 5.8 Pydantic + TypedDict Dual State Schema
+### 5.8 TypedDict-Only State Schema
 
-**Decision**: AgentState is defined as both a `TypedDict` (for LangGraph compatibility) and a `Pydantic BaseModel` (for runtime validation). The TypedDict is the primary schema; Pydantic is available when installed.
+**Decision**: `AgentState` is a `TypedDict` (for LangGraph compatibility). An earlier version of this codebase also defined a parallel `AgentStatePydantic(BaseModel)` and companion `TokenTrackerPydantic` / `DiagnosticObjectPydantic` / `MessagePydantic` classes. These were removed because they were never imported anywhere outside their own definition block — they added no runtime validation, imposed an optional `pydantic` dependency, and their claimed "dual schema" was fictional.
 
-**Rationale**: LangGraph's `StateGraph` requires a TypedDict schema. Pydantic provides validation, default values, and serialization that TypedDict cannot. The dual approach gives both.
+**Rationale**: LangGraph's `StateGraph` requires a TypedDict schema. State factories (`create_initial_state`) already provide safe defaults; Pydantic's per-field validation would add per-call overhead without catching bugs that TypedDict's structural contract (plus existing regression tests) doesn't already catch. The Pydantic option remains available as a future addition if a clear use case emerges.
 
 ### 5.9 Docker-First Sandbox Selection
 

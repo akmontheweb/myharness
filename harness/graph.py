@@ -24,17 +24,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, Optional
 
 from typing_extensions import TypedDict
 
-try:
-    from pydantic import BaseModel, Field  # noqa: F811
-    _PYDANTIC_AVAILABLE = True
-except ImportError:
-    _PYDANTIC_AVAILABLE = False
-    BaseModel = object  # type: ignore[assignment,misc]
-    Field = None  # type: ignore[assignment,misc]
 logger = logging.getLogger(__name__)
 
 
@@ -107,58 +100,6 @@ class AgentState(TypedDict, total=False):
     spec_architecture_path: str
     deployment_blueprint_path: str
     skip_discovery: bool
-
-
-# ---------------------------------------------------------------------------
-# 1b. Pydantic Models (alternative strongly-typed state)
-# ---------------------------------------------------------------------------
-
-if _PYDANTIC_AVAILABLE:
-    class TokenTrackerPydantic(BaseModel):
-        """Pydantic model for cumulative token cost tracking."""
-        total_input_tokens: int = 0
-        total_output_tokens: int = 0
-        total_cached_tokens: int = 0
-        total_cost_usd: float = 0.0
-        per_model: dict[str, dict[str, Union[int, float]]] = Field(default_factory=dict)
-
-    class DiagnosticObjectPydantic(BaseModel):
-        """Pydantic model for structured compiler diagnostic."""
-        file: str = ""
-        line: int = 0
-        column: int = 0
-        severity: Literal["error", "warning"] = "error"
-        error_code: str = ""
-        message: str = ""
-        semantic_context: str = ""
-
-    class MessagePydantic(BaseModel):
-        """Pydantic model for a single conversation turn."""
-        role: Literal["system", "user", "assistant", "tool"] = "user"
-        content: str = ""
-        name: Optional[str] = None
-        tool_calls: Optional[list[dict[str, Any]]] = None
-        tool_call_id: Optional[str] = None
-
-    class AgentStatePydantic(BaseModel):
-        """
-        Pydantic-based agent state — full equivalent of the TypedDict AgentState.
-        Can be used interchangeably. Provides runtime validation via Pydantic.
-        """
-        workspace_path: str = ""
-        messages: list[MessagePydantic] = Field(default_factory=list)
-        modified_files: list[str] = Field(default_factory=list)
-        compiler_errors: list[DiagnosticObjectPydantic] = Field(default_factory=list)
-        token_tracker: TokenTrackerPydantic = Field(default_factory=TokenTrackerPydantic)
-        loop_counter: dict[str, int] = Field(default_factory=lambda: {"patching": 0, "repair": 0, "compiler": 0, "total_repairs": 0})
-        allow_network: bool = False
-        build_command: str = "make build"
-        budget_remaining_usd: float = 2.00
-        session_id: str = ""
-        exit_code: int = -1
-        node_state: dict[str, Any] = Field(default_factory=dict)
-        skip_discovery: bool = False
-
 
 # ---------------------------------------------------------------------------
 # 2. Default State Factory

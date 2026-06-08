@@ -7,7 +7,7 @@ langgraph-checkpoint-sqlite==3.1.0
 aiofiles==25.1.0
 tree-sitter==0.25.2
 httpx==0.28.1
-pydantic==2.13.4
+# pydantic is a transitive dep of langgraph — no direct usage in harness/
 uuid7==0.1.0
 typing-extensions==4.15.0
 msgpack==1.1.2
