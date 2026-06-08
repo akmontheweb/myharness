@@ -2351,6 +2351,38 @@ class TestDeployBlueprint:
         assert "reverse_proxy" in caddy
         assert "api:8000" in caddy
 
+    def test_dockerfile_name_first_service_uses_plain_dockerfile(self):
+        # First build-context service uses plain "Dockerfile" so Docker's
+        # default lookup works for single-service projects.
+        from harness.deploy import _dockerfile_name_for
+        services = {
+            "api": {"build_context": "./api"},
+            "worker": {"build_context": "./worker"},
+            "postgres": {"base_image": "postgres:16"},  # no build_context
+        }
+        assert _dockerfile_name_for("api", services) == "Dockerfile"
+        assert _dockerfile_name_for("worker", services) == "Dockerfile.worker"
+        assert _dockerfile_name_for("postgres", services) == ""
+
+    def test_compose_and_generation_dockerfile_names_agree(self):
+        # Regression for the original Bug 3: compose used "build_context != '.'"
+        # while generation used "first service vs others" — they could disagree
+        # and produce missing-file errors. Both must now route through
+        # _dockerfile_name_for.
+        from harness.deploy import _generate_compose_file, _dockerfile_name_for
+        services = {
+            "api": {"build_context": "./api", "ports": ["8000:8000"]},
+            "worker": {"build_context": "./worker"},
+        }
+        blueprint = {"services": services, "volumes": {}, "networks": {}}
+        compose = _generate_compose_file(blueprint)
+        for svc_name in services:
+            expected = _dockerfile_name_for(svc_name, services)
+            if expected:
+                assert f"dockerfile: {expected}" in compose, (
+                    f"compose missing dockerfile: {expected} for service {svc_name}"
+                )
+
 
 # ===========================================================================
 # IMPACT TESTS

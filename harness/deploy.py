@@ -23,10 +23,13 @@ Integration:
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time as time_module
 from pathlib import Path
@@ -702,6 +705,31 @@ def _generate_dockerfile(
     return dockerfile
 
 
+def _dockerfile_name_for(svc_name: str, services: dict[str, Any]) -> str:
+    """Return the on-disk Dockerfile filename for a service.
+
+    Both ``_generate_compose_file`` (which writes the ``dockerfile:`` field
+    in docker-compose.yml) and ``generate_assets_from_blueprint`` (which
+    writes the file to disk) must agree by construction. Use the same
+    helper to avoid the previous divergence where compose used
+    ``build_context != "."`` and asset generation used "first service vs
+    others" — they could disagree and produce missing-file errors.
+
+    Convention:
+      - The first service with a build_context keeps the plain ``Dockerfile``
+        name so Docker's default lookup works for single-service projects.
+      - Every additional build-context service uses ``Dockerfile.<svc_name>``.
+      - Services without a build_context (e.g. ``postgres`` pulled as an
+        image) return an empty string.
+    """
+    if not services.get(svc_name, {}).get("build_context"):
+        return ""
+    build_services = [n for n, spec in services.items() if spec.get("build_context")]
+    if not build_services:
+        return ""
+    return "Dockerfile" if svc_name == build_services[0] else f"Dockerfile.{svc_name}"
+
+
 def _generate_compose_file(blueprint: dict[str, Any]) -> str:
     """Generate a docker-compose.yml from the architecture blueprint.
 
@@ -725,7 +753,7 @@ def _generate_compose_file(blueprint: dict[str, Any]) -> str:
         if svc_spec.get("build_context"):
             lines.append("    build:")
             lines.append(f"      context: {svc_spec.get('build_context', '.')}")
-            lines.append(f"      dockerfile: Dockerfile.{svc_name}" if svc_spec.get("build_context", ".") != "." else "      dockerfile: Dockerfile")
+            lines.append(f"      dockerfile: {_dockerfile_name_for(svc_name, services)}")
         else:
             lines.append(f"    image: {svc_spec.get('base_image', 'alpine:3.20')}")
 
@@ -867,7 +895,7 @@ def generate_assets_from_blueprint(
             svc_lang = primary_lang
 
         dockerfile_content = _generate_dockerfile(svc_name, svc_spec, svc_lang, workspace_path)
-        dockerfile_name = f"Dockerfile.{svc_name}" if svc_name != list(services.keys())[0] else "Dockerfile"
+        dockerfile_name = _dockerfile_name_for(svc_name, services)
         dockerfile_path = workspace / dockerfile_name
         dockerfile_path.write_text(dockerfile_content, encoding="utf-8")
         generated.append(str(dockerfile_path.relative_to(workspace)))
@@ -898,6 +926,43 @@ def generate_assets_from_blueprint(
 # ---------------------------------------------------------------------------
 # Phase 4: Health Check & Deployment Orchestrator
 # ---------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=1)
+def _compose_argv() -> tuple[str, ...]:
+    """Return the argv prefix to invoke Docker Compose.
+
+    Docker Compose V2 (``docker compose``, a Go plugin) has been the
+    default since Docker Desktop 4.4+ / Engine 20.10+, and V1
+    (``docker-compose``, Python) was end-of-lifed in July 2023 — many
+    modern Linux distros and CI images no longer ship it. Prefer V2; only
+    fall back to the legacy binary if the V2 plugin is not present.
+
+    The detection runs once per process (lru_cache) so we don't probe
+    Docker on every health-check / teardown call.
+    """
+    if shutil.which("docker"):
+        try:
+            result = subprocess.run(
+                ["docker", "compose", "version"],
+                capture_output=True,
+                timeout=5.0,
+                check=False,
+            )
+            if result.returncode == 0:
+                return ("docker", "compose")
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    if shutil.which("docker-compose"):
+        logger.warning(
+            "[deploy] Docker Compose V2 plugin not detected; falling back to "
+            "legacy docker-compose binary (EOL since July 2023)."
+        )
+        return ("docker-compose",)
+    # Neither resolves — return the V2 form so the eventual subprocess
+    # error message is the modern one. The caller's error handling will
+    # surface "command not found".
+    return ("docker", "compose")
+
 
 async def _run_docker_inspect(container_name: str) -> dict[str, Any]:
     """Run docker inspect and return parsed status."""
@@ -934,7 +999,7 @@ async def _get_compose_services(workspace_path: str, compose_file: str) -> list[
         return []
     try:
         proc = await asyncio.create_subprocess_exec(
-            "docker-compose", "-f", compose_path, "config", "--services",
+            *_compose_argv(), "-f", compose_path, "config", "--services",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             cwd=workspace_path,
         )
@@ -1004,7 +1069,7 @@ async def health_check_loop(
     if os.path.isfile(compose_path):
         try:
             proc = await asyncio.create_subprocess_exec(
-                "docker-compose", "-f", compose_path, "logs", "--tail=100",
+                *_compose_argv(), "-f", compose_path, "logs", "--tail=100",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 cwd=workspace_path,
             )
@@ -1138,7 +1203,7 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
     # Build
     try:
         proc = await asyncio.create_subprocess_exec(
-            "docker-compose", "-f", compose_path, "up", "--build", "-d",
+            *_compose_argv(), "-f", compose_path, "up", "--build", "-d",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             cwd=workspace_path,
         )
@@ -1210,7 +1275,7 @@ async def teardown_containers(workspace_path: str, compose_file: str = "docker-c
         return False
     try:
         proc = await asyncio.create_subprocess_exec(
-            "docker-compose", "-f", compose_path, "down", "--remove-orphans",
+            *_compose_argv(), "-f", compose_path, "down", "--remove-orphans",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             cwd=workspace_path,
         )
