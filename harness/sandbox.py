@@ -72,6 +72,11 @@ class BuildResult:
     diagnostics: list[DiagnosticObject] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     timed_out: bool = False
+    # True when the disk log streamer hit its byte cap. raw_output is
+    # incomplete in this case — diagnostic parsing may miss the real error
+    # if it occurred after the cap was hit. Surfaced so downstream nodes
+    # can warn the user instead of treating the truncated tail as ground truth.
+    log_truncated: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +106,7 @@ class SandboxBackend(ABC):
         allow_network: bool = False,
         readonly_cache_mounts: Optional[list[str]] = None,
         extra_env: Optional[dict[str, str]] = None,
-    ) -> tuple[int, str, bool]:
+    ) -> tuple[int, str, bool, bool]:
         """
         Execute a shell command inside the isolation backend.
 
@@ -171,7 +176,7 @@ class UnshareBackend(SandboxBackend):
         allow_network: bool = False,
         readonly_cache_mounts: Optional[list[str]] = None,
         extra_env: Optional[dict[str, str]] = None,
-    ) -> tuple[int, str, bool]:
+    ) -> tuple[int, str, bool, bool]:
         ns_cmd = self._build_namespace_command(
             command,
             workspace_path,
@@ -258,7 +263,15 @@ class DockerBackend(SandboxBackend):
         return f"docker({self.image})"
 
     def is_available(self) -> bool:
-        """Check if Docker is installed and the daemon is reachable."""
+        """
+        Check if Docker is installed AND the daemon is reachable by *this*
+        user. Distinguishes three failure shapes so users debugging an
+        unexpected fallback to unshare/bare see the real reason:
+
+          - binary missing            → silent False (expected)
+          - daemon not running        → logged warning
+          - permission denied         → logged error with suggested fix
+        """
         if not shutil.which(self.docker_path):
             return False
         try:
@@ -266,10 +279,39 @@ class DockerBackend(SandboxBackend):
                 [self.docker_path, "info"],
                 capture_output=True,
                 timeout=10,
+                text=True,
             )
-            return result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            logger.warning("[sandbox] Docker availability check failed: %s", e)
             return False
+
+        if result.returncode == 0:
+            return True
+
+        # docker info failed — surface why. stderr typically contains:
+        #   "permission denied while trying to connect to the Docker daemon socket"
+        #   "Cannot connect to the Docker daemon at unix:///var/run/docker.sock"
+        stderr = (result.stderr or "").lower()
+        if "permission denied" in stderr:
+            logger.error(
+                "[sandbox] Docker is installed but the daemon socket is not accessible to this user. "
+                "Add the user to the 'docker' group (`sudo usermod -aG docker $USER`) and re-login, "
+                "or run the harness with sufficient privileges. Falling back to non-Docker backend."
+            )
+        elif "cannot connect" in stderr or "is the docker daemon running" in stderr:
+            logger.warning(
+                "[sandbox] Docker is installed but the daemon is not running. "
+                "Start it (`sudo systemctl start docker`) or use Docker Desktop. "
+                "Falling back to non-Docker backend."
+            )
+        else:
+            logger.warning(
+                "[sandbox] `docker info` failed (exit=%d). Falling back to non-Docker backend. "
+                "stderr=%s",
+                result.returncode,
+                (result.stderr or "").strip()[:200],
+            )
+        return False
 
     async def run(
         self,
@@ -279,7 +321,7 @@ class DockerBackend(SandboxBackend):
         allow_network: bool = False,
         readonly_cache_mounts: Optional[list[str]] = None,
         extra_env: Optional[dict[str, str]] = None,
-    ) -> tuple[int, str, bool]:
+    ) -> tuple[int, str, bool, bool]:
         docker_cmd = self._build_docker_command(
             command,
             workspace_path,
@@ -366,7 +408,7 @@ class BareBackend(SandboxBackend):
         allow_network: bool = False,
         readonly_cache_mounts: Optional[list[str]] = None,
         extra_env: Optional[dict[str, str]] = None,
-    ) -> tuple[int, str, bool]:
+    ) -> tuple[int, str, bool, bool]:
         cmd = ["sh", "-c", f"cd '{workspace_path}' && {command}"]
         logger.info("[sandbox:bare] Running without isolation (bare subprocess).")
         return await _execute_subprocess_with_timeout(cmd, timeout_seconds, extra_env=extra_env)
@@ -383,7 +425,7 @@ async def _execute_subprocess_with_timeout(
     log_buffer_mode: str = "disk",
     max_log_size_mb: int = 500,
     log_temp_dir: str = "/tmp/.harness",
-) -> tuple[int, str, bool]:
+) -> tuple[int, str, bool, bool]:
     """
     Execute a command with asyncio subprocess, strict timeout, and PGID
     termination hooks to kill hanging builds (including all child processes).
@@ -403,7 +445,10 @@ async def _execute_subprocess_with_timeout(
         log_temp_dir: Directory for temp log files (disk mode only).
 
     Returns:
-        Tuple of (exit_code, combined_stdout_stderr, timed_out).
+        Tuple of (exit_code, combined_stdout_stderr, timed_out, log_truncated).
+        log_truncated is True when the streamer's byte cap was hit — the
+        returned output is missing data and downstream diagnostic parsing
+        may not reflect the true error.
     """
     timed_out = False
     exit_code = -1
@@ -485,47 +530,50 @@ async def _execute_subprocess_with_timeout(
                 pgid,
             )
             _kill_process_group(pgid, proc)
-
-            # Drain remaining output after kill
+            # Do NOT call proc.communicate() here — the reader tasks below
+            # are still draining stdout/stderr, and communicate() racing
+            # them on the same pipes can deadlock or duplicate output. Just
+            # wait briefly for the killed process to actually terminate,
+            # then let the reader tasks naturally hit EOF and exit.
             try:
-                remaining_stdout, remaining_stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=10.0
-                )
-                if remaining_stdout:
-                    await streamer.write_stdout_block(remaining_stdout)
-                if remaining_stderr:
-                    await streamer.write_stderr_block(remaining_stderr)
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
             except asyncio.TimeoutError:
-                logger.warning("[sandbox] Process did not terminate after kill signal.")
+                logger.warning("[sandbox] Process did not terminate within 5s of SIGKILL.")
 
             exit_code = -9  # SIGKILL equivalent
 
-        # Cancel any reader tasks still running
+        # Cancel any reader tasks still running. After the process exits
+        # they hit EOF and complete naturally; on timeout-kill they may
+        # already have exited or need an explicit cancel.
         for task in reader_tasks:
             if not task.done():
-                task.cancel()
                 try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+                    await asyncio.wait_for(task, timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
         for task in pending:
             if not task.done():
                 task.cancel()
 
     except FileNotFoundError:
         await streamer.close()
-        return 127, f"Command not found: {cmd[0]}", False
+        return 127, f"Command not found: {cmd[0]}", False, False
     except PermissionError:
         await streamer.close()
-        return 126, f"Permission denied: {cmd[0]}", False
+        return 126, f"Permission denied: {cmd[0]}", False, False
     except Exception as exc:
         logger.exception("[sandbox] Unexpected subprocess error.")
         await streamer.close()
-        return 1, f"Subprocess error: {exc}", False
+        return 1, f"Subprocess error: {exc}", False, False
 
     full_output = await streamer.read_all()
+    log_truncated = getattr(streamer, "is_truncated", lambda: False)()
     await streamer.close(keep_on_success=(exit_code == 0))
-    return exit_code, full_output, timed_out
+    return exit_code, full_output, timed_out, log_truncated
 
 
 # ---------------------------------------------------------------------------
@@ -626,9 +674,14 @@ class DiskLogStreamer:
         if self._stdout_file is None:
             return
         if self._total_bytes >= self.max_size_bytes:
+            if self._overflow_count == 0:
+                logger.error(
+                    "[logstream:disk] Build log exceeded %.0fMB cap. Truncating from this point "
+                    "onward — downstream diagnostic parsing may miss the real error if it occurs "
+                    "after this position. Raise sandbox.log_buffer_max_mb to capture more.",
+                    self.max_size_bytes / (1024 * 1024),
+                )
             self._overflow_count += 1
-            if self._overflow_count % 1000 == 1:
-                logger.warning("[logstream:disk] Log overflow — truncating. Total bytes: %d", self._total_bytes)
             return
         self._stdout_file.write(data)
         self._total_bytes += len(data)
@@ -637,12 +690,21 @@ class DiskLogStreamer:
         if self._stderr_file is None:
             return
         if self._total_bytes >= self.max_size_bytes:
+            if self._overflow_count == 0:
+                logger.error(
+                    "[logstream:disk] Build log exceeded %.0fMB cap. Truncating from this point "
+                    "onward — downstream diagnostic parsing may miss the real error if it occurs "
+                    "after this position. Raise sandbox.log_buffer_max_mb to capture more.",
+                    self.max_size_bytes / (1024 * 1024),
+                )
             self._overflow_count += 1
-            if self._overflow_count % 1000 == 1:
-                logger.warning("[logstream:disk] Log overflow — truncating. Total bytes: %d", self._total_bytes)
             return
         self._stderr_file.write(data)
         self._total_bytes += len(data)
+
+    def is_truncated(self) -> bool:
+        """True if any write was dropped because the cap was hit."""
+        return self._overflow_count > 0
 
     async def write_stdout_block(self, data: bytes) -> None:
         if self._stdout_file is None:
@@ -1163,7 +1225,7 @@ class SandboxExecutor:
             build_command,
         )
 
-        exit_code, raw_output, timed_out = await self.backend.run(
+        exit_code, raw_output, timed_out, log_truncated = await self.backend.run(
             command=build_command,
             workspace_path=self.workspace_path,
             timeout_seconds=self.timeout_seconds,
@@ -1179,9 +1241,16 @@ class SandboxExecutor:
         # Parse structured diagnostics
         diagnostics = extract_diagnostics(raw_output, build_command, self.workspace_path)
 
+        if log_truncated:
+            logger.error(
+                "[sandbox] Build log was truncated at the configured cap. The error "
+                "shown below may not be the root cause — extracted diagnostics: %d.",
+                len(diagnostics),
+            )
+
         logger.info(
-            "[sandbox] Build finished: backend=%s exit=%d elapsed=%.2fs timed_out=%s diagnostics=%d",
-            self.backend.name, exit_code, elapsed, timed_out, len(diagnostics),
+            "[sandbox] Build finished: backend=%s exit=%d elapsed=%.2fs timed_out=%s diagnostics=%d log_truncated=%s",
+            self.backend.name, exit_code, elapsed, timed_out, len(diagnostics), log_truncated,
         )
 
         return BuildResult(
@@ -1190,6 +1259,7 @@ class SandboxExecutor:
             diagnostics=diagnostics,
             elapsed_seconds=elapsed,
             timed_out=timed_out,
+            log_truncated=log_truncated,
         )
 
 

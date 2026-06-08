@@ -329,6 +329,73 @@ class TestSandboxBackend:
         backend = create_backend("bare")
         assert isinstance(backend, BareBackend)
 
+    @pytest.mark.asyncio
+    async def test_disk_log_streamer_surfaces_truncation(self):
+        # Regression: log overflow was silently dropped; downstream had no way
+        # to know diagnostics might be incomplete.
+        from harness.sandbox import DiskLogStreamer
+        streamer = DiskLogStreamer(max_size_mb=0.001)  # ~1KB cap
+        await streamer.open()
+        try:
+            # Write enough to definitely overflow
+            big_block = b"X" * 2048
+            await streamer.write_stdout(big_block)
+            await streamer.write_stderr(b"more")
+            assert streamer.is_truncated() is True
+
+            # Smaller writes that fit don't trigger the flag
+            small_streamer = DiskLogStreamer(max_size_mb=1)
+            await small_streamer.open()
+            await small_streamer.write_stdout(b"hi\n")
+            assert small_streamer.is_truncated() is False
+            await small_streamer.close()
+        finally:
+            await streamer.close()
+
+    @pytest.mark.asyncio
+    async def test_build_result_carries_log_truncated_flag(self):
+        from harness.sandbox import BuildResult
+        # Default is False (no truncation)
+        r = BuildResult(exit_code=0, raw_output="ok")
+        assert r.log_truncated is False
+        # Carries through when set
+        r2 = BuildResult(exit_code=1, raw_output="...", log_truncated=True)
+        assert r2.log_truncated is True
+
+    def test_docker_is_available_distinguishes_failure_modes(self, monkeypatch, caplog):
+        # Regression: docker info failure used to just return False with no
+        # signal whether the daemon was down or perms were wrong.
+        from harness.sandbox import DockerBackend
+        import subprocess as sp
+
+        backend = DockerBackend()
+
+        class FakeResult:
+            def __init__(self, returncode, stderr):
+                self.returncode = returncode
+                self.stderr = stderr
+                self.stdout = ""
+
+        # Pretend docker binary exists
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/docker")
+
+        # Case 1: permission denied
+        monkeypatch.setattr(sp, "run", lambda *a, **kw: FakeResult(
+            1, "permission denied while trying to connect to the Docker daemon socket"
+        ))
+        with caplog.at_level("ERROR"):
+            assert backend.is_available() is False
+        assert any("docker' group" in r.message for r in caplog.records)
+        caplog.clear()
+
+        # Case 2: daemon not running
+        monkeypatch.setattr(sp, "run", lambda *a, **kw: FakeResult(
+            1, "Cannot connect to the Docker daemon"
+        ))
+        with caplog.at_level("WARNING"):
+            assert backend.is_available() is False
+        assert any("daemon is not running" in r.message for r in caplog.records)
+
 
 class TestDiagnosticParsing:
 
