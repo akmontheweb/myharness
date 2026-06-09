@@ -44,6 +44,26 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 @dataclass
+class FixSuggestion:
+    """
+    A compiler-emitted machine-applicable fix for a diagnostic.
+
+    Populated by parsers that read structured diagnostic output (e.g. rustc's
+    --error-format=json carries children[].spans[].suggested_replacement;
+    gcc/clang's -fdiagnostics-format=json carries fixits[]). Consumed by
+    harness.autofix to apply the fix without spending an LLM call.
+
+    Spans are 1-indexed (matches the compiler's own coordinate system).
+    """
+    replacement: str             # exact text to substitute
+    span_start_line: int         # 1-indexed
+    span_start_col: int          # 1-indexed
+    span_end_line: int
+    span_end_col: int
+    applicability: str           # "machine-applicable" | "maybe-incorrect" | "unspecified"
+
+
+@dataclass
 class DiagnosticObject:
     """
     Structured compiler diagnostic, matches the DiagnosticObjectDict
@@ -56,9 +76,10 @@ class DiagnosticObject:
     error_code: str = ""
     message: str = ""
     semantic_context: str = ""
+    suggested_fix: Optional["FixSuggestion"] = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "file": self.file,
             "line": self.line,
             "column": self.column,
@@ -67,6 +88,16 @@ class DiagnosticObject:
             "message": self.message,
             "semantic_context": self.semantic_context,
         }
+        if self.suggested_fix is not None:
+            out["suggested_fix"] = {
+                "replacement": self.suggested_fix.replacement,
+                "span_start_line": self.suggested_fix.span_start_line,
+                "span_start_col": self.suggested_fix.span_start_col,
+                "span_end_line": self.suggested_fix.span_end_line,
+                "span_end_col": self.suggested_fix.span_end_col,
+                "applicability": self.suggested_fix.applicability,
+            }
+        return out
 
 
 @dataclass
@@ -256,12 +287,20 @@ class DockerBackend(SandboxBackend):
         cpu_limit: str = "1.0",
         pids_limit: int = 100,
         docker_path: str = "docker",
+        read_only_root: bool = True,
     ):
         self.image = image
         self.memory_limit = memory_limit
         self.cpu_limit = cpu_limit
         self.pids_limit = pids_limit
         self.docker_path = docker_path
+        # When True (default) the container's root FS is mounted read-only and
+        # only /tmp is writable. Setting this to False is required for builds
+        # that install packages into system locations (pip install -e .,
+        # npm install -g, cargo install) because pip's --user fallback writes
+        # to /root/.local which is *also* on the read-only root FS. The
+        # container is --rm so dropping read-only does not leak state.
+        self.read_only_root = read_only_root
 
     @property
     def name(self) -> str:
@@ -352,13 +391,20 @@ class DockerBackend(SandboxBackend):
         cmd = [
             self.docker_path, "run",
             "--rm",                              # Auto-cleanup container on exit
-            "--read-only",                       # Read-only root filesystem
             "--tmpfs", "/tmp:exec",              # Writable /tmp for build artifacts
             f"--memory={self.memory_limit}",     # Memory limit
             f"--cpus={self.cpu_limit}",          # CPU limit
             f"--pids-limit={self.pids_limit}",   # Prevent fork bombs
             "--stop-timeout", str(max(5, timeout_seconds // 10)),  # Graceful stop
         ]
+
+        if self.read_only_root:
+            cmd.append("--read-only")
+            # When the root FS is RO, pip / npm / cargo will try the per-user
+            # fallback (~/.local, ~/.cache, ~/.npm). Without a writable HOME
+            # those installs fail with "Read-only file system: '/root/...'"
+            # *after* downloading every wheel. Give them a tmpfs to land in.
+            cmd.extend(["--tmpfs", "/root:exec"])
 
         # Network isolation
         if allow_network:
@@ -1066,17 +1112,34 @@ def _parse_generic_diagnostics(raw_output: str, workspace_path: str) -> list[Dia
 
 
 def extract_diagnostics(raw_output: str, build_command: str, workspace_path: str) -> list[DiagnosticObject]:
-    """Extract structured diagnostics from compiler output using appropriate parser."""
-    compiler = _detect_compiler(build_command)
+    """Extract structured diagnostics from compiler output using appropriate parser.
 
+    Routes through the parser_registry plugin set first (covers Python/pytest,
+    Java/Maven/Gradle, TypeScript/tsc, Dart, plus rustc/gcc/go) so toolchains
+    beyond the four legacy hard-coded ones produce structured diagnostics
+    instead of an empty list. Falls back to the legacy JSON parsers when
+    the registry returns nothing.
+    """
+    try:
+        from harness.parser_registry import detect_and_parse
+        registry_diags = detect_and_parse(
+            raw_output,
+            build_command=build_command,
+            workspace_path=workspace_path,
+        )
+        if registry_diags:
+            return registry_diags
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[extract_diagnostics] parser_registry failed: %s", exc)
+
+    compiler = _detect_compiler(build_command)
     if compiler in ("rustc", "cargo"):
         return _parse_rust_json_diagnostics(raw_output)
     elif compiler in ("gcc", "g++", "clang", "clang++"):
         return _parse_gcc_json_diagnostics(raw_output)
     elif compiler == "go":
         return _parse_go_diagnostics(raw_output)
-    else:
-        return _parse_generic_diagnostics(raw_output, workspace_path)
+    return _parse_generic_diagnostics(raw_output, workspace_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1206,15 +1269,50 @@ class SandboxExecutor:
         backend: Optional[SandboxBackend] = None,
         command_validator: Optional[Any] = None,
         extra_env: Optional[dict[str, str]] = None,
+        sandbox_config: Optional[dict[str, Any]] = None,
     ):
         self.workspace_path = os.path.abspath(workspace_path)
         self.allow_network = allow_network
-        self.timeout_seconds = timeout_seconds
-        self.readonly_cache_mounts = readonly_cache_mounts or []
-        self.pgid_kill_on_timeout = pgid_kill_on_timeout
-        self.backend = backend or _auto_detect_backend()
         self.command_validator = command_validator  # Optional CommandValidator for security checks
         self.extra_env = extra_env or {}
+
+        cfg = sandbox_config or {}
+        # Per-call config overrides — sandbox_config keys win when both supplied.
+        self.timeout_seconds = cfg.get("timeout_seconds", timeout_seconds)
+        cfg_mounts = cfg.get("readonly_cache_mounts")
+        self.readonly_cache_mounts = (
+            list(cfg_mounts) if cfg_mounts is not None
+            else (readonly_cache_mounts or [])
+        )
+        self.pgid_kill_on_timeout = cfg.get(
+            "pgid_kill_on_timeout", pgid_kill_on_timeout,
+        )
+
+        if backend is not None:
+            self.backend = backend
+        else:
+            docker_kwargs: dict[str, Any] = {}
+            if "docker_image" in cfg:
+                docker_kwargs["image"] = cfg["docker_image"]
+            if "docker_memory_limit" in cfg:
+                docker_kwargs["memory_limit"] = cfg["docker_memory_limit"]
+            if "docker_cpu_limit" in cfg:
+                docker_kwargs["cpu_limit"] = cfg["docker_cpu_limit"]
+            if "docker_pids_limit" in cfg:
+                docker_kwargs["pids_limit"] = cfg["docker_pids_limit"]
+            if "read_only_root" in cfg:
+                docker_kwargs["read_only_root"] = bool(cfg["read_only_root"])
+            requested_backend = (cfg.get("backend", "auto") or "auto").lower()
+            if requested_backend in ("auto", ""):
+                # auto-detect: forward docker kwargs (auto-detect itself
+                # only applies them to DockerBackend; non-docker fallbacks
+                # get no kwargs).
+                self.backend = _auto_detect_backend(**docker_kwargs)
+            elif requested_backend == "docker":
+                self.backend = create_backend("docker", **docker_kwargs)
+            else:
+                # unshare / bare don't take image kwargs; pass none.
+                self.backend = create_backend(requested_backend)
 
     async def run(self, build_command: str) -> BuildResult:
         """

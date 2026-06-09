@@ -195,6 +195,7 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "node_throttle", "models", "model_routing", "persistence",
     "manifest_file", "redaction", "security", "skills", "deployment",
     "speculative", "impact", "lintgate", "logging", "languages",
+    "test_generation",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -231,6 +232,9 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     "logging": frozenset({
         "level", "log_dir", "json_stderr", "langsmith",
+    }),
+    "test_generation": frozenset({
+        "enabled", "max_iterations",
     }),
 }
 
@@ -328,12 +332,52 @@ def _generate_workspace_config(
         )
 
 
-def resolve_build_command(cli_build_cmd: Optional[str], config: dict[str, Any]) -> str:
+def _detect_default_build_command(workspace_path: str) -> Optional[str]:
+    """Pick a sensible build command by sniffing workspace markers.
+
+    Returns None when the workspace gives no hint — caller falls back to
+    the historical default. Probed in priority order so a polyglot repo
+    with a Makefile still uses it.
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return None
+
+    def has(name: str) -> bool:
+        return os.path.exists(os.path.join(workspace_path, name))
+
+    if has("Makefile") or has("makefile") or has("GNUmakefile"):
+        return "make build"
+    if has("pyproject.toml"):
+        return "python3 -m pip install -e . && python3 -m pytest -q"
+    if has("requirements.txt"):
+        return "python3 -m pip install -r requirements.txt && python3 -m pytest -q"
+    if has("package.json"):
+        return "npm install && npm test"
+    if has("Cargo.toml"):
+        return "cargo build && cargo test"
+    if has("go.mod"):
+        return "go build ./... && go test ./..."
+    # Last-chance heuristic: any .py file at top level → assume pytest
+    try:
+        for entry in os.listdir(workspace_path):
+            if entry.endswith(".py"):
+                return "python3 -m pytest -q"
+    except OSError:
+        pass
+    return None
+
+
+def resolve_build_command(
+    cli_build_cmd: Optional[str],
+    config: dict[str, Any],
+    workspace_path: Optional[str] = None,
+) -> str:
     """
     Resolve the build command using hierarchical discovery:
         1. CLI flag --build-cmd (if provided)
         2. .harness_config.json 'build_command' key
-        3. Default from cli.json: 'make build'
+        3. Workspace sniff (Makefile / pyproject.toml / package.json / etc.)
+        4. Default 'make build'
     """
     if cli_build_cmd:
         logger.info("[cli] Using build command from CLI flag: %s", cli_build_cmd)
@@ -342,6 +386,11 @@ def resolve_build_command(cli_build_cmd: Optional[str], config: dict[str, Any]) 
     if config_cmd:
         logger.info("[cli] Using build command from config: %s", config_cmd)
         return config_cmd
+    if workspace_path:
+        detected = _detect_default_build_command(workspace_path)
+        if detected:
+            logger.info("[cli] Detected build command from workspace markers: %s", detected)
+            return detected
     fallback = "make build"
     logger.info("[cli] No build command configured. Using default: %s", fallback)
     return fallback
@@ -1184,7 +1233,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         return 1
 
     config = discover_config(workspace_path)
-    build_command = resolve_build_command(args.build_cmd, config)
+    build_command = resolve_build_command(args.build_cmd, config, workspace_path)
 
     # Extract persistence settings
     persistence_cfg = config.get("persistence", {})
@@ -1306,6 +1355,8 @@ async def cmd_run(args: argparse.Namespace) -> int:
             skip_discovery=not getattr(args, "discover", False),
             lintgate_config=config.get("lintgate", {}),
             deployment_config=config.get("deployment", {}),
+            sandbox_config=config.get("sandbox", {}),
+            test_generation_config=config.get("test_generation", {}),
         )
     except Exception:
         logger.exception("Graph execution failed with unhandled exception.")
@@ -1372,7 +1423,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         await checkpointer.conn.close()
         return 1
 
-    build_command = resolve_build_command(args.build_cmd, config)
+    build_command = resolve_build_command(args.build_cmd, config, workspace_path)
     token_budget = config.get("token_budget", {})
     budget_usd = token_budget.get("hard_cap_usd", 2.00)
     allow_network = args.allow_network or config.get("allow_network", False)
@@ -1429,6 +1480,10 @@ async def cmd_resume(args: argparse.Namespace) -> int:
             session_id=args.session_id,
             checkpointer=checkpointer,
             thread_id=args.session_id,
+            lintgate_config=config.get("lintgate", {}),
+            deployment_config=config.get("deployment", {}),
+            sandbox_config=config.get("sandbox", {}),
+            test_generation_config=config.get("test_generation", {}),
         )
     except Exception:
         logger.exception("Resume execution failed.")
@@ -1539,7 +1594,7 @@ def _format_doctor_line(status: str, label: str, detail: str) -> str:
 
 
 def _doctor_check_git(workspace_path: str) -> tuple[str, str]:
-    """Workspace is a git repo (rev-parse --git-dir)."""
+    """Workspace is a git repo (rev-parse --git-dir) AND HEAD resolves."""
     import subprocess
     try:
         result = subprocess.run(
@@ -1555,6 +1610,22 @@ def _doctor_check_git(workspace_path: str) -> tuple[str, str]:
     if result.returncode != 0:
         return "fail", (
             f"{workspace_path} is not a git repo (run 'git init' to initialize)"
+        )
+    # Repo exists — also confirm HEAD resolves. An unborn HEAD breaks
+    # speculative branching (worktree add needs HEAD as the source ref).
+    try:
+        head_result = subprocess.run(
+            ["git", "-C", workspace_path, "rev-parse", "--verify", "--quiet", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        return "warn", "git repo detected, but HEAD verify timed out"
+    if head_result.returncode != 0:
+        return "warn", (
+            f"git repo at {workspace_path} has no commits yet (unborn HEAD); "
+            "make an initial commit before 'harness run' to enable speculative repair"
         )
     return "pass", f"git repo detected at {workspace_path}"
 

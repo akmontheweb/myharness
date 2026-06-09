@@ -1,6 +1,6 @@
 {
     "_comment": "AI Agent Harness per-project configuration. Global models are in ~/.harness/config.json.",
-    "build_command": "make build",
+    "build_command": "pip install -e '.[dev]' && python3 -m pytest -q",
     "allow_network": false,
     "sandbox": {
         "readonly_cache_mounts": [

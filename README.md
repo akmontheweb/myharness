@@ -15,6 +15,22 @@ Anthropic, DeepSeek, and local Ollama models are all first-class.
 
 ## Quick start
 
+The fastest way on a fresh machine — works on Linux, macOS, Windows
+(WSL2 or native) — is the interactive bootstrap script:
+
+```bash
+git clone <repo-url> myharness && cd myharness
+python3 scripts/setup.py        # or `make setup`
+```
+
+The script probes the platform, locates Python 3.11+, creates a venv,
+runs `pip install -e .`, prompts for an LLM provider + API key, writes
+`~/.harness/config.json`, runs `harness doctor`, and offers to print the
+install commands for optional scanners and formatters. Re-running is
+idempotent — existing venvs and config files are detected and reused.
+
+Manual path (each step in detail):
+
 ```bash
 # 1. Install
 pip install -e ".[dev]"
@@ -35,6 +51,16 @@ harness run -r /path/to/repo -p "Add JWT authentication to the login endpoint"
 On first run, `myharness` auto-generates `.harness_config.json` in the
 workspace from your global config plus shipped defaults. Edit it to customize
 per-project settings (model routing, build command, sandbox limits).
+
+For a full deployment walkthrough — prerequisites, sandbox setup, API keys,
+and platform-specific notes for Linux / macOS / Windows (WSL2 + native) —
+see [docs/installation.md](docs/installation.md).
+
+Once a `harness run` finishes a green build it has already produced your
+`Dockerfile`, `docker-compose.yml`, and (when needed) `Caddyfile`, then
+brought the dev env up with health checks. See
+[docs/app-deployment.md](docs/app-deployment.md) for the artefact contract,
+the preview gate, and how to bring the same setup up on a different host.
 
 ## Command reference
 
@@ -135,7 +161,7 @@ Logs are written to `~/.harness/logs/<session-id>.log` and stderr.
 | Linux (Ubuntu 22.04+) | ✓ supported | ✓ supported | ✓ opt-in via `HARNESS_ALLOW_UNSAFE_SANDBOX=true` | ✓ Python 3.11 / 3.12 / 3.13 |
 | macOS (Intel + Apple Silicon) | ✓ likely (Docker Desktop), untested | ✗ not available (`unshare` is Linux-only) | ✓ opt-in, untested | ✗ not in CI |
 | Windows + WSL2 | ✓ likely (Docker Desktop), untested | ? depends on WSL2 kernel config | ✗ path handling untested | ✗ not in CI |
-| Windows (native) | ✗ not supported | ✗ not supported | ✗ not supported | ✗ |
+| Windows (native) | ✓ best-effort (Docker Desktop, Linux containers) — see [docs/installation.md](docs/installation.md) | ✗ not available | ✗ not recommended | ✗ not in CI |
 
 Linux is the only platform covered by the CI matrix and the only one the
 project actively tests. macOS and WSL2 are best-effort — the Docker

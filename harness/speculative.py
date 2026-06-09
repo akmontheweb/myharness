@@ -162,6 +162,18 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
         logger.error("[speculative] All variant LLM calls failed.")
         return _fallback_result()
 
+    # Speculative needs HEAD to exist (worktree add uses HEAD as the source ref).
+    # On a freshly `git init`'d repo with zero commits, skip cleanly instead
+    # of letting `git worktree add HEAD` fail N times with a cryptic error.
+    if not _repo_has_resolvable_head(workspace_path):
+        logger.warning(
+            "[speculative] Skipping speculative branching: workspace %s has no commits yet "
+            "(unborn HEAD). Make an initial commit to enable speculative repair. "
+            "Falling back to sequential repair.",
+            workspace_path,
+        )
+        return _fallback_result()
+
     # --- Step 2: Create isolated worktrees and apply patches ---
     variant_results: list[VariantResult] = []
 
@@ -482,6 +494,24 @@ def _build_variant_cache_env(worktree_path: str) -> dict[str, str]:
         # Generic XDG fallback caught by anything else
         "XDG_CACHE_HOME": _sub("xdg"),
     }
+
+
+def _repo_has_resolvable_head(repo_path: str) -> bool:
+    """True iff the repo at repo_path has at least one commit (HEAD resolves).
+
+    Speculative branching depends on `git worktree add ... HEAD`, which fails
+    on an empty `git init`'d repo with `fatal: invalid reference: HEAD`.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_path, "rev-parse", "--verify", "--quiet", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
 
 
 def _create_worktree(repo_path: str, worktree_path: str) -> bool:

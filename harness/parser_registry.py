@@ -16,9 +16,9 @@ import json
 import logging
 import os
 import re
-from typing import Optional
+from typing import Any, Optional
 
-from harness.sandbox import BaseLanguageParser, DiagnosticObject
+from harness.sandbox import BaseLanguageParser, DiagnosticObject, FixSuggestion
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +116,42 @@ class RustParser(BaseLanguageParser):
 
     Extracts one JSON object per line; filters to compiler-message diagnostic
     entries containing spans with file/line/column/message/code information.
+
+    When a child-diagnostic carries a ``suggested_replacement`` span, the
+    suggestion is hoisted onto the primary DiagnosticObject as a
+    FixSuggestion so harness.autofix can apply machine-applicable fixes
+    without an LLM round-trip.
     """
+
+    @staticmethod
+    def _extract_suggestion(msg_data: dict[str, Any]) -> Optional[FixSuggestion]:
+        """Walk children[].spans[] for the first span carrying a replacement.
+
+        Rust may emit multiple child notes/hints; we take the first one
+        that has a concrete ``suggested_replacement`` and a ``suggestion_applicability``.
+        Maybe-incorrect and unspecified suggestions are still surfaced —
+        autofix is what filters by applicability.
+        """
+        for child in msg_data.get("children", []) or []:
+            if not isinstance(child, dict):
+                continue
+            for span in child.get("spans", []) or []:
+                if not isinstance(span, dict):
+                    continue
+                replacement = span.get("suggested_replacement")
+                if replacement is None:
+                    continue
+                return FixSuggestion(
+                    replacement=str(replacement),
+                    span_start_line=int(span.get("line_start", 0) or 0),
+                    span_start_col=int(span.get("column_start", 0) or 0),
+                    span_end_line=int(span.get("line_end", 0) or 0),
+                    span_end_col=int(span.get("column_end", 0) or 0),
+                    applicability=str(
+                        span.get("suggestion_applicability", "unspecified")
+                    ).lower().replace("_", "-"),
+                )
+        return None
 
     @staticmethod
     def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
@@ -143,6 +178,7 @@ class RustParser(BaseLanguageParser):
                 error_code=msg_data.get("code", ""),
                 message=msg_data.get("message", ""),
                 semantic_context=msg_data.get("rendered", ""),
+                suggested_fix=RustParser._extract_suggestion(msg_data),
             ))
         return diagnostics
 
@@ -153,7 +189,44 @@ class GccClangParser(BaseLanguageParser):
 
     Expects one JSON array per diagnostic line. Each array contains diagnostic
     items with location (caret) and message fields.
+
+    When a diagnostic carries a ``fixits[]`` entry, the first fixit is
+    hoisted onto the DiagnosticObject as a FixSuggestion so harness.autofix
+    can apply it without an LLM round-trip. GCC/clang only emit fixits when
+    they're confident, so applicability defaults to ``"machine-applicable"``.
     """
+
+    @staticmethod
+    def _extract_suggestion(item: dict[str, Any]) -> Optional[FixSuggestion]:
+        """Lift the first fixit on a GCC/clang diagnostic to a FixSuggestion.
+
+        GCC/clang fixit shape:
+            {"start": {"file": ..., "line": L, "column": C},
+             "next":  {"file": ..., "line": L2, "column": C2},
+             "string": "<replacement>"}
+        ``next`` is the exclusive end position of the span to replace.
+        """
+        fixits = item.get("fixits")
+        if not isinstance(fixits, list) or not fixits:
+            return None
+        for fix in fixits:
+            if not isinstance(fix, dict):
+                continue
+            start = fix.get("start") if isinstance(fix.get("start"), dict) else {}
+            nxt = fix.get("next") if isinstance(fix.get("next"), dict) else {}
+            if "string" not in fix:
+                continue
+            return FixSuggestion(
+                replacement=str(fix.get("string", "")),
+                span_start_line=int(start.get("line", 0) or 0),
+                span_start_col=int(start.get("column", 0) or 0),
+                span_end_line=int(nxt.get("line", 0) or 0),
+                span_end_col=int(nxt.get("column", 0) or 0),
+                # GCC/clang only emit fixits when they're confident — they
+                # are equivalent to rustc's "machine-applicable".
+                applicability="machine-applicable",
+            )
+        return None
 
     @staticmethod
     def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
@@ -178,6 +251,7 @@ class GccClangParser(BaseLanguageParser):
                             error_code=str(item.get("option", "")),
                             message=item.get("message", ""),
                             semantic_context="",
+                            suggested_fix=GccClangParser._extract_suggestion(item),
                         ))
         return diagnostics
 

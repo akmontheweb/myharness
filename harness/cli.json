@@ -59,5 +59,10 @@
     "lintgate": {
         "_comment": "Lintgate behaviour. format_modified_files=false (default) skips the auto-formatter on pre-existing files to avoid clobbering user style outside the patch region. Linters still run on all modified files.",
         "format_modified_files": false
+    },
+    "test_generation": {
+        "_comment": "Auto-generate stack-specific unit tests for modified source files after patching. Tests run deterministically in the sandbox before lintgate. Disable by setting enabled=false.",
+        "enabled": true,
+        "max_iterations": 2
     }
 }

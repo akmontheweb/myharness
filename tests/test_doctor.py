@@ -19,11 +19,33 @@ from harness.cli import (
 
 
 class TestDoctorGitCheck:
-    def test_passes_in_a_git_repo(self):
+    @staticmethod
+    def _init_repo_with_commit(tmpdir: str) -> None:
+        """git init + one empty commit so HEAD resolves. Uses inline identity
+        so the test doesn't depend on the runner's global git config."""
+        subprocess.run(["git", "init", "-q", tmpdir], check=True)
+        subprocess.run(
+            ["git", "-C", tmpdir,
+             "-c", "user.email=test@example.com", "-c", "user.name=Test",
+             "commit", "--allow-empty", "-q", "-m", "init"],
+            check=True,
+        )
+
+    def test_passes_in_a_git_repo_with_a_commit(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            subprocess.run(["git", "init", "-q", tmpdir], check=True)
+            self._init_repo_with_commit(tmpdir)
             status, _detail = _doctor_check_git(tmpdir)
             assert status == "pass"
+
+    def test_warns_on_unborn_head(self):
+        # Regression: a freshly `git init`'d repo with zero commits has an
+        # unborn HEAD, which silently breaks speculative repair. Doctor must
+        # warn instead of pretending all is well.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subprocess.run(["git", "init", "-q", tmpdir], check=True)
+            status, detail = _doctor_check_git(tmpdir)
+            assert status == "warn"
+            assert "no commits" in detail or "unborn" in detail.lower()
 
     def test_fails_outside_a_git_repo(self):
         with tempfile.TemporaryDirectory() as tmpdir:

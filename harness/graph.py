@@ -101,6 +101,14 @@ class AgentState(TypedDict, total=False):
     spec_architecture_path: str
     deployment_blueprint_path: str
     skip_discovery: bool
+    # Paths of test files the test_generation_node has written this session.
+    # Telemetry / status display only; the patcher continues to use
+    # `modified_files` as the source of truth for git staging.
+    generated_tests: list[str]
+    # Config carried in state so test_generation_node can read it without
+    # round-tripping through cli.py's config loader. Loaded from the
+    # "test_generation" section of cli.json / .harness_config.json.
+    test_generation_config: dict[str, Any]
 
 # ---------------------------------------------------------------------------
 # 2. Default State Factory
@@ -161,6 +169,57 @@ def create_initial_state(
     )
 
 
+# Files that conventionally live at workspace root and are exempt from the
+# "all source under <root>/" enforcement when a source root is detected.
+# patching_node / repair_node / test_generation_node compose the patcher
+# allowlist as [<source_root>/, tests/, test/, __tests__/, *_ROOT_ALLOWLIST_FILES].
+_ROOT_ALLOWLIST_FILES: frozenset[str] = frozenset({
+    "setup.py", "setup.cfg", "pyproject.toml",
+    "conftest.py", "manage.py", "__init__.py",
+    "wsgi.py", "asgi.py", "main.py",
+    "tox.ini", "pytest.ini", "MANIFEST.in", ".gitignore",
+})
+
+
+def _build_patcher_allowlist(workspace_path: str) -> Optional[list[str]]:
+    """Return the patcher allowed_paths list for ``workspace_path``.
+
+    Returns ``None`` when no source root could be detected (flat or
+    ambiguous workspaces) — preserves the pre-fix permissive behaviour
+    so projects without a clear convention keep working as before.
+
+    Otherwise returns a list combining:
+      - the source root itself as a directory prefix (e.g. ``"app/"``),
+      - the conventional test trees,
+      - the conventionally-root files in :data:`_ROOT_ALLOWLIST_FILES`,
+      - any ``requirements*.txt`` actually present at the workspace root.
+
+    Mirrors the language used in the system prompt's "Workspace Layout"
+    section, so the LLM sees the same rules as the patcher applies.
+    """
+    from harness.impact import _detect_source_root
+    root = _detect_source_root(workspace_path)
+    if not root:
+        return None
+
+    allowlist: list[str] = [
+        f"{root}/",
+        "tests/", "test/", "__tests__/",
+        *_ROOT_ALLOWLIST_FILES,
+    ]
+
+    # Pick up any requirements*.txt actually present so the LLM can amend
+    # them without the patcher rejecting the write.
+    try:
+        for entry in os.listdir(workspace_path):
+            if entry.startswith("requirements") and entry.endswith(".txt"):
+                allowlist.append(entry)
+    except OSError:
+        pass
+
+    return allowlist
+
+
 def _build_system_prompt(workspace_path: str, build_command: str) -> str:
     """
     Construct the static, immutable system prompt anchored at messages[0].
@@ -181,8 +240,9 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
     # actually use. A pure FastAPI project doesn't need the Angular skill
     # in its system prompt; trimming saves ~2-3 KB per call and reduces
     # noise in the prompt.
-    from harness.impact import _detect_workspace_stack
+    from harness.impact import _detect_workspace_stack, _detect_source_root
     workspace_tags = _detect_workspace_stack(workspace_path)
+    source_root = _detect_source_root(workspace_path)
 
     # Tier 1: Harness skills (harness/skills/*.md) — agent standards +
     # stack-specific skills filtered by `applies_to:` frontmatter.
@@ -205,6 +265,38 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
     if project_skills:
         project_skills = f"## Project Skills & Conventions\n{project_skills}\n"
 
+    # --- Technology-Specific Style Guides ---
+    # Two-tier like skills: shipped defaults under harness/style_guides/
+    # + per-project overrides under {workspace}/style_guides/. Both are
+    # filtered by `applies_to:` frontmatter against the detected stack
+    # so e.g. a pure Python project never sees React style content.
+    from harness.style_guides import load_style_guides
+    style_guides = load_style_guides(workspace_path, workspace_tags=workspace_tags)
+    if style_guides:
+        style_guides = f"## Coding Style Guides\n{style_guides}\n"
+
+    # --- Workspace Layout Constraint ---
+    # When the workspace has a clear source root (e.g. `app/`, `src/`, `lib/`),
+    # tell the LLM that new source files MUST land there. Paired with the
+    # `allowed_paths` enforcement in patching_node / repair_node — files
+    # outside the allowlist are rejected with a clear error so the LLM
+    # tries again with the constraint in mind.
+    layout_block = ""
+    if source_root:
+        layout_block = (
+            f"## Workspace Layout (mandatory)\n"
+            f"The workspace organizes its source under `{source_root}/`. "
+            f"**All new source files MUST be created under `{source_root}/`.** "
+            f"Do NOT place new modules at workspace root.\n\n"
+            f"The only files that may live at workspace root are: "
+            f"`setup.py`, `setup.cfg`, `pyproject.toml`, `conftest.py`, "
+            f"`manage.py`, `__init__.py`, `wsgi.py`, `asgi.py`, `main.py`, "
+            f"`requirements*.txt`, `tox.ini`, `pytest.ini`, `MANIFEST.in`, "
+            f"`.gitignore`. Test files live under `tests/`, `test/`, or "
+            f"`__tests__/` per the language convention. CREATE_FILE blocks "
+            f"that target other root paths will be rejected by the patcher.\n"
+        )
+
     return f"""You are an expert software engineer with deep knowledge of the codebase below.
 
 ## Repository Root
@@ -212,7 +304,7 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
 
 ## Directory Structure (snapshot at invocation)
 {tree}
-{harness_skills if harness_skills else ""}{project_skills if project_skills else ""}
+{layout_block}{harness_skills if harness_skills else ""}{project_skills if project_skills else ""}{style_guides if style_guides else ""}
 ## Build Command
 {build_command}
 
@@ -709,13 +801,17 @@ Generate your patches NOW. Only the blocks above. No other text."""
         token_tracker = state.get("token_tracker", {})
         token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
 
-        # Apply patches to disk
+        # Apply patches to disk. Constrain new source files to the detected
+        # source root (e.g. `app/`, `src/`) when one exists, so the LLM
+        # can't accidentally place new modules at workspace root.
         workspace = state.get("workspace_path", os.getcwd())
         existing_modified = list(state.get("modified_files", []))
+        allowed_paths = _build_patcher_allowlist(workspace)
         patch_results, modified_files = await process_llm_patch_output(
             response.content,
             workspace,
             existing_modified,
+            allowed_paths=allowed_paths,
         )
 
         # Append the LLM response to messages
@@ -770,6 +866,181 @@ Generate your patches NOW. Only the blocks above. No other text."""
         }
 
 
+def _toolchain_image_for(build_command: str) -> Optional[str]:
+    """Pick a sandbox image that ships with the toolchain implied by the
+    given build command. Returns None when we have no opinion (so caller
+    keeps whatever is configured)."""
+    cmd = build_command.lower()
+    if "python3" in cmd or "pip " in cmd or "pytest" in cmd or "poetry" in cmd:
+        return "python:3.12-slim"
+    if "npm " in cmd or "yarn " in cmd or "pnpm " in cmd or "node " in cmd:
+        return "node:20-slim"
+    if "cargo " in cmd:
+        return "rust:1.79-slim"
+    if cmd.strip().startswith("go ") or " go build" in cmd or " go test" in cmd:
+        return "golang:1.22"
+    return None
+
+
+def _build_command_needs_network(build_command: str) -> bool:
+    """True when the build command performs a package install that needs
+    to reach a registry (pip/npm/yarn/pnpm/cargo/go)."""
+    cmd = build_command.lower()
+    return any(token in cmd for token in (
+        "pip install", "pip3 install", "npm install", "yarn install",
+        "pnpm install", "cargo build", "cargo test", "go mod",
+        "go get", "poetry install",
+    ))
+
+
+# Patterns that mean the build container is missing a required runtime
+# (interpreter, test framework, package manager) — NOT a code bug. When
+# one of these fires we route to HITL immediately instead of burning the
+# whole 3-iteration repair budget on a problem the LLM cannot fix from
+# inside the sandbox.
+_ENV_MISCONFIG_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Python: "/usr/local/bin/python3: No module named pytest"
+    # Dotted names (e.g. 'api.database') are excluded — those signal a
+    # local-import bug in the user's code, which the repair loop can fix.
+    re.compile(r"(?m)^/[^:\s]+/python3?: No module named (?P<sym>[^.\s]+)\s*$"),
+    # Python: "ModuleNotFoundError: No module named 'pytest'"
+    # Same dotted-name exclusion as above.
+    re.compile(r"ModuleNotFoundError: No module named ['\"](?P<sym>[^'\".]+)['\"]"),
+    # Shell-style "<cmd>: command not found" (covers npm, cargo, go, etc.)
+    re.compile(r"(?m)^(?:/bin/sh: \d+: )?(?P<sym>[\w.\-+]+): command not found\s*$"),
+    re.compile(r"(?m)^(?:bash: )?(?P<sym>[\w.\-+]+): command not found\s*$"),
+    # Dash / busybox shells say "X: not found" (no "command"). Often
+    # prefixed with "/bin/sh: 1: " in the alpine/slim images.
+    re.compile(r"(?m)^/bin/sh: \d+: (?P<sym>\S+): not found\s*$"),
+    # Docker entrypoint missing (exec format / OCI runtime error)
+    re.compile(r"executable file not found in \$?PATH: (?P<sym>\S+)"),
+    re.compile(r'exec: "(?P<sym>[^"]+)": executable file not found'),
+    # Node: "node: not found" or "npm: not found"
+    re.compile(r"(?m)^(?P<sym>node|npm|yarn|pnpm): not found\s*$"),
+)
+
+
+def _is_env_misconfig(raw_output: str) -> Optional[str]:
+    """Return the missing module / binary name when the build output looks
+    like an environment misconfiguration, otherwise None.
+
+    Catches the "container doesn't ship the toolchain the build_command
+    invokes" class of failure (e.g. ``pytest`` not in ``python:3.12-slim``,
+    ``npm: command not found`` in a base image). Used by compiler_node to
+    short-circuit the repair loop — no amount of LLM patching will fix a
+    missing system binary.
+    """
+    if not raw_output:
+        return None
+    # Scan only the tail — these errors land at the end of the log when
+    # the missing-binary line is the last thing the container prints.
+    tail = raw_output[-4000:]
+    for pattern in _ENV_MISCONFIG_PATTERNS:
+        match = pattern.search(tail)
+        if match:
+            return match.group("sym").strip("'\"")
+    return None
+
+
+def _env_misconfig_hint(symbol: str, build_command: str) -> str:
+    """Build the actionable HITL message for an env-misconfig hit."""
+    # Pick the most likely installer for the missing symbol.
+    py_symbols = {"pytest", "ruff", "mypy", "black", "poetry", "tox", "nox"}
+    if symbol.lower() in py_symbols or "python" in symbol.lower():
+        installer = f"pip install {symbol}"
+    elif symbol in {"npm", "node", "yarn", "pnpm"}:
+        installer = (
+            f"use a node-bearing docker_image (e.g. node:20-slim) — "
+            f"'{symbol}' is not installable from inside the container"
+        )
+    elif symbol in {"cargo", "rustc"}:
+        installer = (
+            f"use a rust-bearing docker_image (e.g. rust:1.79-slim) — "
+            f"'{symbol}' is not installable from inside the container"
+        )
+    elif symbol in {"go"}:
+        installer = (
+            f"use a go-bearing docker_image (e.g. golang:1.22) — "
+            f"'{symbol}' is not installable from inside the container"
+        )
+    else:
+        installer = f"install {symbol} before running the build"
+    return (
+        f"Build container is missing '{symbol}'. The repair LLM cannot fix this — "
+        f"it's a sandbox/dependency setup issue. "
+        f"Fix: update build_command to prepend the install step "
+        f"(e.g. '{installer} && {build_command.strip()}') "
+        f"or switch sandbox.docker_image to one that ships '{symbol}'."
+    )
+
+
+# Bare base images that ship none of the language toolchains. When the
+# resolved build_command implies a specific toolchain, swap one of these
+# out for a matching toolchain image so the very first build doesn't
+# exit 127 with "python3: not found" / "node: not found".
+_BARE_IMAGE_DEFAULTS = frozenset({
+    "ubuntu:22.04", "ubuntu:latest", "debian:12", "debian:latest",
+})
+
+
+def _apply_toolchain_adaptation(
+    build_command: str,
+    sandbox_config: Optional[dict[str, Any]],
+    allow_network: bool,
+) -> tuple[dict[str, Any], bool, bool, bool, bool]:
+    """Idempotently adapt sandbox_config/allow_network to match the build
+    command's implied toolchain.
+
+    Returns
+    -------
+    (new_sandbox_config, allow_network, image_was_adapted,
+     network_was_adapted, ro_root_was_adapted).
+
+    Calling twice with the same inputs returns *_was_adapted=False on
+    the second call — each conditional only fires when its precondition is
+    still true (image is a known-bare default, allow_network still False,
+    read_only_root unset / still True).
+    """
+    cfg = dict(sandbox_config or {})
+    image_was_adapted = False
+    network_was_adapted = False
+    ro_root_was_adapted = False
+
+    cur_image = cfg.get("docker_image", "ubuntu:22.04")
+    toolchain_image = _toolchain_image_for(build_command)
+    if (
+        toolchain_image
+        and cur_image in _BARE_IMAGE_DEFAULTS
+        and cur_image != toolchain_image
+    ):
+        cfg["docker_image"] = toolchain_image
+        image_was_adapted = True
+
+    new_allow_network = allow_network
+    needs_install = _build_command_needs_network(build_command)
+    if not allow_network and needs_install:
+        new_allow_network = True
+        network_was_adapted = True
+
+    # Install commands (pip install -e ., npm install -g, cargo install)
+    # write to system locations the --read-only root FS makes unreachable.
+    # Pip's `--user` fallback also fails because /root sits on the RO root.
+    # Auto-flip read_only_root → False so the install can land, unless the
+    # user has explicitly set it to True (respect explicit opt-in to hard
+    # isolation even if it breaks the build — they'll need a baked image).
+    if needs_install and "read_only_root" not in cfg:
+        cfg["read_only_root"] = False
+        ro_root_was_adapted = True
+
+    return (
+        cfg,
+        new_allow_network,
+        image_was_adapted,
+        network_was_adapted,
+        ro_root_was_adapted,
+    )
+
+
 async def compiler_node(state: AgentState) -> dict[str, Any]:
     """
     Node 3: The Verifier.
@@ -792,6 +1063,61 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     workspace = state.get("workspace_path", os.getcwd())
     build_cmd = state.get("build_command", "make build")
     allow_network = state.get("allow_network", False)
+    sandbox_cfg = dict(state.get("sandbox_config", {}) or {})
+
+    # Late-bound adaptive detection: if the resolved build_cmd is the
+    # historical default and the workspace genuinely has no Makefile,
+    # re-sniff now that codegen has likely populated the tree. This
+    # rescues greenfield runs where workspace detection at cmd_run start
+    # had nothing to go on but the spec file.
+    adapted_build_cmd: Optional[str] = None
+    if build_cmd.strip() == "make build" and not any(
+        os.path.exists(os.path.join(workspace, name))
+        for name in ("Makefile", "makefile", "GNUmakefile")
+    ):
+        from harness.cli import _detect_default_build_command
+        late = _detect_default_build_command(workspace)
+        if late and late != "make build":
+            logger.info(
+                "[compiler_node] Workspace has no Makefile; adapting build command "
+                "from default 'make build' to detected: %s", late,
+            )
+            adapted_build_cmd = late
+            build_cmd = late
+
+    # Late-bound sandbox image / network adaptation. With the pre-flight
+    # adaptation in run_graph this is now a safety net — it only fires when
+    # the build_command was just adapted above (greenfield rescue), or on
+    # resume from a pre-fix checkpoint whose sandbox_config wasn't yet
+    # adapted. The helper is idempotent: if the image already matches the
+    # toolchain, image_was_adapted is False and no extra log line appears.
+    prev_image = sandbox_cfg.get("docker_image", "ubuntu:22.04")
+    (
+        sandbox_cfg,
+        allow_network,
+        image_was_adapted,
+        network_was_adapted,
+        ro_root_was_adapted,
+    ) = _apply_toolchain_adaptation(build_cmd, sandbox_cfg, allow_network)
+    if image_was_adapted:
+        logger.info(
+            "[compiler_node] Adapting sandbox docker_image from %r to %r "
+            "to match build toolchain implied by command: %s",
+            prev_image, sandbox_cfg["docker_image"], build_cmd,
+        )
+    if network_was_adapted:
+        logger.info(
+            "[compiler_node] Adapting allow_network from False to True "
+            "because build command requires package install: %s",
+            build_cmd,
+        )
+    if ro_root_was_adapted:
+        logger.info(
+            "[compiler_node] Adapting sandbox.read_only_root from True to False "
+            "because build command installs packages (pip/npm/cargo/go) into "
+            "system locations the read-only root FS would block: %s",
+            build_cmd,
+        )
 
     # Delegate to the sandbox module for actual execution.
     from harness.sandbox import SandboxExecutor
@@ -799,6 +1125,7 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     executor = SandboxExecutor(
         workspace_path=workspace,
         allow_network=allow_network,
+        sandbox_config=sandbox_cfg,
     )
     result = await executor.run(build_cmd)
 
@@ -812,16 +1139,56 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         len(compiler_errors),
     )
 
+    # Detect "sandbox is missing a required runtime" failures (e.g. pytest
+    # not in python:3.12-slim). No LLM repair can fix this — synthesize a
+    # focused diagnostic and let the router short-circuit to HITL.
+    env_misconfig_symbol: Optional[str] = None
+    if exit_code != 0 and not compiler_errors:
+        env_misconfig_symbol = _is_env_misconfig(raw_log)
+        if env_misconfig_symbol:
+            logger.warning(
+                "[compiler_node] Environment misconfig detected: missing '%s'. "
+                "Short-circuiting repair loop — this needs a config fix, not an LLM patch.",
+                env_misconfig_symbol,
+            )
+            compiler_errors = [{
+                "file": "<sandbox>",
+                "line": 0,
+                "column": 0,
+                "severity": "error",
+                "error_code": "ENV_MISCONFIG",
+                "message": _env_misconfig_hint(env_misconfig_symbol, build_cmd),
+                "semantic_context": (
+                    f"Missing runtime: {env_misconfig_symbol}. "
+                    f"Build command: {build_cmd}. "
+                    f"docker_image: {sandbox_cfg.get('docker_image', 'ubuntu:22.04')}."
+                ),
+            }]
+
     # Build the return dictionary
+    node_state: dict[str, Any] = {
+        "current_node": "compiler",
+        "last_build_output": raw_log,
+    }
+    if env_misconfig_symbol:
+        node_state["env_misconfig"] = True
+        node_state["env_misconfig_symbol"] = env_misconfig_symbol
+
     return_dict: dict[str, Any] = {
         "exit_code": exit_code,
         "compiler_errors": compiler_errors,
         "loop_counter": loop_counter,
-        "node_state": {
-            "current_node": "compiler",
-            "last_build_output": raw_log,
-        },
+        "node_state": node_state,
     }
+
+    # Persist the adapted command so repair_node / patching_node prompts
+    # and subsequent compiler invocations see the updated value.
+    if adapted_build_cmd is not None:
+        return_dict["build_command"] = adapted_build_cmd
+    if image_was_adapted:
+        return_dict["sandbox_config"] = sandbox_cfg
+    if network_was_adapted:
+        return_dict["allow_network"] = allow_network
 
     # Trigger memory cleanse on successful build
     if exit_code == 0:
@@ -854,6 +1221,55 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     loop_counter["repair"] = loop_counter.get("repair", 0) + 1
     loop_counter["total_repairs"] = loop_counter.get("total_repairs", 0) + 1
 
+    # Build a concise repair prompt from structured diagnostics
+    errors: list[DiagnosticObjectDict] = state.get("compiler_errors", [])
+
+    # --- Deterministic autofix pass (R1+R2+R3) ---
+    # Try to resolve diagnostics with compiler-suggested fixes,
+    # missing-import insertion, or known-safe security autofixes BEFORE
+    # spending an LLM call. Anything still unhandled falls through to
+    # the LLM exactly as before.
+    from harness.autofix import apply_autofixes, autofix_system_message
+    workspace_path = state.get("workspace_path", os.getcwd())
+    unhandled, applied_fixes = await apply_autofixes(list(errors), workspace_path)
+    autofix_modified_files = list(state.get("modified_files", []))
+    autofix_messages = list(state.get("messages", []))
+    if applied_fixes:
+        for r in applied_fixes:
+            if r.file not in autofix_modified_files:
+                autofix_modified_files.append(r.file)
+        sys_msg = autofix_system_message(applied_fixes)
+        if sys_msg:
+            autofix_messages.append({"role": "system", "content": sys_msg})
+        logger.info(
+            "[repair_node] autofix resolved %d of %d diagnostic(s) without LLM.",
+            len(applied_fixes), len(errors),
+        )
+
+    # Short-circuit: every diagnostic was resolved deterministically →
+    # skip the LLM call entirely. Hand the routing back to compiler_node
+    # for re-verification with the modified files in state.
+    if applied_fixes and not unhandled:
+        return {
+            "messages": autofix_messages,
+            "modified_files": autofix_modified_files,
+            "loop_counter": loop_counter,
+            "node_state": {
+                "current_node": "repair",
+                "repair_context": "all diagnostics resolved by autofix",
+                "repair_success": len(applied_fixes),
+                "repair_fail": 0,
+                "autofix": {
+                    "applied": len(applied_fixes),
+                    "fix_kinds": sorted({r.fix_kind for r in applied_fixes}),
+                },
+            },
+        }
+
+    # The LLM only sees the unhandled tail.
+    errors = unhandled
+    error_summary = _format_diagnostics_for_repair(errors)
+
     gateway = get_gateway()
     if gateway is None:
         logger.error("[repair_node] No gateway configured. Cannot call LLM.")
@@ -862,9 +1278,27 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             "loop_counter": loop_counter,
         }
 
-    # Build a concise repair prompt from structured diagnostics
-    errors: list[DiagnosticObjectDict] = state.get("compiler_errors", [])
-    error_summary = _format_diagnostics_for_repair(errors)
+    # Detect security-finding repair: every diagnostic carries an
+    # error_code prefixed by the scanner name (BANDIT:, SEMGREP:, TRIVY:,
+    # GITLEAKS:, GITLEAKS-FALLBACK:) because _findings_to_diagnostics in
+    # harness/security.py builds them that way. When ALL diagnostics
+    # carry such a prefix we know the repair is being driven by the
+    # security gate, not a compile failure, and we swap in framing that
+    # tells the LLM to fix the vulnerability root cause rather than
+    # patch over a build error.
+    _SECURITY_PREFIXES = ("BANDIT:", "SEMGREP:", "TRIVY:", "GITLEAKS:", "GITLEAKS-FALLBACK:")
+    is_security_repair = bool(errors) and all(
+        str(e.get("error_code", "")).upper().startswith(_SECURITY_PREFIXES) for e in errors
+    )
+
+    # Detect repair driven by harness-generated test failures. The
+    # test_generation_node tags each diagnostic with an error_code starting
+    # with "TEST_FAILURE" so we can swap in framing that tells the LLM these
+    # are unit-test failures (not compile errors) and that fixing the
+    # implementation is preferred over weakening the test assertion.
+    is_test_failure_repair = bool(errors) and all(
+        str(e.get("error_code", "")).upper().startswith("TEST_FAILURE") for e in errors
+    )
 
     # Include lintgate errors from the previous compiler run
     lintgate_state = state.get("node_state", {}).get("lintgate", {})
@@ -883,7 +1317,9 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         from harness.gateway import NodeRole
         from harness.patcher import process_llm_patch_output
 
-        messages = list(state.get("messages", []))
+        # Use the autofix-augmented messages list so the LLM sees the
+        # "we already fixed X" system message and doesn't re-fix.
+        messages = list(autofix_messages)
         budget = state.get("budget_remaining_usd", 2.00)
 
         # --- Cross-Model Speculative Execution ---
@@ -912,8 +1348,40 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         else:
             escalation_model = None
 
-        # Inject the error summary as a user message for context
-        if use_escalation:
+        # Inject the error summary as a user message for context. The
+        # framing sentence differs across three cases:
+        #   1. Security gate flagged vulnerabilities → tell the LLM these
+        #      are post-build security findings (build passes!) so it
+        #      doesn't try to "fix a broken build" by removing tests or
+        #      catching exceptions broadly. Emphasise minimum diff and
+        #      not weakening other controls.
+        #   2. Build failed and the cheap model has already missed twice
+        #      → escalate to the reasoning model with reasoning framing.
+        #   3. Build failed, first or second attempt → standard framing.
+        if is_security_repair:
+            repair_prompt = (
+                "The deterministic security gate flagged the following vulnerabilities "
+                "in code that has already passed the build. Generate precise SEARCH/REPLACE "
+                "patches that REMOVE the root cause without regressing existing tests. "
+                "Prefer the minimum diff: do not refactor unrelated code, do not weaken "
+                "the security control elsewhere, and if a finding requires a dependency "
+                "upgrade, write the new version into the manifest rather than vendoring "
+                f"a patched copy.\n\n{error_summary}"
+            )
+        elif is_test_failure_repair:
+            repair_prompt = (
+                "The harness-generated unit tests just failed when executed in the "
+                "sandbox. These are NOT compile errors — the code builds. For each "
+                "failure, decide whether the implementation is wrong or the test "
+                "expectation is wrong. Default to fixing the implementation when the "
+                "behaviour was specified in the requirements; only adjust the test "
+                "when the expectation itself contradicts the spec. Do NOT add mocks "
+                "to make a test pass — if a test cannot be exercised without external "
+                "dependencies, rewrite it to use the test runner's built-in fakes "
+                "(monkeypatch / tmp_path / httptest / @TempDir) instead."
+                f"\n\n{error_summary}"
+            )
+        elif use_escalation:
             repair_prompt = (
                 f"The build has failed {total_repairs} time(s) despite previous fix attempts. "
                 f"The simpler model could not resolve these errors. You are a senior reasoning model. "
@@ -971,13 +1439,19 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         token_tracker = state.get("token_tracker", {})
         token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
 
-        # Apply the fix patches to disk
+        # Apply the fix patches to disk. Seed the modified-files list with
+        # files the autofix pass already touched so they survive the LLM
+        # round-trip into state. Same source-root allowlist as patching_node
+        # so the repair LLM can't widen the surface area by writing new
+        # modules outside the configured layout.
         workspace = state.get("workspace_path", os.getcwd())
-        existing_modified = list(state.get("modified_files", []))
+        existing_modified = list(autofix_modified_files)
+        allowed_paths = _build_patcher_allowlist(workspace)
         patch_results, modified_files = await process_llm_patch_output(
             response.content,
             workspace,
             existing_modified,
+            allowed_paths=allowed_paths,
         )
 
         # Append the LLM response to messages
@@ -1058,7 +1532,10 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
     budget_remaining = state.get("budget_remaining_usd", 0.0)
 
     trigger_reason = "unknown"
-    if budget_remaining <= 0.0:
+    if state.get("node_state", {}).get("env_misconfig"):
+        sym = state.get("node_state", {}).get("env_misconfig_symbol", "")
+        trigger_reason = f"env_misconfig:{sym}" if sym else "env_misconfig"
+    elif budget_remaining <= 0.0:
         trigger_reason = "budget_exhausted"
     elif loop_counter.get("total_repairs", 0) >= 3:
         trigger_reason = "repair_loop_limit"
@@ -1145,6 +1622,16 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     if exit_code == 0:
         logger.info("[router] Build succeeded (exit 0). Routing to security scan.")
         return _transition("security_scan_node")
+
+    # Environment misconfig (missing pytest, npm, etc.) — LLM repair cannot
+    # fix this. Skip the budget burn and surface the actionable error.
+    if state.get("node_state", {}).get("env_misconfig"):
+        symbol = state.get("node_state", {}).get("env_misconfig_symbol", "")
+        logger.warning(
+            "[router] Sandbox env misconfig (missing '%s'). Skipping repair loop, routing to HITL.",
+            symbol,
+        )
+        return _transition("human_intervention_node")
 
     if total_repairs >= max_iterations:
         logger.warning(
@@ -1773,7 +2260,7 @@ def route_after_gatekeeper(state: AgentState) -> str:
 # 7. Route After HITL: Always Back to Compiler
 # ---------------------------------------------------------------------------
 
-def route_after_security_scan(state: AgentState) -> Literal["patching_node", "human_intervention_node", "deployment_discovery_node", "__end__"]:
+def route_after_security_scan(state: AgentState) -> Literal["repair_node", "human_intervention_node", "deployment_discovery_node", "__end__"]:
     """
     Conditional edge router executed after security_scan_node completes.
 
@@ -1783,13 +2270,17 @@ def route_after_security_scan(state: AgentState) -> Literal["patching_node", "hu
                                                   pipeline; user picks up the
                                                   artifact from build/app/outputs/)
         No security findings                    → deployment_discovery_node
-        Security findings AND sec_attempts < 2  → patching_node (fix the vulnerability)
+        Security findings AND sec_attempts < 2  → repair_node (fix the vulnerability)
         Security findings AND sec_attempts >= 2 → human_intervention_node
         budget_remaining <= 0                   → human_intervention_node
 
-    Routes to patching_node (not repair_node) so the LLM can generate patches
-    to remove hardcoded secrets and fix SAST findings. After patching, the
-    compiler verifies the fix, and security_scan_node re-verifies clean.
+    Routes to repair_node so security findings travel through the same
+    formatter (``_format_diagnostics_for_repair``) and escalation logic
+    (cheap → reasoning model on round 3) that compile errors use. The
+    repair_node prompt detects the scanner-prefixed error_codes
+    populated by security_scan_node and switches its framing sentence
+    to make the security context explicit to the LLM. After repair, the
+    compiler verifies the fix and security_scan_node re-verifies clean.
     """
     budget_remaining: float = state.get("budget_remaining_usd", 0.0)
     loop_counter: dict[str, int] = state.get("loop_counter", {})
@@ -1825,9 +2316,11 @@ def route_after_security_scan(state: AgentState) -> Literal["patching_node", "hu
         )
         return "human_intervention_node"
 
-    logger.info("[router] %d security finding(s) detected. Routing to patching_node for fix (attempt %d/%d).",
-                 len(compiler_errors), sec_attempts, max_sec_attempts)
-    return "patching_node"
+    logger.info(
+        "[router] %d security finding(s) detected. Routing to repair_node for fix (attempt %d/%d).",
+        len(compiler_errors), sec_attempts, max_sec_attempts,
+    )
+    return "repair_node"
 
 
 # ---------------------------------------------------------------------------
@@ -1920,6 +2413,14 @@ def build_graph() -> Any:
     from harness.speculative import speculate_node as _speculate_node
     graph.add_node("speculative_node", _speculate_node)
 
+    # Register test-generation node — runs after speculative branching, before
+    # lintgate, so the deterministic lint pass formats generated tests too.
+    from harness.test_generation import (
+        test_generation_node as _test_generation_node,
+        route_after_test_generation as _route_after_test_generation,
+    )
+    graph.add_node("test_generation_node", _test_generation_node)
+
     # Register exhaustive discovery nodes
     graph.add_node("requirements_discovery_node", requirements_discovery_node)
     graph.add_node("architecture_discovery_node", architecture_discovery_node)
@@ -2007,7 +2508,20 @@ def build_graph() -> Any:
     # patching → speculative → lintgate → compiler
     # =====================================================================
     graph.add_edge("patching_node", "speculative_node")
-    graph.add_edge("speculative_node", "lintgate_node")
+    # speculative_node → test_generation_node → conditional edge:
+    #   - tests passed (or skipped) → lintgate_node
+    #   - tests failed → repair_node (TEST_FAILURE diagnostics surfaced)
+    #   - env_misconfig (no LLM gateway / max iterations) → human_intervention_node
+    graph.add_edge("speculative_node", "test_generation_node")
+    graph.add_conditional_edges(
+        "test_generation_node",
+        _route_after_test_generation,
+        {
+            "lintgate_node": "lintgate_node",
+            "repair_node": "repair_node",
+            "human_intervention_node": "human_intervention_node",
+        },
+    )
     graph.add_edge("lintgate_node", "compiler_node")
 
     # =====================================================================
@@ -2040,13 +2554,15 @@ def build_graph() -> Any:
     # Register deployment discovery node
     graph.add_node("deployment_discovery_node", deployment_discovery_node)
 
-    # Route security_scan clean → deployment discovery (or END for Flutter)
+    # Route security_scan clean → deployment discovery (or END for Flutter);
+    # findings → repair_node so security fixes go through the same
+    # _format_diagnostics_for_repair + escalation path as compile errors.
     graph.add_conditional_edges(
         "security_scan_node",
         route_after_security_scan,
         {
             "deployment_discovery_node": "deployment_discovery_node",
-            "patching_node": "patching_node",
+            "repair_node": "repair_node",
             "human_intervention_node": "human_intervention_node",
             "__end__": END,
         },
@@ -2125,6 +2641,8 @@ async def run_graph(
     skip_discovery: bool = False,
     lintgate_config: Optional[dict[str, Any]] = None,
     deployment_config: Optional[dict[str, Any]] = None,
+    sandbox_config: Optional[dict[str, Any]] = None,
+    test_generation_config: Optional[dict[str, Any]] = None,
 ) -> AgentState:
     """
     Execute the full agent graph from start to finish.
@@ -2171,6 +2689,41 @@ async def run_graph(
         initial_state["lintgate_config"] = lintgate_config  # type: ignore[typeddict-unknown-key]
     if deployment_config is not None:
         initial_state["deployment_config"] = deployment_config  # type: ignore[typeddict-unknown-key]
+    if test_generation_config is not None:
+        initial_state["test_generation_config"] = test_generation_config  # type: ignore[typeddict-unknown-key]
+
+    # Pre-flight toolchain adaptation: pick the right docker image (and
+    # network bit) NOW so the very first compile lands on, e.g.,
+    # python:3.12-slim instead of wasting a build cycle on ubuntu:22.04
+    # exiting 127 with "python3: not found". compiler_node's own call to
+    # the same helper is idempotent — it becomes a no-op once we've
+    # pre-adapted here.
+    (
+        adapted_cfg,
+        adapted_allow_network,
+        image_was_adapted,
+        network_was_adapted,
+        ro_root_was_adapted,
+    ) = _apply_toolchain_adaptation(build_command, sandbox_config, allow_network)
+    if image_was_adapted:
+        logger.info(
+            "[run_graph] Pre-flight sandbox docker_image set to %r "
+            "to match build toolchain implied by: %s",
+            adapted_cfg["docker_image"], build_command,
+        )
+    if network_was_adapted:
+        logger.info(
+            "[run_graph] Pre-flight allow_network=True because build command "
+            "requires registry access: %s", build_command,
+        )
+        initial_state["allow_network"] = adapted_allow_network
+    if ro_root_was_adapted:
+        logger.info(
+            "[run_graph] Pre-flight sandbox.read_only_root=False because build "
+            "command installs packages into system locations: %s", build_command,
+        )
+    if sandbox_config is not None or image_was_adapted or ro_root_was_adapted:
+        initial_state["sandbox_config"] = adapted_cfg  # type: ignore[typeddict-unknown-key]
 
     # Compile graph with checkpointer
     compiled_graph = compile_graph(checkpointer=checkpointer)

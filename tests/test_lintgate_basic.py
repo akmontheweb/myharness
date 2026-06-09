@@ -6,6 +6,8 @@ import os
 
 import pytest
 
+from pathlib import Path
+
 from harness.lintgate import (
     FormatterSpec,
     LintGateResult,
@@ -13,7 +15,106 @@ from harness.lintgate import (
     register_formatter,
     get_formatter_for_file,
     _resolve_path,
+    _inject_missing_typing_imports,
 )
+
+
+class TestInjectMissingTypingImports:
+    """Regression: LLM-generated code routinely uses Optional/List/etc. without
+    importing them, then ruff trips F821. Lintgate auto-injects to avoid
+    expensive LLM repair loops."""
+
+    def _write(self, tmpdir: str, src: str) -> str:
+        path = os.path.join(tmpdir, "mod.py")
+        Path(path).write_text(src)
+        return path
+
+    def test_adds_missing_optional(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = (
+                "import asyncio\n"
+                "\n"
+                "class W:\n"
+                "    def __init__(self):\n"
+                "        self._task: Optional[asyncio.Task] = None\n"
+            )
+            path = self._write(tmpdir, src)
+            assert _inject_missing_typing_imports(path) == 1
+            new_src = Path(path).read_text()
+            assert "from typing import Optional" in new_src
+            assert new_src.startswith("from typing import Optional\nimport asyncio")
+
+    def test_extends_existing_typing_import(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = (
+                "from typing import List\n"
+                "\n"
+                "def f(xs: List[int]) -> Dict[str, int]:\n"
+                "    return {}\n"
+            )
+            path = self._write(tmpdir, src)
+            assert _inject_missing_typing_imports(path) == 1
+            new_src = Path(path).read_text()
+            # Single merged line, names sorted
+            assert new_src.count("from typing import") == 1
+            assert "Dict" in new_src.splitlines()[0]
+            assert "List" in new_src.splitlines()[0]
+
+    def test_noop_when_already_imported(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = (
+                "from typing import Optional\n"
+                "\n"
+                "x: Optional[int] = None\n"
+            )
+            path = self._write(tmpdir, src)
+            before = Path(path).read_text()
+            assert _inject_missing_typing_imports(path) == 0
+            assert Path(path).read_text() == before
+
+    def test_noop_when_no_typing_names_used(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = "x = 1\nprint(x)\n"
+            path = self._write(tmpdir, src)
+            before = Path(path).read_text()
+            assert _inject_missing_typing_imports(path) == 0
+            assert Path(path).read_text() == before
+
+    def test_inserts_after_future_imports(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = (
+                "from __future__ import annotations\n"
+                "\n"
+                "x: Optional[int] = None\n"
+            )
+            path = self._write(tmpdir, src)
+            assert _inject_missing_typing_imports(path) == 1
+            new_lines = Path(path).read_text().splitlines()
+            # __future__ stays first
+            assert new_lines[0].startswith("from __future__ import")
+            # typing import lands after
+            assert any(
+                line.startswith("from typing import Optional") for line in new_lines[1:]
+            )
+
+    def test_skips_syntax_error_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = "def broken(:\n    pass\n"
+            path = self._write(tmpdir, src)
+            before = Path(path).read_text()
+            assert _inject_missing_typing_imports(path) == 0
+            assert Path(path).read_text() == before
+
+    def test_recognized_in_subscript_context(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = (
+                "def f() -> Iterator[int]:\n"
+                "    yield 1\n"
+                "    yield 2\n"
+            )
+            path = self._write(tmpdir, src)
+            assert _inject_missing_typing_imports(path) == 1
+            assert "Iterator" in Path(path).read_text()
 
 
 class TestFormatterSpec:

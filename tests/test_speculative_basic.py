@@ -1,5 +1,6 @@
 """Tests for harness/speculative.py — variant building basics."""
 
+import subprocess
 import tempfile
 
 import pytest
@@ -8,8 +9,34 @@ from harness.speculative import (
     VariantResult,
     SpeculativeResult,
     _build_variant_cache_env,
+    _repo_has_resolvable_head,
     _select_winner,
 )
+
+
+class TestRepoHasResolvableHead:
+    """Guard for the speculative branching pre-check that avoids the cryptic
+    `fatal: invalid reference: HEAD` error on freshly-init'd repos."""
+
+    def test_false_on_empty_init(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subprocess.run(["git", "init", "-q", tmpdir], check=True)
+            assert _repo_has_resolvable_head(tmpdir) is False
+
+    def test_true_after_initial_commit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subprocess.run(["git", "init", "-q", tmpdir], check=True)
+            subprocess.run(
+                ["git", "-C", tmpdir,
+                 "-c", "user.email=test@example.com", "-c", "user.name=Test",
+                 "commit", "--allow-empty", "-q", "-m", "init"],
+                check=True,
+            )
+            assert _repo_has_resolvable_head(tmpdir) is True
+
+    def test_false_outside_a_repo(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assert _repo_has_resolvable_head(tmpdir) is False
 
 
 class TestVariantResult:

@@ -92,21 +92,21 @@ _BLOCK_PATTERNS = {
         r'<<<REPLACE_BLOCK>>>\s*\n'
         r'file:\s*(.+?)\s*\n'
         r'search:\s*\n(.*?)\n'
-        r'replace:\s*\n(.*?)\n'
+        r'replace:\s*\n(.*?)'
         r'<<<END_REPLACE_BLOCK>>>',
         re.DOTALL,
     ),
     OperationType.CREATE_FILE: re.compile(
         r'<<<CREATE_FILE>>>\s*\n'
         r'file:\s*(.+?)\s*\n'
-        r'content:\s*\n(.*?)\n'
+        r'content:\s*\n(.*?)'
         r'<<<END_CREATE_FILE>>>',
         re.DOTALL,
     ),
     OperationType.DELETE_BLOCK: re.compile(
         r'<<<DELETE_BLOCK>>>\s*\n'
         r'file:\s*(.+?)\s*\n'
-        r'search:\s*\n(.*?)\n'
+        r'search:\s*\n(.*?)'
         r'<<<END_DELETE_BLOCK>>>',
         re.DOTALL,
     ),
@@ -115,7 +115,7 @@ _BLOCK_PATTERNS = {
         r'file:\s*(.+?)\s*\n'
         r'anchor:\s*(.+?)\s*\n'
         r'placement:\s*(before|after)\s*\n'
-        r'content:\s*\n(.*?)\n'
+        r'content:\s*\n(.*?)'
         r'<<<END_INSERT_AT_BLOCK>>>',
         re.DOTALL,
     ),
@@ -453,11 +453,17 @@ class TextPatcher(BasePatcher):
         if _err is not None:
             return _err
         if not os.path.isfile(full_path):
+            if not search.strip():
+                logger.info(
+                    "[patcher:text] %s missing and search is empty — "
+                    "treating REPLACE_BLOCK as CREATE_FILE.", filepath,
+                )
+                return await self.create_file(filepath, replace)
             return PatchResult(
                 success=False,
                 file=filepath,
                 operation=OperationType.REPLACE_BLOCK,
-                error=f"File not found: {full_path}",
+                error=f"File not found: {filepath}. Use CREATE_FILE for new files.",
             )
 
         try:
@@ -774,6 +780,24 @@ class TreeSitterPatcher(BasePatcher):
         full_path, _err = self._resolve_safe(filepath, OperationType.REPLACE_BLOCK)
         if _err is not None:
             return _err
+        if not os.path.isfile(full_path):
+            # Common LLM mistake: emit REPLACE_BLOCK with an empty search
+            # against a file that doesn't exist yet, when CREATE_FILE was
+            # intended. Degrade quietly so the repair round still lands
+            # the file rather than failing with a raw ENOENT.
+            if not search.strip():
+                logger.info(
+                    "[patcher:ast] %s missing and search is empty — "
+                    "treating REPLACE_BLOCK as CREATE_FILE.", filepath,
+                )
+                text_patcher = TextPatcher(self.workspace_root)
+                return await text_patcher.create_file(filepath, replace)
+            return PatchResult(
+                success=False,
+                file=filepath,
+                operation=OperationType.REPLACE_BLOCK,
+                error=f"File not found: {filepath}. Use CREATE_FILE for new files.",
+            )
         lang = get_language_for_file(filepath)
         if lang is None:
             text_patcher = TextPatcher(self.workspace_root)
@@ -841,6 +865,13 @@ class TreeSitterPatcher(BasePatcher):
         full_path, _err = self._resolve_safe(filepath, OperationType.DELETE_BLOCK)
         if _err is not None:
             return _err
+        if not os.path.isfile(full_path):
+            return PatchResult(
+                success=False,
+                file=filepath,
+                operation=OperationType.DELETE_BLOCK,
+                error=f"File not found: {filepath}. Cannot delete from a file that does not exist.",
+            )
         lang = get_language_for_file(filepath)
         if lang is None:
             text_patcher = TextPatcher(self.workspace_root)
@@ -900,6 +931,13 @@ class TreeSitterPatcher(BasePatcher):
         full_path, _err = self._resolve_safe(filepath, OperationType.INSERT_AT_BLOCK)
         if _err is not None:
             return _err
+        if not os.path.isfile(full_path):
+            return PatchResult(
+                success=False,
+                file=filepath,
+                operation=OperationType.INSERT_AT_BLOCK,
+                error=f"File not found: {filepath}. Use CREATE_FILE for new files.",
+            )
         lang = get_language_for_file(filepath)
         if lang is None:
             text_patcher = TextPatcher(self.workspace_root)

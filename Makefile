@@ -1,7 +1,15 @@
 # Auto-generated Makefile by harness
 # Detected project type: Python
 
-.PHONY: build clean test hooks-install release
+.PHONY: build clean test hooks-install release setup
+
+# One-shot bootstrap for a fresh machine. Walks the operator through
+# 11 phases: platform / Python / git / sandbox probes → venv → pip
+# install → LLM config wizard → harness doctor → optional tools →
+# summary. See docs/installation.md §0 for the scripted-install
+# overview, or scripts/setup.py --help for CLI flags.
+setup:
+	@python3 scripts/setup.py $(SETUP_ARGS)
 
 build:
 	python -m compileall . 2>/dev/null || python3 -m compileall . 2>/dev/null || echo 'Python compile check skipped'

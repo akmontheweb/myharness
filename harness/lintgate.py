@@ -29,6 +29,115 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+# Common PEP 484 names that LLM-generated code routinely uses without
+# remembering to import. Kept narrow to names that are essentially never
+# bound as local identifiers, so a name-only check (no full scope analysis)
+# is safe.
+_TYPING_AUTO_IMPORT_NAMES = frozenset({
+    "Optional", "List", "Dict", "Tuple", "Set", "Union", "Any",
+    "Callable", "Type", "Iterator", "Iterable", "Generator",
+    "Mapping", "Sequence", "FrozenSet", "DefaultDict", "Awaitable",
+    "Coroutine", "AsyncIterator", "AsyncIterable", "AsyncGenerator",
+    "TypeVar", "Literal", "Final",
+})
+
+
+def _inject_missing_typing_imports(filepath: str) -> int:
+    """Pre-lint sweep: add `from typing import X` for typing names that
+    appear in the file but aren't imported. Returns count of names injected.
+
+    Skips files with syntax errors (ruff will report those upstream).
+    Idempotent — running twice is a no-op.
+    """
+    import ast
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            src = f.read()
+    except (OSError, UnicodeDecodeError):
+        return 0
+    if not src.strip():
+        return 0
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return 0
+
+    imported: set[str] = set()
+    first_typing_import: Optional[ast.ImportFrom] = None
+    all_typing_aliases: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in (
+            "typing", "typing_extensions",
+        ):
+            for alias in node.names:
+                imported.add(alias.asname or alias.name)
+            if node.module == "typing":
+                if first_typing_import is None:
+                    first_typing_import = node
+                all_typing_aliases.extend(
+                    alias.name + (f" as {alias.asname}" if alias.asname else "")
+                    for alias in node.names
+                )
+
+    referenced: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in _TYPING_AUTO_IMPORT_NAMES:
+            referenced.add(node.id)
+
+    needed = referenced - imported
+    if not needed:
+        return 0
+
+    lines = src.splitlines(keepends=True)
+    if first_typing_import is not None:
+        start = first_typing_import.lineno - 1
+        end = getattr(first_typing_import, "end_lineno", first_typing_import.lineno)
+        merged_names = sorted(set(all_typing_aliases) | needed)
+        lines[start:end] = [f"from typing import {', '.join(merged_names)}\n"]
+    else:
+        insert_at = _typing_import_insertion_point(tree, lines)
+        lines.insert(insert_at, f"from typing import {', '.join(sorted(needed))}\n")
+
+    new_src = "".join(lines)
+    if new_src == src:
+        return 0
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(new_src)
+    except OSError:
+        return 0
+    return len(needed)
+
+
+def _typing_import_insertion_point(tree: Any, lines: list[str]) -> int:
+    """Return 0-based line index for inserting a new `from typing import`
+    line. Goes AFTER shebang, encoding cookie, module docstring, and
+    `from __future__` imports so future-annotations stays at file head.
+    """
+    import ast as _ast
+    insert_at = 0
+    if lines and lines[0].startswith("#!"):
+        insert_at = 1
+    if (
+        insert_at < len(lines)
+        and lines[insert_at].lstrip().startswith("#")
+        and "coding" in lines[insert_at]
+    ):
+        insert_at += 1
+    if (
+        tree.body
+        and isinstance(tree.body[0], _ast.Expr)
+        and isinstance(tree.body[0].value, _ast.Constant)
+        and isinstance(tree.body[0].value.value, str)
+    ):
+        insert_at = max(insert_at, getattr(tree.body[0], "end_lineno", tree.body[0].lineno))
+    for node in tree.body:
+        if isinstance(node, _ast.ImportFrom) and node.module == "__future__":
+            insert_at = max(insert_at, getattr(node, "end_lineno", node.lineno))
+    return insert_at
+
+
 def _classify_files_by_git_status(
     files: list[str], workspace_path: str
 ) -> tuple[set[str], set[str]]:
@@ -376,6 +485,23 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
 
     for ext, files in grouped.items():
         spec = _DEFAULT_FORMATTERS[ext]
+
+        # --- Python typing-import auto-injection (pre-format) ---
+        # LLM-generated code frequently uses Optional/List/Dict/etc. without
+        # importing them, then trips ruff F821. Fix it deterministically
+        # before format/lint runs so a stylistic miss doesn't trigger an
+        # expensive LLM repair loop.
+        if ext == ".py":
+            for filepath in files:
+                full_path = _resolve_path(filepath, workspace_path)
+                if not full_path or not os.path.isfile(full_path):
+                    continue
+                injected = _inject_missing_typing_imports(full_path)
+                if injected:
+                    logger.info(
+                        "[lintgate_node] Injected %d missing typing import(s) into %s",
+                        injected, filepath,
+                    )
 
         # --- Run Formatter ---
         if is_tool_available(spec.command):

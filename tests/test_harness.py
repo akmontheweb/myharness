@@ -102,6 +102,53 @@ content
         blocks = parse_patch_blocks("just some text, no blocks here")
         assert blocks == []
 
+    def test_empty_content_create_file_does_not_eat_next_block(self):
+        # Regression: an empty-content CREATE_FILE used to extend its non-greedy
+        # capture past its own END marker and swallow the next block whole.
+        from harness.patcher import parse_patch_blocks, OperationType
+        output = """<<<CREATE_FILE>>>
+file: pkg/__init__.py
+content:
+<<<END_CREATE_FILE>>>
+
+<<<CREATE_FILE>>>
+file: pkg/models.py
+content:
+from enum import Enum
+<<<END_CREATE_FILE>>>"""
+        blocks = parse_patch_blocks(output)
+        assert len(blocks) == 2
+        assert blocks[0].operation == OperationType.CREATE_FILE
+        assert blocks[0].file == "pkg/__init__.py"
+        assert blocks[0].content == ""
+        assert blocks[1].operation == OperationType.CREATE_FILE
+        assert blocks[1].file == "pkg/models.py"
+        assert blocks[1].content == "from enum import Enum"
+        assert "<<<" not in blocks[0].content
+        assert "<<<" not in blocks[1].content
+
+    def test_empty_replace_block_capture(self):
+        # Regression: empty replacement (delete-by-replace) must not consume the END marker.
+        from harness.patcher import parse_patch_blocks, OperationType
+        output = """<<<REPLACE_BLOCK>>>
+file: a.py
+search:
+print("x")
+replace:
+<<<END_REPLACE_BLOCK>>>
+
+<<<CREATE_FILE>>>
+file: b.py
+content:
+ok
+<<<END_CREATE_FILE>>>"""
+        blocks = parse_patch_blocks(output)
+        assert len(blocks) == 2
+        assert blocks[0].operation == OperationType.REPLACE_BLOCK
+        assert blocks[0].replace == ""
+        assert blocks[1].file == "b.py"
+        assert blocks[1].content == "ok"
+
 
 class TestTextPatcher:
 
@@ -540,6 +587,48 @@ x = 1
             assert results[0].success
             assert "anywhere/file.py" in modified
 
+    @pytest.mark.asyncio
+    async def test_replace_block_missing_yaml_file_clear_error(self):
+        # Regression: REPLACE_BLOCK on a missing .yml file used to surface
+        # a raw "[Errno 2] No such file or directory" OSError because the
+        # AST path tried to read the file directly. Now it returns a clear
+        # "File not found" message.
+        from harness.patcher import HybridPatcher, PatchBlock, OperationType
+        with tempfile.TemporaryDirectory() as tmpdir:
+            patcher = HybridPatcher(tmpdir)
+            block = PatchBlock(
+                operation=OperationType.REPLACE_BLOCK,
+                file=".github/workflows/test.yml",
+                search="name: test",
+                replace="name: ci",
+            )
+            result = await patcher.apply_patch(block)
+            assert not result.success
+            assert "not found" in result.error.lower()
+            assert "errno" not in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_replace_block_missing_file_with_empty_search_degrades_to_create(self):
+        # Regression: when the LLM emits REPLACE_BLOCK with an empty search
+        # against a non-existent file, that's a classic "should have used
+        # CREATE_FILE" mistake. The patcher now silently degrades instead
+        # of failing the repair round.
+        from harness.patcher import HybridPatcher, PatchBlock, OperationType
+        with tempfile.TemporaryDirectory() as tmpdir:
+            patcher = HybridPatcher(tmpdir)
+            block = PatchBlock(
+                operation=OperationType.REPLACE_BLOCK,
+                file=".github/workflows/test.yml",
+                search="",
+                replace="name: ci\non: [push]\n",
+            )
+            result = await patcher.apply_patch(block)
+            assert result.success
+            new_path = os.path.join(tmpdir, ".github/workflows/test.yml")
+            assert os.path.isfile(new_path)
+            with open(new_path) as f:
+                assert "name: ci" in f.read()
+
 
 # ===========================================================================
 # SANDBOX TESTS
@@ -643,6 +732,54 @@ class TestSandboxBackend:
         assert "ghp_leaked-test" not in output
         assert "KEEP=value" in output  # unrelated vars survive
 
+    def test_docker_cmd_default_is_read_only_with_writable_home(self):
+        # Default DockerBackend keeps --read-only for defense in depth, but
+        # always supplies a tmpfs at /root so pip's --user fallback can land
+        # without [Errno 30].
+        from harness.sandbox import DockerBackend
+        backend = DockerBackend(image="python:3.12-slim")
+        cmd = backend._build_docker_command(
+            "pytest -q", "/work", allow_network=False,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        assert "--read-only" in cmd
+        # /tmp tmpfs is always present; /root tmpfs comes with --read-only
+        tmpfs_targets = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
+        assert "/tmp:exec" in tmpfs_targets
+        assert "/root:exec" in tmpfs_targets
+
+    def test_docker_cmd_drops_read_only_when_root_writable_requested(self):
+        # When the toolchain adapter detects an install command it flips
+        # read_only_root=False. The docker command must then drop both
+        # --read-only AND the /root tmpfs (root FS is writable now).
+        from harness.sandbox import DockerBackend
+        backend = DockerBackend(image="python:3.12-slim", read_only_root=False)
+        cmd = backend._build_docker_command(
+            "pip install -e .", "/work", allow_network=True,
+            cache_mounts=[], extra_env={}, timeout_seconds=60,
+        )
+        assert "--read-only" not in cmd
+        tmpfs_targets = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
+        # /tmp tmpfs always stays; /root tmpfs only gets added with read-only
+        assert "/tmp:exec" in tmpfs_targets
+        assert "/root:exec" not in tmpfs_targets
+
+    def test_sandbox_executor_threads_read_only_root_into_docker(self):
+        # SandboxExecutor must forward sandbox_config["read_only_root"] to
+        # DockerBackend so the auto-adapter's flip actually reaches the
+        # container.
+        from harness.sandbox import SandboxExecutor, DockerBackend
+        executor = SandboxExecutor(
+            workspace_path="/work",
+            sandbox_config={
+                "backend": "docker",
+                "docker_image": "python:3.12-slim",
+                "read_only_root": False,
+            },
+        )
+        assert isinstance(executor.backend, DockerBackend)
+        assert executor.backend.read_only_root is False
+
     def test_docker_is_available_distinguishes_failure_modes(self, monkeypatch, caplog):
         # Regression: docker info failure used to just return False with no
         # signal whether the daemon was down or perms were wrong.
@@ -716,6 +853,25 @@ class TestDiagnosticParsing:
         assert _is_critical_line("fatal error: something went wrong")
         assert _is_critical_line("SIGSEGV: segmentation violation")
         assert not _is_critical_line("info: compiling module A")
+
+    def test_extract_diagnostics_routes_python_through_registry(self):
+        # Regression: the legacy extract_diagnostics() only handled
+        # rust/gcc/go/generic and returned 0 diagnostics for any Python
+        # error (pytest, ModuleNotFoundError, etc.), even though
+        # parser_registry.PythonParser is registered and capable of
+        # parsing it. Build failures were going to the repair LLM blind.
+        from harness.sandbox import extract_diagnostics
+        py_traceback = (
+            "Traceback (most recent call last):\n"
+            '  File "/workspace/app/main.py", line 42, in <module>\n'
+            "    from missing import thing\n"
+            "ModuleNotFoundError: No module named 'missing'\n"
+        )
+        diags = extract_diagnostics(py_traceback, "python3 -m pytest -q", "/workspace")
+        assert len(diags) == 1, "Python traceback should produce 1 structured diagnostic"
+        assert diags[0].error_code == "ModuleNotFoundError"
+        assert "missing" in diags[0].message
+        assert diags[0].file.endswith("main.py")
 
     def test_diagnostic_object_to_dict(self):
         from harness.sandbox import DiagnosticObject
@@ -1835,6 +1991,96 @@ class TestAgentState:
             assert result == {}
 
 
+class TestToolchainAdaptation:
+    """Regression: sandbox image adaptation used to fire inside compiler_node
+    only — wasting the first build on the wrong base image — and was also
+    not idempotent across rounds."""
+
+    def test_adapts_ubuntu_to_python_for_pytest(self):
+        from harness.graph import _apply_toolchain_adaptation
+        cfg, allow_net, img_adapted, net_adapted, ro_adapted = (
+            _apply_toolchain_adaptation(
+                "python3 -m pytest -q", {"docker_image": "ubuntu:22.04"}, False,
+            )
+        )
+        assert img_adapted
+        assert cfg["docker_image"] == "python:3.12-slim"
+        # pytest doesn't install packages — no network or read_only_root flip
+        assert not net_adapted
+        assert allow_net is False
+        assert not ro_adapted
+        assert "read_only_root" not in cfg
+
+    def test_adapts_network_for_pip_install(self):
+        from harness.graph import _apply_toolchain_adaptation
+        cfg, allow_net, img_adapted, net_adapted, ro_adapted = (
+            _apply_toolchain_adaptation(
+                "pip install -r requirements.txt && pytest",
+                {"docker_image": "ubuntu:22.04"}, False,
+            )
+        )
+        assert img_adapted
+        assert net_adapted
+        assert allow_net is True
+        # Install command must also flip read_only_root → False, otherwise
+        # pip install fails with [Errno 30] on /root/.local.
+        assert ro_adapted
+        assert cfg["read_only_root"] is False
+
+    def test_idempotent_when_already_adapted(self):
+        # Calling twice should not re-flag image_was_adapted — otherwise
+        # compiler_node would log a noisy adaptation message every round
+        # even though the config is already correct.
+        from harness.graph import _apply_toolchain_adaptation
+        cfg1, _, img1, _, _ = _apply_toolchain_adaptation(
+            "pytest -q", {"docker_image": "ubuntu:22.04"}, False,
+        )
+        assert img1
+        cfg2, _, img2, _, _ = _apply_toolchain_adaptation(
+            "pytest -q", cfg1, False,
+        )
+        assert not img2, "second call should be a no-op"
+        assert cfg2["docker_image"] == cfg1["docker_image"]
+
+    def test_preserves_user_chosen_non_bare_image(self):
+        # If the user picked a specific image (not one of the bare defaults),
+        # don't override it — they know better than the heuristic.
+        from harness.graph import _apply_toolchain_adaptation
+        cfg, _, img_adapted, _, _ = _apply_toolchain_adaptation(
+            "pytest -q", {"docker_image": "myorg/custom-python:1.0"}, False,
+        )
+        assert not img_adapted
+        assert cfg["docker_image"] == "myorg/custom-python:1.0"
+
+    def test_respects_explicit_read_only_root_setting(self):
+        # If the user explicitly pinned read_only_root, don't override it
+        # even when the build command installs packages — they're opting
+        # into hard isolation knowing the build will need a baked image.
+        from harness.graph import _apply_toolchain_adaptation
+        cfg, _, _, _, ro_adapted = _apply_toolchain_adaptation(
+            "pip install -r requirements.txt && pytest",
+            {"docker_image": "python:3.12-slim", "read_only_root": True},
+            True,
+        )
+        assert not ro_adapted
+        assert cfg["read_only_root"] is True
+
+    def test_ro_root_adaptation_is_idempotent(self):
+        # Once read_only_root has been flipped to False, calling again is
+        # a no-op — the key exists in cfg so the auto-flip doesn't refire.
+        from harness.graph import _apply_toolchain_adaptation
+        cfg1, _, _, _, ro1 = _apply_toolchain_adaptation(
+            "pip install -e . && pytest",
+            {"docker_image": "python:3.12-slim"}, False,
+        )
+        assert ro1
+        cfg2, _, _, _, ro2 = _apply_toolchain_adaptation(
+            "pip install -e . && pytest", cfg1, True,
+        )
+        assert not ro2, "second call should not re-flag ro_root adaptation"
+        assert cfg2["read_only_root"] is False
+
+
 class TestDiscoveryNodes:
     """Regression: discovery nodes used to hardcode budget=2.00 and write_spec
     used to swallow OSError silently."""
@@ -2102,13 +2348,18 @@ class TestSecurityScanRouting:
             assert route_after_security_scan(state) == "deployment_discovery_node"
 
     def test_route_after_security_scan_findings(self):
+        # Security findings route to repair_node (not patching_node) so
+        # the LLM gets the structured _format_diagnostics_for_repair
+        # block and the security-aware framing sentence. The earlier
+        # routing to patching_node sent only an unstructured system
+        # message and missed the canonical diagnostic shape.
         from harness.graph import route_after_security_scan
         with tempfile.TemporaryDirectory() as tmpdir:
             state = _make_state(tmpdir)
             state["budget_remaining_usd"] = 1.0
             state["compiler_errors"] = [{"file": "test.py", "message": "secret found"}]
             state["loop_counter"] = {"security": 0}
-            assert route_after_security_scan(state) == "patching_node"
+            assert route_after_security_scan(state) == "repair_node"
 
     def test_route_after_security_scan_max_attempts(self):
         from harness.graph import route_after_security_scan
@@ -2749,6 +3000,236 @@ class TestCLI:
         from harness.cli import resolve_build_command
         result = resolve_build_command(None, {})
         assert result == "make build"
+
+    def test_detect_build_command_makefile_wins(self):
+        from harness.cli import _detect_default_build_command
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "Makefile").write_text("build:\n\techo ok\n")
+            Path(tmpdir, "pyproject.toml").write_text("[project]\nname='x'\n")
+            assert _detect_default_build_command(tmpdir) == "make build"
+
+    def test_detect_build_command_python_requirements(self):
+        from harness.cli import _detect_default_build_command
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "requirements.txt").write_text("pytest\n")
+            cmd = _detect_default_build_command(tmpdir)
+            assert cmd is not None
+            assert "pip install -r requirements.txt" in cmd
+            assert "pytest" in cmd
+
+    def test_detect_build_command_python_pyproject(self):
+        from harness.cli import _detect_default_build_command
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "pyproject.toml").write_text("[project]\nname='x'\n")
+            cmd = _detect_default_build_command(tmpdir)
+            assert cmd is not None
+            assert "pip install -e" in cmd
+            assert "pytest" in cmd
+
+    def test_detect_build_command_node(self):
+        from harness.cli import _detect_default_build_command
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "package.json").write_text('{"name":"x"}')
+            assert _detect_default_build_command(tmpdir) == "npm install && npm test"
+
+    def test_detect_build_command_loose_python_files(self):
+        from harness.cli import _detect_default_build_command
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "main.py").write_text("print('hi')\n")
+            assert _detect_default_build_command(tmpdir) == "python3 -m pytest -q"
+
+    def test_detect_build_command_no_hints_returns_none(self):
+        from harness.cli import _detect_default_build_command
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "README.md").write_text("hi\n")
+            assert _detect_default_build_command(tmpdir) is None
+
+    def test_resolve_build_command_uses_workspace_detection(self):
+        # Regression: when no CLI flag and no config build_command, the
+        # resolver must sniff the workspace before falling back to make.
+        from harness.cli import resolve_build_command
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "requirements.txt").write_text("fastapi\n")
+            cmd = resolve_build_command(None, {}, tmpdir)
+            assert "pip install" in cmd
+            assert "pytest" in cmd
+            assert cmd != "make build"
+
+    @pytest.mark.asyncio
+    async def test_compiler_node_adapts_build_cmd_when_no_makefile(self, monkeypatch):
+        # Regression: greenfield runs resolve build_command at cmd_run start
+        # when the workspace is empty, so detection returns None and we get
+        # the historical 'make build' default. Once codegen lands files, the
+        # compiler node must re-detect — otherwise the sandbox runs 'make
+        # build' against a Makefile-less repo and exits 127 every iteration.
+        from harness import graph as graph_mod
+        from harness.sandbox import BuildResult
+
+        captured_cmd: dict[str, str] = {}
+
+        class FakeExecutor:
+            def __init__(self, workspace_path, allow_network=False, sandbox_config=None):
+                pass
+            async def run(self, build_cmd: str) -> BuildResult:
+                captured_cmd["cmd"] = build_cmd
+                return BuildResult(exit_code=0, raw_output="ok")
+
+        monkeypatch.setattr("harness.sandbox.SandboxExecutor", FakeExecutor)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "requirements.txt").write_text("fastapi\n")
+            state = {
+                "workspace_path": tmpdir,
+                "build_command": "make build",
+                "allow_network": False,
+                "loop_counter": {},
+                "messages": [],
+            }
+            result = await graph_mod.compiler_node(state)
+
+        assert "pip install" in captured_cmd["cmd"]
+        assert "pytest" in captured_cmd["cmd"]
+        assert result.get("build_command") == captured_cmd["cmd"]
+
+    @pytest.mark.asyncio
+    async def test_compiler_node_keeps_explicit_make_build_when_makefile_exists(self, monkeypatch):
+        from harness import graph as graph_mod
+        from harness.sandbox import BuildResult
+
+        captured_cmd: dict[str, str] = {}
+
+        class FakeExecutor:
+            def __init__(self, workspace_path, allow_network=False, sandbox_config=None):
+                pass
+            async def run(self, build_cmd: str) -> BuildResult:
+                captured_cmd["cmd"] = build_cmd
+                return BuildResult(exit_code=0, raw_output="ok")
+
+        monkeypatch.setattr("harness.sandbox.SandboxExecutor", FakeExecutor)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "Makefile").write_text("build:\n\techo ok\n")
+            state = {
+                "workspace_path": tmpdir,
+                "build_command": "make build",
+                "allow_network": False,
+                "loop_counter": {},
+                "messages": [],
+            }
+            result = await graph_mod.compiler_node(state)
+
+        assert captured_cmd["cmd"] == "make build"
+        assert "build_command" not in result
+
+    @pytest.mark.asyncio
+    async def test_compiler_node_swaps_image_and_network_for_python_build(self, monkeypatch):
+        # Regression: when the build command adapts to python AND the
+        # sandbox image is still the historical bare ubuntu:22.04 default,
+        # compiler_node must also swap the image to a python toolchain
+        # image and enable network so pip can install deps. Otherwise
+        # python3 -m pytest still exits 127 forever.
+        from harness import graph as graph_mod
+        from harness.sandbox import BuildResult
+
+        captured: dict[str, Any] = {}
+
+        class FakeExecutor:
+            def __init__(self, workspace_path, allow_network=False, sandbox_config=None):
+                captured["allow_network"] = allow_network
+                captured["sandbox_config"] = sandbox_config
+            async def run(self, build_cmd: str) -> BuildResult:
+                captured["cmd"] = build_cmd
+                return BuildResult(exit_code=0, raw_output="ok")
+
+        monkeypatch.setattr("harness.sandbox.SandboxExecutor", FakeExecutor)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "requirements.txt").write_text("fastapi\n")
+            state = {
+                "workspace_path": tmpdir,
+                "build_command": "make build",
+                "allow_network": False,
+                "loop_counter": {},
+                "messages": [],
+                "sandbox_config": {"docker_image": "ubuntu:22.04"},
+            }
+            result = await graph_mod.compiler_node(state)
+
+        assert "pip install" in captured["cmd"]
+        assert captured["sandbox_config"]["docker_image"] == "python:3.12-slim"
+        assert captured["allow_network"] is True
+        assert result["sandbox_config"]["docker_image"] == "python:3.12-slim"
+        assert result["allow_network"] is True
+
+    @pytest.mark.asyncio
+    async def test_compiler_node_swaps_image_on_resume_with_already_adapted_command(self, monkeypatch):
+        # Regression: a session resumed from a checkpoint where build_command
+        # is ALREADY 'python3 -m pytest -q' (adapted by a previous run) but
+        # sandbox_config still has the bare ubuntu image — the swap must
+        # still fire on its own, not gate behind 'was just adapted this turn'.
+        from harness import graph as graph_mod
+        from harness.sandbox import BuildResult
+
+        captured: dict[str, Any] = {}
+
+        class FakeExecutor:
+            def __init__(self, workspace_path, allow_network=False, sandbox_config=None):
+                captured["allow_network"] = allow_network
+                captured["sandbox_config"] = sandbox_config
+            async def run(self, build_cmd: str) -> BuildResult:
+                return BuildResult(exit_code=0, raw_output="ok")
+
+        monkeypatch.setattr("harness.sandbox.SandboxExecutor", FakeExecutor)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "requirements.txt").write_text("fastapi\n")
+            state = {
+                "workspace_path": tmpdir,
+                # Already adapted in a prior turn — make-build condition is false.
+                "build_command": "python3 -m pip install -r requirements.txt && python3 -m pytest -q",
+                "allow_network": False,
+                "loop_counter": {},
+                "messages": [],
+                "sandbox_config": {"docker_image": "ubuntu:22.04"},
+            }
+            result = await graph_mod.compiler_node(state)
+
+        assert captured["sandbox_config"]["docker_image"] == "python:3.12-slim"
+        assert captured["allow_network"] is True
+        assert result["sandbox_config"]["docker_image"] == "python:3.12-slim"
+
+    @pytest.mark.asyncio
+    async def test_compiler_node_preserves_user_chosen_image(self, monkeypatch):
+        # Regression: if the user has explicitly customized docker_image
+        # away from the bare default, the late-bound swap must respect it.
+        from harness import graph as graph_mod
+        from harness.sandbox import BuildResult
+
+        captured: dict[str, Any] = {}
+
+        class FakeExecutor:
+            def __init__(self, workspace_path, allow_network=False, sandbox_config=None):
+                captured["sandbox_config"] = sandbox_config
+            async def run(self, build_cmd: str) -> BuildResult:
+                return BuildResult(exit_code=0, raw_output="ok")
+
+        monkeypatch.setattr("harness.sandbox.SandboxExecutor", FakeExecutor)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "requirements.txt").write_text("fastapi\n")
+            state = {
+                "workspace_path": tmpdir,
+                "build_command": "make build",
+                "allow_network": False,
+                "loop_counter": {},
+                "messages": [],
+                "sandbox_config": {"docker_image": "my-company/build:latest"},
+            }
+            result = await graph_mod.compiler_node(state)
+
+        # User-chosen image is preserved
+        assert captured["sandbox_config"]["docker_image"] == "my-company/build:latest"
+        assert "sandbox_config" not in result
 
 
 # ===========================================================================

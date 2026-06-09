@@ -641,10 +641,15 @@ def _detect_workspace_stack(workspace_path: str) -> set[str]:
 
     Detection scans manifest files and their declared dependencies. The
     returned tag taxonomy:
-        Languages:           python, node, java, dart, go, rust
+        Languages:           python, node, typescript, java, dart, go, rust
         Backend frameworks:  fastapi, django, spring, express, nest, fastify
         Frontend frameworks: react, vue, angular
-        Mobile:              flutter
+        Markup / style:      html, css, tailwind
+        Mobile platforms:    ios, android   (target-platform tags — set
+                             whenever the workspace builds for that
+                             platform via Flutter, React Native, or
+                             native Swift/Kotlin)
+        Mobile frameworks:   flutter
         Databases:           postgres, redis, mysql
         Build tools:         maven, gradle
 
@@ -734,6 +739,20 @@ def _detect_workspace_stack(workspace_path: str) -> set[str]:
                 tags.add("nest")
             if "fastify" in deps:
                 tags.add("fastify")
+            # TypeScript — declared dep is the strongest signal; the
+            # tsconfig.json fallback below catches projects that consume
+            # TS only via a build tool (vite, esbuild) without a direct dep.
+            if "typescript" in deps:
+                tags.add("typescript")
+            # Tailwind — declared dep covers the common case; the
+            # tailwind.config.* fallback below catches projects that
+            # vendor the CLI or pull it transitively.
+            if "tailwindcss" in deps:
+                tags.add("tailwind")
+            # React Native targets BOTH iOS and Android by default.
+            # Expo apps too — they pull react-native transitively.
+            if "react-native" in deps or "expo" in deps:
+                tags.update({"ios", "android"})
             # DB clients
             if "pg" in deps or "postgres" in deps or "@vercel/postgres" in deps:
                 tags.add("postgres")
@@ -743,6 +762,87 @@ def _detect_workspace_stack(workspace_path: str) -> set[str]:
                 tags.add("mysql")
         except (json.JSONDecodeError, ValueError):
             pass
+
+    # TypeScript fallback — tsconfig at root is the canonical signal even
+    # when package.json doesn't declare TS as a direct dep (vite/esbuild
+    # toolchains often pull it transitively).
+    if _exists("tsconfig.json"):
+        tags.add("typescript")
+
+    # Tailwind fallback — config file at root.
+    if (
+        _exists("tailwind.config.js")
+        or _exists("tailwind.config.ts")
+        or _exists("tailwind.config.cjs")
+        or _exists("tailwind.config.mjs")
+    ):
+        tags.add("tailwind")
+
+    # HTML / CSS — any frontend framework workspace produces and consumes
+    # both, so style guidance for HTML semantics and CSS layout always
+    # applies. Standalone .html / .css at the workspace root catches plain
+    # static sites with no JS framework.
+    if tags & {"react", "vue", "angular"}:
+        tags.update({"html", "css"})
+    else:
+        try:
+            for entry in os.listdir(workspace_path):
+                lower = entry.lower()
+                if lower.endswith(".html") or lower.endswith(".htm"):
+                    tags.add("html")
+                if lower.endswith(".css") or lower.endswith(".scss") or lower.endswith(".sass"):
+                    tags.add("css")
+        except OSError:
+            pass
+
+    # Mobile target platforms — set whenever the workspace builds for
+    # iOS and/or Android. Sources:
+    #   * Flutter projects always create ios/ and android/ sub-projects
+    #     unless the team explicitly removed one (rare).
+    #   * Native iOS: Podfile + *.xcodeproj / *.xcworkspace at the root.
+    #     Swift Package Manager projects with iOS deployment targets are
+    #     also iOS, but distinguishing those from server-side Swift
+    #     packages requires reading Package.swift content — defer for now.
+    #   * Native Android: settings.gradle with an `:app` include, or a
+    #     root build.gradle whose content references com.android.application.
+    #     AndroidManifest.xml in the tree is the irrefutable signal.
+    def _isdir(relpath: str) -> bool:
+        return os.path.isdir(os.path.join(workspace_path, relpath))
+
+    if "flutter" in tags:
+        # Flutter project — check which platform folders were kept.
+        if _isdir("ios"):
+            tags.add("ios")
+        if _isdir("android"):
+            tags.add("android")
+
+    # Native iOS markers (works for non-Flutter SwiftUI / UIKit apps too).
+    if _exists("Podfile") or _exists("ios/Podfile"):
+        tags.add("ios")
+    try:
+        for entry in os.listdir(workspace_path):
+            if entry.endswith(".xcodeproj") or entry.endswith(".xcworkspace"):
+                tags.add("ios")
+                break
+    except OSError:
+        pass
+
+    # Native Android markers.
+    if _exists("AndroidManifest.xml") or _exists("app/AndroidManifest.xml"):
+        tags.add("android")
+    if _exists("app/build.gradle") or _exists("app/build.gradle.kts"):
+        tags.add("android")
+    settings_gradle = _read("settings.gradle") + _read("settings.gradle.kts")
+    if "':app'" in settings_gradle or '":app"' in settings_gradle:
+        tags.add("android")
+    root_gradle_blob = "\n".join(
+        _read(f) for f in ("build.gradle", "build.gradle.kts", "app/build.gradle", "app/build.gradle.kts")
+    )
+    if (
+        "com.android.application" in root_gradle_blob
+        or "com.android.library" in root_gradle_blob
+    ):
+        tags.add("android")
 
     # Java/Spring — scan pom.xml or build.gradle for spring-boot deps.
     java_blob = "\n".join(_read(f) for f in ("pom.xml", "build.gradle", "build.gradle.kts"))
@@ -763,6 +863,159 @@ def _detect_workspace_stack(workspace_path: str) -> set[str]:
             tags.add("mysql")
 
     return tags
+
+
+# ---------------------------------------------------------------------------
+# 3a. Source-Root Detection
+# ---------------------------------------------------------------------------
+
+# Source-file extensions across the supported stacks. Used to find the
+# dominant top-level folder containing project code.
+_SOURCE_FILE_EXTENSIONS: frozenset[str] = frozenset({
+    ".py", ".pyi",
+    ".js", ".mjs", ".cjs", ".jsx",
+    ".ts", ".tsx",
+    ".go",
+    ".java",
+    ".rs",
+    ".dart",
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp",
+})
+
+# Top-level directories that should never be considered a source root even
+# when they're full of code. Generated artefacts, vendored deps, docs, etc.
+_NEVER_SOURCE_DIRS: frozenset[str] = frozenset({
+    "tests", "test", "__tests__", "spec", "specs",
+    "__pycache__", "node_modules", "vendor", "target",
+    "build", "dist", "out",
+    ".venv", "venv", "env", ".env",
+    ".git", ".svn", ".hg",
+    ".tox", ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "docs", "doc", "examples", "example", "scripts", "tools",
+    "migrations", "fixtures", "deployment", "infra",
+    "ios", "android",     # mobile platforms
+    "public", "static",   # frontend assets
+})
+
+# Directory names we BIAS TOWARD when picking a source root. A folder named
+# `app/` or `src/` beats a folder named `random_thing/` even when the latter
+# has marginally more source files — to avoid locking onto an unrelated
+# vendored tree.
+_PREFERRED_SOURCE_NAMES: frozenset[str] = frozenset({
+    "app", "src", "lib", "pkg", "source", "sources", "internal",
+})
+
+_MAX_FILES_PER_SCAN = 5000
+
+
+def _detect_source_root(workspace_path: str) -> Optional[str]:
+    """Return the dominant top-level directory containing source files.
+
+    Used by graph._build_system_prompt and patching_node/repair_node to
+    constrain LLM-generated code to the workspace's existing layout —
+    when this returns `"app"`, the LLM is told (and the patcher
+    enforces) that all new source modules go under `app/` rather than
+    landing at workspace root.
+
+    Detection logic:
+      1. Skip directories in ``_NEVER_SOURCE_DIRS`` and any starting
+         with ``.``.
+      2. For every remaining top-level dir AND the workspace root
+         itself, count source files (extensions in
+         ``_SOURCE_FILE_EXTENSIONS``), recursing up to
+         ``_MAX_FILES_PER_SCAN`` files.
+      3. Bias toward a preferred name (``app`` / ``src`` / ``lib`` /
+         ``pkg`` / ``source`` / ``sources`` / ``internal``) when it has
+         at least one source file: it wins over any other candidate.
+      4. Otherwise pick the directory with the most source files,
+         provided it dominates (≥ 80% of all non-root source files OR
+         > 3 files vs. 0 in every other candidate).
+      5. Return ``None`` when the workspace is flat (all source at
+         root), empty (no source files anywhere), or genuinely
+         ambiguous (no clear leader).
+
+    Returns the **directory name** (no trailing slash, no path prefix),
+    so callers compose ``f"{root}/"`` themselves for patcher allowlists.
+    """
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return None
+
+    try:
+        entries = os.listdir(workspace_path)
+    except OSError:
+        return None
+
+    counts: dict[str, int] = {}
+    files_scanned = 0
+    root_source_count = 0
+
+    for entry in entries:
+        full = os.path.join(workspace_path, entry)
+        if os.path.isfile(full):
+            if os.path.splitext(entry)[1].lower() in _SOURCE_FILE_EXTENSIONS:
+                root_source_count += 1
+                files_scanned += 1
+                if files_scanned >= _MAX_FILES_PER_SCAN:
+                    break
+            continue
+        if not os.path.isdir(full):
+            continue
+        if entry.startswith(".") or entry in _NEVER_SOURCE_DIRS:
+            continue
+
+        dir_count = 0
+        for sub_root, sub_dirs, sub_files in os.walk(full):
+            # Prune ignored subdirectories in-place so os.walk doesn't recurse.
+            sub_dirs[:] = [
+                d for d in sub_dirs
+                if not d.startswith(".") and d not in _NEVER_SOURCE_DIRS
+            ]
+            for fname in sub_files:
+                if os.path.splitext(fname)[1].lower() in _SOURCE_FILE_EXTENSIONS:
+                    dir_count += 1
+                    files_scanned += 1
+                    if files_scanned >= _MAX_FILES_PER_SCAN:
+                        break
+            if files_scanned >= _MAX_FILES_PER_SCAN:
+                break
+        counts[entry] = dir_count
+        if files_scanned >= _MAX_FILES_PER_SCAN:
+            break
+
+    # No source files at all → no opinion.
+    total_non_root = sum(counts.values())
+    if total_non_root == 0 and root_source_count == 0:
+        return None
+
+    # Preferred-name bias: if any preferred name has ≥1 source file, it wins
+    # over any non-preferred candidate. Among preferred names, the one with
+    # the most files wins.
+    preferred_candidates = {
+        name: cnt for name, cnt in counts.items()
+        if name in _PREFERRED_SOURCE_NAMES and cnt > 0
+    }
+    if preferred_candidates:
+        best_preferred = max(preferred_candidates.items(), key=lambda kv: kv[1])
+        return best_preferred[0]
+
+    # No preferred-name match. Fall back to "the dominant non-preferred dir,
+    # if it dominates clearly." Used for workspaces with stack-specific
+    # roots like `cmd/` for Go or unusual project layouts.
+    if not counts:
+        return None
+    best_name, best_count = max(counts.items(), key=lambda kv: kv[1])
+    if best_count == 0:
+        return None
+    # Domination test: best is ≥ 80% of all non-root, OR best is > 3 and the
+    # runner-up is 0.
+    second_best = sorted(counts.values(), reverse=True)[1] if len(counts) > 1 else 0
+    dominates = (
+        (total_non_root > 0 and best_count >= 0.8 * total_non_root and best_count > 0)
+        or (best_count > 3 and second_best == 0)
+    )
+    if not dominates:
+        return None
+    return best_name
 
 
 # ---------------------------------------------------------------------------

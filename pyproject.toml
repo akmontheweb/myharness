@@ -54,6 +54,12 @@ harness = ["cli.json", "model_prices.json"]
 line-length = 120
 target-version = "py311"
 
+[tool.pytest.ini_options]
+# Collect tests only from the tests/ directory so source modules whose
+# filenames happen to start with `test_` (e.g. harness/test_generation.py,
+# the auto-test-gen graph node) are not picked up as test files.
+testpaths = ["tests"]
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
