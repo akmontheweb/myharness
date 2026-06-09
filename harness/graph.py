@@ -312,6 +312,28 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
 ## Build Command
 {build_command}
 
+## Dependency Manifest Coherence (mandatory)
+The build command above is exactly what the sandbox will execute. Every CLI
+the build invokes (test runner, linter, type checker, formatter) MUST be
+declared in the workspace's dependency manifest — otherwise the install
+step succeeds but the next step fails with "No module named X" /
+"command not found", and the run wastes a repair iteration.
+
+Audit the build command before writing any manifest:
+  - `pip install -r requirements.txt && pytest`  → `requirements.txt`
+    must list `pytest` (and `pytest-asyncio`, `ruff`, `mypy`, etc. if the
+    command invokes them).
+  - `pip install -e '.[dev]' && pytest`  → `pytest` must live under
+    `[project.optional-dependencies].dev` in `pyproject.toml`.
+  - `npm install && npm test`  → the test runner referenced by the `test`
+    script must be in `package.json` `devDependencies`.
+  - `cargo build && cargo test`  → cargo bundles the runner; no extra dep.
+  - `go build ./... && go test ./...`  → go bundles the runner; no extra dep.
+
+When you generate or amend a manifest, include every tool the build needs.
+A clean separation between runtime and dev dependencies is fine, but BOTH
+must be installable by the build command.
+
 ## Your Role
 You are an autonomous coding agent. You will receive tasks and must:
 1. Plan the implementation strategy before writing code.
@@ -946,6 +968,43 @@ def _is_env_misconfig(raw_output: str) -> Optional[str]:
     return None
 
 
+# Pip-installable test / lint tools. When `_is_env_misconfig` flags one
+# of these as missing, the LLM repair loop CAN fix it by appending the
+# package to the workspace's dependency manifest — no image swap needed.
+# Contrast with non-installable symbols (npm, node, cargo, go, rustc,
+# docker) where the base image itself is wrong and only a config change
+# can unblock the run; those still short-circuit to HITL.
+_PIP_INSTALLABLE_SYMBOLS: frozenset[str] = frozenset({
+    "pytest", "pytest-asyncio", "pytest-cov", "pytest-mock", "pytest-xdist",
+    "ruff", "mypy", "black", "isort", "flake8", "pylint",
+    "coverage", "tox", "nox", "poetry",
+})
+
+
+def _repairable_dep_hint(symbol: str, build_command: str) -> str:
+    """Repair-friendly diagnostic for a missing pip-installable test / lint
+    tool. Reaches the repair LLM via compiler_errors and points it at the
+    smallest possible patch (add the dep to requirements.txt or pyproject
+    dev extras). Distinct from :func:`_env_misconfig_hint`, which is sent
+    to HITL because no in-container patch can fix it.
+    """
+    return (
+        f"Build failed: '{symbol}' is required by the build command but is "
+        f"not declared as a dependency. The sandbox runs "
+        f"`{build_command.strip()}`, which invokes `{symbol}` after the "
+        f"install step — but '{symbol}' isn't in the workspace's "
+        f"dependency manifest, so pip never installs it.\n\n"
+        f"Fix in ONE place:\n"
+        f"  - If the install step is `pip install -r requirements.txt`: "
+        f"add `{symbol}` to `requirements.txt`.\n"
+        f"  - If the install step is `pip install -e '.[dev]'`: add "
+        f"`{symbol}` to `[project.optional-dependencies].dev` in "
+        f"`pyproject.toml`.\n"
+        f"Do not change the build_command or docker_image — the package "
+        f"is pip-installable and the current image is correct."
+    )
+
+
 def _env_misconfig_hint(symbol: str, build_command: str) -> str:
     """Build the actionable HITL message for an env-misconfig hit."""
     # Pick the most likely installer for the missing symbol.
@@ -1143,25 +1202,46 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         len(compiler_errors),
     )
 
-    # Detect "sandbox is missing a required runtime" failures (e.g. pytest
-    # not in python:3.12-slim). No LLM repair can fix this — synthesize a
-    # focused diagnostic and let the router short-circuit to HITL.
+    # Detect "sandbox is missing a required runtime" failures and split into
+    # two routes:
+    #   - Pip-installable test/lint tools (pytest, ruff, mypy, ...): the
+    #     repair LLM CAN fix it by amending the workspace's dep manifest.
+    #     Emit a MISSING_DEP diagnostic and let normal routing take over so
+    #     repair_node gets the diagnostic as context.
+    #   - Everything else (npm/node/cargo/go/docker, single-segment local
+    #     modules): the image itself is wrong / the LLM cannot help from
+    #     inside the sandbox. Short-circuit to HITL as before.
     env_misconfig_symbol: Optional[str] = None
+    env_misconfig_is_repairable: bool = False
     if exit_code != 0 and not compiler_errors:
         env_misconfig_symbol = _is_env_misconfig(raw_log)
         if env_misconfig_symbol:
-            logger.warning(
-                "[compiler_node] Environment misconfig detected: missing '%s'. "
-                "Short-circuiting repair loop — this needs a config fix, not an LLM patch.",
-                env_misconfig_symbol,
+            env_misconfig_is_repairable = (
+                env_misconfig_symbol.lower() in _PIP_INSTALLABLE_SYMBOLS
             )
+            if env_misconfig_is_repairable:
+                logger.info(
+                    "[compiler_node] Missing '%s' is pip-installable. Routing "
+                    "through repair loop so the LLM can amend the dep manifest.",
+                    env_misconfig_symbol,
+                )
+                msg = _repairable_dep_hint(env_misconfig_symbol, build_cmd)
+                code = "MISSING_DEP"
+            else:
+                logger.warning(
+                    "[compiler_node] Environment misconfig detected: missing '%s'. "
+                    "Short-circuiting repair loop — this needs a config fix, not an LLM patch.",
+                    env_misconfig_symbol,
+                )
+                msg = _env_misconfig_hint(env_misconfig_symbol, build_cmd)
+                code = "ENV_MISCONFIG"
             compiler_errors = [{
                 "file": "<sandbox>",
                 "line": 0,
                 "column": 0,
                 "severity": "error",
-                "error_code": "ENV_MISCONFIG",
-                "message": _env_misconfig_hint(env_misconfig_symbol, build_cmd),
+                "error_code": code,
+                "message": msg,
                 "semantic_context": (
                     f"Missing runtime: {env_misconfig_symbol}. "
                     f"Build command: {build_cmd}. "
@@ -1174,7 +1254,9 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         "current_node": "compiler",
         "last_build_output": raw_log,
     }
-    if env_misconfig_symbol:
+    # Only set the short-circuit flag for symbols the LLM truly can't fix.
+    # Repairable symbols carry their diagnostic into repair_node normally.
+    if env_misconfig_symbol and not env_misconfig_is_repairable:
         node_state["env_misconfig"] = True
         node_state["env_misconfig_symbol"] = env_misconfig_symbol
 

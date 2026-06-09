@@ -162,19 +162,19 @@ def stub_sandbox(monkeypatch, tmp_path):
 class TestCompilerNodeShortCircuit:
 
     @pytest.mark.asyncio
-    async def test_compiler_node_short_circuits_on_env_misconfig(
+    async def test_compiler_node_short_circuits_on_non_installable(
         self, stub_sandbox, tmp_path,
     ):
-        # Reproduces the user's incident: sandbox returns exit=1 with
-        # "No module named pytest". compiler_node must:
+        # npm/node/cargo/go aren't pip-installable from inside the sandbox —
+        # the image itself is wrong, so compiler_node must short-circuit:
         #   - synthesise a single ENV_MISCONFIG diagnostic
         #   - set node_state["env_misconfig"] = True
         #   - record the symbol so the router and HITL can surface it
-        stub_sandbox(1, "/usr/local/bin/python3: No module named pytest\n")
+        stub_sandbox(1, "/bin/sh: 1: npm: not found\n")
 
         state = {
             "workspace_path": str(tmp_path),
-            "build_command": "python3 -m pytest -q",
+            "build_command": "npm install && npm test",
             "allow_network": False,
             "sandbox_config": {"docker_image": "python:3.12-slim"},
             "loop_counter": {},
@@ -183,12 +183,48 @@ class TestCompilerNodeShortCircuit:
 
         assert result["exit_code"] == 1
         assert result["node_state"]["env_misconfig"] is True
-        assert result["node_state"]["env_misconfig_symbol"] == "pytest"
+        assert result["node_state"]["env_misconfig_symbol"] == "npm"
         assert len(result["compiler_errors"]) == 1
         diag = result["compiler_errors"][0]
         assert diag["error_code"] == "ENV_MISCONFIG"
+        assert "npm" in diag["message"]
+
+    @pytest.mark.asyncio
+    async def test_compiler_node_routes_pytest_through_repair_not_hitl(
+        self, stub_sandbox, tmp_path,
+    ):
+        # Repro of the user's recurring HITL bounce: codegen produced a
+        # requirements.txt without pytest, build fails with "No module
+        # named pytest". Before the fix this short-circuited to HITL and
+        # the repair loop never got to amend the manifest. Now:
+        #   - emits a MISSING_DEP diagnostic pointing at requirements.txt
+        #   - does NOT set node_state["env_misconfig"], so route_after_compiler
+        #     falls through to the normal repair_node path
+        stub_sandbox(1, "/usr/local/bin/python3: No module named pytest\n")
+
+        state = {
+            "workspace_path": str(tmp_path),
+            "build_command": (
+                "python3 -m pip install -r requirements.txt && python3 -m pytest -q"
+            ),
+            "allow_network": True,
+            "sandbox_config": {"docker_image": "python:3.12-slim"},
+            "loop_counter": {},
+        }
+        result = await compiler_node(state)
+
+        assert result["exit_code"] == 1
+        # No env_misconfig flag → router will go to repair_node, not HITL.
+        assert "env_misconfig" not in result["node_state"]
+        assert "env_misconfig_symbol" not in result["node_state"]
+        assert len(result["compiler_errors"]) == 1
+        diag = result["compiler_errors"][0]
+        assert diag["error_code"] == "MISSING_DEP"
         assert "pytest" in diag["message"]
-        assert "pip install pytest" in diag["message"]
+        # The diagnostic must point the repair LLM at requirements.txt
+        # (the actionable fix), not at the legacy "swap docker_image" path.
+        assert "requirements.txt" in diag["message"]
+        assert "pyproject.toml" in diag["message"]
 
     @pytest.mark.asyncio
     async def test_compiler_node_does_not_short_circuit_on_real_error(
