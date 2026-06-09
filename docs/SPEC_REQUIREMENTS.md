@@ -1,22 +1,22 @@
 # AI Agent Harness — Requirements Specification
 
-*Auto-generated from exhaustive codebase analysis of the harness itself.*
+*Refreshed from current codebase state. Companion to `SPEC_ARCHITECTURE.md`.*
 
 ---
 
 ## 1. Executive Summary
 
-AI Agent Harness is a production-grade, model-agnostic autonomous coding agent built on LangGraph. It accepts natural language engineering tasks, generates precise code patches via LLMs, verifies them through sandboxed builds, and deploys containerized applications — all under budget guardrails, security scanning, and git lifecycle management. The system supports exhaustive multi-phase discovery (requirements → architecture → deployment), human-in-the-loop intervention points, checkpoint-based crash recovery, and cross-model speculative repair escalation.
+AI Agent Harness is a production-grade, model-agnostic autonomous coding agent built on LangGraph. It accepts natural language engineering tasks, generates precise code patches via LLMs, verifies them through sandboxed builds, and deploys containerized applications — all under budget guardrails, security scanning, and git lifecycle management. The system supports exhaustive multi-phase discovery (requirements → architecture → deployment), human-in-the-loop intervention points, checkpoint-based crash recovery, cross-model speculative repair escalation, and stack-aware multi-language workflows across Python / Java / Node / Dart / Flutter.
 
 ---
 
 ## 2. Functional Requirements (FR)
 
 ### FR-001: CLI Subcommand Routing
-- **Description:** The system MUST provide a `harness` CLI with subcommands `run`, `resume`, `status`, and `purge`, each with their own argument parsers and help text.
+- **Description:** The system MUST provide a `harness` CLI with subcommands `run`, `resume`, `status`, `doctor`, and `purge`, each with their own argument parsers and help text.
 - **Priority:** Must Have
 - **Acceptance Criteria:**
-  - Given `harness -h`, the system displays help with all subcommands listed.
+  - Given `harness -h`, the system displays help with all five subcommands listed.
   - Given `harness run -h`, the system displays run-specific help with all flags documented.
 
 ### FR-002: Workspace-Bound Execution
@@ -51,12 +51,13 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given a REPLACE_BLOCK where the SEARCH text doesn't match, the patcher logs a failure.
 
 ### FR-006: Sandboxed Build Verification
-- **Description:** The system MUST execute the project's build command inside an isolated sandbox (Linux namespaces via `unshare`, Docker container, or bare subprocess). Build output MUST be parsed for structured diagnostics.
+- **Description:** The system MUST execute the project's build command inside an isolated sandbox. Auto-detect priority is Docker → unshare (Linux namespaces) → bare (opt-in via `HARNESS_ALLOW_UNSAFE_SANDBOX=true`). Build output MUST be parsed for structured diagnostics.
 - **Priority:** Must Have
 - **Acceptance Criteria:**
   - Given `build_command: "make build"`, the command runs inside a sandbox and returns exit code + diagnostics.
-  - Given a compilation error in Go/Rust/C/Python format, structured `DiagnosticObject` dicts are extracted.
+  - Given a compilation error in Rust / GCC-Clang / Go / Python / Java / TypeScript / Dart / generic format, structured `DiagnosticObject` dicts are extracted.
   - Given a timeout of 300 seconds, builds exceeding the limit are killed with PGID-based process group termination.
+  - Given no available backend and no opt-in, the harness raises `RuntimeError` and emits a `sandbox_start_failed` event.
 
 ### FR-007: Repair Loop with Budget Guardrail
 - **Description:** On build failure, the system MUST route to a repair node that analyzes compiler diagnostics and generates fix patches. After 3 failed repair attempts, the system MUST escalate to human intervention. If the budget ($2.00 default) is exhausted, execution MUST stop.
@@ -74,12 +75,13 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given no fallback model configured, the primary model is reused for all attempts.
 
 ### FR-009: Human-in-the-Loop Intervention
-- **Description:** When the repair limit is hit or budget is exhausted, the system MUST present an interactive stdin menu with options: view diffs, resume, inject hint, pause for manual edits, increase budget, or abandon with git rollback.
+- **Description:** When the repair limit is hit or budget is exhausted, the system MUST present an interactive HITL menu with options: view diffs, resume, inject hint, pause for manual edits, increase budget, save and quit (resumable), or abandon with git rollback. The transport is pluggable via `harness/hitl.py` (`StdinChannel`, `FileChannel`, `HttpChannel`).
 - **Priority:** Must Have
 - **Acceptance Criteria:**
-  - Given HITL triggered, a menu with [v/r/e/m/b/q] options is displayed.
+  - Given HITL triggered, a menu with [v/r/e/m/b/s/q] options is displayed.
   - Given user selects [b] (increase budget), `budget_remaining_usd` increases by $2.00 and the menu re-displays.
-  - Given user selects [q] and confirms, `git checkout -- .` is executed and the session ends.
+  - Given user selects [s] (save & quit), the session is checkpointed and the developer is shown the exact `harness resume --session-id` command.
+  - Given user selects [q] and confirms, `git checkout -- .` is executed, the session ends, and a `hitl_gate_blocked` event is emitted.
 
 ### FR-010: Secret Redaction Before API Calls
 - **Description:** All outbound LLM messages MUST pass through a `SecretScanner` that detects and redacts API keys, tokens, JWT secrets, and high-entropy strings before transmission.
@@ -151,11 +153,11 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given `harness purge --session-id <id>`, only that thread's checkpoints are deleted.
 
 ### FR-019: Lint Gate (Deterministic Format Verification)
-- **Description:** Before each build, modified files MUST be auto-formatted and linted using language-specific tools (ruff, gofmt, prettier, rustfmt, clang-format). Lint errors are surfaced in the build output.
+- **Description:** Before each build, modified files MUST be auto-formatted and linted using language-specific tools. Lintgate ships specs for `.py` / `.pyi` (ruff), `.go` (gofmt), `.rs` (rustfmt + clippy), `.ts` / `.tsx` / `.js` / `.jsx` / `.css` / `.html` / `.json` / `.yaml` / `.yml` / `.md` (prettier), `.c` / `.h` / `.cpp` / `.cc` / `.cxx` / `.hpp` (clang-format), `.java` (google-java-format), `.dart` (`dart format`), `.sh` / `.bash` (shfmt), and `.sql` (sqlfluff). Lint errors are surfaced in the build output. By default, formatting only runs on files actually patched this session (`lintgate.format_modified_files=false`); linters run on all modified files.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
   - Given modified `.py` files, ruff format + ruff check are executed.
-  - Given modified `.go` files, gofmt is executed.
+  - Given modified `.dart` files, `dart format` runs.
   - Given no matching formatter for a file extension, it is skipped.
 
 ### FR-020: Multi-Variant Speculative Execution
@@ -171,7 +173,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Priority:** Should Have
 - **Acceptance Criteria:**
   - Given a Python workspace with `requirements.txt`, a Python Dockerfile is generated.
-  - Given the deployment blueprint, `docker-compose up --build -d` is executed.
+  - Given the deployment blueprint, `docker compose up --build -d` is executed (Compose V2 syntax, no hyphen).
   - Given containers are running, health check polling confirms readiness within 30s.
 
 ### FR-022: Security Scanning Gate
@@ -195,73 +197,136 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given a Python workspace with cross-file imports, the dependency graph is built.
   - Given a patch to a file with 3 downstream dependents, those dependents are listed in the impact result.
 
+### FR-025: First-Run Healthcheck (`harness doctor`)
+- **Description:** The CLI MUST expose `harness doctor`, which runs five healthchecks and reports each as PASS / WARN / FAIL with a colored marker (suppressed when stdout is not a TTY or `NO_COLOR` is set): git repo presence, API keys per configured `model_routing` provider, sandbox backend reachability, checkpoint DB writability, and config parse cleanliness (re-running `discover_config` + `_validate_config_keys`).
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given a healthy install, `harness doctor` exits 0.
+  - Given a missing API key for a routed non-Ollama provider, the `api keys` check reports FAIL listing the missing `{PROVIDER}_API_KEY` env vars and the command exits non-zero.
+  - Given a typoed nested config key, the `config parse` check reports WARN with the fuzzy-match suggestion.
+
+### FR-026: Multi-Stack Tree-Sitter Coverage
+- **Description:** The patcher, impact analyzer, and diagnostic parsers MUST cover Python, Java, JavaScript/TypeScript, Dart (Flutter), Rust, Go, and C/C++ uniformly. Grammars MUST come from a single bundled wheel (`tree-sitter-language-pack`) to avoid the dependency churn of upgrading six individual grammar packages.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given a `.dart` file, `DartParser` extracts diagnostics in Dart's compiler format.
+  - Given a Java compilation error, `JavaParser` parses it; given TypeScript, `TypeScriptParser`.
+  - Given an unknown extension, parsing falls back to `GenericParser` (regex on `file:line:col: severity: message`).
+
+### FR-027: Stack-Aware Skill Filtering
+- **Description:** Skill files in `harness/skills/` MAY declare an `applies_to: [tag1, tag2]` YAML frontmatter. At graph assembly, the workspace is fingerprinted into a tag set; skill files with a non-overlapping `applies_to` set MUST be excluded from the LLM prompt. Skill files with no frontmatter MUST always load (universal skills).
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given a Flutter workspace (tags include `flutter`, `dart`), `flutter.md` loads and `python_fastapi.md` does not.
+  - Given a workspace tag set that doesn't intersect any `applies_to` declaration, only frontmatter-free skills load.
+
+### FR-028: Flutter / Mobile Routing Short-Circuit
+- **Description:** Flutter projects don't fit the docker-compose-up deploy model (the artifact is a mobile binary). On a clean security scan, if the workspace is detected as a Flutter project, the graph MUST route directly to END instead of through the deployment pipeline.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given a workspace with `pubspec.yaml` declaring a Flutter SDK dep and a clean security scan, the deploy pipeline is skipped and the graph terminates.
+
+### FR-029: Structured Failure-Event Catalogue
+- **Description:** Failure sites MUST emit structured events via `harness.observability.log_failure(name, **fields)` (ERROR-level mirror of the existing `emit_event` helper). Each event MUST carry a snake_case `event` field so failures are grep-able from the per-session JSONL log by name instead of by string fragment. Initial catalogue: `sandbox_start_failed`, `token_budget_exhausted`, `hitl_gate_blocked`.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given the gateway refuses dispatch because `budget_remaining_usd <= 0`, a `token_budget_exhausted` event is emitted with `hard_cap_usd` and `role`.
+  - Given a JSONL session log, `jq 'select(.event == "sandbox_start_failed")'` returns all sandbox-bootstrap failures.
+
+### FR-030: Recursive Config Typo Detection
+- **Description:** `_validate_config_keys` MUST warn on unknown top-level config keys (e.g., `model_routin`) AND on unknown nested keys (e.g., `token_budget.hrad_cap_usd`) with fuzzy-match suggestions. The check covers `sandbox`, `token_budget`, `node_throttle`, `persistence`, `model_routing`, `deployment`, `lintgate`, and `logging`. Keys starting with `_` (comment keys) MUST be skipped.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `{"token_budget": {"hrad_cap_usd": 1.0}}`, the validator emits a WARNING containing `Unknown config key 'token_budget.hrad_cap_usd'` and `did you mean 'hard_cap_usd'?`.
+  - Given a clean config, no `Unknown config key` warnings are emitted.
+
+### FR-031: Continuous Integration Gate
+- **Description:** Every push to `main` and every pull request MUST trigger a GitHub Actions workflow that runs the full pytest pack on Python 3.11 / 3.12 / 3.13. The workflow MUST set `CI=true` and `HARNESS_AUTO_APPROVE=true` so HITL gates auto-approve in headless mode. A failing job MUST block merge.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a PR that breaks any test, the `pytest (py3.11)` / `(py3.12)` / `(py3.13)` job(s) fail.
+  - Given a green pytest run on all three Python versions, the workflow reports `success`.
+
 ---
 
 ## 3. System Scope
 
 ### In-Scope
-- CLI interface with 4 subcommands (run, resume, status, purge)
+- CLI interface with 5 subcommands (run, resume, status, doctor, purge)
 - LangGraph-based agent graph with 20+ nodes
 - Multi-provider LLM gateway (DeepSeek, Anthropic, OpenAI, Ollama)
-- Hierarchical JSON configuration with deep merge
+- Hierarchical JSON configuration with deep merge + recursive typo detection
 - SEARCH/REPLACE patch application with AST-aware fallback
-- Sandboxed build execution (unshare, Docker, bare)
-- Structured diagnostic parsing for Go, Rust, GCC/Clang, Python
+- Sandboxed build execution (Docker → unshare → bare, in auto-detect priority)
+- Structured diagnostic parsing for Rust, GCC/Clang, Go, Python, Java, TypeScript, Dart, and a generic fallback
 - Cross-model speculative repair escalation (cheap → expensive)
-- Human-in-the-loop interactive menu with 6 actions
+- Human-in-the-loop interactive menu with 7 actions, pluggable transport (stdin / file / HTTP webhook)
 - Zero-knowledge secret redaction before all API calls
 - Git branch lifecycle management (stash, patch branch, commit, rollback)
-- Exhaustive 3-phase discovery pipeline with structured Q&A loops
+- Exhaustive 3-phase discovery pipeline with structured Q&A loops (opt-in via `--discover`)
 - Pre-flight manifest → spec synthesis with interactive review
 - SQLite checkpoint persistence with WAL mode and 30-day TTL GC
 - Read-only session status inspector with timestamp and workspace display
-- Lint gate with auto-detected formatters per language
+- First-run healthcheck (`harness doctor`) covering five environment preconditions
+- Structured failure-event catalogue (`log_failure(name, **fields)`)
+- Lint gate with auto-detected formatters per language (Python, Java, JS/TS, Dart, Go, Rust, C/C++, shell, SQL, markdown, YAML, JSON, HTML, CSS)
 - Multi-variant speculative compilation in parallel git worktrees
-- Container deployment pipeline (telemetry → blueprint → Dockerfile → compose → health check)
+- Container deployment pipeline (telemetry → blueprint → Dockerfile → docker compose v2 → health check); short-circuits to END for Flutter / mobile projects
 - Post-build security scanning (gitleaks + bandit/semgrep)
 - Conversation memory cleanse for prefix-cache optimization
-- Dependency graph impact analysis
-- Two-tier skills system (harness-level + project-level markdown conventions)
+- Dependency graph impact analysis backed by tree-sitter grammars for Python, Java, JS/TS, Dart, Rust, Go, and C/C++
+- Two-tier skills system (harness-level + project-level markdown conventions) with stack-aware filtering via `applies_to:` frontmatter
+- GitHub Actions CI matrix on Python 3.11 / 3.12 / 3.13
 
 ### Out-of-Scope
 - Interactive IDE plugin or VS Code extension
-- Web-based dashboard or GUI
+- Web-based dashboard or GUI (intentionally deferred per `docs/production-readiness-audit.md` T4.1 — out of scope for v1.x without user demand)
 - Multi-user concurrent session management
 - Cloud-hosted SaaS offering
 - Non-Git version control systems (Mercurial, SVN)
-- Windows sandbox backends (only Linux supported)
+- Native Windows support (Windows + WSL2 is best-effort untested; the `unshare` backend is Linux-only)
 - Real-time streaming collaboration
 - Built-in code review or PR management
 - Training or fine-tuning of LLMs
+- Example workspaces shipped in-tree (deferred per audit T3.1 — speculative without user feedback)
 
 ---
 
 ## 4. Technical Constraints
 
 ### Language and Runtime
-- **Language:** Python 3.11+
+- **Language:** Python 3.11+ (CI matrix: 3.11 / 3.12 / 3.13)
 - **Async Model:** asyncio with `async/await` throughout
-- **Type System:** TypedDict for LangGraph compatibility, Pydantic for runtime validation
+- **Type System:** TypedDict for LangGraph compatibility; no Pydantic dependency (removed — see `SPEC_ARCHITECTURE.md` §5.8).
 - **Package Manager:** pip + pyproject.toml
 
-### Key Dependencies
+### Key Dependencies (runtime)
 | Package | Minimum Version | Purpose |
 |---------|----------------|---------|
 | langgraph | 0.4.0 | Stateful graph execution with checkpointing |
 | langgraph-checkpoint-sqlite | 2.0.0 | SQLite persistence backend |
 | aiofiles | 24.0.0 | Async file I/O |
 | tree-sitter | 0.23.0 | AST-aware code manipulation |
+| tree-sitter-language-pack | 1.8.0 | Bundled grammars for 165+ languages (Python / Java / JS / TS / TSX / Dart / Rust / Go / Swift / …). Replaces six individual `tree-sitter-*` grammar packages. |
 | httpx | 0.28.0 | Async HTTP client for LLM API calls |
-| pydantic | 2.10.0 | Runtime validation and serialization |
-| msgpack | 1.1.0 | Deserialization of checkpoint BLOBs |
 | uuid7 | 0.1.0 | Time-sortable UUID generation |
 | typing-extensions | 4.12.0 | TypedDict and type hint backports |
 
+### Key Dependencies (dev / test)
+| Package | Minimum Version | Purpose |
+|---------|----------------|---------|
+| pytest | 8.0.0 | Test runner |
+| pytest-asyncio | 0.24.0 | `@pytest.mark.asyncio` support |
+| ruff | 0.8.0 | Lint + format |
+| mypy | 1.13.0 | Strict type checking |
+| pre-commit | 3.7.0 | Local commit gate |
+| msgpack | 1.0.0 | Required by the storage GC regression test (not a runtime dep — runtime code falls back to JSON if absent). |
+
 ### Platform Requirements
-- **OS:** Linux (namespace isolation requires Linux kernel 4.0+)
-- **Optional:** Docker daemon for container-based sandbox and deployment
-- **Disk:** ~10MB for checkpoint database per 30-day window
-- **Network:** Outbound HTTPS required for LLM API calls (unless using Ollama local-only)
+- **OS:** Linux is the only platform covered by the CI matrix. macOS and Windows + WSL2 are best-effort via the Docker backend (untested). See the platform support matrix in `README.md`.
+- **Sandbox backend:** Docker daemon, or Linux user-namespace support (`unshare --user`), or `HARNESS_ALLOW_UNSAFE_SANDBOX=true` opt-in for the bare backend.
+- **Disk:** ~10MB for checkpoint database per 30-day window.
+- **Network:** Outbound HTTPS required for LLM API calls (unless `force_local_only` + Ollama).
 
 ### Performance Targets
 - CLI startup (config discovery): < 100ms
@@ -287,10 +352,14 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Workspace path does not exist:** CLI exits with code 1 before any graph execution.
 - **No checkpointer configured:** Graph runs ephemerally with `MemorySaver`; no crash recovery.
 - **Config JSON malformed:** Error logged with exact file path; harness refuses to proceed.
+- **Config key typo (top-level or nested):** WARNING logged with fuzzy-match suggestion (FR-030); the entry is ignored and the harness continues.
 - **Build command not found:** Sandbox returns exit code 127; parsed as a generic diagnostic.
-- **Docker daemon unreachable:** `create_backend("auto")` falls back from Docker → unshare → bare.
+- **Sandbox auto-detect fails entirely:** Raises `RuntimeError` and emits `sandbox_start_failed` event; falls back to bare only when `HARNESS_ALLOW_UNSAFE_SANDBOX=true` is set.
+- **Token budget exhausted:** Gateway raises `RuntimeError` and emits `token_budget_exhausted` event.
+- **HITL abandon chosen:** `_attempt_git_rollback()` runs and `hitl_gate_blocked` event is emitted.
 - **gitleaks not installed:** Security scan falls back to Python regex-based secret scanner.
 - **msgpack module missing:** `_deserialize_checkpoint_blob()` falls back to JSON text decoding for legacy rows.
+- **`harness doctor` failure:** Non-zero exit with a one-line summary listing failed checks; warnings (e.g. only-Ollama routing) do not block exit 0.
 
 ### Boundary Conditions
 - **Max repair iterations:** 3 (hardcoded in `route_after_compiler`)

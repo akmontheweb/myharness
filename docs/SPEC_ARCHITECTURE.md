@@ -1,6 +1,6 @@
 # AI Agent Harness — Architecture Specification
 
-*Auto-generated from exhaustive codebase analysis.*
+*Refreshed from current codebase state. Companion to `SPEC_REQUIREMENTS.md`.*
 
 ---
 
@@ -49,7 +49,7 @@ The harness is a single-process Python application with these deployable/service
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
-│                        HARSH CLI PROCESS                           │
+│                       HARNESS CLI PROCESS                          │
 │                                                                    │
 │  ┌───────────────────┐  ┌──────────────────┐  ┌────────────────┐  │
 │  │   CLI Layer        │  │  Persistence      │  │  Git Lifecycle │  │
@@ -109,7 +109,16 @@ The harness is a single-process Python application with these deployable/service
 harness/
 ├── __init__.py           # Package init, version, __all__
 ├── cli.json              # Fallback defaults (shipped config)
-├── cli.py                # CLI entry, subcommand routing, HITL menus, config discovery
+├── cli.py                # CLI entry, subcommand routing (run / resume / status / doctor / purge),
+│                         # HITL menus, config discovery, doctor healthchecks
+│   ├── discover_config()        # Hierarchical merge: workspace → home → cli.json
+│   ├── _validate_config_keys()  # Recursive top-level + nested typo detection (FR-030)
+│   ├── cmd_run / cmd_resume / cmd_status / cmd_purge
+│   ├── cmd_doctor()             # 5-check healthcheck (FR-025)
+│   ├── _doctor_check_git / api_keys / sandbox / checkpoint_db / config
+│   ├── human_gatekeeper_node()  # Three-phase HITL gatekeeper
+│   ├── hitl_menu_loop()         # 7-action HITL menu: [v/r/e/m/b/s/q]
+│   └── interactive_review_loop()# Pre-flight manifest review
 ├── gateway.py            # Model-agnostic LLM Gateway
 │   ├── GatewayConfig     # Runtime config dataclass
 │   ├── Gateway           # Orchestrator: dispatch + budget + retry
@@ -200,12 +209,45 @@ harness/
 │   ├── SubAgentSkill     # Autonomous mini-agent
 │   ├── DocGenSkill       # Documentation sub-agent
 │   └── SkillRegistry     # Global singleton
-└── parser_registry.py    # Diagnostic parser plugins
+│   # NOTE: stack-aware skill filtering (FR-027) lives in
+│   # graph.py:_parse_skill_frontmatter() — it reads the
+│   # `applies_to:` YAML frontmatter on harness/skills/*.md
+│   # files and intersects against the workspace tag set
+│   # before loading skills into the prompt.
+├── hitl.py               # Pluggable HITL transport (FR-009)
+│   ├── HitlChannel       # ABC: prompt / notes / confirm / wait_for_manual_edit
+│   ├── StdinChannel      # Default — interactive terminal
+│   ├── FileChannel       # Read prompts/answers from JSONL files
+│   ├── HttpChannel       # POST prompts to a webhook; receive answers as JSON
+│   ├── get_channel / set_channel / reset_channel  # Process-wide singleton
+│   └── _auto_approve()   # CI / HARNESS_AUTO_APPROVE / non-TTY auto-approve
+├── observability.py      # Structured logging + JSONL session events
+│   ├── JSONFormatter     # One JSON object per log line, with `extra=` merge
+│   ├── configure_logging()  # Stderr + per-session JSONL + optional LangSmith
+│   ├── emit_event()      # INFO-level structured event (successful / observational)
+│   └── log_failure()     # ERROR-level structured failure event (FR-029)
+│                         # Catalogue: sandbox_start_failed, token_budget_exhausted,
+│                         #            hitl_gate_blocked.
+├── trust.py              # Workspace boundary enforcement + structured-output trust
+│   ├── safe_resolve()           # Block path traversal outside workspace_root
+│   ├── is_path_allowed()
+│   ├── is_valid_docker_image / service_name / env_var_name / port_mapping
+│   ├── validate_blueprint()     # Deploy blueprint schema check
+│   ├── validate_discovery_json()# Discovery-LLM output trust gate
+│   ├── validate_blueprint_json()# Deploy-LLM output trust gate
+│   ├── validate_synthesized_spec()  # Manifest-synthesis trust gate (Bug 7 closure)
+│   └── safe_subprocess_env()    # Scrub envrionment passed to sandbox subprocess
+└── parser_registry.py    # Diagnostic parser plugins (FR-026)
     ├── RustParser        # --error-format=json
     ├── GccClangParser    # -fdiagnostics-format=json
     ├── GoParser          # file:line:col: message
     ├── PythonParser      # Traceback extraction
+    ├── JavaParser        # javac / maven / gradle diagnostic shapes
+    ├── TypeScriptParser  # tsc / eslint
+    ├── DartParser        # dart analyze / flutter build
     ├── GenericParser     # file:line:col: severity: message
+    ├── register_parser / register_extension_parser
+    ├── get_parser / get_parser_for_extension / list_registered_parsers
     └── detect_and_parse() # Auto-detect + parse
 ```
 
@@ -285,24 +327,33 @@ harness/
     │                          │                 └── [abandon] → END
     │                          │
     ▼                          │
-14. deployment_discovery_node │
+14. Flutter detected? ─yes─▶ [END]  (FR-028 — mobile builds bypass docker compose)
+    │ no                       │
+    ▼                          │
+15. deployment_discovery_node │
     │                          │
     ▼                          │
-15. generate_deployment_spec  │
+16. generate_deployment_spec  │
     │                          │
     ▼                          │
-16. human_gatekeeper (DEPLOY) │
+17. human_gatekeeper (DEPLOY) │
     │ (approve)                │
     ▼                          │
-17. deployment_node            │
+18. deployment_node            │
     ├── scan_workspace_telemetry()
     ├── synthesize_architecture()
     ├── generate_assets_from_blueprint()
-    ├── docker-compose up --build -d
+    ├── docker compose up --build -d   # V2 syntax, no hyphen
     └── health_check_loop()
         │
         ▼
       [END]
+
+Independent of the graph, `harness doctor` reuses the same config-
+discovery + checkpoint-DB code paths to run five healthchecks (git
+repo, API keys per routed provider, sandbox backend reachable,
+checkpoint DB writable, config parses cleanly) and reports
+PASS/WARN/FAIL with colored markers.
 ```
 
 ### 3.3 State Mutation per Node
@@ -340,29 +391,42 @@ AgentState fields and which nodes write to them:
 | Layer | Technology | Justification |
 |-------|-----------|---------------|
 | **Orchestration** | LangGraph ≥ 0.4.0 | Stateful graph execution with checkpointing; typed state schema |
-| **Language** | Python 3.11+ | TypedDict, asyncio improvements, `None`-aware operators |
+| **Language** | Python 3.11+ (CI: 3.11 / 3.12 / 3.13) | TypedDict, asyncio improvements, `None`-aware operators |
 | **Persistence** | aiosqlite + WAL mode | Crash-safe, zero-config, survives reboots; WAL for concurrent reads |
 | **File I/O** | aiofiles ≥ 24.0 | Non-blocking disk ops with sync fallback for missing dep |
-| **AST Parsing** | tree-sitter + tree-sitter-python | Structural code manipulation; preserves formatting |
+| **AST Parsing** | tree-sitter + tree-sitter-language-pack ≥ 1.8 | Single wheel covering 165+ grammars (Python / Java / JS / TS / TSX / Dart / Rust / Go / Swift / …); replaces six individual grammar packages and gives us Dart coverage that has no standalone PyPI distribution |
 | **HTTP Client** | httpx ≥ 0.28 | Async HTTP/2 with connection pooling and timeout management |
 | **Config** | JSON (discovered hierarchically) | Workspace `.harness_config.json` → `~/.harness/config.json` → `cli.json` |
 | **Testing** | pytest + pytest-asyncio | Async test support, fixture injection, coverage |
+| **CI** | GitHub Actions matrix | `pytest tests/ -q --tb=short` on push to `main` and PRs across Python 3.11 / 3.12 / 3.13 |
+| **Pre-commit** | pre-commit + local pytest hook | Same suite runs locally as in CI; bypassable with `--no-verify` for emergencies only |
 | **Linting** | ruff ≥ 0.8 | Fast Python linter + formatter |
-| **Type Checking** | mypy ≥ 1.13 (strict mode) | TypedDict validation, Pydantic compatibility |
-| **Sandbox** | Linux unshare(2) | Kernel namespace isolation without Docker dependency |
-| **Sandbox (alt)** | Docker CLI | Container isolation with CPU/memory/PID limits |
+| **Type Checking** | mypy ≥ 1.13 (strict mode) | TypedDict validation |
+| **Sandbox (primary)** | Docker CLI | Strongest isolation, built-in resource limits; preferred by `backend: "auto"` |
+| **Sandbox (fallback)** | Linux unshare(2) | Kernel namespace isolation without Docker dependency |
+| **Sandbox (opt-in)** | bare subprocess | Zero isolation; opt-in via `HARNESS_ALLOW_UNSAFE_SANDBOX=true` for environments where neither Docker nor user-namespaces are available |
 | **Secrets** | SHA-256 hashing | Stable hash for traceability without exposing values |
+| **Release** | `make release` + `scripts/release.py` | SemVer bump → CHANGELOG roll → tag → push; refuses dirty trees and off-`main` runs |
 
 **Dependency Versions (pyproject.toml):**
 ```
+# runtime
 langgraph>=0.4.0
 langgraph-checkpoint-sqlite>=2.0.0
 aiofiles>=24.0.0
 tree-sitter>=0.23.0
+tree-sitter-language-pack>=1.8.0
 httpx>=0.28.0
-pydantic>=2.10.0
 uuid7>=0.1.0
 typing-extensions>=4.12.0
+
+# dev (extras = "dev")
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
+ruff>=0.8.0
+mypy>=1.13.0
+pre-commit>=3.7.0
+msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON if missing
 ```
 
 ---
@@ -399,7 +463,7 @@ typing-extensions>=4.12.0
 
 **Rationale**: LLMs produce better code when given exhaustive context. The multi-phase discovery eliminates ambiguous requirements before patches are generated, reducing downstream repair loops.
 
-**Trade-off**: Adds significant pre-generation latency and LLM token cost. Bypassable via `--prompt-only` (skips discovery).
+**Trade-off**: Adds significant pre-generation latency and LLM token cost. Discovery is **off by default**; opt in with `--discover` on greenfield projects or when working from a blank workspace. The legacy `--skip-discovery` flag remains as a hidden no-op alias for scripts.
 
 ### 5.5 Secret Redaction Before Every API Call
 
@@ -464,6 +528,54 @@ typing-extensions>=4.12.0
 **Decision**: When the HITL menu shows "No compiler errors captured" but `node_state.last_build_output` exists, it now displays the raw build output (last 2000 chars) instead of leaving the developer blind.
 
 **Rationale**: The developer needs to see what actually failed before choosing an action ([e] hint, [m] manual fix, [r] retry). Previously, with zero structured diagnostics, the HITL screen gave no actionable information.
+
+### 5.15 First-Run Healthcheck (`harness doctor`)
+
+**Decision**: A dedicated `harness doctor` subcommand surfaces the five environment preconditions that previously turned into silent first-run failures: git repo presence, API keys per routed provider, sandbox backend reachability, checkpoint DB writability, and config parse cleanliness. Each check returns one of PASS / WARN / FAIL with a colored marker; the command exits non-zero on any FAIL.
+
+**Rationale**: Before doctor, users debugging a broken install had to read error messages buried in `harness run` logs. Surfacing the preconditions explicitly turns "why didn't anything happen?" into "your `OPENAI_API_KEY` is missing." Each check is also a smoke test for the underlying config path, so doctor doubles as a sanity check after editing `.harness_config.json`.
+
+**Trade-off**: Adds five subprocess + filesystem probes (~50ms each, parallel where possible) per invocation. Acceptable for a deliberate operator command.
+
+### 5.16 Pluggable HITL Transport
+
+**Decision**: The HITL menu is rendered through an `HitlChannel` interface with three built-in implementations: `StdinChannel` (default — interactive terminal), `FileChannel` (read prompts/answers from JSONL files; useful for replay and tests), `HttpChannel` (POST prompt → receive JSON answer; useful for remote operators / web dashboards).
+
+**Rationale**: The original implementation hard-coded `input()` calls inside the gatekeeper nodes, which made every HITL site uniquely difficult to test. Routing through an ABC let us write deterministic tests against `FileChannel` and unblocked the still-deferred web dashboard (T4.1) without committing to it.
+
+**Trade-off**: One extra indirection per prompt. The channel is a process-wide singleton, so non-CI tests reset it via `reset_channel()`.
+
+### 5.17 Multi-Stack Coverage via `tree-sitter-language-pack`
+
+**Decision**: Replace six individual `tree-sitter-*` grammar packages with the single `tree-sitter-language-pack` wheel, which bundles 165+ grammars including Python, Java, JS/TS/TSX, Dart, Rust, Go, and Swift. Patcher, impact analyzer, and the new `JavaParser` / `TypeScriptParser` / `DartParser` all read from the same registry.
+
+**Rationale**: Six grammar packages meant six upgrade cadences, six release-note streams, and one of them (Dart) had no standalone PyPI distribution at all. Consolidating to one wheel buys us Dart coverage and amortizes the grammar churn into a single dependency line. Adding a new language is now "register a parser" instead of "add a new dependency."
+
+**Trade-off**: Slightly larger install footprint (~15 MB of bundled grammars). The footprint is paid once at install time, not per-run.
+
+### 5.18 Stack-Aware Skill Filtering
+
+**Decision**: Skill files in `harness/skills/` may declare an `applies_to: [tag1, tag2]` YAML frontmatter (parsed by `graph.py:_parse_skill_frontmatter`). At graph assembly, the workspace is fingerprinted to a tag set (`python`, `flutter`, `spring`, `react`, …); skill files whose `applies_to` doesn't intersect the workspace tags are excluded from the LLM prompt. Files without frontmatter always load (universal skills).
+
+**Rationale**: A user working on a Flutter app should not see a 4000-character Django Channels skill in their prompt. Filtering at the frontmatter level keeps the prompt budget small without forcing the harness to "guess" relevance from filename pattern matching.
+
+**Trade-off**: Skill authors have to remember to add the frontmatter — but the failure mode is permissive (no frontmatter → always load), so the worst case is a too-large prompt, not a missing skill.
+
+### 5.19 Flutter / Mobile Routing Short-Circuit
+
+**Decision**: On a clean security scan, if the workspace looks like a Flutter project (`pubspec.yaml` with `flutter:` SDK dep, detected by `impact._is_flutter_project`), the graph routes directly to END instead of through the docker compose deploy pipeline.
+
+**Rationale**: Flutter's artifact is a mobile binary (APK / AAB / IPA / web bundle), not a docker compose service stack. Running the deploy pipeline on a Flutter project would produce an unrunnable Dockerfile and waste budget on a synthesize-architecture LLM call. Short-circuiting matches the user's mental model — "build and stop."
+
+**Trade-off**: Flutter projects don't get the deploy-blueprint HITL gate. That's correct for v1.x; if users ask for cloud-build wiring we can add a `flutter:` deploy backend.
+
+### 5.20 Structured Failure-Event Catalogue
+
+**Decision**: Failure sites emit structured events via `harness.observability.log_failure(name, **fields)` — an ERROR-level mirror of the existing `emit_event` helper. Each event carries a snake_case `event` field, so failures are grep-able from the per-session JSONL log by event name instead of by string fragment. The initial catalogue: `sandbox_start_failed`, `token_budget_exhausted`, `hitl_gate_blocked`.
+
+**Rationale**: Logging was already comprehensive but inconsistent — every module invented its own `logger.error("...")` format, so an operator scanning a failure across modules had to grep multiple substrings. A named event catalogue makes the failure modes a first-class queryable shape: `jq 'select(.event == "token_budget_exhausted")'`.
+
+**Trade-off**: New failure sites need a name. The `log_failure` docstring lists naming conventions (`_failed`, `_exhausted`, `_blocked`) and the canonical catalogue, so authors can extend it without inventing new patterns.
 
 ---
 
@@ -588,21 +700,28 @@ _MODEL_REGISTRY: dict[str, ModelSpec]
 - **semgrep**: Universal SAST (`scan --config=auto --json --quiet`)
 - **ruff**: Python formatting (`format --quiet`) and linting (`check --fix --quiet`)
 - **gofmt**: Go formatting (`-w`)
-- **prettier**: JS/TS/CSS/JSON/YAML formatting (`--write`)
-- **rustfmt**: Rust formatting (`--edition 2021`)
-- **clang-format**: C/C++ formatting (`-i`)
-- **docker-compose**: Container orchestration (`up --build -d`, `down`)
+- **prettier**: JS / TS / TSX / JSX / CSS / HTML / JSON / YAML / Markdown formatting (`--write`)
+- **rustfmt** + **clippy**: Rust formatting + lint
+- **clang-format**: C / C++ formatting (`-i`)
+- **google-java-format**: Java formatting
+- **dart format**: Dart formatting (Flutter / Dart projects)
+- **shfmt**: shell-script formatting
+- **sqlfluff**: SQL linting + formatting
+- **docker compose** (V2 — no hyphen): Container orchestration (`up --build -d`, `down`). The legacy `docker-compose` V1 binary is no longer probed.
 
 ---
 
 ## 8. Deployment & Environment
 
 ### 8.1 Runtime Requirements
-- Python 3.11+
-- Linux (for unshare sandbox backend) — macOS/Docker works via Docker backend fallback
+- Python 3.11+ (3.11 / 3.12 / 3.13 covered by CI)
+- Linux is the only platform actively tested. macOS and Windows + WSL2 are
+  best-effort via the Docker backend — see the platform matrix in `README.md`.
 - Git 2.x+ (for branch lifecycle management)
-- Optional: Docker daemon (for Docker sandbox backend)
-- Optional: tree-sitter language grammars (for AST-aware patching)
+- Sandbox: Docker daemon (preferred), OR Linux user-namespace support
+  (`unshare --user`), OR opt-in bare via `HARNESS_ALLOW_UNSAFE_SANDBOX=true`.
+- tree-sitter grammars ship in-tree via `tree-sitter-language-pack`; no
+  per-language install needed.
 
 ### 8.2 Configuration Files
 | File | Location | Purpose |
@@ -619,6 +738,10 @@ _MODEL_REGISTRY: dict[str, ModelSpec]
 | `OPENAI_API_KEY` | OpenAI API authentication |
 | `CI` | Detect CI environment (auto-approve HITL gate behavior) |
 | `HARNESS_AUTO_APPROVE` | Force auto-approve for non-interactive runs |
+| `HARNESS_ALLOW_UNSAFE_SANDBOX` | Opt in to the `bare` (zero-isolation) sandbox backend when neither Docker nor `unshare` is available. Never set this outside a disposable VM. |
+| `NO_COLOR` | Suppress ANSI colour markers in `harness doctor` output. |
+| `LANGCHAIN_API_KEY` | Required when `logging.langsmith=true` to forward traces to LangSmith. |
+| `LANGCHAIN_TRACING_V2`, `LANGSMITH_PROJECT` | Additional LangSmith trace routing knobs honoured by `configure_logging`. |
 
 ### 8.4 Generated Files (during execution)
 - `docs/SPEC_REQUIREMENTS.md` — Requirements specification
