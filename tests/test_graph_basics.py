@@ -1,10 +1,6 @@
 """Tests for harness/graph.py — orchestration basics."""
 
-import tempfile
-from pathlib import Path
-from unittest.mock import MagicMock, AsyncMock
 
-import pytest
 
 from harness.graph import (
     apply_memory_cleanse,

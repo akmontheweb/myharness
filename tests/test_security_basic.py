@@ -4,7 +4,6 @@ import tempfile
 import subprocess
 import os
 
-import pytest
 
 from harness.security import (
     GitGuardian,
@@ -200,3 +199,55 @@ class TestCreateCommandValidatorFromConfig:
         }
         validator = create_command_validator_from_config(config)
         assert validator is not None
+
+
+class TestSandboxExecutorPicksUpGlobalValidator:
+    """P0.2 regression: every SandboxExecutor instantiated without an explicit
+    `command_validator=` argument MUST pick up the process-wide default set by
+    cmd_run. Without this, the validator is dead code (default = None means
+    `if self.command_validator is not None` skips the check entirely).
+    """
+
+    def test_executor_inherits_global_validator(self):
+        from harness.sandbox import SandboxExecutor
+        from harness.security import (
+            CommandValidator,
+            set_command_validator,
+            get_command_validator,
+        )
+
+        marker_validator = CommandValidator()
+        set_command_validator(marker_validator)
+        try:
+            executor = SandboxExecutor(workspace_path="/tmp")
+            assert executor.command_validator is marker_validator, (
+                "SandboxExecutor must fall back to the global CommandValidator "
+                "set by cmd_run when no command_validator is passed."
+            )
+        finally:
+            set_command_validator(None)
+            assert get_command_validator() is None
+
+    def test_executor_explicit_validator_wins_over_global(self):
+        from harness.sandbox import SandboxExecutor
+        from harness.security import CommandValidator, set_command_validator
+
+        global_validator = CommandValidator()
+        explicit_validator = CommandValidator()
+        set_command_validator(global_validator)
+        try:
+            executor = SandboxExecutor(
+                workspace_path="/tmp",
+                command_validator=explicit_validator,
+            )
+            assert executor.command_validator is explicit_validator
+        finally:
+            set_command_validator(None)
+
+    def test_executor_no_global_no_explicit_is_none(self):
+        from harness.sandbox import SandboxExecutor
+        from harness.security import set_command_validator
+
+        set_command_validator(None)
+        executor = SandboxExecutor(workspace_path="/tmp")
+        assert executor.command_validator is None

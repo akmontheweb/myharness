@@ -9,3 +9,14 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-commit]
+
+      # ruff check mirrors the CI quality job — sub-second on this repo,
+      # so it's always-run rather than gated on changed files.
+      - id: ruff-check
+        name: ruff check (lint)
+        entry: python -m ruff check harness/ tests/
+        language: system
+        types: [python]
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]

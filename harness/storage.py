@@ -63,6 +63,36 @@ class CheckpointSummary:
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver as _OfficialAsyncSqliteSaver  # noqa: E402
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint schema versioning  (P2.4)
+# ---------------------------------------------------------------------------
+#
+# Every checkpoint blob carries a schema version stamped into its metadata.
+# Bump CHECKPOINT_SCHEMA_VERSION when AgentState gains a required field or
+# the on-disk channel layout changes in a way that older checkpoints can't
+# be safely resumed against. cmd_resume refuses to load a checkpoint whose
+# version is higher than the running harness (older harness, newer file)
+# or whose version is older than MIN_RESUMABLE_SCHEMA_VERSION (incompatible
+# format). Missing version = legacy checkpoint (pre-versioning); we WARN
+# and allow resume so the rollout doesn't strand existing users.
+#
+# The version is stored under ``_harness_schema_version`` inside the
+# checkpoint *metadata* dict (a separate SQLite column from the channel
+# blob) so injecting it can't disturb LangGraph's own state-restore logic.
+CHECKPOINT_SCHEMA_VERSION = 1
+MIN_RESUMABLE_SCHEMA_VERSION = 1
+SCHEMA_VERSION_METADATA_KEY = "_harness_schema_version"
+
+
+class CheckpointSchemaMismatchError(RuntimeError):
+    """Raised when a checkpoint's stamped schema version is incompatible.
+
+    Distinct from CheckpointCorruptedError (blob decode failure): the blob
+    decoded fine, but its version field signals it can't be safely resumed
+    by the running harness build.
+    """
+
+
 async def _configure_sqlite_pragmas(conn: Any, db_path: str) -> None:
     """
     Set crash-safety pragmas on a freshly-opened aiosqlite connection and
@@ -98,7 +128,8 @@ async def _configure_sqlite_pragmas(conn: Any, db_path: str) -> None:
 class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
     """
     Thin wrapper around the official langgraph-checkpoint-sqlite AsyncSqliteSaver
-    that adds TTL garbage collection and a path-based constructor.
+    that adds TTL garbage collection, a path-based constructor, and
+    secret-redaction on the checkpoint write path.
 
     Usage:
         async with HarnessAsyncSqliteSaver.from_db_path("~/.harness/checkpoints.db") as saver:
@@ -107,12 +138,18 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
 
     _db_path: str
     _ttl_days: int
+    # When True, every aput / aput_writes redacts the `messages` channel
+    # through harness.redactor before letting LangGraph serialize it. This
+    # keeps secrets the user pasted into a prompt out of the on-disk SQLite
+    # blob. Defaults to True; opt out via persistence.redact_messages: false.
+    _redact_messages_on_checkpoint: bool
 
     @classmethod
     async def from_db_path(
         cls,
         db_path: str = "~/.harness/checkpoints.db",
         ttl_days: int = 30,
+        redact_messages: bool = True,
     ) -> "HarnessAsyncSqliteSaver":
         """
         Create a HarnessAsyncSqliteSaver from a filesystem path.
@@ -136,16 +173,89 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
         # Attach metadata for GC & inspection
         instance._db_path = expanded_path
         instance._ttl_days = ttl_days
+        instance._redact_messages_on_checkpoint = redact_messages
 
         # Run 30-day TTL garbage collection
         await instance._run_gc()
 
         logger.info(
-            "[storage] HarnessAsyncSqliteSaver initialised at %s (TTL=%d days).",
+            "[storage] HarnessAsyncSqliteSaver initialised at %s "
+            "(TTL=%d days, redact_messages=%s).",
             expanded_path,
             ttl_days,
+            redact_messages,
         )
         return instance
+
+    # ------------------------------------------------------------------
+    # Redaction hook on the write path.
+    #
+    # LangGraph routes every state transition through aput (full snapshot)
+    # and aput_writes (per-channel pending writes). Both serialise via
+    # self.serde — we intercept *before* serde sees the data so the redacted
+    # form is what lands in SQLite.
+    # ------------------------------------------------------------------
+
+    def _redact_messages_list(self, messages: Any) -> Any:
+        """Redact a messages-channel value in place. Returns the (possibly
+        modified) value. Falls back to the original on any error so a
+        redactor crash never blocks the checkpoint write."""
+        if not getattr(self, "_redact_messages_on_checkpoint", True):
+            return messages
+        if not isinstance(messages, list):
+            return messages
+        try:
+            from harness.redactor import redact_messages
+        except Exception:  # noqa: BLE001
+            return messages
+        try:
+            # redact_messages tolerates non-dict items and is a no-op if the
+            # global scanner hasn't been configured.
+            return redact_messages(messages)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001 — fail open on redactor errors
+            logger.warning("[storage] message redaction failed; persisting raw: %s", exc)
+            return messages
+
+    async def aput(self, config, checkpoint, metadata, new_versions):  # type: ignore[override]
+        # Redact the `messages` channel inside the full state snapshot before
+        # delegating to the LangGraph serializer. We mutate a shallow copy so
+        # the in-memory state the running graph holds is untouched.
+        try:
+            channel_values = checkpoint.get("channel_values") if isinstance(checkpoint, dict) else None
+            if isinstance(channel_values, dict) and "messages" in channel_values:
+                redacted = self._redact_messages_list(channel_values["messages"])
+                if redacted is not channel_values["messages"]:
+                    # Avoid mutating the live state object.
+                    new_channels = dict(channel_values)
+                    new_channels["messages"] = redacted
+                    checkpoint = {**checkpoint, "channel_values": new_channels}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[storage] aput redaction wrapper failed: %s", exc)
+        # Stamp the checkpoint schema version into the metadata blob (P2.4).
+        # Use a shallow copy so we don't mutate LangGraph's internal dict.
+        if isinstance(metadata, dict):
+            metadata = {**metadata, SCHEMA_VERSION_METADATA_KEY: CHECKPOINT_SCHEMA_VERSION}
+        return await super().aput(config, checkpoint, metadata, new_versions)
+
+    async def aput_writes(self, config, writes, task_id, task_path: str = ""):  # type: ignore[override]
+        # aput_writes records the pending channel writes from a node return.
+        # For the `messages` channel that value is the new messages list.
+        try:
+            redacted_writes = []
+            mutated = False
+            for channel, value in writes:
+                if channel == "messages":
+                    new_value = self._redact_messages_list(value)
+                    if new_value is not value:
+                        mutated = True
+                    redacted_writes.append((channel, new_value))
+                else:
+                    redacted_writes.append((channel, value))
+            if mutated:
+                writes = redacted_writes
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[storage] aput_writes redaction wrapper failed: %s", exc)
+        return await super().aput_writes(config, writes, task_id, task_path)
 
     async def _run_gc(self) -> int:
         """
@@ -304,7 +414,18 @@ def generate_session_id(user_provided: Optional[str] = None) -> str:
 # 4. Status Inspector — Read-Only Session Snapshot
 # ---------------------------------------------------------------------------
 
-def _deserialize_checkpoint_blob(blob: Any) -> dict[str, Any]:
+class CheckpointCorruptedError(RuntimeError):
+    """Raised when a checkpoint blob cannot be deserialized by any decoder.
+
+    Callers that are about to ACT on a checkpoint (notably ``cmd_resume``
+    restoring graph state) should let this propagate so the operator sees
+    a clear "checkpoint corrupted" message instead of a silent fresh-start.
+    Callers that are merely SCANNING many rows (TTL GC, status listings)
+    should swallow it so one bad row doesn't halt the batch.
+    """
+
+
+def _deserialize_checkpoint_blob(blob: Any, *, strict: bool = False) -> dict[str, Any]:
     """
     Deserialize a checkpoint column BLOB from the SQLite store.
 
@@ -312,7 +433,14 @@ def _deserialize_checkpoint_blob(blob: Any) -> dict[str, Any]:
     binary blobs (via JsonPlusSerializer). Falls back to JSON for
     backwards compatibility with any legacy text-based rows.
 
-    Returns an empty dict on failure.
+    Args:
+        blob: the raw column value from SQLite.
+        strict: when True, raise CheckpointCorruptedError if every decoder
+            fails (used by cmd_resume's pre-flight validation). When False
+            (default), return ``{}`` so batch scanners (TTL GC, status
+            listings) don't halt on a single bad row.
+
+    Returns ``{}`` on failure when ``strict=False``.
     """
     if blob is None:
         return {}
@@ -328,24 +456,93 @@ def _deserialize_checkpoint_blob(blob: Any) -> dict[str, Any]:
             try:
                 return msgpack.unpackb(blob, raw=False)
             except Exception as e:  # noqa: BLE001
-                # msgpack.exceptions.UnpackException or any decode failure —
-                # don't crash on a single corrupt row; fall through to JSON.
-                logger.debug("[storage] msgpack unpack failed (%s); trying JSON.", e)
+                # msgpack.exceptions.UnpackException or any decode failure.
+                # Promoted from DEBUG to WARNING so the operator sees the
+                # decode failure in default-level logs instead of silently
+                # falling through to a JSON attempt and then to {}.
+                logger.warning(
+                    "[storage] msgpack unpack failed (%s); trying JSON fallback.",
+                    e,
+                )
 
         # Fallback: try decoding as UTF-8 JSON text (legacy format)
         try:
             return json.loads(blob.decode("utf-8", errors="replace"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "[storage] JSON fallback also failed (%s). Blob is unreadable.",
+                exc,
+            )
+            if strict:
+                raise CheckpointCorruptedError(
+                    "Checkpoint blob could not be decoded as msgpack or JSON."
+                ) from exc
             return {}
 
     # Plain text JSON path (legacy / backwards-compat)
     if isinstance(blob, str):
         try:
             return json.loads(blob)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            logger.warning("[storage] Plain-text JSON decode failed (%s).", exc)
+            if strict:
+                raise CheckpointCorruptedError(
+                    "Plain-text checkpoint blob is not valid JSON."
+                ) from exc
             return {}
 
+    if strict:
+        raise CheckpointCorruptedError(
+            f"Unsupported checkpoint blob type: {type(blob).__name__}"
+        )
     return {}
+
+
+def validate_checkpoint_schema(metadata_blob: Any) -> Optional[int]:
+    """Validate a checkpoint's stamped schema version (P2.4).
+
+    Returns the resolved version (None when missing). Raises
+    CheckpointSchemaMismatchError when the stamped version is incompatible
+    with the running harness.
+
+    Policy:
+      - Missing version: legacy checkpoint, predates P2.4. WARNs and returns
+        None so cmd_resume still proceeds — failing here would strand every
+        operator who upgrades.
+      - Version > CHECKPOINT_SCHEMA_VERSION: written by a newer harness.
+        Refuse: silently loading an unknown-future state risks data loss.
+      - Version < MIN_RESUMABLE_SCHEMA_VERSION: incompatible older format.
+        Refuse with the same explicit error.
+    """
+    metadata = _deserialize_checkpoint_blob(metadata_blob)
+    if not isinstance(metadata, dict):
+        return None
+    raw = metadata.get(SCHEMA_VERSION_METADATA_KEY)
+    if raw is None:
+        logger.warning(
+            "[storage] Checkpoint has no schema version stamp — treating as "
+            "pre-P2.4 legacy and allowing resume. Re-running this session "
+            "will write a versioned checkpoint going forward."
+        )
+        return None
+    try:
+        version = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise CheckpointSchemaMismatchError(
+            f"Checkpoint schema_version is not an integer: {raw!r}"
+        ) from exc
+    if version > CHECKPOINT_SCHEMA_VERSION:
+        raise CheckpointSchemaMismatchError(
+            f"Checkpoint was written by a newer harness "
+            f"(checkpoint schema v{version}, this harness supports v{CHECKPOINT_SCHEMA_VERSION}). "
+            f"Upgrade the harness or start a fresh session."
+        )
+    if version < MIN_RESUMABLE_SCHEMA_VERSION:
+        raise CheckpointSchemaMismatchError(
+            f"Checkpoint schema v{version} is older than the minimum supported "
+            f"version (v{MIN_RESUMABLE_SCHEMA_VERSION}). Start a fresh session."
+        )
+    return version
 
 
 def _format_checkpoint_ts(ts_value: Any) -> str:
@@ -361,7 +558,7 @@ def _format_checkpoint_ts(ts_value: Any) -> str:
         return "(unknown)"
 
     try:
-        from datetime import datetime, timezone as dt_timezone
+        from datetime import datetime
         # Strip trailing 'Z' and parse ISO 8601 UTC
         cleaned = ts_value.replace("Z", "+00:00")
         dt = datetime.fromisoformat(cleaned)

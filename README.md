@@ -48,6 +48,17 @@ harness doctor
 harness run -r /path/to/repo -p "Add JWT authentication to the login endpoint"
 ```
 
+For a pilot install where you need bit-exact reproducibility (recommended
+when shipping to a paying customer), use the pinned constraints file:
+
+```bash
+pip install -e . --constraint requirements-prod.txt
+```
+
+`requirements-prod.txt` records the exact versions of every direct and
+transitive dependency. Regenerate it after a deliberate dependency bump
+with `pip freeze | grep -v '^-e ' | sort > requirements-prod.txt`.
+
 On first run, `myharness` auto-generates `.harness_config.json` in the
 workspace from your global config plus shipped defaults. Edit it to customize
 per-project settings (model routing, build command, sandbox limits).
@@ -71,6 +82,7 @@ the preview gate, and how to bring the same setup up on a different host.
 | `harness status` | Read-only inspection of a checkpointed session. |
 | `harness doctor` | Run first-run healthchecks (git, API keys, sandbox, DB, config). |
 | `harness purge` | Wipe checkpoint data. |
+| `harness --version` | Print the installed harness version and exit. |
 
 ### `harness run`
 
@@ -152,7 +164,14 @@ Run `harness doctor` first — it tells you which subsystem is unhappy.
 | `[WARN] config parse` (`Unknown config key ...`) | Typo in `.harness_config.json` | Apply the suggested correction shown in the warning. |
 | `[FAIL] checkpoint db` (`sqlite3 open failed`) | DB path not writable | Change `persistence.db_path` to a writable location. |
 
-Logs are written to `~/.harness/logs/<session-id>.log` and stderr.
+For failures during a session — checkpoint corruption, budget exhaustion,
+sandbox dead mid-run, workspace lock stuck, persistent LLM silence — see
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md) for diagnostic commands and recovery
+recipes per failure mode.
+
+Logs are written to `~/.harness/logs/<session-id>.jsonl` (rotated at
+10 MB by default; configurable via `logging.max_bytes` and
+`logging.backup_count`) and stderr.
 
 ## Platform support
 

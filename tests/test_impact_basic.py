@@ -2,7 +2,6 @@
 
 import tempfile
 
-import pytest
 
 from harness.impact import (
     ImpactResult,
@@ -278,7 +277,6 @@ class TestWorkspaceStackDetector:
     """_detect_workspace_stack drives language-aware skill filtering."""
 
     def test_empty_workspace_yields_no_tags(self):
-        import os
         from harness.impact import _detect_workspace_stack
         with tempfile.TemporaryDirectory() as tmp:
             assert _detect_workspace_stack(tmp) == set()

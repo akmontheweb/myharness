@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -818,7 +819,7 @@ class TestSandboxBackend:
 class TestDiagnosticParsing:
 
     def test_parse_go_diagnostics(self):
-        from harness.sandbox import _parse_go_diagnostics, DiagnosticObject
+        from harness.sandbox import _parse_go_diagnostics
         output = "src/main.go:10:5: undefined: xyz\nother.go:3:1: syntax error\n"
         diags = _parse_go_diagnostics(output)
         assert len(diags) == 2
@@ -891,7 +892,6 @@ class TestDiagnosticParsing:
     @pytest.mark.asyncio
     async def test_execute_build_sandbox(self):
         from harness.sandbox import SandboxExecutor, BareBackend
-        import subprocess as _sp
         with tempfile.TemporaryDirectory() as tmpdir:
             executor = SandboxExecutor(
                 workspace_path=tmpdir,
@@ -1053,7 +1053,6 @@ class TestSecretPatterns:
     def test_redaction_preserves_json_validity(self):
         # Bracketed replacements ([REDACTED:...]) are JSON-string-safe
         # because they contain no `"` or `\`.
-        import json
         from harness.redactor import SecretScanner
         scanner = SecretScanner(mode="hash")
         msg = json.dumps({"api_key": "sk-ant-api01-abcdef1234567890abcdef1234567890abcdef1234567890abcd"})
@@ -1505,7 +1504,7 @@ class TestGateway:
         # Regression: the fill loop used `break` when a message was too big
         # to fit. This caused all *older* (smaller) messages to be dropped
         # even if they would have fit. `continue` is correct.
-        from harness.gateway import check_context_window, ModelSpec, estimate_token_count
+        from harness.gateway import check_context_window, ModelSpec
         # Small context: sys + last must fit, one middle too large, one tiny
         spec = ModelSpec(provider="test", model_id="test", context_window=300,
                         input_cost_per_1m=1.0, output_cost_per_1m=1.0)
@@ -1718,8 +1717,6 @@ class TestGatekeeperAutoApprove:
         # passed it to the API. Verify the payload now carries the
         # `thinking` block and forces temperature=1.0.
         from harness.gateway import AnthropicProvider, ModelSpec
-        import asyncio
-        from unittest.mock import AsyncMock, patch
 
         spec = ModelSpec(
             provider="anthropic", model_id="claude-test",
@@ -2012,11 +2009,18 @@ class TestToolchainAdaptation:
         assert "read_only_root" not in cfg
 
     def test_adapts_network_for_pip_install(self):
+        # P1.3 closeout: auto-network on pip-install detection now requires
+        # explicit opt-in via sandbox.auto_enable_network_for_install. Pass
+        # it here so the historical behaviour is preserved end-to-end.
         from harness.graph import _apply_toolchain_adaptation
         cfg, allow_net, img_adapted, net_adapted, ro_adapted = (
             _apply_toolchain_adaptation(
                 "pip install -r requirements.txt && pytest",
-                {"docker_image": "ubuntu:22.04"}, False,
+                {
+                    "docker_image": "ubuntu:22.04",
+                    "auto_enable_network_for_install": True,
+                },
+                False,
             )
         )
         assert img_adapted
@@ -2026,6 +2030,19 @@ class TestToolchainAdaptation:
         # pip install fails with [Errno 30] on /root/.local.
         assert ro_adapted
         assert cfg["read_only_root"] is False
+
+    def test_auto_network_off_refuses_to_flip(self):
+        # P1.3 regression: when the opt-in is absent (the default), the
+        # heuristic must NOT silently flip allow_network. Operator gets a
+        # warning log; sandbox stays isolated.
+        from harness.graph import _apply_toolchain_adaptation
+        _cfg, allow_net, _img, net_adapted, _ro = _apply_toolchain_adaptation(
+            "pip install -r requirements.txt && pytest",
+            {"docker_image": "ubuntu:22.04"},  # no auto_enable_network_for_install
+            False,
+        )
+        assert not net_adapted
+        assert allow_net is False
 
     def test_idempotent_when_already_adapted(self):
         # Calling twice should not re-flag image_was_adapted — otherwise
@@ -2071,7 +2088,11 @@ class TestToolchainAdaptation:
         from harness.graph import _apply_toolchain_adaptation
         cfg1, _, _, _, ro1 = _apply_toolchain_adaptation(
             "pip install -e . && pytest",
-            {"docker_image": "python:3.12-slim"}, False,
+            {
+                "docker_image": "python:3.12-slim",
+                "auto_enable_network_for_install": True,
+            },
+            False,
         )
         assert ro1
         cfg2, _, _, _, ro2 = _apply_toolchain_adaptation(
@@ -3151,7 +3172,12 @@ class TestCLI:
                 "allow_network": False,
                 "loop_counter": {},
                 "messages": [],
-                "sandbox_config": {"docker_image": "ubuntu:22.04"},
+                # P1.3: opt in explicitly so the auto-flip is allowed for
+                # this test. Default in real configs is False.
+                "sandbox_config": {
+                    "docker_image": "ubuntu:22.04",
+                    "auto_enable_network_for_install": True,
+                },
             }
             result = await graph_mod.compiler_node(state)
 
@@ -3190,7 +3216,11 @@ class TestCLI:
                 "allow_network": False,
                 "loop_counter": {},
                 "messages": [],
-                "sandbox_config": {"docker_image": "ubuntu:22.04"},
+                # P1.3: opt in explicitly so the auto-flip is allowed.
+                "sandbox_config": {
+                    "docker_image": "ubuntu:22.04",
+                    "auto_enable_network_for_install": True,
+                },
             }
             result = await graph_mod.compiler_node(state)
 
@@ -3398,7 +3428,8 @@ class TestSpeculative:
         with tempfile.TemporaryDirectory() as outer:
             v1 = os.path.join(outer, "variant-1")
             v2 = os.path.join(outer, "variant-2")
-            os.makedirs(v1); os.makedirs(v2)
+            os.makedirs(v1)
+            os.makedirs(v2)
             env1 = _build_variant_cache_env(v1)
             env2 = _build_variant_cache_env(v2)
             assert env1["PIP_CACHE_DIR"] != env2["PIP_CACHE_DIR"]

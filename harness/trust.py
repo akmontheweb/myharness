@@ -192,6 +192,37 @@ def validate_blueprint(blueprint: dict[str, Any]) -> list[str]:
 _MAX_QUESTION_TEXT_LEN = 10_000
 # Maximum number of modules in a discovery response.
 _MAX_MODULES = 50
+# Total response-size cap. A well-formed discovery response is a few KB;
+# 1 MB is two orders of magnitude above that, so the cap only triggers on
+# pathological input (malicious LLM, runaway generation).
+_MAX_DISCOVERY_BYTES = 1_000_000
+# Recursion depth cap. Discovery JSON is shallow (object -> modules -> questions
+# -> primitives, depth ~4). Python's default recursion limit is 1000, so a
+# nested response could DoS the parser before our other guards see it.
+_MAX_DISCOVERY_DEPTH = 10
+
+
+def _json_depth(node: Any, _seen: Optional[set] = None) -> int:
+    """Return the maximum nesting depth of a parsed JSON tree.
+
+    Cycle-safe via an id() set so a malformed object graph can't OOM us.
+    A primitive is depth 0; ``{"a": 1}`` is depth 1; ``{"a": [1]}`` is depth 2.
+    """
+    if _seen is None:
+        _seen = set()
+    if id(node) in _seen:
+        return 0
+    if isinstance(node, dict):
+        _seen.add(id(node))
+        if not node:
+            return 1
+        return 1 + max(_json_depth(v, _seen) for v in node.values())
+    if isinstance(node, list):
+        _seen.add(id(node))
+        if not node:
+            return 1
+        return 1 + max(_json_depth(v, _seen) for v in node)
+    return 0
 
 
 def validate_discovery_json(content: str) -> tuple[dict[str, Any], list[str]]:
@@ -215,6 +246,14 @@ def validate_discovery_json(content: str) -> tuple[dict[str, Any], list[str]]:
     """
     errors: list[str] = []
 
+    # Pre-flight size guard. UTF-8 string length in bytes is the right unit —
+    # JSON parsing allocates roughly that much memory plus parser overhead.
+    if len(content.encode("utf-8", errors="replace")) > _MAX_DISCOVERY_BYTES:
+        errors.append(
+            f"discovery response exceeds {_MAX_DISCOVERY_BYTES} bytes — refusing to parse"
+        )
+        return {}, errors
+
     # Strip code fences (LLMs sometimes wrap JSON in ```json ... ```)
     stripped = _strip_code_fences(content)
     if not stripped.strip():
@@ -230,6 +269,13 @@ def validate_discovery_json(content: str) -> tuple[dict[str, Any], list[str]]:
     if not isinstance(data, dict):
         errors.append("discovery response must be a JSON object")
         return {}, errors
+
+    depth = _json_depth(data)
+    if depth > _MAX_DISCOVERY_DEPTH:
+        errors.append(
+            f"discovery response nesting depth {depth} exceeds {_MAX_DISCOVERY_DEPTH}"
+        )
+        return data, errors
 
     # "complete" is the most critical field — must be a bool
     if "complete" in data and not isinstance(data["complete"], bool):

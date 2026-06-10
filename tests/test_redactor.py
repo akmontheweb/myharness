@@ -1,9 +1,7 @@
 """Tests for harness/redactor.py — Secret scanning and redaction."""
 
-import pytest
 from harness.redactor import (
     SecretScanner,
-    RedactionResult,
     _is_high_entropy,
 )
 

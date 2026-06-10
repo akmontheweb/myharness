@@ -4,7 +4,6 @@ import logging
 import os
 import tempfile
 
-import pytest
 
 
 class TestJSONFormatter:
@@ -89,19 +88,23 @@ class TestConfigureLogging:
             for handler in logging.getLogger().handlers:
                 handler.flush()
             with open(path) as f:
-                lines = [l.strip() for l in f if l.strip()]
+                lines = [ln.strip() for ln in f if ln.strip()]
             assert len(lines) >= 1
             for line in lines:
                 json.loads(line)  # every line must be valid JSON
 
     def test_returns_none_on_unwritable_log_dir(self, monkeypatch):
         from harness.observability import configure_logging
-        import harness.observability as obs_mod
+        import logging.handlers as logging_handlers
 
         def bad_fh(*a, **kw):
             raise OSError("simulated disk full")
 
-        monkeypatch.setattr(obs_mod.logging, "FileHandler", bad_fh)
+        # P2.3: file handler is now RotatingFileHandler by default — patch
+        # that to simulate disk failure. Also patch the plain FileHandler in
+        # case max_bytes=0 is passed (legacy path).
+        monkeypatch.setattr(logging_handlers, "RotatingFileHandler", bad_fh)
+        monkeypatch.setattr(logging, "FileHandler", bad_fh)
         with tempfile.TemporaryDirectory() as log_dir:
             path = configure_logging(
                 session_id="fail-session",
@@ -110,6 +113,58 @@ class TestConfigureLogging:
             )
         # Must not raise — returns None on failure
         assert path is None
+
+    def test_rotating_handler_used_by_default(self):
+        from harness.observability import configure_logging
+        from logging.handlers import RotatingFileHandler
+        with tempfile.TemporaryDirectory() as log_dir:
+            configure_logging(
+                session_id="rotate-default",
+                log_dir=log_dir,
+                level="INFO",
+            )
+            handlers = logging.getLogger().handlers
+            file_handlers = [h for h in handlers if isinstance(h, RotatingFileHandler)]
+            assert file_handlers, "default config should install RotatingFileHandler"
+            rfh = file_handlers[0]
+            assert rfh.maxBytes == 10_000_000
+            assert rfh.backupCount == 5
+
+    def test_rotation_actually_rotates_when_size_exceeded(self):
+        from harness.observability import configure_logging
+        with tempfile.TemporaryDirectory() as log_dir:
+            path = configure_logging(
+                session_id="rotate-small",
+                log_dir=log_dir,
+                level="DEBUG",
+                max_bytes=2_000,    # tiny cap so a few records trip rotation
+                backup_count=2,
+            )
+            # Each JSON record is well under 2 KB; emit enough to force at
+            # least one rotation.
+            log = logging.getLogger("harness.rotate.test")
+            for i in range(200):
+                log.info("rotation-test record %d with some filler payload xxxxxxxxxxxxxxxxxxxxxxxxxxx", i)
+            for h in logging.getLogger().handlers:
+                h.flush()
+            # After rotation the live file and at least one .1 backup must exist.
+            assert os.path.isfile(path)
+            assert os.path.isfile(path + ".1"), "expected at least one rotated backup"
+
+    def test_max_bytes_zero_uses_plain_file_handler(self):
+        from harness.observability import configure_logging
+        from logging.handlers import RotatingFileHandler
+        with tempfile.TemporaryDirectory() as log_dir:
+            configure_logging(
+                session_id="rotate-off",
+                log_dir=log_dir,
+                level="INFO",
+                max_bytes=0,
+            )
+            handlers = logging.getLogger().handlers
+            assert not any(isinstance(h, RotatingFileHandler) for h in handlers), \
+                "max_bytes=0 must opt out of rotation"
+            assert any(isinstance(h, logging.FileHandler) for h in handlers)
 
     def test_no_langsmith_without_api_key(self, monkeypatch):
         # When LANGCHAIN_API_KEY is absent, LangSmith init must skip silently.
@@ -137,8 +192,8 @@ class TestEmitEvent:
             for handler in logging.getLogger().handlers:
                 handler.flush()
             with open(path) as f:
-                lines = [json.loads(l) for l in f if l.strip()]
-            events = [l for l in lines if l.get("event") == "llm_call"]
+                lines = [json.loads(ln) for ln in f if ln.strip()]
+            events = [ev for ev in lines if ev.get("event") == "llm_call"]
             assert len(events) >= 1
             assert events[0]["model"] == "x:y"
             assert events[0]["cost_usd"] == 0.01
@@ -155,8 +210,8 @@ class TestEmitEvent:
             for handler in logging.getLogger().handlers:
                 handler.flush()
             with open(path) as f:
-                lines = [json.loads(l) for l in f if l.strip()]
-            events = [l for l in lines if l.get("event") == "sandbox_start_failed"]
+                lines = [json.loads(ln) for ln in f if ln.strip()]
+            events = [ev for ev in lines if ev.get("event") == "sandbox_start_failed"]
             assert len(events) >= 1
             assert events[0]["level"] == "ERROR"
             assert events[0]["reason"] == "auto_detect_no_backend"
@@ -174,7 +229,7 @@ class TestEmitEvent:
             for handler in logging.getLogger().handlers:
                 handler.flush()
             with open(path) as f:
-                events = [json.loads(l) for l in f if l.strip() and "token_budget_exhausted" in l]
+                events = [json.loads(ln) for ln in f if ln.strip() and "token_budget_exhausted" in ln]
             assert len(events) >= 1
             assert events[0]["hard_cap_usd"] == 2.0
 

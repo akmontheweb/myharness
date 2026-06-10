@@ -3,7 +3,6 @@
 import subprocess
 import tempfile
 
-import pytest
 
 from harness.speculative import (
     VariantResult,

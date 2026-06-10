@@ -5,7 +5,6 @@ import os
 import tempfile
 from pathlib import Path
 
-import pytest
 
 from harness.cli import (
     discover_config,
@@ -255,7 +254,7 @@ class TestBuildParser:
         parser = build_parser()
         # Should be able to parse a command
         try:
-            args = parser.parse_args(["run", "--help"])
+            parser.parse_args(["run", "--help"])
         except SystemExit:
             # --help causes exit, which is expected
             pass

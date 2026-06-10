@@ -51,9 +51,6 @@ def _make_server(response_body: bytes = b'{"answer": "ok"}',
     return server
 
 
-from typing import Optional  # keep this import at top; re-ordered here for clarity
-
-
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
     """Reset channel singleton and env vars before each test."""

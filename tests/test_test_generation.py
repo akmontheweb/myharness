@@ -4,7 +4,6 @@ sandbox execution node wired between speculative_node and lintgate_node.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import pytest

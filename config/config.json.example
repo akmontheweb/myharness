@@ -1,0 +1,105 @@
+{
+    "_comment": "Example global config for AI Agent Harness. Copy to config.json and fill in your own model registry, API keys, and routing. The real config.json is .gitignored because it carries secrets — never commit it.",
+    "models": {
+        "openai:gpt-4o": {
+            "provider": "openai",
+            "model_id": "gpt-4o",
+            "context_window": 128000,
+            "input_cost_per_1m": 2.50,
+            "output_cost_per_1m": 10.00,
+            "cached_input_cost_per_1m": 1.25,
+            "api_base_url": "https://api.openai.com/v1",
+            "supports_thinking": false,
+            "supports_cache": true,
+            "_api_key_hint": "Prefer setting OPENAI_API_KEY in your shell. Inline 'api_key' here works too but be careful — this file holds secrets."
+        },
+        "openai:gpt-4o-mini": {
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+            "context_window": 128000,
+            "input_cost_per_1m": 0.15,
+            "output_cost_per_1m": 0.60,
+            "cached_input_cost_per_1m": 0.075,
+            "api_base_url": "https://api.openai.com/v1",
+            "supports_thinking": false,
+            "supports_cache": true
+        },
+        "anthropic:claude-sonnet-4": {
+            "provider": "anthropic",
+            "model_id": "claude-sonnet-4-20250514",
+            "context_window": 200000,
+            "input_cost_per_1m": 3.00,
+            "output_cost_per_1m": 15.00,
+            "cached_input_cost_per_1m": 0.30,
+            "api_base_url": "https://api.anthropic.com/v1",
+            "supports_thinking": false,
+            "supports_cache": true,
+            "_api_key_hint": "Set ANTHROPIC_API_KEY in your shell."
+        },
+        "deepseek:deepseek-v4-pro": {
+            "provider": "deepseek",
+            "model_id": "deepseek-v4-pro",
+            "context_window": 131072,
+            "input_cost_per_1m": 0.14,
+            "output_cost_per_1m": 0.28,
+            "cached_input_cost_per_1m": 0.014,
+            "api_base_url": "https://api.deepseek.com/v1",
+            "supports_thinking": false,
+            "api_key": "REPLACE_WITH_YOUR_DEEPSEEK_KEY",
+            "supports_cache": true
+        },
+        "deepseek:deepseek-v4-flash": {
+            "provider": "deepseek",
+            "model_id": "deepseek-v4-flash",
+            "context_window": 131072,
+            "input_cost_per_1m": 0.14,
+            "output_cost_per_1m": 0.28,
+            "cached_input_cost_per_1m": 0.014,
+            "api_base_url": "https://api.deepseek.com/v1",
+            "supports_thinking": false,
+            "api_key": "REPLACE_WITH_YOUR_DEEPSEEK_KEY",
+            "supports_cache": true
+        },
+        "ollama:qwen2.5-coder:14b": {
+            "provider": "ollama",
+            "model_id": "qwen2.5-coder:14b",
+            "context_window": 131072,
+            "input_cost_per_1m": 0.0,
+            "output_cost_per_1m": 0.0,
+            "api_base_url": "http://localhost:11434/v1",
+            "supports_thinking": false,
+            "supports_cache": false
+        }
+    },
+    "model_routing": {
+        "_comment": "Default routing for all projects. Override per-project in .harness_config.json. Point each role to a model_key registered above.",
+        "planning_primary": "deepseek:deepseek-v4-flash",
+        "planning_fallback": "deepseek:deepseek-v4-flash",
+        "patching_primary": "deepseek:deepseek-v4-pro",
+        "repair_primary": "deepseek:deepseek-v4-pro",
+        "_doc_reviewer_comment": "Doc reviewer LLM — independent of code reviewer. Setting doc_reviewer_primary IS the opt-in; leave empty to skip doc review entirely.",
+        "doc_reviewer_primary": "",
+        "doc_reviewer_mode": "thinking",
+        "doc_reviewer_fallback": "",
+        "_code_reviewer_comment": "Code reviewer LLM — independent of doc reviewer. Setting code_reviewer_primary IS the opt-in; leave empty to skip code review entirely.",
+        "code_reviewer_primary": "",
+        "code_reviewer_mode": "thinking",
+        "code_reviewer_fallback": "",
+        "ollama_local_model": "ollama:qwen2.5-coder:14b"
+    },
+    "node_throttle": {
+        "_comment": "Per-loop hard ceilings. Review cycles clamp [0,5]; discovery clamp [1,30]; 0 suspends a review loop without clearing the model slot.",
+        "max_patch_repair_iterations": 3,
+        "max_doc_review_cycles": 1,
+        "max_code_review_cycles": 1,
+        "max_discovery_iterations": 10
+    },
+    "token_budget": {
+        "hard_cap_usd": 2.00,
+        "context_window_threshold_pct": 0.85
+    },
+    "persistence": {
+        "db_path": "~/.harness/checkpoints.db",
+        "ttl_days": 30
+    }
+}

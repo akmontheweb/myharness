@@ -8,13 +8,11 @@ the workspace's detected stack tags.
 from __future__ import annotations
 
 import os
-import tempfile
 from textwrap import dedent
 
 import pytest
 
 from harness.style_guides import (
-    DEFAULT_MAX_FILE_CHARS,
     HARNESS_STYLE_GUIDES_DIR,
     _load_style_guides_markdown,
     load_style_guides,

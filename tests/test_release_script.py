@@ -1,7 +1,6 @@
 """Smoke tests for scripts/release.py — pure-function logic only."""
 
 import importlib.util
-import os
 import tempfile
 from pathlib import Path
 

@@ -12,12 +12,23 @@ concurrency:
 
 jobs:
   test:
-    name: pytest (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: pytest (py${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # P2.6: macOS + Windows runs are advisory for now — Linux is the only
+    # blocking target. The matrix gives early signal on platform-specific
+    # regressions (fcntl on Windows, paths on macOS) without gating merges
+    # until the platform backlog is triaged.
+    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
     env:
       # Non-TTY auto-approval path inside cmd_run; ensures HITL gates
       # never block CI by waiting on stdin.
@@ -41,3 +52,41 @@ jobs:
 
       - name: Run pytest
         run: pytest tests/ -q --tb=short
+
+  quality:
+    name: lint + types
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package and dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # ruff check is the blocking gate — keeps `harness/` free of unused
+      # imports, undefined names, and style errors that change behaviour.
+      - name: ruff check
+        run: ruff check harness/ tests/
+
+      # ruff format is advisory for now. There are ~20 files needing a
+      # one-shot reformat; lifting `continue-on-error` is the next step
+      # once that lands.
+      - name: ruff format --check
+        continue-on-error: true
+        run: ruff format --check harness/ tests/
+
+      # mypy is advisory for now — the codebase has accumulated typing
+      # debt; surfacing it in CI gives signal without blocking merges
+      # until we triage the backlog.
+      - name: mypy
+        continue-on-error: true
+        run: mypy harness/

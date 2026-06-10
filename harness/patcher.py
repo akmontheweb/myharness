@@ -257,8 +257,44 @@ async def _awrite(filepath: str, content: str) -> None:
     Previously this used a plain ``open(filepath, "w")`` which truncated the
     file *before* writing — a crash between truncate and final flush left
     the user's file empty.
+
+    P1.2: refuse to write through a symlink at ``filepath`` (Linux/macOS).
+    ``safe_resolve`` already rejects symlinks that escape the workspace,
+    but an attacker could pre-stage a symlink ``pyproject.toml ->
+    ~/.ssh/authorized_keys`` (or any in-workspace dotfile) and ride the
+    LLM's first patch onto a sensitive target. ``lstat`` + ``O_NOFOLLOW``
+    closes that path before the atomic rename takes effect. Windows path
+    symlinks are not protected (no portable O_NOFOLLOW); logged as a
+    debug message so operators on Windows aren't surprised.
     """
     import tempfile
+
+    # P1.2: reject symlinks at the destination BEFORE we set up the temp
+    # file. os.path.islink uses lstat under the hood — the same primitive
+    # O_NOFOLLOW relies on, with the advantage that we can issue a useful
+    # error before any disk write happens. On Linux/macOS we also try to
+    # open the file with O_NOFOLLOW as a belt-and-braces check that
+    # catches races between this check and the os.replace below.
+    if os.path.lexists(filepath) and os.path.islink(filepath):
+        raise PermissionError(
+            f"[patcher] Refusing to write through symlink: {filepath!r}. "
+            f"This usually indicates a path-traversal attempt or a "
+            f"stale dev symlink — delete the symlink and retry."
+        )
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is not None and os.path.lexists(filepath):
+        try:
+            check_fd = os.open(filepath, os.O_RDONLY | nofollow)
+        except OSError as exc:
+            # ELOOP: target is a symlink. Anything else (permissions,
+            # missing file) is fine to let through to the existing write path.
+            if getattr(exc, "errno", None) in (40, 62):  # ELOOP across Linux/BSD
+                raise PermissionError(
+                    f"[patcher] O_NOFOLLOW check tripped on {filepath!r}: "
+                    f"target resolves through a symlink ({exc})."
+                ) from exc
+        else:
+            os.close(check_fd)
 
     directory = os.path.dirname(os.path.abspath(filepath)) or "."
     # delete=False so we own cleanup; suffix keeps editor file-watchers happy.

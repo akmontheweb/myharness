@@ -7,7 +7,7 @@ name = "ai-agent-harness"
 version = "1.0.0"
 description = "Production-grade, model-agnostic AI Agent Harness with LangGraph orchestration, sandboxed builds, and bulletproof persistence."
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 authors = [
     { name = "AI Agent Harness Team" }
 ]

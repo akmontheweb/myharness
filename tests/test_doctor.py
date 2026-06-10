@@ -4,9 +4,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
-import pytest
 
 from harness.cli import (
     _doctor_check_api_keys,

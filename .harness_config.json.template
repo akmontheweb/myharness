@@ -1,5 +1,5 @@
 {
-    "_comment": "AI Agent Harness per-project template. Global models go in ~/.harness/config.json.",
+    "_comment": "AI Agent Harness per-project template. Global models go in <myharness_root>/config/config.json.",
     "build_command": "make build",
     "allow_network": false,
     "sandbox": {
@@ -17,10 +17,15 @@
         "context_window_threshold_pct": 0.85
     },
     "node_throttle": {
-        "max_patch_repair_iterations": 3
+        "max_patch_repair_iterations": 3,
+        "_review_comment": "Doc/code review cycle caps. Clamped to [0,5]; 0 suspends without clearing the model slot.",
+        "max_doc_review_cycles": 1,
+        "max_code_review_cycles": 1,
+        "_discovery_comment": "Discovery interview iteration cap. Clamped to [1,30].",
+        "max_discovery_iterations": 10
     },
     "model_routing": {
-        "_comment": "Point each role to a model key registered in ~/.harness/config.json.",
+        "_comment": "Point each role to a model key registered in <myharness_root>/config/config.json.",
         "planning_primary": "",
         "planning_mode": "thinking_max",
         "planning_fallback": "",
@@ -28,6 +33,14 @@
         "patching_mode": "non_thinking",
         "repair_primary": "",
         "repair_mode": "thinking",
+        "_doc_reviewer_comment": "Doc reviewer — independent of code reviewer. Empty primary == doc review skipped.",
+        "doc_reviewer_primary": "",
+        "doc_reviewer_mode": "thinking",
+        "doc_reviewer_fallback": "",
+        "_code_reviewer_comment": "Code reviewer — independent of doc reviewer. Empty primary == code review skipped.",
+        "code_reviewer_primary": "",
+        "code_reviewer_mode": "thinking",
+        "code_reviewer_fallback": "",
         "ollama_local_model": "",
         "ollama_local_backup": "",
         "force_local_only": false

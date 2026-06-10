@@ -1,6 +1,5 @@
 """Tests for harness/parser_registry.py — error parsing utilities."""
 
-import pytest
 
 from harness.parser_registry import (
     _strip_ansi,

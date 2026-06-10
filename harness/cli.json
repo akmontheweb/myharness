@@ -1,5 +1,5 @@
 {
-    "_comment": "AI Agent Harness — built-in fallback defaults. Override per-project via .harness_config.json and globally via ~/.harness/config.json.",
+    "_comment": "AI Agent Harness — built-in fallback defaults. Override per-project via .harness_config.json and globally via <myharness_root>/config/config.json.",
     "build_command": "make build",
     "allow_network": false,
     "sandbox": {

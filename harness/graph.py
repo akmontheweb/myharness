@@ -109,6 +109,13 @@ class AgentState(TypedDict, total=False):
     # round-tripping through cli.py's config loader. Loaded from the
     # "test_generation" section of cli.json / .harness_config.json.
     test_generation_config: dict[str, Any]
+    # Reviewer LLM artifacts. Each is independently populated; either may be
+    # absent if the corresponding *_reviewer_primary slot is unset.
+    reviewer_comments_requirements: str
+    reviewer_comments_code: str
+    # Discovery-shaped follow-up questions the doc reviewer wants the user to
+    # answer in a second pass of the interview loop.
+    reviewer_followups: list[dict[str, Any]]
 
 # ---------------------------------------------------------------------------
 # 2. Default State Factory
@@ -158,7 +165,10 @@ def create_initial_state(
             total_cost_usd=0.0,
             per_model={},
         ),
-        loop_counter={"patching": 0, "repair": 0, "compiler": 0, "total_repairs": 0},
+        loop_counter={
+            "patching": 0, "repair": 0, "compiler": 0, "total_repairs": 0,
+            "review_spec": 0, "review_code": 0,
+        },
         allow_network=allow_network,
         build_command=build_command,
         budget_remaining_usd=budget_usd,
@@ -188,29 +198,52 @@ _ROOT_ALLOWLIST_FILES: frozenset[str] = frozenset({
 def _build_patcher_allowlist(workspace_path: str) -> Optional[list[str]]:
     """Return the patcher allowed_paths list for ``workspace_path``.
 
-    Returns ``None`` when no source root could be detected (flat or
-    ambiguous workspaces) — preserves the pre-fix permissive behaviour
-    so projects without a clear convention keep working as before.
-
-    Otherwise returns a list combining:
+    When a source root is detected, returns the focused allowlist:
       - the source root itself as a directory prefix (e.g. ``"app/"``),
       - the conventional test trees,
       - the conventionally-root files in :data:`_ROOT_ALLOWLIST_FILES`,
       - any ``requirements*.txt`` actually present at the workspace root.
+
+    When detection fails (flat / ambiguous workspaces) we used to return
+    ``None`` which the patcher reads as "allow ANY path under the
+    workspace tree". That gave the LLM unconstrained write access to
+    ``.git/`` config, dotfiles, and anywhere else in the tree — well
+    outside the intent of "edit the source." Instead we return a
+    conservative best-guess allowlist covering the common source layouts
+    (``src/``, ``lib/``, ``app/``, ``pkg/``, ``cmd/``) plus the standard
+    test trees and root manifest files. If the LLM genuinely needs to
+    write somewhere outside that, the patcher will reject the write and
+    the operator can either fix the layout heuristic in ``harness.impact``
+    or add a top-level entry to the allowlist explicitly.
 
     Mirrors the language used in the system prompt's "Workspace Layout"
     section, so the LLM sees the same rules as the patcher applies.
     """
     from harness.impact import _detect_source_root
     root = _detect_source_root(workspace_path)
-    if not root:
-        return None
 
-    allowlist: list[str] = [
-        f"{root}/",
-        "tests/", "test/", "__tests__/",
-        *_ROOT_ALLOWLIST_FILES,
-    ]
+    if root:
+        allowlist: list[str] = [
+            f"{root}/",
+            "tests/", "test/", "__tests__/",
+            *_ROOT_ALLOWLIST_FILES,
+        ]
+    else:
+        # Conservative fallback when no source root is detected. Covers the
+        # 95% case (src/, lib/, app/, pkg/, cmd/) without resorting to the
+        # old "anything goes" permissive default.
+        logger.warning(
+            "[allowlist] No source root detected for %s — falling back to "
+            "conservative allowlist (src/, lib/, app/, pkg/, cmd/, tests/). "
+            "If the LLM needs to write elsewhere, fix detection in "
+            "harness.impact._detect_source_root or extend _ROOT_ALLOWLIST_FILES.",
+            workspace_path,
+        )
+        allowlist = [
+            "src/", "lib/", "app/", "pkg/", "cmd/",
+            "tests/", "test/", "__tests__/",
+            *_ROOT_ALLOWLIST_FILES,
+        ]
 
     # Pick up any requirements*.txt actually present so the LLM can amend
     # them without the patcher rejecting the write.
@@ -1063,6 +1096,12 @@ def _apply_toolchain_adaptation(
     the second call — each conditional only fires when its precondition is
     still true (image is a known-bare default, allow_network still False,
     read_only_root unset / still True).
+
+    P1.3: the network auto-enable on a pip/npm install heuristic is gated
+    by ``sandbox.auto_enable_network_for_install`` (default ``false``).
+    When the heuristic would fire but the opt-in is off, the function
+    declines to flip ``allow_network`` and logs a warning so the operator
+    sees the divergence instead of silently widening the blast radius.
     """
     cfg = dict(sandbox_config or {})
     image_was_adapted = False
@@ -1082,8 +1121,21 @@ def _apply_toolchain_adaptation(
     new_allow_network = allow_network
     needs_install = _build_command_needs_network(build_command)
     if not allow_network and needs_install:
-        new_allow_network = True
-        network_was_adapted = True
+        # Explicit opt-in required (default False). Without this gate, the
+        # heuristic cracks the network-isolation contract automatically.
+        if cfg.get("auto_enable_network_for_install", False):
+            new_allow_network = True
+            network_was_adapted = True
+        else:
+            logger.warning(
+                "[sandbox] Build command requires network access for install "
+                "but sandbox.auto_enable_network_for_install is false. "
+                "Build will run offline and likely fail; either pre-install "
+                "deps in the sandbox image, run `harness run --allow-network`, "
+                "or set sandbox.auto_enable_network_for_install=true in "
+                ".harness_config.json. Build command: %s",
+                build_command,
+            )
 
     # Install commands (pip install -e ., npm install -g, cargo install)
     # write to system locations the --read-only root FS makes unreachable.
@@ -1577,6 +1629,32 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             },
         }
     except RuntimeError as exc:
+        # Distinguish empty-response (P1.5) and budget-too-low (P1.4) from
+        # the generic budget-exhausted case so the HITL router can surface
+        # a precise message instead of pretending budget was depleted.
+        from harness.gateway import EmptyLLMResponseError, BudgetTooLowError
+        if isinstance(exc, EmptyLLMResponseError):
+            logger.warning("[repair_node] LLM returned empty content: %s", exc)
+            return {
+                "node_state": {
+                    "current_node": "repair",
+                    "error": str(exc),
+                    "llm_silent": True,
+                    "hitl_trigger": "llm_silent",
+                },
+                "loop_counter": loop_counter,
+            }
+        if isinstance(exc, BudgetTooLowError):
+            logger.warning("[repair_node] Pre-flight budget refusal: %s", exc)
+            return {
+                "node_state": {
+                    "current_node": "repair",
+                    "error": str(exc),
+                    "budget_exhausted": True,
+                    "hitl_trigger": "budget_preflight",
+                },
+                "loop_counter": loop_counter,
+            }
         logger.warning("[repair_node] Gateway refused during repair: %s", exc)
         return {
             "node_state": {"current_node": "repair", "error": str(exc), "budget_exhausted": True},
@@ -1717,6 +1795,14 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
             "[router] Sandbox env misconfig (missing '%s'). Skipping repair loop, routing to HITL.",
             symbol,
         )
+        return _transition("human_intervention_node")
+
+    # P1.5: empty LLM response detected. Three rounds of an empty repair LLM
+    # would burn three compile cycles with no chance of success; short-circuit
+    # to HITL with the precise trigger so the operator sees "llm_silent"
+    # instead of the generic repair-limit message.
+    if state.get("node_state", {}).get("llm_silent"):
+        logger.warning("[router] LLM returned empty content. Routing to HITL immediately.")
         return _transition("human_intervention_node")
 
     if total_repairs >= max_iterations:
@@ -2173,6 +2259,514 @@ async def write_spec_node(state: AgentState) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Reviewer LLM nodes (DOC_REVIEWER + CODE_REVIEWER)
+# ---------------------------------------------------------------------------
+
+_SPEC_REVIEW_SYSTEM_PROMPT = """You are an independent reviewer of a software requirements/architecture specification. \
+A different LLM drafted the spec; your job is to critique it adversarially.
+
+Return STRICT JSON with this exact top-level shape and NOTHING else (no prose, no markdown fences):
+{
+  "completeness": ["string description of what is missing"],
+  "contradictions": ["..."],
+  "ambiguity": ["..."],
+  "missing_edge_cases": ["..."],
+  "security_gaps": ["..."],
+  "testability": ["..."],
+  "followup_questions": [
+    {"id": "R1", "text": "question for the human author", "critical": true}
+  ]
+}
+
+Each array may be empty if no issues are found in that category. \
+Follow-up questions should be precise and answerable by the human in one or two sentences. \
+Mark a question critical=true only if its answer would change the architecture or invalidate the spec."""
+
+
+_SPEC_REVISE_INSTRUCTION_TEMPLATE = """The original specification draft is below, followed by an independent reviewer's critique JSON. \
+Produce a fully revised specification document that addresses every actionable item in the critique. \
+Output ONLY the revised Markdown — no preamble, no postscript, no code fences.
+
+## Original Spec ({gate})
+{original_spec}
+
+## Reviewer Critique JSON
+{critique_json}
+"""
+
+
+def _review_followups_to_discovery_shape(critique: dict[str, Any], gate: str) -> list[dict[str, Any]]:
+    """Convert reviewer follow-up questions into the modules-and-questions shape
+    that the existing discovery_interview_loop renders natively. All follow-ups
+    are marked critical=False so the user can finalize with DONE — the original
+    discovery phase already enforced critical-unknowns; this second pass is for
+    refinement, not blocking."""
+    raw = critique.get("followup_questions", []) or []
+    if not isinstance(raw, list):
+        return []
+
+    questions: list[dict[str, Any]] = []
+    for idx, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text", "")).strip()
+        if not text:
+            continue
+        qid = str(item.get("id", "")).strip() or f"R{idx + 1}"
+        questions.append({"id": qid, "text": text, "critical": False})
+
+    if not questions:
+        return []
+
+    module_name = f"Reviewer Follow-ups ({gate.capitalize()})"
+    return [{"name": module_name, "questions": questions}]
+
+
+async def spec_review_node(state: AgentState) -> dict[str, Any]:
+    """
+    Independent LLM critiques the freshly written spec, then the primary
+    planning model revises it. Only fires for REQUIREMENTS and ARCHITECTURE
+    gates; DEPLOYMENT short-circuits.
+
+    Activation is purely by configuration: if `doc_reviewer_primary` is empty
+    in .harness_config.json, this node is a no-op and the graph follows the
+    existing path (write_spec_node → human_gatekeeper_node).
+    """
+    gate = state.get("current_gate", "REQUIREMENTS")
+    loop_counter = dict(state.get("loop_counter", {}))
+    counter = loop_counter.get("review_spec", 0)
+
+    gateway = get_gateway()
+    gateway_config = get_gateway_config()
+
+    doc_reviewer_primary = ""
+    max_cycles = 1
+    if gateway_config is not None:
+        doc_reviewer_primary = getattr(gateway_config, "doc_reviewer_primary", "") or ""
+        max_cycles = int(getattr(gateway_config, "max_doc_review_cycles", 1) or 0)
+
+    # Determine which spec path to operate on.
+    if gate == "REQUIREMENTS":
+        path_key = "spec_requirements_path"
+        review_filename = "SPEC_REQUIREMENTS_REVIEW.md"
+    elif gate == "ARCHITECTURE":
+        path_key = "spec_architecture_path"
+        review_filename = "SPEC_ARCHITECTURE_REVIEW.md"
+    else:
+        logger.info("[spec_review] gate=%s — out of reviewer scope, passing through.", gate)
+        return {"node_state": {"current_node": "spec_review", "skipped": True}}
+
+    spec_path = state.get(path_key, "")
+    budget = state.get("budget_remaining_usd", 0.0)
+
+    if not doc_reviewer_primary:
+        logger.info("[spec_review] doc_reviewer_primary not configured — skipping.")
+        return {"node_state": {"current_node": "spec_review", "skipped": True}}
+    if gateway is None:
+        logger.info("[spec_review] No gateway available — skipping.")
+        return {"node_state": {"current_node": "spec_review", "skipped": True}}
+    if counter >= max_cycles:
+        logger.info("[spec_review] cycle cap reached (%d/%d) — passing through.", counter, max_cycles)
+        return {"node_state": {"current_node": "spec_review", "skipped": True}}
+    if budget < 0.10:
+        logger.info("[spec_review] budget too low ($%.4f) — skipping.", budget)
+        return {"node_state": {"current_node": "spec_review", "skipped": True}}
+    if not spec_path or not os.path.isfile(spec_path):
+        logger.info("[spec_review] spec file missing (%s) — skipping.", spec_path)
+        return {"node_state": {"current_node": "spec_review", "skipped": True}}
+
+    try:
+        with open(spec_path, "r", encoding="utf-8") as f:
+            original_spec = f.read()
+    except OSError as exc:
+        logger.warning("[spec_review] Cannot read %s: %s", spec_path, exc)
+        return {"node_state": {"current_node": "spec_review", "skipped": True}}
+
+    # Short user-goal summary — keeps the reviewer prompt cheap and prevents
+    # it from re-litigating the discovery process.
+    messages = state.get("messages", [])
+    user_goal = ""
+    if len(messages) >= 2:
+        user_goal = str(messages[1].get("content", ""))[:1000]
+
+    from harness.gateway import NodeRole
+
+    critique_user_prompt = (
+        f"## User Goal\n{user_goal}\n\n"
+        f"## Specification Under Review ({gate})\n{original_spec}\n\n"
+        "Produce the JSON critique now."
+    )
+    critique_messages = [
+        {"role": "system", "content": _SPEC_REVIEW_SYSTEM_PROMPT},
+        {"role": "user", "content": critique_user_prompt},
+    ]
+
+    try:
+        critique_response, new_budget = await gateway.dispatch(
+            messages=critique_messages,
+            role=NodeRole.DOC_REVIEWER,
+            budget_remaining_usd=budget,
+        )
+    except Exception as exc:
+        logger.warning("[spec_review] Reviewer dispatch failed: %s — passing through.", exc)
+        return {"node_state": {"current_node": "spec_review", "skipped": True}}
+
+    token_tracker = gateway.aggregate_tokens(state.get("token_tracker", {}), critique_response.usage)
+
+    # Parse the critique JSON; tolerate code fences.
+    try:
+        from harness.trust import _strip_code_fences  # type: ignore
+        critique_text = _strip_code_fences(critique_response.content)
+    except Exception:
+        critique_text = critique_response.content.strip()
+
+    try:
+        critique = json.loads(critique_text)
+        if not isinstance(critique, dict):
+            raise ValueError("critique JSON must be an object")
+    except (ValueError, json.JSONDecodeError) as exc:
+        logger.warning("[spec_review] Critique was not valid JSON (%s) — passing through.", exc)
+        return {
+            "messages": list(messages) + [
+                MessageDict(role="assistant", content=critique_response.content)
+            ],
+            "token_tracker": token_tracker,
+            "budget_remaining_usd": new_budget,
+            "node_state": {"current_node": "spec_review", "skipped": True},
+        }
+
+    # Persist the critique to a separate review document for the user.
+    review_path = os.path.join(os.path.dirname(spec_path), review_filename)
+    try:
+        with open(review_path, "w", encoding="utf-8") as f:
+            f.write(f"# {gate.capitalize()} Spec Review\n\n")
+            f.write("*Generated by the independent doc-reviewer LLM.*\n\n")
+            f.write("```json\n")
+            f.write(json.dumps(critique, indent=2))
+            f.write("\n```\n")
+    except OSError as exc:
+        logger.warning("[spec_review] Failed to write %s: %s", review_path, exc)
+
+    # Re-spec call: ask the planning model to produce a revised spec.
+    revise_prompt = _SPEC_REVISE_INSTRUCTION_TEMPLATE.format(
+        gate=gate,
+        original_spec=original_spec,
+        critique_json=json.dumps(critique, indent=2),
+    )
+    revise_messages = [
+        {"role": "system", "content": "You are a senior specification author. Output clean Markdown only."},
+        {"role": "user", "content": revise_prompt},
+    ]
+    try:
+        revised_response, new_budget = await gateway.dispatch(
+            messages=revise_messages,
+            role=NodeRole.PLANNING,
+            budget_remaining_usd=new_budget,
+        )
+    except Exception as exc:
+        logger.warning("[spec_review] Revise dispatch failed: %s — leaving original spec.", exc)
+        revised_response = None
+
+    if revised_response is not None:
+        token_tracker = gateway.aggregate_tokens(token_tracker, revised_response.usage)
+        revised_text = revised_response.content.strip()
+        if revised_text:
+            try:
+                with open(spec_path, "w", encoding="utf-8") as f:
+                    f.write(revised_text)
+                logger.info("[spec_review] Revised spec written to %s.", spec_path)
+            except OSError as exc:
+                logger.warning("[spec_review] Failed to overwrite %s: %s", spec_path, exc)
+
+    loop_counter["review_spec"] = counter + 1
+
+    # Shape follow-up questions for the discovery interview loop. The loop
+    # reads state["discovery_questions"], so populate that. We also reset the
+    # discovery counters so the loop renders these as a fresh round.
+    followups = _review_followups_to_discovery_shape(critique, gate)
+    discovery_payload: dict[str, Any] = {
+        "modules": followups,
+        "complete": False,
+        "summary": (
+            f"Reviewer raised {sum(len(m['questions']) for m in followups)} "
+            "follow-up question(s)."
+        ) if followups else "Reviewer found no critical issues.",
+    }
+    delta: dict[str, Any] = {
+        "messages": list(messages),
+        "token_tracker": token_tracker,
+        "budget_remaining_usd": new_budget,
+        "loop_counter": loop_counter,
+        "reviewer_followups": followups,
+        "current_gate": gate,
+        "node_state": {
+            "current_node": "spec_review",
+            "skipped": False,
+            "review_path": review_path,
+            "followup_count": sum(len(m["questions"]) for m in followups),
+            # critical=False for every reviewer question (see helper) so the
+            # user can DONE through after the second pass.
+            "discovery_critical_remaining": 0,
+            "discovery_complete": False,
+            "discovery_question_count": 0,
+        },
+    }
+    if gate == "REQUIREMENTS":
+        delta["reviewer_comments_requirements"] = json.dumps(critique)
+    if followups:
+        delta["discovery_questions"] = discovery_payload
+    return delta
+
+
+_CODE_REVIEW_SYSTEM_PROMPT = """You are an independent reviewer of code generated by another LLM. \
+Critique it adversarially for correctness, security, performance, idiomatic style, and missing tests.
+
+Return STRICT JSON with this exact shape and NOTHING else (no prose, no markdown fences):
+{
+  "findings": [
+    {
+      "file": "path/to/file.ext",
+      "line": 42,
+      "severity": "high|medium|low",
+      "category": "correctness|security|performance|idiomatic|missing_tests",
+      "suggestion": "concrete description of the change to make"
+    }
+  ]
+}
+
+`findings` may be empty if the code is clean. Be specific: vague suggestions like "improve error handling" are useless. \
+Each finding must name a file and (where applicable) a line number."""
+
+
+async def code_review_node(state: AgentState) -> dict[str, Any]:
+    """
+    Independent LLM critiques freshly compiled code, then the patcher model
+    incorporates the feedback. Activation is purely by configuration: empty
+    code_reviewer_primary == no-op, falling through to security_scan_node.
+    """
+    loop_counter = dict(state.get("loop_counter", {}))
+    counter = loop_counter.get("review_code", 0)
+    modified_files = list(state.get("modified_files", []))
+    workspace = state.get("workspace_path", os.getcwd())
+    budget = state.get("budget_remaining_usd", 0.0)
+
+    gateway = get_gateway()
+    gateway_config = get_gateway_config()
+
+    code_reviewer_primary = ""
+    max_cycles = 1
+    if gateway_config is not None:
+        code_reviewer_primary = getattr(gateway_config, "code_reviewer_primary", "") or ""
+        max_cycles = int(getattr(gateway_config, "max_code_review_cycles", 1) or 0)
+
+    if not code_reviewer_primary:
+        logger.info("[code_review] code_reviewer_primary not configured — skipping.")
+        return {"node_state": {"current_node": "code_review", "skipped": True, "repatched": False}}
+    if gateway is None:
+        return {"node_state": {"current_node": "code_review", "skipped": True, "repatched": False}}
+    if counter >= max_cycles:
+        logger.info("[code_review] cycle cap reached (%d/%d) — passing through.", counter, max_cycles)
+        return {"node_state": {"current_node": "code_review", "skipped": True, "repatched": False}}
+    if budget < 0.10:
+        logger.info("[code_review] budget too low ($%.4f) — skipping.", budget)
+        return {"node_state": {"current_node": "code_review", "skipped": True, "repatched": False}}
+    if not modified_files:
+        logger.info("[code_review] no modified_files — skipping.")
+        return {"node_state": {"current_node": "code_review", "skipped": True, "repatched": False}}
+
+    # Snapshot up to 20 files, 2000 lines each, to bound token cost.
+    snapshot_chunks: list[str] = []
+    file_cap = 20
+    line_cap = 2000
+    for path in modified_files[:file_cap]:
+        abs_path = path if os.path.isabs(path) else os.path.join(workspace, path)
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[:line_cap]
+        except OSError as exc:
+            snapshot_chunks.append(f"### {path}\n(could not read: {exc})\n")
+            continue
+        snapshot_chunks.append(
+            f"### {path}\n```\n{''.join(lines)}\n```\n"
+        )
+
+    from harness.gateway import NodeRole
+
+    critique_user_prompt = (
+        "## Modified Files\n" + "\n".join(snapshot_chunks) +
+        "\n\nProduce the JSON critique now."
+    )
+    critique_messages = [
+        {"role": "system", "content": _CODE_REVIEW_SYSTEM_PROMPT},
+        {"role": "user", "content": critique_user_prompt},
+    ]
+
+    try:
+        critique_response, new_budget = await gateway.dispatch(
+            messages=critique_messages,
+            role=NodeRole.CODE_REVIEWER,
+            budget_remaining_usd=budget,
+        )
+    except Exception as exc:
+        logger.warning("[code_review] Reviewer dispatch failed: %s — passing through.", exc)
+        return {"node_state": {"current_node": "code_review", "skipped": True, "repatched": False}}
+
+    token_tracker = gateway.aggregate_tokens(state.get("token_tracker", {}), critique_response.usage)
+
+    try:
+        from harness.trust import _strip_code_fences  # type: ignore
+        critique_text = _strip_code_fences(critique_response.content)
+    except Exception:
+        critique_text = critique_response.content.strip()
+
+    try:
+        critique = json.loads(critique_text)
+        findings = critique.get("findings", []) if isinstance(critique, dict) else []
+        if not isinstance(findings, list):
+            findings = []
+    except (ValueError, json.JSONDecodeError) as exc:
+        logger.warning("[code_review] Critique was not valid JSON (%s) — passing through.", exc)
+        findings = []
+        critique = {"findings": []}
+
+    # Persist the critique regardless of whether findings exist.
+    docs_dir = os.path.join(workspace, "docs")
+    try:
+        os.makedirs(docs_dir, exist_ok=True)
+        review_path = os.path.join(docs_dir, "CODE_REVIEW.md")
+        with open(review_path, "w", encoding="utf-8") as f:
+            f.write("# Code Review\n\n")
+            f.write("*Generated by the independent code-reviewer LLM.*\n\n")
+            if not findings:
+                f.write("No findings.\n")
+            else:
+                f.write("```json\n")
+                f.write(json.dumps(critique, indent=2))
+                f.write("\n```\n")
+    except OSError as exc:
+        logger.warning("[code_review] Failed to write CODE_REVIEW.md: %s", exc)
+
+    loop_counter["review_code"] = counter + 1
+
+    if not findings:
+        logger.info("[code_review] No findings — passing through to security scan.")
+        return {
+            "token_tracker": token_tracker,
+            "budget_remaining_usd": new_budget,
+            "loop_counter": loop_counter,
+            "reviewer_comments_code": json.dumps(critique),
+            "node_state": {
+                "current_node": "code_review",
+                "skipped": False,
+                "repatched": False,
+                "findings_count": 0,
+            },
+        }
+
+    # Re-patch call. Use the patcher format-reminder so the patcher model
+    # returns the same SEARCH/REPLACE block syntax patching_node uses.
+    from harness.patcher import process_llm_patch_output
+
+    _CODE_REVIEW_FORMAT_REMINDER = """[CRITICAL FORMAT INSTRUCTION]
+You MUST respond using ONLY the patch block syntax below. No explanations, no markdown fences, no text outside the blocks.
+
+Valid blocks:
+<<<CREATE_FILE>>>
+file: path/to/file.ext
+content:
+<complete file contents>
+<<<END_CREATE_FILE>>>
+
+<<<REPLACE_BLOCK>>>
+file: path/to/file.ext
+search:
+<exact lines to find>
+replace:
+<exact replacement lines>
+<<<END_REPLACE_BLOCK>>>
+
+<<<DELETE_BLOCK>>>
+file: path/to/file.ext
+search:
+<exact lines to delete>
+<<<END_DELETE_BLOCK>>>
+
+<<<INSERT_AT_BLOCK>>>
+file: path/to/file.ext
+anchor: <function or class name>
+placement: before|after
+content:
+<lines to insert>
+<<<END_INSERT_AT_BLOCK>>>
+
+Generate the patches that address every finding below. Output only the blocks — no other text."""
+
+    repatch_user_prompt = (
+        f"## Reviewer Findings (JSON)\n```json\n{json.dumps(critique, indent=2)}\n```\n\n"
+        f"## Modified Files Snapshot\n" + "\n".join(snapshot_chunks) +
+        f"\n\n{_CODE_REVIEW_FORMAT_REMINDER}"
+    )
+    repatch_messages = [
+        {"role": "system", "content": "You are a senior software engineer. Apply the reviewer's feedback as patch blocks only."},
+        {"role": "user", "content": repatch_user_prompt},
+    ]
+
+    try:
+        repatch_response, new_budget = await gateway.dispatch(
+            messages=repatch_messages,
+            role=NodeRole.PATCHING,
+            budget_remaining_usd=new_budget,
+        )
+    except Exception as exc:
+        logger.warning("[code_review] Re-patch dispatch failed: %s — proceeding without re-patch.", exc)
+        return {
+            "token_tracker": token_tracker,
+            "budget_remaining_usd": new_budget,
+            "loop_counter": loop_counter,
+            "reviewer_comments_code": json.dumps(critique),
+            "node_state": {
+                "current_node": "code_review",
+                "skipped": False,
+                "repatched": False,
+                "findings_count": len(findings),
+            },
+        }
+
+    token_tracker = gateway.aggregate_tokens(token_tracker, repatch_response.usage)
+
+    allowed_paths = _build_patcher_allowlist(workspace)
+    patch_results, new_modified_files = await process_llm_patch_output(
+        repatch_response.content,
+        workspace,
+        modified_files,
+        allowed_paths=allowed_paths,
+    )
+    success_count = sum(1 for r in patch_results if r.success)
+    repatched = success_count > 0
+
+    logger.info(
+        "[code_review] Findings=%d, re-patched=%d/%d files (success=%s).",
+        len(findings), success_count, len(patch_results), repatched,
+    )
+
+    return {
+        "modified_files": new_modified_files,
+        "token_tracker": token_tracker,
+        "budget_remaining_usd": new_budget,
+        "loop_counter": loop_counter,
+        "reviewer_comments_code": json.dumps(critique),
+        "node_state": {
+            "current_node": "code_review",
+            "skipped": False,
+            "repatched": repatched,
+            "findings_count": len(findings),
+            "repatch_success": success_count,
+            "repatch_total": len(patch_results),
+        },
+    }
+
+
 async def generate_deployment_spec_node(state: AgentState) -> dict[str, Any]:
     """
     Runs workspace telemetry + architecture spec through the deployment
@@ -2263,22 +2857,47 @@ Output as clean Markdown."""
 def route_after_discovery(state: AgentState) -> str:
     """
     Routes after discovery_interview_loop completes.
-    
+
     Decision matrix:
         discovery_complete == true  → write_spec_node (serialize to .md)
         discovery_complete == false AND critical > 0 → loop back to discovery node
         discovery_complete == false AND no critical → write_spec_node (non-critical only)
         user typed 'DONE' with critical remaining → alert + loop back
         user typed 'SUSPEND' → save & quit (route to END)
+
+    Loop ceiling: the per-gate discovery_question_count is compared against
+    GatewayConfig.max_discovery_iterations (default 10). When the cap is
+    reached we forward to write_spec_node with the current draft instead of
+    looping again — prevents a runaway loop from a confused user or a
+    misbehaving LLM that keeps emitting follow-ups.
     """
     node_state = state.get("node_state", {})
     complete = node_state.get("discovery_complete", False)
     critical = node_state.get("discovery_critical_remaining", 0)
     gate = state.get("current_gate", "REQUIREMENTS")
+    rounds = int(node_state.get("discovery_question_count", 0) or 0)
 
     if node_state.get("hitl_suspend"):
         logger.info("[router] Discovery: developer chose to suspend. Routing to END.")
         return "__end__"
+
+    # Loop-cap short-circuit. Honoured before the user_done_with_critical
+    # branch so a user who keeps typing DONE doesn't trap us either.
+    cap = 10
+    try:
+        from harness.gateway import get_gateway_config
+        gw_config = get_gateway_config()
+        if gw_config is not None:
+            cap = int(getattr(gw_config, "max_discovery_iterations", 10) or 10)
+    except Exception:  # noqa: BLE001
+        pass
+    if rounds >= cap:
+        logger.warning(
+            "[router] Discovery hit max_discovery_iterations (%d). "
+            "Forwarding to write_spec_node with the current draft.",
+            cap,
+        )
+        return "write_spec_node"
 
     if node_state.get("user_done_with_critical"):
         # User tried to exit with critical unknowns — route back to the correct discovery node
@@ -2518,6 +3137,11 @@ def build_graph() -> Any:
     from harness.cli import human_gatekeeper_node as _human_gatekeeper_node
     graph.add_node("human_gatekeeper_node", _human_gatekeeper_node)
 
+    # Register reviewer LLM nodes (DOC_REVIEWER + CODE_REVIEWER). Each is a
+    # no-op when its corresponding *_reviewer_primary slot is unset in config.
+    graph.add_node("spec_review_node", spec_review_node)
+    graph.add_node("code_review_node", code_review_node)
+
     # Register deployment spec node
     graph.add_node("generate_deployment_spec_node", generate_deployment_spec_node)
 
@@ -2569,8 +3193,41 @@ def build_graph() -> Any:
         },
     )
 
-    # After write_spec, present to human gatekeeper for final approval
-    graph.add_edge("write_spec_node", "human_gatekeeper_node")
+    # After write_spec, route through the doc-reviewer LLM (no-op if reviewer
+    # is not configured). The reviewer either revises the spec and asks the
+    # user follow-up questions, or short-circuits to the human gatekeeper.
+    graph.add_edge("write_spec_node", "spec_review_node")
+
+    def route_after_spec_review(state: AgentState) -> Literal[
+        "discovery_interview_loop", "human_gatekeeper_node"
+    ]:
+        """The human gatekeeper is the FINAL review gate. The LLM reviewer
+        either bails (no model configured / cycle cap / no follow-ups) and we
+        route straight to the gatekeeper, or it produces follow-up questions
+        and we route through one more pass of the discovery interview loop
+        before the gatekeeper sees the upgraded spec."""
+        if state.get("skip_discovery", False):
+            return "human_gatekeeper_node"
+        node_state = state.get("node_state", {}) or {}
+        if node_state.get("skipped", False):
+            return "human_gatekeeper_node"
+        followups = state.get("reviewer_followups", []) or []
+        if followups:
+            logger.info(
+                "[router] spec_review produced %d follow-up question(s) — routing to discovery interview.",
+                sum(len(m.get("questions", [])) for m in followups),
+            )
+            return "discovery_interview_loop"
+        return "human_gatekeeper_node"
+
+    graph.add_conditional_edges(
+        "spec_review_node",
+        route_after_spec_review,
+        {
+            "discovery_interview_loop": "discovery_interview_loop",
+            "human_gatekeeper_node": "human_gatekeeper_node",
+        },
+    )
 
     # Gatekeeper routes: approve → next phase, refine → loop back
     graph.add_conditional_edges(
@@ -2612,14 +3269,42 @@ def build_graph() -> Any:
 
     # =====================================================================
     # Compiler → repair loop + security gate
+    #
+    # On a clean compile, divert through code_review_node first. The reviewer
+    # may apply a re-patch that needs re-validation, so it routes back to
+    # compiler_node if it re-patched; otherwise it proceeds to security_scan.
+    # The reviewer is a no-op when code_reviewer_primary is unset in config,
+    # so this path is behavior-compatible with the pre-reviewer flow.
     # =====================================================================
     graph.add_conditional_edges(
         "compiler_node",
         route_after_compiler,
         {
-            "security_scan_node": "security_scan_node",
+            # Clean compile → code reviewer (no-op pass-through if unconfigured).
+            "security_scan_node": "code_review_node",
             "repair_node": "repair_node",
             "human_intervention_node": "human_intervention_node",
+        },
+    )
+
+    def route_after_code_review(state: AgentState) -> Literal[
+        "compiler_node", "security_scan_node"
+    ]:
+        """If the reviewer re-patched, re-validate by going back through the
+        compiler. If not (no findings, cycle cap, or unconfigured), proceed
+        straight to security_scan_node — exactly today's behavior."""
+        node_state = state.get("node_state", {}) or {}
+        if node_state.get("repatched", False):
+            logger.info("[router] code_review re-patched — re-running compiler.")
+            return "compiler_node"
+        return "security_scan_node"
+
+    graph.add_conditional_edges(
+        "code_review_node",
+        route_after_code_review,
+        {
+            "compiler_node": "compiler_node",
+            "security_scan_node": "security_scan_node",
         },
     )
 

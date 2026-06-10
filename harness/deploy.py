@@ -27,7 +27,6 @@ import functools
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -44,10 +43,6 @@ logger = logging.getLogger(__name__)
 # Identifier validators and blueprint validation live in the central trust
 # module. Local aliases are kept so call sites in this file don't change.
 from harness.trust import (  # noqa: E402
-    is_valid_docker_image as _is_valid_docker_image,
-    is_valid_service_name as _is_valid_service_name,
-    is_valid_env_var_name as _is_valid_env_var_name,
-    is_valid_port_mapping as _is_valid_port_mapping,
     validate_blueprint as _validate_blueprint,
 )
 

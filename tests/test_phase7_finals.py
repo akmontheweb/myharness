@@ -1,13 +1,11 @@
 """Tests for Phase 7 — skills, patcher, speculative refinements."""
 
 import tempfile
-from pathlib import Path
 
-import pytest
 
 from harness.patcher import PatchResult, OperationType
 from harness.skills import (
-    SubAgentSkill, SkillSchema, SkillType, SkillRegistry, get_skill
+    SubAgentSkill, SkillSchema, SkillType, get_skill
 )
 
 

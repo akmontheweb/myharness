@@ -356,7 +356,6 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # --- Build the LLM prompt ---
     from harness.gateway import NodeRole
     from harness.patcher import process_llm_patch_output
-    from harness.style_guides import load_style_guides
 
     test_guides_dir = os.path.join(os.path.dirname(__file__), "test_guides")
     guides_body = ""

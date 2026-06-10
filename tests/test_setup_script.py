@@ -11,8 +11,6 @@ table.
 from __future__ import annotations
 
 import importlib.util
-import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -108,11 +106,29 @@ class TestBuildDefaultConfig:
                 f"would trip the doctor's config-parse warning"
             )
         # The model_routing section must use only known nested keys.
+        # `_`-prefixed keys are comments and are skipped by the validator at
+        # runtime (see cli.py _validate_config_keys), so mirror that here.
         routing_known = _KNOWN_NESTED_KEYS["model_routing"]
         for nested in cfg["model_routing"]:
+            if nested.startswith("_"):
+                continue
             assert nested in routing_known, (
                 f"Setup script wrote unknown model_routing key {nested!r}"
             )
+        # Same skip for any other nested sections (e.g. node_throttle) that
+        # use inline `_comment` documentation keys.
+        for section, section_value in cfg.items():
+            if not isinstance(section_value, dict):
+                continue
+            known_nested = _KNOWN_NESTED_KEYS.get(section)
+            if known_nested is None:
+                continue
+            for nested in section_value:
+                if nested.startswith("_"):
+                    continue
+                assert nested in known_nested, (
+                    f"Setup script wrote unknown {section} key {nested!r}"
+                )
 
     def test_routes_all_three_roles_to_chosen_model(self, setup_module_obj):
         cfg = setup_module_obj._build_default_config(

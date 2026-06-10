@@ -42,7 +42,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 MODEL_CATALOGUE = REPO_ROOT / "harness" / "model_prices.json"
 DEFAULT_VENV = "~/.venvs/harness"
-CONFIG_DIR = Path.home() / ".harness"
+CONFIG_DIR = REPO_ROOT / "config"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 # Per-provider default model keys. These reference catalogue entries in
@@ -343,7 +343,7 @@ def _load_model_catalogue() -> set[str]:
 
 
 def _build_default_config(provider: str, model_key: str) -> dict:
-    """Construct the user-global ~/.harness/config.json body.
+    """Construct the in-repo global <root>/config/config.json body.
 
     The shipped catalogue keys (anthropic:claude-..., openai:gpt-...,
     etc.) are accepted directly by the gateway, so model_routing
@@ -361,6 +361,21 @@ def _build_default_config(provider: str, model_key: str) -> dict:
             "repair_primary": model_key,
             "repair_fallback": "",
             "repair_mode": "thinking",
+            "_doc_reviewer_comment": "Doc reviewer LLM — independent of code reviewer. Setting doc_reviewer_primary IS the opt-in; leave empty to skip doc review entirely.",
+            "doc_reviewer_primary": "",
+            "doc_reviewer_mode": "thinking",
+            "doc_reviewer_fallback": "",
+            "_code_reviewer_comment": "Code reviewer LLM — independent of doc reviewer. Setting code_reviewer_primary IS the opt-in; leave empty to skip code review entirely.",
+            "code_reviewer_primary": "",
+            "code_reviewer_mode": "thinking",
+            "code_reviewer_fallback": "",
+        },
+        "node_throttle": {
+            "_comment": "Per-loop hard ceilings. Clamped to [0,5] at config load; 0 suspends the loop without clearing the model slot.",
+            "max_patch_repair_iterations": 3,
+            "max_doc_review_cycles": 1,
+            "max_code_review_cycles": 1,
+            "max_discovery_iterations": 10,
         },
     }
 
@@ -681,7 +696,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     else:
         api_key = ""
 
-    # Write ~/.harness/config.json
+    # Write <root>/config/config.json
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if CONFIG_FILE.exists():
         overwrite = _confirm(

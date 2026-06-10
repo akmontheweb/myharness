@@ -7,7 +7,6 @@ existing layout. Returns None when the layout is flat or ambiguous.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from harness.impact import _detect_source_root

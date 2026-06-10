@@ -41,6 +41,23 @@ class NodeRole(Enum):
     PATCHING = "patching"
     REPAIR = "repair"
     HUMAN_INTERVENTION = "human_intervention"
+    DOC_REVIEWER = "doc_reviewer"
+    CODE_REVIEWER = "code_reviewer"
+
+
+class EmptyLLMResponseError(RuntimeError):
+    """Raised by the gateway when the provider returns an empty content body
+    after every retry. Distinct from generic RuntimeError so callers
+    (repair / HITL routers) can short-circuit to a clear operator message
+    instead of looping for several rounds while the provider stays silent.
+    """
+
+
+class BudgetTooLowError(RuntimeError):
+    """Raised by the gateway's pre-flight budget estimate when the projected
+    cost of a single call already exceeds the remaining budget. Stops the
+    advisory hard-cap from being silently overspent by a single big call.
+    """
 
 
 @dataclass
@@ -1074,6 +1091,20 @@ class GatewayConfig:
     repair_primary: str = ""
     repair_fallback: str = ""
     repair_mode: str = "thinking"
+    # Doc reviewer — fully independent of code reviewer. Empty primary == disabled.
+    doc_reviewer_primary: str = ""
+    doc_reviewer_mode: str = "thinking"
+    doc_reviewer_fallback: str = ""
+    max_doc_review_cycles: int = 1
+    # Code reviewer — fully independent of doc reviewer. Empty primary == disabled.
+    code_reviewer_primary: str = ""
+    code_reviewer_mode: str = "thinking"
+    code_reviewer_fallback: str = ""
+    max_code_review_cycles: int = 1
+    # Hard ceiling on rounds of the discovery interview loop. Without this,
+    # a confused user (or hostile LLM) can loop indefinitely on follow-up
+    # questions, burning budget. Clamped to [1, 30] at config load.
+    max_discovery_iterations: int = 10
     ollama_local_model: str = ""
     ollama_local_backup: str = ""
     force_local_only: bool = False
@@ -1103,6 +1134,15 @@ class Gateway:
         self.config = config
         # Provider cache: lazily instantiated per unique model_key
         self._providers: dict[str, BaseLLM] = {}
+        # 429/503 circuit breaker (P1.9). When too many rate-limit / server
+        # failures pile up in a short window, fall the next call back to
+        # local Ollama instead of burning retries with no chance of
+        # success. Kept in-memory only — resets when the process restarts.
+        from collections import deque as _deque
+        self._rate_limit_failures: "_deque[float]" = _deque(maxlen=64)
+        self._circuit_window_seconds: float = 300.0   # 5-minute rolling window
+        self._circuit_failure_threshold: int = 3       # open after 3 hits in-window
+        self._circuit_open_until: float = 0.0           # epoch seconds; 0 = closed
 
     async def _get_provider(self, model_key: str) -> BaseLLM:
         """Get or create a cached provider instance."""
@@ -1111,6 +1151,36 @@ class Gateway:
                 model_key, ssl_verify=self.config.ssl_verify
             )
         return self._providers[model_key]
+
+    def _circuit_is_open(self) -> bool:
+        """Return True when recent 429/503 failures should force a fall-back
+        to local Ollama for the next call. The breaker auto-closes after
+        ``_circuit_window_seconds`` of cool-down."""
+        import time as _t
+        now = _t.monotonic()
+        if self._circuit_open_until and now < self._circuit_open_until:
+            return True
+        # Trim failures outside the rolling window.
+        window_start = now - self._circuit_window_seconds
+        while self._rate_limit_failures and self._rate_limit_failures[0] < window_start:
+            self._rate_limit_failures.popleft()
+        if len(self._rate_limit_failures) >= self._circuit_failure_threshold:
+            # Open the circuit for the rest of the window plus a short buffer.
+            self._circuit_open_until = now + max(60.0, self._circuit_window_seconds / 2)
+            logger.warning(
+                "[gateway] Rate-limit circuit breaker OPEN: %d failures in last %ds. "
+                "Forcing local fallback until %.0fs from now.",
+                len(self._rate_limit_failures),
+                int(self._circuit_window_seconds),
+                self._circuit_open_until - now,
+            )
+            return True
+        return False
+
+    def _record_rate_limit_failure(self) -> None:
+        """Record a 429/503 failure so the circuit breaker can detect bursts."""
+        import time as _t
+        self._rate_limit_failures.append(_t.monotonic())
 
     async def close(self) -> None:
         """Close all open provider HTTP clients."""
@@ -1138,6 +1208,12 @@ class Gateway:
             return self.config.patching_primary
         elif role == NodeRole.REPAIR:
             return self.config.repair_primary
+        elif role == NodeRole.DOC_REVIEWER:
+            # No silent fallback: empty means reviewer is not configured. The
+            # caller (spec_review_node) must check this and skip the call.
+            return self.config.doc_reviewer_primary
+        elif role == NodeRole.CODE_REVIEWER:
+            return self.config.code_reviewer_primary
         else:
             return self.config.patching_primary  # Default
 
@@ -1149,6 +1225,10 @@ class Gateway:
             return self.config.patching_mode.lower() == "thinking" or self.config.patching_mode.lower() == "thinking_max"
         elif role == NodeRole.REPAIR:
             return self.config.repair_mode.lower() == "thinking" or self.config.repair_mode.lower() == "thinking_max"
+        elif role == NodeRole.DOC_REVIEWER:
+            return self.config.doc_reviewer_mode.lower() in ("thinking", "thinking_max")
+        elif role == NodeRole.CODE_REVIEWER:
+            return self.config.code_reviewer_mode.lower() in ("thinking", "thinking_max")
         return False
 
     def _get_models_with_keys(self) -> list[tuple[str, ModelSpec]]:
@@ -1215,8 +1295,20 @@ class Gateway:
                 f"Budget remaining: ${budget_remaining_usd:.4f}"
             )
 
+        # P1.9: 429/503 circuit breaker — if recent rate-limit bursts have
+        # piled up, divert this call to local Ollama instead of burning
+        # retries against a degraded provider. We do this BEFORE model
+        # selection so explicit overrides also get diverted (the override
+        # would have hit the same wall).
+        if not force_local and not self.config.force_local_only and self._circuit_is_open():
+            logger.warning(
+                "[gateway] Rate-limit circuit OPEN — diverting role=%s to local Ollama.",
+                role.value,
+            )
+            force_local = True
+
         # Select model + provider — explicit override wins over role-based routing.
-        if model_override:
+        if model_override and not force_local:
             model_key = model_override
         else:
             model_key = self.select_model(role, force_local=force_local)
@@ -1256,7 +1348,7 @@ class Gateway:
                 raise RuntimeError(
                     f"[API KEY MISSING]: No API key configured for '{model_key}'.\n"
                     f"  However, {len(keyed_models)} other model(s) already have keys configured: {', '.join(keyed_names)}.\n"
-                    f"  To use '{model_key}', add its API key to ~/.harness/config.json or set the "
+                    f"  To use '{model_key}', add its API key to <myharness_root>/config/config.json or set the "
                     f"{provider.spec.provider.upper()}_API_KEY environment variable.\n"
                     f"  To use a different model that already has a key, update 'model_routing' in your config to "
                     f"point to one of: {', '.join(keyed_names)}."
@@ -1272,7 +1364,7 @@ class Gateway:
                     f"\n"
                     f"  To add an API key, either:\n"
                     f"  1. Set the {provider.spec.provider.upper()}_API_KEY environment variable\n"
-                    f"  2. Add \"api_key\" to the model entry in ~/.harness/config.json"
+                    f"  2. Add \"api_key\" to the model entry in <myharness_root>/config/config.json"
                 )
             else:
                 # No models have keys at all — standard error
@@ -1286,7 +1378,7 @@ class Gateway:
                     f"  1. Set the {env_var} environment variable:\n"
                     f"     export {env_var}=\"your-api-key-here\"\n"
                     f"\n"
-                    f"  2. Add \"api_key\" to the model entry in ~/.harness/config.json:\n"
+                    f"  2. Add \"api_key\" to the model entry in <myharness_root>/config/config.json:\n"
                     f"     {{\n"
                     f"       \"models\": {{\n"
                     f"         \"{model_key}\": {{\n"
@@ -1326,6 +1418,47 @@ class Gateway:
             threshold_pct=self.config.context_window_threshold_pct,
         )
 
+        # Pre-flight budget estimate (P1.4). The post-call guard at the top
+        # of dispatch refuses calls when the budget is already <= 0, but it
+        # doesn't catch the "budget is positive but the next call costs more
+        # than it" case — a single big planning call could overspend by its
+        # own cost. We compute a rough projected cost from message length
+        # plus a reserve for the response and refuse early if it would push
+        # us past the hard cap. Estimation is intentionally pessimistic
+        # (chars/4 + 4k output reserve) — better to refuse a borderline
+        # call than overspend the cap silently.
+        try:
+            est_input_chars = sum(
+                len(m.get("content", "")) if isinstance(m.get("content", ""), str) else 0
+                for m in messages
+            )
+            est_input_tokens = max(1, est_input_chars // 4)
+            est_output_tokens = 4000  # pessimistic reserve for the response
+            est_cost = (
+                (est_input_tokens / 1_000_000.0) * spec.input_cost_per_1m
+                + (est_output_tokens / 1_000_000.0) * spec.output_cost_per_1m
+            )
+            if est_cost > budget_remaining_usd:
+                raise BudgetTooLowError(
+                    "Pre-flight estimate $%.4f exceeds remaining budget $%.4f "
+                    "for role=%s model=%s (est_input_tokens=%d). Aborting "
+                    "before dispatch to keep the hard cap honest."
+                    % (est_cost, budget_remaining_usd, role.value, model_key, est_input_tokens)
+                )
+            # Early warning when we land within 20% of the cap. Helps the
+            # operator notice they're approaching the wall before HITL fires.
+            if budget_remaining_usd > 0 and est_cost > 0.8 * budget_remaining_usd:
+                logger.warning(
+                    "[gateway] Pre-flight estimate $%.4f is within 20%% of remaining "
+                    "budget $%.4f (role=%s, model=%s). Consider raising the cap or "
+                    "switching to a cheaper model.",
+                    est_cost, budget_remaining_usd, role.value, model_key,
+                )
+        except BudgetTooLowError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — estimate must never block valid calls
+            logger.debug("[gateway] Pre-flight cost estimate failed: %s", exc)
+
         # Execute with retry/backoff
         logger.info("[gateway] Dispatching to %s (role=%s, thinking=%s).", model_key, role.value, thinking)
 
@@ -1339,11 +1472,70 @@ class Gateway:
                 **llm_kwargs,
             )
 
-        response = await retry_with_backoff(
-            _call,
-            max_retries=self.config.max_retries,
-            base_delay=self.config.base_delay,
-        )
+        # P1.9: instrument the retry path so a 429/503 burst that exhausts
+        # retries gets recorded for the circuit breaker. Non-rate-limit
+        # exceptions propagate unchanged.
+        try:
+            response = await retry_with_backoff(
+                _call,
+                max_retries=self.config.max_retries,
+                base_delay=self.config.base_delay,
+            )
+        except httpx.HTTPStatusError as exc:
+            try:
+                status = int(exc.response.status_code)
+            except Exception:  # noqa: BLE001
+                status = 0
+            if status == 429 or status >= 500:
+                self._record_rate_limit_failure()
+            raise
+
+        # Empty-content guard (P1.5). retry_with_backoff handles transport
+        # failures (429 / 5xx / connection) but not "200 OK with empty
+        # content body" — that surface as a silent success. Retry up to two
+        # extra times on a fresh dispatch before giving up; if still empty,
+        # raise EmptyLLMResponseError so the caller (repair / HITL router)
+        # can short-circuit to a clear operator message instead of wasting
+        # three repair iterations.
+        empty_retry_attempts = 2
+        while (
+            response.content is None
+            or (isinstance(response.content, str) and not response.content.strip())
+        ) and empty_retry_attempts > 0:
+            logger.warning(
+                "[gateway] Provider returned empty content (model=%s role=%s). "
+                "Retrying (%d remaining).",
+                response.model, role.value, empty_retry_attempts,
+            )
+            empty_retry_attempts -= 1
+            try:
+                response = await retry_with_backoff(
+                    _call,
+                    max_retries=self.config.max_retries,
+                    base_delay=self.config.base_delay,
+                )
+            except Exception:  # noqa: BLE001 — let the empty path below raise cleanly
+                break
+
+        if response.content is None or (
+            isinstance(response.content, str) and not response.content.strip()
+        ):
+            try:
+                from harness.observability import log_failure
+                log_failure(
+                    "llm_empty_response",
+                    role=role.value if hasattr(role, "value") else str(role),
+                    model=getattr(response, "model", ""),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            raise EmptyLLMResponseError(
+                f"Provider returned empty content for role={role.value} model="
+                f"{getattr(response, 'model', '?')} after empty-retry exhaustion. "
+                f"This commonly indicates a content filter, an exhausted token "
+                f"budget on the provider side, or a malformed prompt. Surface to "
+                f"HITL rather than looping."
+            )
 
         # Deduct cost from budget
         cost = response.usage.cost_usd
@@ -1451,6 +1643,10 @@ def _validate_routing_keys(
         ("patching_primary", model_routing.get("patching_primary", "")),
         ("repair_primary", model_routing.get("repair_primary", "")),
         ("repair_fallback", model_routing.get("repair_fallback", "")),
+        ("doc_reviewer_primary", model_routing.get("doc_reviewer_primary", "")),
+        ("doc_reviewer_fallback", model_routing.get("doc_reviewer_fallback", "")),
+        ("code_reviewer_primary", model_routing.get("code_reviewer_primary", "")),
+        ("code_reviewer_fallback", model_routing.get("code_reviewer_fallback", "")),
         ("ollama_local_model", model_routing.get("ollama_local_model", "")),
         ("ollama_local_backup", model_routing.get("ollama_local_backup", "")),
     ]
@@ -1585,6 +1781,41 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
     # Validate routing keys against registered models (catches typos early)
     _validate_routing_keys(model_routing, set(_MODEL_REGISTRY.keys()))
     token_budget = config_dict.get("token_budget", {})
+    node_throttle = config_dict.get("node_throttle", {})
+
+    # Clamp review-cycle caps to [0, 5] so a misconfigured value cannot blow
+    # past the safety budget. 0 is a valid runtime opt-out (suspends the
+    # reviewer without clearing the model slot).
+    def _clamp_cycles(raw: Any, default: int) -> int:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return default
+        if value < 0:
+            logger.warning("Review cycle cap %d < 0; clamping to 0.", value)
+            return 0
+        if value > 5:
+            logger.warning("Review cycle cap %d > 5; clamping to 5.", value)
+            return 5
+        return value
+
+    def _clamp_discovery_iterations(raw: Any) -> int:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 10
+        if value < 1:
+            logger.warning(
+                "max_discovery_iterations %d < 1; clamping to 1 (one pass only).",
+                value,
+            )
+            return 1
+        if value > 30:
+            logger.warning(
+                "max_discovery_iterations %d > 30; clamping to 30.", value,
+            )
+            return 30
+        return value
 
     gateway_config = GatewayConfig(
         planning_primary=model_routing.get("planning_primary", ""),
@@ -1595,6 +1826,17 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         repair_primary=model_routing.get("repair_primary", ""),
         repair_fallback=model_routing.get("repair_fallback", ""),
         repair_mode=model_routing.get("repair_mode", "thinking"),
+        doc_reviewer_primary=model_routing.get("doc_reviewer_primary", ""),
+        doc_reviewer_mode=model_routing.get("doc_reviewer_mode", "thinking"),
+        doc_reviewer_fallback=model_routing.get("doc_reviewer_fallback", ""),
+        max_doc_review_cycles=_clamp_cycles(node_throttle.get("max_doc_review_cycles", 1), 1),
+        code_reviewer_primary=model_routing.get("code_reviewer_primary", ""),
+        code_reviewer_mode=model_routing.get("code_reviewer_mode", "thinking"),
+        code_reviewer_fallback=model_routing.get("code_reviewer_fallback", ""),
+        max_code_review_cycles=_clamp_cycles(node_throttle.get("max_code_review_cycles", 1), 1),
+        max_discovery_iterations=_clamp_discovery_iterations(
+            node_throttle.get("max_discovery_iterations", 10)
+        ),
         ollama_local_model=model_routing.get("ollama_local_model", ""),
         ollama_local_backup=model_routing.get("ollama_local_backup", ""),
         force_local_only=model_routing.get("force_local_only", False),

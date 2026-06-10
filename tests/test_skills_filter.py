@@ -9,7 +9,6 @@ import json
 import os
 import tempfile
 
-import pytest
 
 from harness.graph import (
     _build_system_prompt,

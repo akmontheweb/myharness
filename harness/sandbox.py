@@ -1273,7 +1273,17 @@ class SandboxExecutor:
     ):
         self.workspace_path = os.path.abspath(workspace_path)
         self.allow_network = allow_network
-        self.command_validator = command_validator  # Optional CommandValidator for security checks
+        # Fall back to the process-wide default validator (set by cmd_run via
+        # harness.security.set_command_validator) so every executor gets
+        # defense-in-depth without each call site having to pass one. Tests
+        # and one-off scripts that don't initialise a global remain unchanged.
+        if command_validator is None:
+            try:
+                from harness.security import get_command_validator
+                command_validator = get_command_validator()
+            except Exception:  # noqa: BLE001 — fail open: validator is defense in depth
+                command_validator = None
+        self.command_validator = command_validator
         self.extra_env = extra_env or {}
 
         cfg = sandbox_config or {}

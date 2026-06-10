@@ -242,6 +242,37 @@ class TestValidateDiscoveryJson:
         _, errors = validate_discovery_json(payload)
         assert any("10000 chars" in e or "exceeds" in e for e in errors)
 
+    def test_oversized_total_response_rejected(self):
+        from harness.trust import validate_discovery_json, _MAX_DISCOVERY_BYTES
+        # Use a benign top-level pad field — keeps the test independent of the
+        # per-question text cap (which trips first if we pad inside `text`).
+        payload = json.dumps({"complete": False, "modules": [], "pad": "y" * (_MAX_DISCOVERY_BYTES + 1)})
+        _, errors = validate_discovery_json(payload)
+        assert any("exceeds" in e and "bytes" in e for e in errors)
+
+    def test_deeply_nested_response_rejected(self):
+        from harness.trust import validate_discovery_json, _MAX_DISCOVERY_DEPTH
+        # Build {"a": {"a": {... 20 deep ...}}}
+        nested = "v"
+        for _ in range(_MAX_DISCOVERY_DEPTH + 5):
+            nested = {"a": nested}
+        payload = json.dumps(nested)
+        _, errors = validate_discovery_json(payload)
+        assert any("nesting depth" in e for e in errors)
+
+    def test_at_depth_limit_accepted(self):
+        from harness.trust import validate_discovery_json
+        # A normal discovery response (depth ~4) must not be rejected.
+        payload = json.dumps({
+            "modules": [
+                {"name": "INPUT", "questions": [{"id": "Q1", "text": "What?"}]}
+            ],
+            "complete": False,
+        })
+        _, errors = validate_discovery_json(payload)
+        assert not any("nesting depth" in e for e in errors)
+        assert not any("bytes" in e for e in errors)
+
 
 # ---------------------------------------------------------------------------
 # 5. validate_blueprint_json
@@ -396,10 +427,10 @@ class TestAdversarialSweep:
 
 
 # ---------------------------------------------------------------------------
-# Additional coverage: safe_subprocess_env all scrubbed vars
+# Additional coverage: safe_subprocess_env extra scrubbed-var checks
 # ---------------------------------------------------------------------------
 
-class TestSafeSubprocessEnv:
+class TestSafeSubprocessEnvCoverage:
     """Test that all sensitive env vars are scrubbed."""
 
     def test_all_scrubbed_vars_removed(self, monkeypatch):
@@ -427,7 +458,7 @@ class TestSafeSubprocessEnv:
 # Additional coverage: validate_blueprint_json
 # ---------------------------------------------------------------------------
 
-class TestValidateBlueprintJson:
+class TestValidateBlueprintJsonCoverage:
     """Test blueprint JSON validation."""
 
     def test_valid_blueprint_json(self):
@@ -469,7 +500,7 @@ class TestValidateBlueprintJson:
 # Additional coverage: is_path_allowed with symlinks
 # ---------------------------------------------------------------------------
 
-class TestIsPathAllowed:
+class TestIsPathAllowedCoverage:
     """Test path allowlist validation."""
 
     def test_file_inside_workspace_no_allowlist(self):

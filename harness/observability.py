@@ -131,12 +131,22 @@ def log_failure(name: str, **fields: Any) -> None:
 # 3. Logging configuration
 # ---------------------------------------------------------------------------
 
+# Defaults for the rotating file handler. A typical session writes a few
+# hundred KB of JSONL; 10 MB × 5 backups gives ~50 MB per session before
+# the oldest backup is dropped — enough for post-mortem of any single run
+# without unbounded disk growth over weeks of operation.
+_DEFAULT_LOG_MAX_BYTES = 10_000_000
+_DEFAULT_LOG_BACKUP_COUNT = 5
+
+
 def configure_logging(
     session_id: str,
     log_dir: str = "~/.harness/logs",
     level: str = "INFO",
     langsmith_enabled: bool = False,
     json_stderr: bool = False,
+    max_bytes: int = _DEFAULT_LOG_MAX_BYTES,
+    backup_count: int = _DEFAULT_LOG_BACKUP_COUNT,
 ) -> Optional[str]:
     """
     Configure the harness logging stack for a session.
@@ -154,6 +164,11 @@ def configure_logging(
         level:             Root log level string ("DEBUG", "INFO", etc.).
         langsmith_enabled: Opt-in to LangSmith tracing.
         json_stderr:       Emit JSON to stderr instead of the default human format.
+        max_bytes:         Rotate the session log file when it grows past this
+                           many bytes (0 disables rotation; falls back to a
+                           plain FileHandler for parity with legacy behavior).
+        backup_count:      Number of rotated backups to keep alongside the
+                           live file (oldest is deleted on the next rotation).
 
     Returns:
         Absolute path of the created session log file, or None on failure.
@@ -179,12 +194,25 @@ def configure_logging(
     root.addHandler(stderr_handler)
 
     # --- per-session JSONL file handler ---
+    # Rotating by default so a long pilot session can't silently fill the
+    # operator's disk. When max_bytes=0 we drop back to plain FileHandler
+    # (used by tests that assert on a single non-rotating .jsonl file).
     log_file_path: Optional[str] = None
     try:
         expanded_dir = os.path.expanduser(log_dir)
         os.makedirs(expanded_dir, exist_ok=True)
         candidate_path = os.path.join(expanded_dir, f"{session_id}.jsonl")
-        file_handler = logging.FileHandler(candidate_path, encoding="utf-8")
+        file_handler: logging.Handler
+        if max_bytes and max_bytes > 0:
+            from logging.handlers import RotatingFileHandler
+            file_handler = RotatingFileHandler(
+                candidate_path,
+                maxBytes=max_bytes,
+                backupCount=max(0, backup_count),
+                encoding="utf-8",
+            )
+        else:
+            file_handler = logging.FileHandler(candidate_path, encoding="utf-8")
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(JSONFormatter())
         root.addHandler(file_handler)

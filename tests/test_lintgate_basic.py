@@ -1,10 +1,8 @@
 """Tests for harness/lintgate.py — formatter and linter basics."""
 
-import shutil
 import tempfile
 import os
 
-import pytest
 
 from pathlib import Path
 

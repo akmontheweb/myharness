@@ -19,7 +19,6 @@ Integration points:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -1794,3 +1793,26 @@ def create_command_validator_from_config(config_dict: dict[str, Any]) -> Command
         allow_all_commands=security_cfg.get("allow_all_commands", False),
         allow_network_in_build=security_cfg.get("allow_network_in_build", False),
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. Global validator accessor
+#
+# Mirrors the pattern used by harness/redactor.py's global SecretScanner.
+# `cmd_run` calls set_command_validator() at startup so every SandboxExecutor
+# instantiated during the session picks it up automatically — defense-in-depth
+# without having to thread the validator through every call site.
+# ---------------------------------------------------------------------------
+
+_global_command_validator: Optional[CommandValidator] = None
+
+
+def set_command_validator(validator: Optional[CommandValidator]) -> None:
+    """Set the process-wide default CommandValidator. Pass None to clear."""
+    global _global_command_validator
+    _global_command_validator = validator
+
+
+def get_command_validator() -> Optional[CommandValidator]:
+    """Return the process-wide default CommandValidator, or None if unset."""
+    return _global_command_validator

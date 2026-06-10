@@ -10,7 +10,6 @@ existing layout is `app/<module>.py`.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import pytest
@@ -86,11 +85,22 @@ def _seed_app_workspace(tmp_path) -> None:
 
 class TestBuildPatcherAllowlist:
 
-    def test_returns_none_for_flat_workspace(self, tmp_path):
-        # Flat workspace → no source root → no enforcement.
+    def test_returns_conservative_fallback_for_flat_workspace(self, tmp_path):
+        # P1.1 closeout: when no source root is detected, the patcher used to
+        # see allowlist=None (permissive — anything goes under workspace).
+        # We now hand back a conservative fallback covering common layouts
+        # so the LLM is still constrained.
         (tmp_path / "foo.py").write_text("")
         (tmp_path / "bar.py").write_text("")
-        assert _build_patcher_allowlist(str(tmp_path)) is None
+        allowlist = _build_patcher_allowlist(str(tmp_path))
+        assert allowlist is not None
+        # Must NOT be the permissive None default any more.
+        # Must include the common source-layout prefixes.
+        for expected in ("src/", "lib/", "app/", "pkg/", "cmd/"):
+            assert expected in allowlist
+        # Test trees and root manifest files still present.
+        assert "tests/" in allowlist
+        assert "pyproject.toml" in allowlist
 
     def test_returns_allowlist_for_app_workspace(self, tmp_path):
         _seed_app_workspace(tmp_path)
@@ -216,10 +226,14 @@ class TestPatchingNodeAllowlist:
         assert "conftest.py" in result.get("modified_files", [])
 
     @pytest.mark.asyncio
-    async def test_flat_workspace_has_no_enforcement(self, tmp_path, stub_gateway):
-        # Flat workspace (no clear source root). Out-of-root file MUST land,
-        # because allowed_paths is None and the patcher imposes no
-        # additional restriction.
+    async def test_flat_workspace_conservative_fallback_blocks_root_writes(
+        self, tmp_path, stub_gateway,
+    ):
+        # P1.1 closeout: flat workspace no longer means "anything goes".
+        # The conservative fallback restricts writes to common source-layout
+        # prefixes, test trees, and root manifest files. A bare module at
+        # workspace root (not in src/lib/app/pkg/cmd/ and not in
+        # _ROOT_ALLOWLIST_FILES) must now be rejected.
         (tmp_path / "foo.py").write_text("def foo(): pass\n")
         (tmp_path / "bar.py").write_text("def bar(): pass\n")
 
@@ -240,9 +254,38 @@ class TestPatchingNodeAllowlist:
             "token_tracker": {},
         })
 
-        # Pre-fix behaviour preserved: file landed.
-        assert (tmp_path / "new_module.py").exists()
-        assert "new_module.py" in result.get("modified_files", [])
+        # Conservative fallback in effect: bare-root new_module.py is denied.
+        assert not (tmp_path / "new_module.py").exists()
+        assert "new_module.py" not in result.get("modified_files", [])
+
+    @pytest.mark.asyncio
+    async def test_flat_workspace_conservative_fallback_allows_src_writes(
+        self, tmp_path, stub_gateway,
+    ):
+        # Conservative fallback still permits the conventional source-layout
+        # prefixes (src/, lib/, app/, pkg/, cmd/) so the LLM can land a new
+        # file under one of those without a detected source root.
+        (tmp_path / "foo.py").write_text("def foo(): pass\n")
+
+        stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: src/new_module.py\n"
+            "content:\n"
+            "def hello(): pass\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+
+        from harness.graph import patching_node
+        result = await patching_node({
+            "workspace_path": str(tmp_path),
+            "messages": [{"role": "system", "content": "test"}],
+            "modified_files": [],
+            "budget_remaining_usd": 1.0,
+            "token_tracker": {},
+        })
+
+        assert (tmp_path / "src" / "new_module.py").exists()
+        assert "src/new_module.py" in result.get("modified_files", [])
 
 
 # ---------------------------------------------------------------------------

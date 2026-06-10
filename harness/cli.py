@@ -31,8 +31,119 @@ logger = logging.getLogger("harness.cli")
 
 
 # ---------------------------------------------------------------------------
+# Version reporting (P2.5)
+# ---------------------------------------------------------------------------
+
+def _get_harness_version() -> str:
+    """Return the installed harness package version, or '(unknown)' if not
+    discoverable. Used by argparse's ``--version`` action.
+
+    Falls through to '(unknown)' instead of raising so an uninstalled
+    in-tree run (e.g. `python -m harness.cli ...`) still produces a usable
+    help message.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        return version("ai-agent-harness")
+    except (PackageNotFoundError, ImportError, Exception):  # noqa: BLE001
+        return "(unknown)"
+
+
+# ---------------------------------------------------------------------------
+# Workspace lock (P1.7) — single-writer guard
+# ---------------------------------------------------------------------------
+
+# Module-level pin: the lock-file handle MUST outlive cmd_run's locals so
+# the OS holds the lock for the lifetime of the process. Releasing on exit
+# is automatic.
+_WORKSPACE_LOCK_HANDLE: Any = None
+
+
+def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
+    """Acquire an advisory exclusive lock on the workspace.
+
+    Returns the locked file handle on success, or ``False`` when another
+    session holds the lock and ``force`` is False. On platforms without
+    ``fcntl`` (Windows native), logs a debug message and returns ``None``
+    — we trade hardening for compatibility there since the alternatives
+    (msvcrt.locking, file deletion handshake) bring their own surprises.
+
+    Stash the handle in a module-level slot so the GC doesn't release the
+    lock the moment cmd_run's local goes out of scope.
+    """
+    global _WORKSPACE_LOCK_HANDLE
+    try:
+        import fcntl  # type: ignore[import-not-found]
+    except ImportError:
+        logger.debug(
+            "[lock] fcntl unavailable (Windows native?); skipping workspace lock."
+        )
+        return None
+
+    lock_path = os.path.join(workspace_path, ".harness_session.lock")
+    try:
+        fh = open(lock_path, "w", encoding="utf-8")
+    except OSError as exc:
+        logger.warning(
+            "[lock] Could not create lock file %s: %s. Proceeding without lock.",
+            lock_path, exc,
+        )
+        return None
+
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if force:
+            logger.warning(
+                "[lock] %s is held by another session, but --force-lock was "
+                "passed — taking the lock anyway. Concurrent corruption is "
+                "now possible; you own the risk.",
+                lock_path,
+            )
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            except OSError as exc:
+                logger.error("[lock] Force-lock failed too: %s", exc)
+                fh.close()
+                return False
+        else:
+            logger.error(
+                "[lock] Workspace %s is locked by another live `harness run` "
+                "session. Refusing to start so the two don't clobber each "
+                "other's patches.\n"
+                "  Wait for the other session to finish, or pass --force-lock "
+                "if you're certain it's stuck (e.g. a previous crash left the "
+                "lock stranded).",
+                workspace_path,
+            )
+            fh.close()
+            return False
+
+    try:
+        fh.write(f"pid={os.getpid()}\n")
+        fh.flush()
+    except OSError:
+        pass
+
+    _WORKSPACE_LOCK_HANDLE = fh
+    logger.info("[lock] Acquired workspace lock: %s (pid=%d)", lock_path, os.getpid())
+    return fh
+
+
+# ---------------------------------------------------------------------------
 # 1. Configuration Discovery
 # ---------------------------------------------------------------------------
+
+def _get_global_config_path() -> str:
+    """Resolve the repo-root global config path: <myharness_root>/config/config.json.
+
+    The harness package lives at <root>/harness/, so the parent of this
+    module's directory is the repo root.
+    """
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(package_dir)
+    return os.path.join(repo_root, "config", "config.json")
+
 
 def discover_config(workspace_path: str) -> dict[str, Any]:
     """
@@ -40,15 +151,15 @@ def discover_config(workspace_path: str) -> dict[str, Any]:
 
     Priority order:
         1. .harness_config.json in the workspace root (if it exists)
-        2. ~/.harness/config.json (user-global defaults)
+        2. <myharness_root>/config/config.json (in-repo global defaults)
         3. harness/cli.json (shipped fallback defaults)
 
     Returns a merged configuration dictionary.
     """
     config: dict[str, Any] = _get_default_config()
 
-    # Layer 2: User-global config
-    global_config_path = os.path.expanduser("~/.harness/config.json")
+    # Layer 2: In-repo global config (models, API keys, default routing)
+    global_config_path = _get_global_config_path()
     if os.path.isfile(global_config_path):
         try:
             with open(global_config_path, "r", encoding="utf-8") as f:
@@ -87,7 +198,7 @@ def discover_config(workspace_path: str) -> dict[str, Any]:
 def _get_default_config() -> dict[str, Any]:
     """Return fallback configuration loaded from harness/cli.json.
 
-    Models are defined in ~/.harness/config.json (global, shared across projects).
+    Models are defined in <myharness_root>/config/config.json (global, shared across projects).
     Per-project model routing lives in .harness_config.json.
     Fallback defaults live in harness/cli.json (shipped with the package).
     Users can edit cli.json instead of modifying Python source code.
@@ -130,6 +241,9 @@ def _get_default_config() -> dict[str, Any]:
         },
         "node_throttle": {
             "max_patch_repair_iterations": 3,
+            "max_doc_review_cycles": 1,
+            "max_code_review_cycles": 1,
+            "max_discovery_iterations": 10,
         },
         "models": {},
         "model_routing": {
@@ -141,6 +255,12 @@ def _get_default_config() -> dict[str, Any]:
             "repair_primary": "",
             "repair_fallback": "",
             "repair_mode": "thinking",
+            "doc_reviewer_primary": "",
+            "doc_reviewer_mode": "thinking",
+            "doc_reviewer_fallback": "",
+            "code_reviewer_primary": "",
+            "code_reviewer_mode": "thinking",
+            "code_reviewer_fallback": "",
             "ollama_local_model": "",
             "ollama_local_backup": "",
             "force_local_only": False,
@@ -207,20 +327,27 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "backend", "docker_image", "docker_memory_limit", "docker_cpu_limit",
         "docker_pids_limit", "readonly_cache_mounts", "timeout_seconds",
         "pgid_kill_on_timeout", "log_buffer_max_mb",
+        # P1.3: opt-in for auto-enabling network on detected pip/npm install.
+        "auto_enable_network_for_install",
     }),
     "token_budget": frozenset({
         "hard_cap_usd", "context_window_threshold_pct",
     }),
     "node_throttle": frozenset({
         "max_patch_repair_iterations",
+        "max_doc_review_cycles",
+        "max_code_review_cycles",
+        "max_discovery_iterations",
     }),
     "persistence": frozenset({
-        "db_path", "ttl_days",
+        "db_path", "ttl_days", "redact_messages",
     }),
     "model_routing": frozenset({
         "planning_primary", "planning_mode", "planning_fallback",
         "patching_primary", "patching_mode",
         "repair_primary", "repair_fallback", "repair_mode",
+        "doc_reviewer_primary", "doc_reviewer_mode", "doc_reviewer_fallback",
+        "code_reviewer_primary", "code_reviewer_mode", "code_reviewer_fallback",
         "ollama_local_model", "ollama_local_backup", "force_local_only",
     }),
     "deployment": frozenset({
@@ -232,6 +359,8 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     "logging": frozenset({
         "level", "log_dir", "json_stderr", "langsmith",
+        # P2.3: rotation knobs for the per-session JSONL file handler.
+        "max_bytes", "backup_count",
     }),
     "test_generation": frozenset({
         "enabled", "max_iterations",
@@ -287,16 +416,16 @@ def _generate_workspace_config(
     Auto-generate a .harness_config.json in the workspace when one is missing.
 
     Builds the workspace config by extracting relevant fields from the
-    global config (~/.harness/config.json) and filling in remaining fields
-    from the built-in fallback defaults (harness/cli.json).
+    global config (<myharness_root>/config/config.json) and filling in
+    remaining fields from the built-in fallback defaults (harness/cli.json).
     """
     # Fields to pull from global config
     workspace_config: dict[str, Any] = {
         "_comment": (
             "Auto-generated .harness_config.json. Generated because no per-project "
             "configuration was found in this workspace. Values sourced from "
-            "~/.harness/config.json (global) and harness/cli.json (built-in defaults). "
-            "Modify this file to customize per-project settings."
+            "<myharness_root>/config/config.json (global) and harness/cli.json "
+            "(built-in defaults). Modify this file to customize per-project settings."
         ),
         "build_command": fallback_config.get("build_command", "make build"),
         "allow_network": fallback_config.get("allow_network", False),
@@ -593,7 +722,7 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
             print()
             print("=" * 60)
             print("Session saved to checkpoint.")
-            print(f"Resume later with:")
+            print("Resume later with:")
             print(f"  harness resume --session-id {session_id}")
             if workspace and workspace != os.getcwd():
                 print(f"  harness resume --session-id {session_id} -r {workspace}")
@@ -673,7 +802,7 @@ def discovery_interview_loop(state: dict[str, Any]) -> dict[str, Any]:
         print()
         print("=" * 60)
         print("Session saved to checkpoint.")
-        print(f"Resume later with:")
+        print("Resume later with:")
         print(f"  harness resume --session-id {session_id}")
         if workspace and workspace != os.getcwd():
             print(f"  harness resume --session-id {session_id} -r {workspace}")
@@ -862,7 +991,7 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             print()
             print("=" * 60)
             print("Session saved to checkpoint.")
-            print(f"Resume later with:")
+            print("Resume later with:")
             print(f"  harness resume --session-id {session_id}")
             if workspace_path and workspace_path != os.getcwd():
                 print(f"  harness resume --session-id {session_id} -r {workspace_path}")
@@ -1232,6 +1361,20 @@ async def cmd_run(args: argparse.Namespace) -> int:
         logger.error("Workspace path does not exist: %s", workspace_path)
         return 1
 
+    # P1.7: workspace-level advisory lock. Without this, two concurrent
+    # `harness run -r <same workspace>` invocations both read and write
+    # source files in interleaved order — silently corrupting each other's
+    # patches. The lock holds for the lifetime of this process; the OS
+    # releases it on exit. Pass --force-lock to override (e.g. recovering
+    # from a crashed prior process that left the file stranded).
+    workspace_lock_handle = _acquire_workspace_lock(
+        workspace_path, force=getattr(args, "force_lock", False),
+    )
+    if workspace_lock_handle is False:
+        # Another live session holds the lock and the operator didn't
+        # opt into --force-lock. Refuse to proceed.
+        return 1
+
     config = discover_config(workspace_path)
     build_command = resolve_build_command(args.build_cmd, config, workspace_path)
 
@@ -1239,10 +1382,16 @@ async def cmd_run(args: argparse.Namespace) -> int:
     persistence_cfg = config.get("persistence", {})
     db_path = persistence_cfg.get("db_path", "~/.harness/checkpoints.db")
     ttl_days = persistence_cfg.get("ttl_days", 30)
+    redact_messages = bool(persistence_cfg.get("redact_messages", True))
 
-    # Initialize checkpointer
+    # Initialize checkpointer. With redact_messages=True (the default), the
+    # checkpointer scrubs the `messages` channel through harness.redactor
+    # before SQLite serialization, so secrets the user pasted into a prompt
+    # never land at rest in checkpoints.db.
     from harness.storage import HarnessAsyncSqliteSaver, generate_session_id
-    checkpointer = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=ttl_days)
+    checkpointer = await HarnessAsyncSqliteSaver.from_db_path(
+        db_path=db_path, ttl_days=ttl_days, redact_messages=redact_messages,
+    )
 
     session_id = generate_session_id(args.session_id)
 
@@ -1255,12 +1404,25 @@ async def cmd_run(args: argparse.Namespace) -> int:
         level=log_cfg.get("level", "INFO"),
         langsmith_enabled=bool(log_cfg.get("langsmith", False)),
         json_stderr=bool(log_cfg.get("json_stderr", False)),
+        max_bytes=int(log_cfg.get("max_bytes", 10_000_000)),
+        backup_count=int(log_cfg.get("backup_count", 5)),
     )
 
     # Extract budget and sandbox settings
     token_budget = config.get("token_budget", {})
     budget_usd = token_budget.get("hard_cap_usd", 2.00)
     allow_network = args.allow_network or config.get("allow_network", False)
+
+    # Apply CLI overrides for reviewer cycle caps before gateway init so the
+    # gateway picks them up. Clamping happens inside create_gateway_from_config.
+    spec_cycles = getattr(args, "spec_review_cycles", None)
+    code_cycles = getattr(args, "code_review_cycles", None)
+    if spec_cycles is not None or code_cycles is not None:
+        node_throttle_cfg = config.setdefault("node_throttle", {})
+        if spec_cycles is not None:
+            node_throttle_cfg["max_doc_review_cycles"] = spec_cycles
+        if code_cycles is not None:
+            node_throttle_cfg["max_code_review_cycles"] = code_cycles
 
     # Initialize the LLM Gateway and inject it for graph nodes
     from harness.gateway import create_gateway_from_config
@@ -1272,6 +1434,15 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # Initialize the secret redactor
     from harness.redactor import create_redactor_from_config
     create_redactor_from_config(config)
+
+    # Initialize the process-wide CommandValidator so every SandboxExecutor
+    # spawned during this session inherits the configured allow/block lists.
+    # Without this every executor falls back to validator=None (no check).
+    from harness.security import (
+        create_command_validator_from_config,
+        set_command_validator,
+    )
+    set_command_validator(create_command_validator_from_config(config))
 
     # Initialize GitGuardian for branch lifecycle management
     from harness.security import GitGuardian
@@ -1412,8 +1583,11 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     persistence_cfg = config.get("persistence", {})
     db_path = persistence_cfg.get("db_path", "~/.harness/checkpoints.db")
     ttl_days = persistence_cfg.get("ttl_days", 30)
+    redact_messages = bool(persistence_cfg.get("redact_messages", True))
 
-    checkpointer = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=ttl_days)
+    checkpointer = await HarnessAsyncSqliteSaver.from_db_path(
+        db_path=db_path, ttl_days=ttl_days, redact_messages=redact_messages,
+    )
 
     # Verify that the thread exists
     config_for_get = {"configurable": {"thread_id": args.session_id}}
@@ -1439,7 +1613,78 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     from harness.redactor import create_redactor_from_config
     create_redactor_from_config(config)
 
+    # Wire the process-wide CommandValidator so resumed sessions get the same
+    # defense-in-depth as fresh cmd_run sessions.
+    from harness.security import (
+        create_command_validator_from_config,
+        set_command_validator,
+    )
+    set_command_validator(create_command_validator_from_config(config))
+
     logger.info("[resume] Restoring session '%s' from checkpoint.", args.session_id)
+
+    # Pre-flight: confirm the most recent checkpoint blob actually
+    # deserializes. Without this, a corrupted blob is silently restored as
+    # an empty dict, and the graph restarts from scratch — likely clobbering
+    # the workspace with a fresh first patch. Strict mode raises
+    # CheckpointCorruptedError, which we surface as a clean operator message
+    # instead of an opaque internal traceback.
+    from harness.storage import (
+        CheckpointCorruptedError,
+        CheckpointSchemaMismatchError,
+        _deserialize_checkpoint_blob,
+        validate_checkpoint_schema,
+    )
+    import aiosqlite
+    try:
+        async with aiosqlite.connect(os.path.expanduser(db_path)) as conn:
+            async with conn.execute(
+                "SELECT checkpoint, metadata FROM checkpoints "
+                "WHERE thread_id = ? ORDER BY checkpoint_id DESC LIMIT 1",
+                (args.session_id,),
+            ) as cur:
+                row = await cur.fetchone()
+        if row is None:
+            logger.error(
+                "[resume] No checkpoint found for session '%s'. "
+                "Use `harness status --all` to list available sessions.",
+                args.session_id,
+            )
+            return 1
+        try:
+            _deserialize_checkpoint_blob(row[0], strict=True)
+        except CheckpointCorruptedError as exc:
+            logger.error(
+                "[resume] Checkpoint for session '%s' is corrupted: %s\n"
+                "  Options:\n"
+                "    - Start a fresh session with `harness run -r %s -p '<prompt>'`.\n"
+                "    - Restore checkpoints.db from a known-good backup.\n"
+                "    - Run `harness purge --session-id %s` to drop only this session.",
+                args.session_id, exc, workspace_path, args.session_id,
+            )
+            return 1
+        # P2.4: refuse to resume a checkpoint stamped with an incompatible
+        # schema version. Catches the "newer harness wrote this, older
+        # harness is trying to restore" footgun before the graph touches
+        # the workspace.
+        try:
+            validate_checkpoint_schema(row[1])
+        except CheckpointSchemaMismatchError as exc:
+            logger.error(
+                "[resume] Checkpoint for session '%s' has an incompatible schema: %s\n"
+                "  Options:\n"
+                "    - Upgrade or downgrade the harness to match the checkpoint's version.\n"
+                "    - Start a fresh session with `harness run -r %s -p '<prompt>'`.\n"
+                "    - Run `harness purge --session-id %s` to drop only this session.",
+                args.session_id, exc, workspace_path, args.session_id,
+            )
+            return 1
+    except aiosqlite.Error as exc:
+        logger.error(
+            "[resume] Could not read checkpoint DB at %s: %s",
+            db_path, exc,
+        )
+        return 1
 
     # One-screen diagnostic: tell the user exactly what we're about to
     # resume so they don't fly blind. Read-only — re-uses the same
@@ -1637,6 +1882,8 @@ def _doctor_check_api_keys(config: dict[str, Any]) -> tuple[str, str]:
         "planning_primary", "planning_fallback",
         "patching_primary",
         "repair_primary", "repair_fallback",
+        "doc_reviewer_primary", "doc_reviewer_fallback",
+        "code_reviewer_primary", "code_reviewer_fallback",
     )
     needed_providers: dict[str, str] = {}  # provider -> first model that wants it
     for routing_key in routing_keys:
@@ -1718,7 +1965,12 @@ def _doctor_check_sandbox(config: dict[str, Any]) -> tuple[str, str]:
 
 
 def _doctor_check_checkpoint_db(config: dict[str, Any]) -> tuple[str, str]:
-    """Checkpoint DB path is writable (create parent dir, open with sqlite3)."""
+    """Checkpoint DB path is writable AND the latest few rows deserialize.
+
+    A silent fall-back to ``{}`` on corrupted blobs used to mask data loss
+    (P1.6) — verifying a deserialize cycle here surfaces the corruption as
+    a doctor warning instead of a half-resumed session.
+    """
     import sqlite3
     persistence_cfg = config.get("persistence", {}) or {}
     db_path = persistence_cfg.get("db_path", "~/.harness/checkpoints.db")
@@ -1731,10 +1983,64 @@ def _doctor_check_checkpoint_db(config: dict[str, Any]) -> tuple[str, str]:
     try:
         conn = sqlite3.connect(expanded, timeout=2)
         conn.execute("PRAGMA user_version")
-        conn.close()
     except sqlite3.Error as exc:
         return "fail", f"sqlite3 open failed for {expanded}: {exc}"
+
+    # Best-effort deserialize check on the 5 most recent checkpoints. If the
+    # `checkpoints` table doesn't exist yet (fresh DB), skip silently.
+    try:
+        from harness.storage import (
+            CheckpointCorruptedError,
+            _deserialize_checkpoint_blob,
+        )
+        rows = conn.execute(
+            "SELECT thread_id, checkpoint FROM checkpoints "
+            "ORDER BY ROWID DESC LIMIT 5"
+        ).fetchall()
+        corrupted: list[str] = []
+        for thread_id, blob in rows:
+            try:
+                _deserialize_checkpoint_blob(blob, strict=True)
+            except CheckpointCorruptedError:
+                corrupted.append(thread_id)
+        if corrupted:
+            conn.close()
+            unique = sorted(set(corrupted))
+            preview = ", ".join(unique[:3]) + ("…" if len(unique) > 3 else "")
+            return (
+                "warn",
+                f"writable: {expanded} — but {len(corrupted)} recent checkpoint(s) "
+                f"failed to deserialize (threads: {preview}). Run "
+                f"`harness purge --session-id <id>` to drop them.",
+            )
+    except sqlite3.OperationalError:
+        # `checkpoints` table not yet created — fresh DB, nothing to validate.
+        pass
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
     return "pass", f"writable: {expanded}"
+
+
+def _doctor_check_global_config() -> tuple[str, str]:
+    """The in-repo global config file at <myharness_root>/config/config.json exists.
+
+    Without it, discover_config falls back to harness/cli.json's empty-routing
+    defaults and the first LLM dispatch will fail with no model configured.
+    """
+    path = _get_global_config_path()
+    if not os.path.isfile(path):
+        return "fail", (
+            f"missing {path} — run scripts/setup.py or copy config/config.json.example to config/config.json"
+        )
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        return "fail", f"cannot parse {path}: {exc}"
+    return "pass", f"found at {path}"
 
 
 def _doctor_check_config(workspace_path: str) -> tuple[str, str]:
@@ -1788,6 +2094,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
 
     checks: list[tuple[str, tuple[str, str]]] = [
         ("git repo", _doctor_check_git(workspace_path)),
+        ("global config", _doctor_check_global_config()),
         ("api keys", _doctor_check_api_keys(config)),
         ("sandbox backend", _doctor_check_sandbox(config)),
         ("checkpoint db", _doctor_check_checkpoint_db(config)),
@@ -1846,6 +2153,28 @@ async def cmd_purge(args: argparse.Namespace) -> int:
         await checkpointer.adelete_thread(args.session_id)
         print(f"Purged all checkpoints for session '{args.session_id}'.")
         await checkpointer.conn.close()
+        # P2.9: a GDPR / customer-deletion request needs the JSONL transcript
+        # gone too — it may include redacted-but-not-eliminated prompt
+        # excerpts. Best-effort: the live log file plus any rotated backups
+        # (`<id>.jsonl.1`, `.jsonl.2`, ...).
+        log_cfg = config.get("logging", {})
+        log_dir = os.path.expanduser(log_cfg.get("log_dir", "~/.harness/logs"))
+        removed = 0
+        if os.path.isdir(log_dir):
+            import glob
+            patterns = [
+                os.path.join(log_dir, f"{args.session_id}.jsonl"),
+                os.path.join(log_dir, f"{args.session_id}.jsonl.*"),
+            ]
+            for pat in patterns:
+                for path in glob.glob(pat):
+                    try:
+                        os.remove(path)
+                        removed += 1
+                    except OSError as exc:
+                        logger.warning("Could not remove log file %s: %s", path, exc)
+        if removed:
+            print(f"Removed {removed} log file(s) for session '{args.session_id}'.")
     else:
         logger.error("Please specify --all to purge everything or --session-id to purge a specific session.")
         return 1
@@ -1867,6 +2196,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Quick Start:\n"
             "  harness run -r /path/to/repo -p \"Your engineering task description\"\n"
             "  harness -h                     Show this help\n"
+            "  harness --version              Print the installed harness version\n"
             "  harness run -h                 Show run subcommand help\n"
             "  harness status --all           List all checkpointed sessions\n"
         ),
@@ -1879,6 +2209,12 @@ def build_parser() -> argparse.ArgumentParser:
             "  harness status --session-id abc123\n"
             "  harness purge --all\n"
         ),
+    )
+    parser.add_argument(
+        "--version", "-V",
+        action="version",
+        version=f"harness {_get_harness_version()}",
+        help="Print the installed harness version and exit.",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -1954,6 +2290,45 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         dest="skip_discovery_compat",
         help=argparse.SUPPRESS,  # hidden; no longer needed but kept for scripts
+    )
+    # P1.7: workspace-lock override. When another live `harness run` holds
+    # the workspace's session lock, the new run normally refuses to start.
+    # Pass this flag to take the lock anyway — meant for the recovery case
+    # where a previous process crashed without releasing it.
+    run_parser.add_argument(
+        "--force-lock",
+        action="store_true",
+        default=False,
+        dest="force_lock",
+        help=(
+            "Bypass the workspace session lock. Use ONLY when the previous "
+            "harness run process crashed and the .harness_session.lock file "
+            "is stale; running two live sessions concurrently against one "
+            "workspace will corrupt each other's patches."
+        ),
+    )
+    # Reviewer cycle caps. Activation is purely by which model slots are set
+    # in .harness_config.json; these flags only control how many times the
+    # cycle runs when active. Clamped to [0, 5]; 0 suspends the reviewer.
+    run_parser.add_argument(
+        "--spec-review-cycles",
+        type=int,
+        default=None,
+        dest="spec_review_cycles",
+        help=(
+            "Override max_doc_review_cycles for this run (0-5). 0 suspends the "
+            "doc reviewer without clearing doc_reviewer_primary in config."
+        ),
+    )
+    run_parser.add_argument(
+        "--code-review-cycles",
+        type=int,
+        default=None,
+        dest="code_review_cycles",
+        help=(
+            "Override max_code_review_cycles for this run (0-5). 0 suspends "
+            "the code reviewer without clearing code_reviewer_primary in config."
+        ),
     )
 
     # --- `harness resume` ---
