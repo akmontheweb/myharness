@@ -143,15 +143,15 @@
         "force_local_only": false
     },
 
-    "_llm_dispatch_comment": "Per-call LLM dispatch parameters. max_tokens_default is the fallback ceiling on a model's response (visible content + thinking trace combined for reasoning-mode models like deepseek-v4-pro). max_tokens_per_role gives every role an explicit, tunable ceiling — operators can raise repair (thinking trace + patch blocks need headroom), lower doc_reviewer (short critiques), or tweak any other role without code changes. Any role absent from the map falls back to max_tokens_default. Values are clamped to [256, 32768] at load time — below 256 produces useless truncated replies; above 32768 blows past every supported model's per-request output cap. Recommended baselines: planning 4096, patching 4096, repair 8192 (thinking mode + tracebacks eat budget before the patch block lands), doc_reviewer 2048, code_reviewer 4096.",
+    "_llm_dispatch_comment": "Per-call LLM dispatch parameters. max_tokens_default is the fallback ceiling on a model's response (visible content + thinking trace combined for reasoning-mode models like deepseek-v4-pro). max_tokens_per_role gives every role an explicit, tunable ceiling — operators can raise repair (thinking trace + patch blocks need headroom), lower doc_reviewer (short critiques), or tweak any other role without code changes. Any role absent from the map falls back to max_tokens_default. Values are clamped to [256, 32768] at load time — below 256 produces useless truncated replies; above 32768 blows past every supported model's per-request output cap. Recommended baselines: planning 4096, patching 8192 (initial scaffold often emits 4-6 file blocks; thinking mode eats headroom), repair 8192 (thinking trace + tracebacks + patch blocks all share the ceiling), doc_reviewer 4096, code_reviewer 8192 (deeper critiques on larger diffs).",
     "llm_dispatch": {
         "max_tokens_default": 4096,
         "max_tokens_per_role": {
             "planning": 4096,
-            "patching": 4096,
+            "patching": 8192,
             "repair": 8192,
-            "doc_reviewer": 2048,
-            "code_reviewer": 4096
+            "doc_reviewer": 4096,
+            "code_reviewer": 8192
         }
     },
 
