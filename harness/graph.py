@@ -2039,13 +2039,27 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
 
         if use_escalation:
             escalation_model = gateway.config.repair_fallback or gateway.config.planning_fallback
-            if escalation_model:
+            primary_model = gateway.config.repair_primary
+            if escalation_model and escalation_model != primary_model:
                 logger.warning(
                     "[repair_node] Cheap model failed %d time(s). Escalating to reasoning model: %s",
                     total_repairs - 1,
                     escalation_model,
                 )
                 # Escalated repair will use NodeRole.REPAIR with thinking mode enabled
+            elif escalation_model:
+                # Operator configured the same model for primary AND fallback
+                # — "escalating" would just re-run the same model. Skip the
+                # model swap so the misleading "Escalating to <same model>"
+                # banner never fires; thinking mode is already enabled for
+                # the repair role via repair_mode config.
+                logger.info(
+                    "[repair_node] %d previous attempt(s) on the cheap model; "
+                    "repair_fallback==repair_primary (%s), so re-running same "
+                    "model with role=repair (thinking mode honors repair_mode).",
+                    total_repairs - 1, primary_model,
+                )
+                use_escalation = False
             else:
                 logger.warning(
                     "[repair_node] Cheap model failed %d time(s), but no escalation model configured. "
@@ -2433,13 +2447,41 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         )
         return _transition("human_intervention_node")
 
-    if total_repairs >= max_iterations:
+    # Autofixable diagnostics bypass the repair-limit gate. R4
+    # (_try_missing_dep, MISSING_DEP) appends to requirements.txt with
+    # ZERO LLM calls; R5 (_try_dep_resolution_conflict,
+    # DEP_RESOLUTION_CONFLICT) strips version pins the same way. Refusing
+    # to enter repair_node when the limit is reached AND the diagnostic
+    # is deterministic-autofixable strands the operator in HITL on a
+    # problem they can't fix from inside the loop (compiler_node's
+    # MISSING_DEP detection was logging "Routing through repair loop so
+    # autofix / LLM can amend the dep manifest" right before the router
+    # then refused to do so — observed in session d880f762).
+    compiler_errors: list[Any] = state.get("compiler_errors", []) or []
+    autofixable_codes: frozenset[str] = frozenset({
+        "MISSING_DEP", "DEP_RESOLUTION_CONFLICT",
+    })
+    has_autofixable = bool(compiler_errors) and all(
+        str(err.get("error_code", "")).upper() in autofixable_codes
+        for err in compiler_errors
+    )
+
+    if total_repairs >= max_iterations and not has_autofixable:
         logger.warning(
             "[router] Repair limit reached (%d/%d). Routing to HITL.",
             total_repairs,
             max_iterations,
         )
         return _transition("human_intervention_node")
+
+    if total_repairs >= max_iterations and has_autofixable:
+        logger.info(
+            "[router] Repair limit (%d/%d) reached but all %d diagnostic(s) "
+            "are deterministically autofixable (codes=%s). Routing to "
+            "repair_node so autofix can land the fix without an LLM call.",
+            total_repairs, max_iterations, len(compiler_errors),
+            sorted({str(e.get("error_code", "")) for e in compiler_errors}),
+        )
 
     logger.info("[router] Build failed (exit %d). Repair attempt %d/%d.", exit_code, total_repairs + 1, max_iterations)
     return _transition("repair_node")

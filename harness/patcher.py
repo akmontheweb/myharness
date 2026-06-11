@@ -1317,12 +1317,24 @@ async def process_llm_patch_output(
     success_count = sum(1 for r in results if r.success)
     total = len(results)
 
+    # Every file this call wrote to (regardless of whether it was already
+    # tracked in existing_modified_files). REPLACE_BLOCK / INSERT_AT_BLOCK
+    # on a file that the prior patching pass already touched would show
+    # up here, but NOT in `newly_modified` — so the summary log used to
+    # say "Files: []" after successful in-place edits, which misled
+    # operators into thinking the patch landed nowhere. Show the actual
+    # touched files in this call instead.
+    touched_this_call: list[str] = []
+    for r in results:
+        if r.success and r.file not in touched_this_call:
+            touched_this_call.append(r.file)
+
     if total == 0:
         logger.info("[patcher] No patch blocks to apply.")
     elif success_count == total:
         logger.info(
             "[patcher] Applied %d/%d patches. Files: %s",
-            success_count, total, newly_modified,
+            success_count, total, touched_this_call,
         )
     else:
         # Partial- or full-failure path: surface what the LLM tried and why
@@ -1340,8 +1352,8 @@ async def process_llm_patch_output(
             )
         })
         parts = [f"[patcher] Applied {success_count}/{total} patches."]
-        if newly_modified:
-            parts.append(f"Succeeded on: {newly_modified}.")
+        if touched_this_call:
+            parts.append(f"Succeeded on: {touched_this_call}.")
         if rejected_paths:
             parts.append(f"Rejected by allowlist: {rejected_paths}.")
         if other_failures:
