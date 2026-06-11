@@ -1964,14 +1964,47 @@ async def cmd_run(args: argparse.Namespace) -> int:
     token_tracker = final_state.get("token_tracker", {})
     total_cost = token_tracker.get("total_cost_usd", 0.0)
 
-    # Git lifecycle: commit on success, rollback on failure
-    if exit_code == 0:
+    # Distinguish HITL Save & Quit (intentional pause; operator will
+    # `harness resume`) from a hard failure. Previously both took the same
+    # exit_code != 0 branch and the rollback wiped the LLM's in-flight
+    # work — observed in session d880f762 where pressing [s] deleted 21
+    # generated app/ + tests/ + requirements.txt files even though the
+    # operator's intent was the opposite: keep the work, come back later.
+    node_state = final_state.get("node_state", {}) or {}
+    hitl_suspend = bool(node_state.get("hitl_suspend"))
+    hitl_abandon = bool(node_state.get("hitl_abandon"))
+
+    if hitl_suspend:
+        # Suspend = "I'll come back to this." Leave the workspace EXACTLY
+        # as the LLM left it on the agent/patch-<session> branch so a
+        # subsequent `harness resume --session-id <id>` picks up against
+        # the same files. The pre-session stash stays parked (the operator
+        # can list it with `git stash list` and pop it manually if they
+        # need the prior work); popping it here could merge-conflict with
+        # the LLM's edits and surprise the operator.
+        agent_branch = getattr(git_guardian, "_patch_branch", None) or "agent/patch-<unknown>"
+        logger.info(
+            "[cli] HITL suspend: leaving %d LLM-modified file(s) on branch "
+            "'%s'. Resume with `harness resume --session-id %s` to continue "
+            "from the same workspace state.",
+            len(modified_files), agent_branch, session_id,
+        )
+    elif hitl_abandon:
+        # Abandon = user explicitly confirmed "throw it away." The HITL
+        # handler already ran _attempt_git_rollback(workspace_path); the
+        # git_guardian-level rollback below would be redundant on a clean
+        # tree but is the safe-to-rerun belt-and-suspenders.
+        git_guardian.rollback(modified_files)
+        git_guardian.pop_stash()
+    elif exit_code == 0:
+        # Git lifecycle: commit on success
         git_guardian.commit_all_changes(session_id, modified_files, exit_code)
         git_guardian.restore_original_branch()
+        git_guardian.pop_stash()
     else:
+        # Real build failure with no operator intervention — rollback as before.
         git_guardian.rollback(modified_files)
-
-    git_guardian.pop_stash()
+        git_guardian.pop_stash()
 
     logger.info("=" * 60)
     logger.info("Graph Execution Complete")
