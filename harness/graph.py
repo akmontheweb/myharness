@@ -197,6 +197,11 @@ _ROOT_ALLOWLIST_FILES: frozenset[str] = frozenset({
     # CREATE them (e.g. add pytest after env_misconfig HITL), not just
     # amend existing ones via the requirements*.txt scan below.
     "requirements.txt",
+    # Build orchestration — the per-stack makefile_*.md skills instruct
+    # the LLM to emit a Makefile so `make build` runs against a real
+    # target instead of the noisy late-bind adaptation in speculative.py
+    # / compiler_node. GNU make recognises all three casings.
+    "Makefile", "makefile", "GNUmakefile",
 })
 
 
@@ -368,9 +373,10 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
             f"`setup.py`, `setup.cfg`, `pyproject.toml`, `conftest.py`, "
             f"`manage.py`, `__init__.py`, `wsgi.py`, `asgi.py`, `main.py`, "
             f"`requirements*.txt`, `tox.ini`, `pytest.ini`, `MANIFEST.in`, "
-            f"`.gitignore`. Test files live under `tests/`, `test/`, or "
-            f"`__tests__/` per the language convention. CREATE_FILE blocks "
-            f"that target other root paths will be rejected by the patcher.\n"
+            f"`.gitignore`, `Makefile`. Test files live under `tests/`, "
+            f"`test/`, or `__tests__/` per the language convention. "
+            f"CREATE_FILE blocks that target other root paths will be "
+            f"rejected by the patcher.\n"
         )
 
     return f"""You are an expert software engineer with deep knowledge of the codebase below.
@@ -937,6 +943,23 @@ Generate your patches NOW. Only the blocks above. No other text."""
             if not r.success and isinstance(r.error, str)
             and "not in skill allowlist" in r.error
         ]
+        # Capture the remaining (non-allowlist) failures so repair_node can
+        # tell the LLM *why* its patches didn't land. Without this the LLM
+        # only sees "Failed: foo.txt" and re-proposes the same bad search
+        # block on the next round.
+        patch_failures = [
+            {
+                "file": r.file,
+                "operation": (
+                    r.operation.value
+                    if hasattr(r.operation, "value") else str(r.operation)
+                ),
+                "error": (r.error or "")[:800],
+            }
+            for r in patch_results
+            if not r.success and isinstance(r.error, str)
+            and "not in skill allowlist" not in r.error
+        ][:5]
         if success_count > 0:
             status_msg = f"[System]: Applied {success_count}/{len(patch_results)} patches successfully."
             if fail_count > 0:
@@ -974,6 +997,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
                 "patch_success": success_count,
                 "patch_fail": fail_count,
                 "allowlist_rejections": allowlist_rejections,
+                "patch_failures": patch_failures,
                 "allowed_paths": allowed_paths,
             },
         }
@@ -1394,6 +1418,41 @@ def _collect_manifest_snippets_for_repair(
             "json" if rel.endswith(".json") else "text"
         )
         lines.append(f"\n### `{rel}`\n```{lang}\n{content.rstrip()}\n```")
+    return "\n".join(lines) + "\n"
+
+
+def _format_prior_patch_failures(failures: list[Any]) -> str:
+    """Format prior-attempt patch failures into a Markdown block for the
+    repair LLM prompt. Empty string when there are no failures so callers
+    can string-append unconditionally.
+
+    Each failure dict carries ``file``, ``operation``, and ``error``. The
+    error message normally includes the patcher's "Closest match" suggestion
+    — the single most useful signal for the LLM to correct a bad SEARCH block.
+    Without surfacing this, the repair loop just re-emits the same broken
+    patch (see the requirements.txt 5-round failure in the issue logs).
+    """
+    if not failures:
+        return ""
+    lines = [
+        "\n## Patch Failures (PREVIOUS attempt)",
+        (
+            "Your last attempt produced patches that the patcher could not "
+            "apply. The exact reasons are below — read them carefully. Do "
+            "NOT re-emit the same SEARCH block verbatim: either match the "
+            "actual file bytes shown in the closest-match snippet, add more "
+            "context lines if your search was ambiguous, or switch operations "
+            "(e.g. INSERT_AT_BLOCK instead of REPLACE_BLOCK when the target "
+            "line doesn't yet exist)."
+        ),
+    ]
+    for f in failures:
+        file_ref = f.get("file", "?") if isinstance(f, dict) else "?"
+        op_ref = f.get("operation", "replace_block") if isinstance(f, dict) else "replace_block"
+        err_ref = (f.get("error", "") if isinstance(f, dict) else "").strip()
+        lines.append(
+            f"\n### `{file_ref}` ({op_ref})\n```\n{err_ref}\n```"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -2032,6 +2091,14 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         )
         error_summary += rejection_block
 
+    # Surface non-allowlist patch failures from the previous attempt — the
+    # patcher's "Search block not found ... Closest match: <bytes>" suggestion
+    # is the single most useful signal the LLM has to correct a bad patch.
+    # Without this the loop just retries the same broken search block.
+    error_summary += _format_prior_patch_failures(
+        state.get("node_state", {}).get("patch_failures") or []
+    )
+
     # If no structured diagnostics, include the raw build output so the LLM can see the actual error
     if not errors:
         raw_output = state.get("node_state", {}).get("last_build_output", "")
@@ -2225,6 +2292,24 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             if not r.success and isinstance(r.error, str)
             and "not in skill allowlist" in r.error
         ]
+        # Capture the remaining failures (search-block-not-found,
+        # file-already-exists, etc.) so the *next* repair iteration sees the
+        # full error including the patcher's closest-match suggestion. The
+        # LLM otherwise only sees "Failed: foo.txt" and proposes the same
+        # bad patch again — see the requirements.txt loop in the issue logs.
+        patch_failures = [
+            {
+                "file": r.file,
+                "operation": (
+                    r.operation.value
+                    if hasattr(r.operation, "value") else str(r.operation)
+                ),
+                "error": (r.error or "")[:800],
+            }
+            for r in patch_results
+            if not r.success and isinstance(r.error, str)
+            and "not in skill allowlist" not in r.error
+        ][:5]
         status_msg = f"[System]: Repair attempt {loop_counter['total_repairs']}: applied {success_count}/{len(patch_results)} patches."
         if fail_count > 0:
             failed_files = [r.file for r in patch_results if not r.success]
@@ -2260,6 +2345,7 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                 "repair_success": success_count,
                 "repair_fail": fail_count,
                 "allowlist_rejections": allowlist_rejections,
+                "patch_failures": patch_failures,
                 "allowed_paths": allowed_paths,
             },
         }

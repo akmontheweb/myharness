@@ -563,7 +563,48 @@ class TextPatcher(BasePatcher):
                     message=f"region already at target state (no-op on resume): {filepath}",
                     lines_changed=0,
                 )
-            # Try fuzzy matching to produce a helpful error
+            # Whitespace-tolerant fallback: try matching after rstrip-per-line
+            # before declaring failure. Catches trailing-whitespace drift,
+            # trailing-newline-only diff, and CRLF/LF mismatch — common LLM
+            # mistakes on small files where exact-byte matching is brittle.
+            ws_matches = _whitespace_tolerant_match(original, search)
+            if len(ws_matches) == 1:
+                modified = _whitespace_tolerant_replace(
+                    original, search, replace, ws_matches[0],
+                )
+                lines_changed = _count_diff_lines(original, modified)
+                try:
+                    await _awrite(full_path, modified)
+                    logger.info(
+                        "[patcher:text] Replaced block in %s via whitespace-tolerant match "
+                        "(%d lines changed). Exact byte search did not match — the LLM's "
+                        "search block had whitespace/newline drift.",
+                        filepath, lines_changed,
+                    )
+                    return PatchResult(
+                        success=True,
+                        file=filepath,
+                        operation=OperationType.REPLACE_BLOCK,
+                        message=f"Replaced block in {filepath} (whitespace-tolerant match)",
+                        lines_changed=lines_changed,
+                    )
+                except OSError as exc:
+                    return PatchResult(
+                        success=False, file=filepath,
+                        operation=OperationType.REPLACE_BLOCK, error=str(exc),
+                    )
+            if len(ws_matches) > 1:
+                return PatchResult(
+                    success=False,
+                    file=filepath,
+                    operation=OperationType.REPLACE_BLOCK,
+                    error=(
+                        f"Search block matched {len(ws_matches)} regions in "
+                        f"{filepath} under whitespace-tolerant comparison. "
+                        f"Add more context lines to make the search unique."
+                    ),
+                )
+            # No match even after normalization — fall through to closest-match suggestion.
             suggestion = _find_closest_match(original, search)
             return PatchResult(
                 success=False,
@@ -1200,6 +1241,71 @@ def _count_diff_lines(original: str, modified: str) -> int:
         if line.startswith("+") or line.startswith("-"):
             count += 1
     return count // 2  # Each change appears as both + and -
+
+
+def _whitespace_tolerant_match(original: str, search: str) -> list[int]:
+    """Find line-aligned regions of ``original`` that match ``search`` after
+    rstrip-per-line normalization.
+
+    Returns a list of *byte* offsets where each match begins in ``original``.
+    Empty list means no normalized match. Multiple entries means ambiguous —
+    the caller should refuse rather than guess.
+
+    Tolerates: trailing whitespace per line, trailing-newline mismatch on the
+    final line, and CRLF/LF drift. Does NOT tolerate inserted/deleted blank
+    lines mid-block — that is a structural change the LLM should re-emit.
+    """
+    if not search:
+        return []
+    orig_lines_keep = original.splitlines(keepends=True)
+    search_lines = search.splitlines()
+    if not search_lines:
+        return []
+    orig_lines_stripped = [ln.rstrip() for ln in orig_lines_keep]
+    search_lines_stripped = [ln.rstrip() for ln in search_lines]
+    n_search = len(search_lines_stripped)
+    if n_search > len(orig_lines_stripped):
+        return []
+
+    # Build cumulative byte offsets so we can map line index → byte offset
+    # without re-scanning the source for every candidate window.
+    line_offsets = [0]
+    for line in orig_lines_keep:
+        line_offsets.append(line_offsets[-1] + len(line))
+
+    matches: list[int] = []
+    for i in range(len(orig_lines_stripped) - n_search + 1):
+        if orig_lines_stripped[i:i + n_search] == search_lines_stripped:
+            matches.append(line_offsets[i])
+    return matches
+
+
+def _whitespace_tolerant_replace(
+    original: str, search: str, replace: str, start_byte: int,
+) -> str:
+    """Apply ``replace`` to ``original`` at the given byte offset, replacing
+    the same number of lines as ``search`` had (post-rstrip). Preserves the
+    original final-line newline behavior so we don't silently drop or add a
+    trailing newline."""
+    orig_lines_keep = original.splitlines(keepends=True)
+    line_offsets = [0]
+    for line in orig_lines_keep:
+        line_offsets.append(line_offsets[-1] + len(line))
+    start_line = line_offsets.index(start_byte)
+    n_search = len(search.splitlines())
+    end_line = start_line + n_search
+    replaced_bytes = sum(
+        len(orig_lines_keep[j]) for j in range(start_line, end_line)
+    )
+    last_orig_line = orig_lines_keep[end_line - 1]
+    last_has_newline = last_orig_line.endswith(("\n", "\r\n", "\r"))
+    replace_text = replace
+    replace_has_newline = replace_text.endswith(("\n", "\r\n", "\r"))
+    if last_has_newline and not replace_has_newline:
+        replace_text += "\n"
+    elif not last_has_newline and replace_has_newline:
+        replace_text = replace_text.rstrip("\r\n")
+    return original[:start_byte] + replace_text + original[start_byte + replaced_bytes:]
 
 
 def _find_closest_match(text: str, search: str, context: int = 3) -> str:

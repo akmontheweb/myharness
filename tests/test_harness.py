@@ -504,6 +504,127 @@ class TestTextPatcher:
                 with open(os.path.join(tmpdir, name)) as f:
                     assert body in f.read()
 
+    # -------------------------------------------------------------------
+    # Whitespace-tolerant replace_block fallback. Exact-byte matching is
+    # brittle on small files (e.g. requirements.txt) where the LLM tends
+    # to drop trailing whitespace or change CRLF/LF — the patcher must
+    # land the change when the structural intent is unambiguous.
+    # -------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_replace_block_whitespace_tolerant_trailing_newline(self):
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "requirements.txt")
+            # File ends WITHOUT a trailing newline
+            with open(target, "w") as f:
+                f.write("fastapi>=0.100,<1.0\nuvicorn[standard]>=0.23,<1.0\npydantic-settings>=2.0")
+            patcher = TextPatcher(tmpdir)
+            # LLM proposes a search WITH a trailing newline — exact match fails
+            result = await patcher.replace_block(
+                "requirements.txt",
+                "pydantic-settings>=2.0\n",
+                "pydantic-settings>=2.0\nhttpx>=0.27\n",
+            )
+            assert result.success, result.error
+            assert "whitespace-tolerant" in (result.message or "").lower()
+            with open(target) as f:
+                content = f.read()
+            assert "httpx>=0.27" in content
+            # Original final-line newline behavior preserved (no extra newline)
+            assert not content.endswith("\n\n")
+
+    @pytest.mark.asyncio
+    async def test_replace_block_whitespace_tolerant_trailing_spaces(self):
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "config.txt")
+            with open(target, "w") as f:
+                f.write("alpha=1\nbeta=2\ngamma=3\n")
+            patcher = TextPatcher(tmpdir)
+            # LLM's search has trailing spaces the file doesn't have
+            result = await patcher.replace_block(
+                "config.txt",
+                "alpha=1  \nbeta=2\t\n",
+                "alpha=1\nbeta=22\n",
+            )
+            assert result.success, result.error
+            with open(target) as f:
+                content = f.read()
+            assert "beta=22" in content
+            assert "gamma=3" in content  # untouched line preserved
+
+    @pytest.mark.asyncio
+    async def test_replace_block_whitespace_tolerant_crlf_lf(self):
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "win.txt")
+            # File uses CRLF (e.g. cloned on Windows)
+            with open(target, "wb") as f:
+                f.write(b"alpha\r\nbeta\r\ngamma\r\n")
+            patcher = TextPatcher(tmpdir)
+            # LLM emits LF-only search — exact match fails
+            result = await patcher.replace_block("win.txt", "beta\n", "BETA\n")
+            assert result.success, result.error
+            with open(target, "rb") as f:
+                content = f.read()
+            assert b"BETA" in content
+
+    @pytest.mark.asyncio
+    async def test_replace_block_whitespace_tolerant_ambiguous_refuses(self):
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "dup.txt")
+            # Two regions that both normalize to the same content
+            with open(target, "w") as f:
+                f.write("x = 1\n\nx = 1\n")
+            patcher = TextPatcher(tmpdir)
+            # Search with extra trailing whitespace — exact fails, ws-match
+            # finds two regions, must refuse rather than guess
+            result = await patcher.replace_block(
+                "dup.txt", "x = 1  \n", "x = 2\n",
+            )
+            assert not result.success
+            assert "2 regions" in (result.error or "")
+            # File untouched
+            with open(target) as f:
+                assert f.read() == "x = 1\n\nx = 1\n"
+
+    @pytest.mark.asyncio
+    async def test_replace_block_exact_match_still_preferred(self):
+        # Whitespace-tolerant matching must not change exact-match behavior:
+        # when the bytes match, the path is identical to before the change.
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "f.txt")
+            with open(target, "w") as f:
+                f.write("alpha\nbeta\ngamma\n")
+            patcher = TextPatcher(tmpdir)
+            result = await patcher.replace_block("f.txt", "beta\n", "BETA\n")
+            assert result.success
+            assert "whitespace-tolerant" not in (result.message or "").lower()
+            with open(target) as f:
+                assert f.read() == "alpha\nBETA\ngamma\n"
+
+    @pytest.mark.asyncio
+    async def test_replace_block_structural_drift_still_fails(self):
+        # Whitespace tolerance must NOT silently fix structural changes —
+        # an inserted/deleted blank line mid-block is a real difference the
+        # LLM should re-emit, not something we paper over.
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = os.path.join(tmpdir, "f.txt")
+            with open(target, "w") as f:
+                f.write("alpha\n\nbeta\n")  # blank line between
+            patcher = TextPatcher(tmpdir)
+            # Search has no blank line — would silently match if we collapsed
+            # blank lines. Must fail to surface the structural mismatch.
+            result = await patcher.replace_block(
+                "f.txt", "alpha\nbeta\n", "x\n",
+            )
+            assert not result.success
+            assert "not found" in (result.error or "").lower()
+
 
 class TestHybridPatcher:
 
@@ -2644,6 +2765,158 @@ class TestAgentState:
             assert result == {}
 
 
+class TestMakefileSkills:
+    """The per-stack makefile_*.md skills instruct the LLM to emit a Makefile
+    in its first patch so the harness's default `make build` runs against a
+    real target. These tests guard the routing + allowlist wiring."""
+
+    @staticmethod
+    def _skills_dir() -> str:
+        from harness import graph as graph_mod
+        return os.path.join(os.path.dirname(graph_mod.__file__), "skills")
+
+    def test_makefile_python_skill_loads_for_python_workspace(self):
+        from harness.graph import _load_skills_markdown
+        body = _load_skills_markdown(
+            self._skills_dir(),
+            max_file_chars=8000,
+            workspace_tags={"python"},
+        )
+        assert "Python Makefile" in body
+        # The single-stack tag should not pull in unrelated language skills.
+        assert "Node.js / TypeScript Makefile" not in body
+        assert "Rust Makefile" not in body
+        assert "Go Makefile" not in body
+
+    def test_makefile_node_skill_loads_for_node_workspace(self):
+        from harness.graph import _load_skills_markdown
+        body = _load_skills_markdown(
+            self._skills_dir(),
+            max_file_chars=8000,
+            workspace_tags={"node"},
+        )
+        assert "Node.js / TypeScript Makefile" in body
+        assert "Python Makefile" not in body
+
+    def test_makefile_node_skill_loads_for_typescript_workspace(self):
+        # typescript is in node's applies_to list — should load.
+        from harness.graph import _load_skills_markdown
+        body = _load_skills_markdown(
+            self._skills_dir(),
+            max_file_chars=8000,
+            workspace_tags={"typescript"},
+        )
+        assert "Node.js / TypeScript Makefile" in body
+
+    def test_makefile_rust_skill_loads_for_rust_workspace(self):
+        from harness.graph import _load_skills_markdown
+        body = _load_skills_markdown(
+            self._skills_dir(),
+            max_file_chars=8000,
+            workspace_tags={"rust"},
+        )
+        assert "Rust Makefile" in body
+        assert "Python Makefile" not in body
+
+    def test_makefile_go_skill_loads_for_go_workspace(self):
+        from harness.graph import _load_skills_markdown
+        body = _load_skills_markdown(
+            self._skills_dir(),
+            max_file_chars=8000,
+            workspace_tags={"go"},
+        )
+        assert "Go Makefile" in body
+        assert "Java Makefile" not in body
+
+    def test_makefile_java_skill_loads_for_java_workspace(self):
+        from harness.graph import _load_skills_markdown
+        body = _load_skills_markdown(
+            self._skills_dir(),
+            max_file_chars=8000,
+            workspace_tags={"java"},
+        )
+        assert "Java Makefile" in body
+
+    def test_makefile_dart_skill_loads_for_flutter_workspace(self):
+        from harness.graph import _load_skills_markdown
+        body = _load_skills_markdown(
+            self._skills_dir(),
+            max_file_chars=8000,
+            workspace_tags={"flutter", "dart"},
+        )
+        assert "Dart / Flutter Makefile" in body
+
+    def test_no_makefile_skill_for_unknown_stack(self):
+        # A stack the harness doesn't recognize (e.g., elixir) shouldn't
+        # pull in any per-language Makefile skill — late-bind handles it.
+        from harness.graph import _load_skills_markdown
+        body = _load_skills_markdown(
+            self._skills_dir(),
+            max_file_chars=8000,
+            workspace_tags={"elixir"},
+        )
+        for stack in ("Python Makefile", "Node.js / TypeScript Makefile",
+                      "Rust Makefile", "Go Makefile", "Java Makefile",
+                      "Dart / Flutter Makefile"):
+            assert stack not in body, f"{stack} should not load for unknown stack"
+
+    def test_makefile_in_root_allowlist(self):
+        # The patcher rejects root-level CREATE_FILE blocks not in the
+        # allowlist (when a source root is detected). Makefile must be
+        # listed so the LLM's Makefile-emitting patch actually applies.
+        from harness.graph import _ROOT_ALLOWLIST_FILES
+        assert "Makefile" in _ROOT_ALLOWLIST_FILES
+        assert "makefile" in _ROOT_ALLOWLIST_FILES
+        assert "GNUmakefile" in _ROOT_ALLOWLIST_FILES
+
+    def test_layout_block_mentions_makefile(self):
+        # The system-prompt layout-block enumerates allowed root files for
+        # the LLM. Without Makefile in the message, the LLM won't try to
+        # emit one even though the patcher would accept it.
+        from harness.graph import _build_system_prompt
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Force the source-root branch by creating an `app/` directory
+            # — without it, layout_block is empty (greenfield path).
+            os.makedirs(os.path.join(tmpdir, "app"))
+            with open(os.path.join(tmpdir, "app", "__init__.py"), "w") as f:
+                f.write("")
+            prompt = _build_system_prompt(tmpdir, "make build")
+            assert "Makefile" in prompt
+
+    @pytest.mark.asyncio
+    async def test_patcher_accepts_makefile_at_root(self):
+        # End-to-end: a CREATE_FILE block for `Makefile` at workspace root
+        # must pass the allowlist check when the workspace has a clear
+        # source root that triggers `_build_patcher_allowlist`.
+        from harness.graph import _build_patcher_allowlist
+        from harness.patcher import process_llm_patch_output
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Establish a clear source root so the allowlist activates.
+            os.makedirs(os.path.join(tmpdir, "app"))
+            with open(os.path.join(tmpdir, "app", "__init__.py"), "w") as f:
+                f.write("")
+            allowed = _build_patcher_allowlist(tmpdir)
+            assert allowed is not None  # source root detected → allowlist active
+
+            llm_output = """<<<CREATE_FILE>>>
+file: Makefile
+content:
+.PHONY: build test all
+build:
+\tpython3 -m pip install -r requirements.txt
+test:
+\tpython3 -m pytest -q
+all: build test
+<<<END_CREATE_FILE>>>"""
+            results, modified = await process_llm_patch_output(
+                llm_output, tmpdir, allowed_paths=allowed,
+            )
+            assert len(results) == 1
+            assert results[0].success, f"Makefile rejected: {results[0].error}"
+            assert "Makefile" in modified
+            assert os.path.exists(os.path.join(tmpdir, "Makefile"))
+
+
 class TestToolchainAdaptation:
     """Regression: sandbox image adaptation used to fire inside compiler_node
     only — wasting the first build on the wrong base image — and was also
@@ -2831,6 +3104,75 @@ class TestDetectDefaultBuildCommandPyFallback:
         from harness.cli import _detect_default_build_command
         (tmp_path / "README.md").write_text("# hi\n")
         assert _detect_default_build_command(str(tmp_path)) is None
+
+
+class TestPriorPatchFailureSurfacing:
+    """Repair loop used to feed only "Failed: foo.txt" to the next LLM
+    round. The detailed error (including the patcher's closest-match
+    snippet) went to the logger, not the prompt — so the model proposed
+    the same broken patch over and over. _format_prior_patch_failures
+    is the helper that fixes this; verify it surfaces what's needed.
+    """
+
+    def test_empty_list_returns_empty_string(self):
+        from harness.graph import _format_prior_patch_failures
+        assert _format_prior_patch_failures([]) == ""
+        assert _format_prior_patch_failures(None or []) == ""
+
+    def test_failure_block_includes_file_op_and_full_error(self):
+        from harness.graph import _format_prior_patch_failures
+        failures = [{
+            "file": "requirements.txt",
+            "operation": "replace_block",
+            "error": (
+                "Search block not found in requirements.txt. Closest match:\n"
+                "fastapi>=0.100,<1.0\n"
+                "uvicorn[standard]>=0.23,<1.0\n"
+                "pydantic-settings>=2.0"
+            ),
+        }]
+        out = _format_prior_patch_failures(failures)
+        # Header signals to the LLM that this is feedback, not new errors
+        assert "Patch Failures (PREVIOUS attempt)" in out
+        # File and operation are identified
+        assert "requirements.txt" in out
+        assert "replace_block" in out
+        # The closest-match snippet — the critical signal — is preserved
+        assert "fastapi>=0.100,<1.0" in out
+        assert "pydantic-settings>=2.0" in out
+        # Instruction explicitly tells the LLM not to re-emit verbatim
+        assert "do NOT" in out.lower() or "do not" in out.lower()
+
+    def test_multiple_failures_all_included(self):
+        from harness.graph import _format_prior_patch_failures
+        failures = [
+            {"file": "a.py", "operation": "replace_block",
+             "error": "Search block not found in a.py. Closest match:\nfoo"},
+            {"file": "b.py", "operation": "create_file",
+             "error": "File already exists with different content"},
+        ]
+        out = _format_prior_patch_failures(failures)
+        assert "a.py" in out and "b.py" in out
+        assert "Search block not found" in out
+        assert "already exists" in out
+
+    def test_repair_node_surfaces_failures_via_node_state(self):
+        # Integration: confirm the helper is actually invoked when the
+        # state carries patch_failures. We don't run the full repair_node
+        # (it needs a gateway); we exercise the format helper as repair_node
+        # does — calling it with the same dict shape stored by the node.
+        from harness.graph import _format_prior_patch_failures
+        node_state = {
+            "patch_failures": [{
+                "file": "requirements.txt",
+                "operation": "replace_block",
+                "error": "Search block not found in requirements.txt. Closest match:\nfastapi>=0.100",
+            }],
+        }
+        block = _format_prior_patch_failures(node_state.get("patch_failures") or [])
+        assert "Patch Failures" in block
+        assert "requirements.txt" in block
+        assert "fastapi>=0.100" in block
 
 
 class TestRepairableDepHint:
