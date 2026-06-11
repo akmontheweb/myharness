@@ -2496,8 +2496,31 @@ For each sector, ask every question needed to eliminate unknowns. Be extremely t
 ### 8. HIDDEN ASSUMPTIONS
 - Platform requirements (OS, architecture), network topology assumptions, timezone/locale handling, third-party service availability, expected load profiles.
 
-Output a JSON object with modules and questions. Mark critical items with "critical": true.
-Return ONLY valid JSON. No markdown, no explanation, no code blocks."""
+Output the EXACT JSON shape below — the key must be literally "modules"
+(not "sectors", not "questions", not the section titles above). The harness
+parses this shape strictly; any other top-level key yields zero questions
+and the operator sees an empty interview screen.
+
+{
+  "modules": [
+    {"name": "INPUT VALIDATION", "questions": [
+      {"id": "Q1.1", "text": "...", "critical": true},
+      {"id": "Q1.2", "text": "...", "critical": false}
+    ]},
+    {"name": "PAYLOAD FORMATTING", "questions": [...]},
+    {"name": "ERROR HANDLING BEHAVIORS", "questions": [...]},
+    {"name": "MULTI-USER EDGE CASES", "questions": [...]},
+    {"name": "SECURITY CONTROLS", "questions": [...]},
+    {"name": "STRICT BUSINESS LOGIC RULES", "questions": [...]},
+    {"name": "DATA RETENTION BOUNDARIES", "questions": [...]},
+    {"name": "HIDDEN ASSUMPTIONS", "questions": [...]}
+  ],
+  "complete": false,
+  "summary": "Brief status of what's covered vs still unknown"
+}
+
+Mark critical items with "critical": true. Return ONLY valid JSON. No
+markdown, no explanation, no code blocks."""
 
     messages.append({"role": "user", "content": prompt})
 
@@ -2532,6 +2555,24 @@ Return ONLY valid JSON. No markdown, no explanation, no code blocks."""
         modules = discovery_data.get("modules", [])
         total_questions = sum(len(m.get("questions", [])) for m in modules)
         critical_count = sum(1 for m in modules for q in m.get("questions", []) if q.get("critical"))
+
+        # Catch schema drift: a discovery response that parsed but had no
+        # modules + complete=False means the LLM used a different top-level
+        # key (e.g. "sectors", "components"). Surface it loudly so the
+        # operator doesn't see an empty interview screen and silently
+        # answer "DONE" to no questions — which is the exact symptom that
+        # produced the empty Round 1 in session c371c744-….
+        if not modules and not complete:
+            top_keys = sorted(discovery_data.keys()) if isinstance(discovery_data, dict) else []
+            logger.warning(
+                "[reqs_disc] LLM response parsed cleanly but has ZERO modules "
+                "and complete=False — likely the model used a non-canonical "
+                "top-level key (expected 'modules', saw keys=%s). The "
+                "interview will display no questions. Re-issuing as a "
+                "follow-up round will retry with the canonical schema "
+                "embedded in the prompt.",
+                top_keys,
+            )
 
         messages.append({"role": "assistant", "content": json.dumps(discovery_data)})
 
@@ -2608,7 +2649,23 @@ Same JSON schema as before."""
 ### 8. CI/CD PIPELINE HOOKS
 - Build triggers (push, PR, tag), deployment gates (approval, test pass), rollback strategy, canary/blue-green deployment, environment promotion path.
 
-Output JSON with same schema as requirements discovery."""
+Output the EXACT JSON shape below — the top-level key MUST be literally
+"modules" (not "sectors", not "components"). Any other key yields zero
+questions and the operator sees an empty interview screen.
+
+{
+  "modules": [
+    {"name": "STORAGE TOPOLOGY", "questions": [
+      {"id": "A1.1", "text": "...", "critical": true}
+    ]},
+    ... one entry per architectural sector above ...
+  ],
+  "complete": false,
+  "summary": "Brief status of what's resolved vs remaining"
+}
+
+Mark critical items with "critical": true. Return ONLY valid JSON. No
+markdown, no explanation, no code blocks."""
     messages.append({"role": "user", "content": prompt})
 
     from harness.gateway import NodeRole
@@ -2707,7 +2764,21 @@ Same JSON schema as before."""
 ### 4. PARTIAL INFRASTRUCTURE SYNC
 - Verify any pre-existing containers running on host, existing databases or shared network clusters, active ports already bound, avoid destruction or duplication of production resources, sidecar dependencies, legacy service compatibility.
 
-Output JSON with modules and questions. Mark critical items with "critical": true.
+Output the EXACT JSON shape below — top-level key MUST be literally
+"modules". Any other key yields zero questions on the interview screen.
+
+{
+  "modules": [
+    {"name": "RUNTIME PLATFORM", "questions": [
+      {"id": "D1.1", "text": "...", "critical": true}
+    ]},
+    ... one entry per deployment sector above ...
+  ],
+  "complete": false,
+  "summary": "Brief status of what's resolved vs remaining"
+}
+
+Mark critical items with "critical": true.
 Return ONLY valid JSON. No markdown, no explanation, no code blocks."""
 
     messages.append({"role": "user", "content": prompt})
@@ -4076,6 +4147,7 @@ async def run_graph(
     thread_id: Optional[str] = None,
     spec_override: Optional[str] = None,
     skip_discovery: bool = False,
+    is_resume: bool = False,
     lintgate_config: Optional[dict[str, Any]] = None,
     deployment_config: Optional[dict[str, Any]] = None,
     sandbox_config: Optional[dict[str, Any]] = None,
@@ -4173,10 +4245,31 @@ async def run_graph(
         }
     }
 
-    logger.info("[run_graph] Starting graph execution. thread_id=%s session_id=%s", thread_id, session_id)
+    logger.info(
+        "[run_graph] Starting graph execution. thread_id=%s session_id=%s is_resume=%s",
+        thread_id, session_id, is_resume,
+    )
+
+    # Resume mode: do NOT pass a full initial_state — every key in the
+    # input dict overwrites the corresponding channel in the checkpointed
+    # state, so a fresh AgentState would reset messages, loop_counter,
+    # current_gate, node_state, etc. back to their zero values and the
+    # graph would re-enter at START → requirements_discovery_node even
+    # though the prior session was deep in architecture_discovery.
+    # Passing None tells LangGraph "no input update, just continue from
+    # the checkpoint" — the graph picks up at exactly the node that was
+    # in-flight when the session was saved.
+    if is_resume:
+        invoke_input: Optional[AgentState] = None
+        logger.info(
+            "[run_graph] Resume mode: invoking with no input update; "
+            "the graph will continue from the last checkpointed node."
+        )
+    else:
+        invoke_input = initial_state
 
     # Execute the graph — ainvoke streams all state updates and returns final state
-    final_state: AgentState = await compiled_graph.ainvoke(initial_state, config)  # type: ignore[arg-type,return-value]
+    final_state: AgentState = await compiled_graph.ainvoke(invoke_input, config)  # type: ignore[arg-type,return-value]
 
     logger.info("[run_graph] Graph execution complete. Final exit_code=%d", final_state.get("exit_code", -1))
     return final_state

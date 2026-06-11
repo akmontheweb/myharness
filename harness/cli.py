@@ -2142,6 +2142,11 @@ async def cmd_resume(args: argparse.Namespace) -> int:
             session_id=args.session_id,
             checkpointer=checkpointer,
             thread_id=args.session_id,
+            # Tell run_graph not to build a fresh initial_state that would
+            # overwrite the saved channels (messages, loop_counter,
+            # current_gate, node_state, etc.) and force the graph to
+            # re-enter at requirements_discovery from round 1.
+            is_resume=True,
             lintgate_config=config.get("lintgate", {}),
             deployment_config=config.get("deployment", {}),
             sandbox_config=config.get("sandbox", {}),
