@@ -2028,11 +2028,14 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         budget = state.get("budget_remaining_usd", 2.00)
 
         # --- Cross-Model Speculative Execution ---
-        # Repair #1 and #2: use the cheap model (repair_primary)
-        # Repair #3 (final attempt): escalate to the heavy reasoning model (repair_fallback)
-        # This saves tokens by only using the expensive model when the cheap one has failed twice.
+        # Use the cheap model (repair_primary) for the first N-1 attempts;
+        # escalate to the heavy reasoning model (repair_fallback) for the
+        # LAST attempt before HITL. This saves tokens by only spending the
+        # expensive model when the cheap one has had every chance.
+        # N comes from the operator's config (node_throttle.max_patch_repair_iterations).
         total_repairs = loop_counter["total_repairs"]
-        use_escalation = total_repairs >= 2  # Escalate on 2nd+ failure (3rd attempt is the last)
+        max_repair_attempts = int(getattr(gateway.config, "max_patch_repair_iterations", 3))
+        use_escalation = total_repairs >= max(1, max_repair_attempts - 1)
 
         if use_escalation:
             escalation_model = gateway.config.repair_fallback or gateway.config.planning_fallback
@@ -2279,13 +2282,23 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
     loop_counter = state.get("loop_counter", {})
     budget_remaining = state.get("budget_remaining_usd", 0.0)
 
+    # Same source of truth as route_after_compiler — the operator's
+    # node_throttle.max_patch_repair_iterations in config.json. Keeping
+    # the two reads identical means a config change can never produce a
+    # mismatch where the router decided "you hit the limit" but the HITL
+    # banner says something else.
+    gw = get_gateway()
+    max_repair = (
+        int(getattr(gw.config, "max_patch_repair_iterations", 3))
+        if gw is not None else 3
+    )
     trigger_reason = "unknown"
     if state.get("node_state", {}).get("env_misconfig"):
         sym = state.get("node_state", {}).get("env_misconfig_symbol", "")
         trigger_reason = f"env_misconfig:{sym}" if sym else "env_misconfig"
     elif budget_remaining <= 0.0:
         trigger_reason = "budget_exhausted"
-    elif loop_counter.get("total_repairs", 0) >= 3:
+    elif loop_counter.get("total_repairs", 0) >= max_repair:
         trigger_reason = "repair_loop_limit"
     elif state.get("exit_code", -1) != 0:
         trigger_reason = "persistent_build_failure"
@@ -2351,7 +2364,15 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     loop_counter: dict[str, int] = state.get("loop_counter", {})
     budget_remaining: float = state.get("budget_remaining_usd", 0.0)
     total_repairs: int = loop_counter.get("total_repairs", 0)
-    max_iterations: int = 3  # Spec: route to HITL after 3 failed repair attempts
+    # Read the repair-loop limit from the operator's config (single source:
+    # node_throttle.max_patch_repair_iterations). Falls back to the historical
+    # default of 3 when the gateway hasn't been initialised — only happens in
+    # narrow test scenarios that construct the router in isolation.
+    gw = get_gateway()
+    max_iterations: int = (
+        int(getattr(gw.config, "max_patch_repair_iterations", 3))
+        if gw is not None else 3
+    )
 
     def _transition(dest: str) -> str:
         try:

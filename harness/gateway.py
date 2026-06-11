@@ -1105,6 +1105,11 @@ class GatewayConfig:
     # a confused user (or hostile LLM) can loop indefinitely on follow-up
     # questions, burning budget. Clamped to [1, 30] at config load.
     max_discovery_iterations: int = 10
+    # Hard ceiling on build → repair → compile retries after the initial
+    # patching pass. After this many failed repair attempts the router
+    # diverts to HITL instead of looping forever. Clamped to [1, 10] at
+    # config load. Wired from node_throttle.max_patch_repair_iterations.
+    max_patch_repair_iterations: int = 3
     ollama_local_model: str = ""
     ollama_local_backup: str = ""
     force_local_only: bool = False
@@ -1799,6 +1804,32 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             return 5
         return value
 
+    def _clamp_repair_iterations(raw: Any) -> int:
+        """Clamp ``node_throttle.max_patch_repair_iterations`` to [1, 10].
+
+        1 is the floor: the operator wants a single repair attempt before
+        HITL — anything less would mean "no repair loop at all," which
+        defeats the point of the node. 10 is the ceiling: past that the
+        graph is just burning budget on hopeless retries.
+        """
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 3
+        if value < 1:
+            logger.warning(
+                "max_patch_repair_iterations %d < 1; clamping to 1 (single attempt).",
+                value,
+            )
+            return 1
+        if value > 10:
+            logger.warning(
+                "max_patch_repair_iterations %d > 10; clamping to 10.",
+                value,
+            )
+            return 10
+        return value
+
     def _clamp_discovery_iterations(raw: Any) -> int:
         try:
             value = int(raw)
@@ -1836,6 +1867,9 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         max_code_review_cycles=_clamp_cycles(node_throttle.get("max_code_review_cycles", 1), 1),
         max_discovery_iterations=_clamp_discovery_iterations(
             node_throttle.get("max_discovery_iterations", 10)
+        ),
+        max_patch_repair_iterations=_clamp_repair_iterations(
+            node_throttle.get("max_patch_repair_iterations", 3)
         ),
         ollama_local_model=model_routing.get("ollama_local_model", ""),
         ollama_local_backup=model_routing.get("ollama_local_backup", ""),
