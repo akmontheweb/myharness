@@ -1216,6 +1216,55 @@ def _is_no_tests_collected(exit_code: int, raw_output: str, build_command: str) 
     return any(p.search(tail) for p in _NO_TESTS_PATTERNS)
 
 
+# Lines matching these patterns are stripped from build output before the
+# repair LLM sees them. They're informational warnings the toolchain emits
+# regardless of whether the build succeeded, and feeding them to the LLM
+# wastes context AND tempts the model into "fixing" warnings that don't
+# actually block the build. Real errors (build failures, assertion fails,
+# stack traces) are unaffected — those don't match.
+_BUILD_OUTPUT_NOISE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Python deprecation / future / pending warnings emitted as a single
+    # warning summary line OR the multi-line stack-style emission.
+    re.compile(r"^.*\b(?:Deprecation|PendingDeprecation|Future|ResourceWarning)Warning\b.*$"),
+    # pytest's terminal "Warnings summary" header — followed by per-test
+    # warning blocks. Drop the header so the model doesn't infer a warnings
+    # section was important.
+    re.compile(r"^=+\s*warnings summary\s*=+\s*$", re.IGNORECASE),
+    # pip's chatty noise: "[notice] A new release of pip is available…",
+    # the root-user warning, build wheel progress bars, and so on.
+    re.compile(r"^\s*\[notice\]\s+.*$"),
+    re.compile(r"^WARNING: Running pip as the 'root' user.*$"),
+    re.compile(r"^WARNING: .*?Skipping.*?already satisfied.*$"),
+    # Setuptools / pkg_resources transition warnings that have spammed
+    # every Python build for two years and aren't actionable.
+    re.compile(r"^.*\bpkg_resources is deprecated\b.*$"),
+    re.compile(r"^.*\bSetuptoolsDeprecationWarning\b.*$"),
+)
+
+
+def _strip_build_output_noise(raw_output: str) -> str:
+    """Drop deprecation warnings and other non-actionable noise from
+    ``raw_output`` before it reaches the repair LLM.
+
+    Real errors are untouched (none of the patterns match). The filter
+    runs line-by-line so a stack trace mixed with a deprecation line
+    only loses the deprecation line itself, not the surrounding context.
+    """
+    if not raw_output:
+        return raw_output
+    kept: list[str] = []
+    for line in raw_output.splitlines():
+        if any(p.search(line) for p in _BUILD_OUTPUT_NOISE_PATTERNS):
+            continue
+        kept.append(line)
+    # Preserve trailing-newline shape so the slicer's char-budget math
+    # downstream isn't off by one for files that ended in \n.
+    out = "\n".join(kept)
+    if raw_output.endswith("\n"):
+        out += "\n"
+    return out
+
+
 def _slice_build_output_for_repair(
     raw_output: str,
     head_chars: int = 1500,
@@ -1231,16 +1280,22 @@ def _slice_build_output_for_repair(
     the final state, separated by an explicit truncation marker so it knows
     chars were dropped.
 
+    Also strips deprecation / pip-notice noise (see
+    :func:`_strip_build_output_noise`) so the LLM doesn't waste a repair
+    iteration trying to "fix" a DeprecationWarning that doesn't block the
+    build.
+
     For outputs shorter than ``head_chars + tail_chars + 200`` we return
     the whole thing unchanged — the split adds noise without saving space.
     """
     if not raw_output:
         return ""
-    total = len(raw_output)
+    cleaned = _strip_build_output_noise(raw_output)
+    total = len(cleaned)
     if total <= head_chars + tail_chars + 200:
-        return raw_output
-    head = raw_output[:head_chars]
-    tail = raw_output[-tail_chars:]
+        return cleaned
+    head = cleaned[:head_chars]
+    tail = cleaned[-tail_chars:]
     dropped = total - head_chars - tail_chars
     return (
         f"{head}\n"
@@ -1823,8 +1878,23 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     loop_counter["repair"] = loop_counter.get("repair", 0) + 1
     loop_counter["total_repairs"] = loop_counter.get("total_repairs", 0) + 1
 
-    # Build a concise repair prompt from structured diagnostics
-    errors: list[DiagnosticObjectDict] = state.get("compiler_errors", [])
+    # Build a concise repair prompt from structured diagnostics. Drop any
+    # diagnostic the parsers flagged as warning-severity — DeprecationWarning,
+    # PendingDeprecationWarning, ruff style nits, pip notices — none of these
+    # block the build, and surfacing them to the repair LLM tempts it to
+    # spend an iteration "fixing" something that wasn't broken. The unfiltered
+    # list stays in state for observability; only the LLM input is trimmed.
+    raw_errors: list[DiagnosticObjectDict] = state.get("compiler_errors", [])
+    errors: list[DiagnosticObjectDict] = [
+        e for e in raw_errors
+        if str(e.get("severity", "error")).lower() != "warning"
+    ]
+    if len(errors) < len(raw_errors):
+        logger.info(
+            "[repair_node] Filtered %d warning-severity diagnostic(s); "
+            "%d error(s) passed through to repair.",
+            len(raw_errors) - len(errors), len(errors),
+        )
 
     # --- Deterministic autofix pass (R1+R2+R3) ---
     # Try to resolve diagnostics with compiler-suggested fixes,
