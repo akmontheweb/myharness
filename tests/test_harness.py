@@ -1395,6 +1395,68 @@ class TestDiagnosticParsing:
         assert "missing" in diags[0].message
         assert diags[0].file.endswith("main.py")
 
+    def test_pytest_conftest_import_failure(self):
+        # Regression: pytest replaces the standard "Traceback ... File ..."
+        # block with its own short layout when conftest.py fails to import,
+        # exiting with code 4. Without recognizing this layout, the repair
+        # loop ran 5 attempts on tests/conftest.py with zero diagnostics
+        # (session log: a864556d, 2026-06-11).
+        from harness.sandbox import extract_diagnostics
+        output = (
+            "ImportError while loading conftest '/workspace/tests/conftest.py'.\n"
+            "tests/conftest.py:1: in <module>\n"
+            "    import aiosqlite\n"
+            "E   ModuleNotFoundError: No module named 'aiosqlite'\n"
+        )
+        diags = extract_diagnostics(output, "python3 -m pytest -q", "/workspace")
+        assert len(diags) >= 1
+        primary = next(d for d in diags if d.error_code == "ModuleNotFoundError")
+        assert primary.file.endswith("conftest.py")
+        assert primary.line == 1
+        assert "aiosqlite" in primary.message
+
+    def test_pytest_assertion_failure(self):
+        # pytest's normal --tb=short failure output uses its own frame layout
+        # AND a summary line at the bottom. We should produce at least one
+        # diagnostic with the failing test file/line.
+        from harness.sandbox import extract_diagnostics
+        output = (
+            "F                                                                        [100%]\n"
+            "=================================== FAILURES ===================================\n"
+            "___________________________________ test_one ___________________________________\n"
+            "\n"
+            "    def test_one():\n"
+            "        x = 1\n"
+            ">       assert x == 2\n"
+            "E       assert 1 == 2\n"
+            "\n"
+            "tests/test_x.py:3: AssertionError\n"
+            "=========================== short test summary info ============================\n"
+            "FAILED tests/test_x.py::test_one - assert 1 == 2\n"
+            "1 failed in 0.01s\n"
+        )
+        diags = extract_diagnostics(output, "pytest -q", "/workspace")
+        assert len(diags) >= 1
+        files = [d.file for d in diags]
+        assert any(f.endswith("test_x.py") for f in files)
+        assert any(d.error_code == "AssertionError" for d in diags)
+
+    def test_pytest_summary_error_row(self):
+        # ERROR rows in the summary section (collection errors without a
+        # matching per-failure block in the captured slice) must still
+        # surface a diagnostic so the LLM knows which file to repair.
+        from harness.sandbox import extract_diagnostics
+        output = (
+            "=========================== short test summary info ============================\n"
+            "ERROR tests/conftest.py - ModuleNotFoundError: No module named 'aiosqlite'\n"
+            "!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!\n"
+        )
+        diags = extract_diagnostics(output, "pytest -q", "/workspace")
+        assert len(diags) == 1
+        assert diags[0].file.endswith("conftest.py")
+        assert diags[0].error_code == "ModuleNotFoundError"
+        assert "aiosqlite" in diags[0].message
+
     def test_diagnostic_object_to_dict(self):
         from harness.sandbox import DiagnosticObject
         d = DiagnosticObject(file="test.py", line=10, column=5, severity="error",
@@ -2431,6 +2493,79 @@ class TestAgentState:
             state = _make_state(tmpdir)
             state["node_state"] = {"hitl_abandon": True}
             assert route_after_hitl(state) == "__end__"
+
+    @pytest.mark.asyncio
+    async def test_rewind_suspended_checkpoint_re_enters_loop(self):
+        # Regression: Save & Quit ([s]) routes the graph to __end__ with
+        # hitl_suspend=True. A naive `harness resume` then ainvoke(None)s on
+        # an already-terminated checkpoint and exits in milliseconds with
+        # 0 nodes executed. The rewind helper detects this case and stamps
+        # the checkpoint so the outgoing edge from human_intervention_node
+        # re-fires, routing back to compiler_node.
+        from harness.graph import _rewind_suspended_checkpoint
+        from unittest.mock import AsyncMock, MagicMock
+
+        fake_state = MagicMock()
+        fake_state.next = ()  # at END
+        fake_state.values = {
+            "node_state": {"hitl_suspend": True, "hitl_active": False},
+        }
+        compiled = MagicMock()
+        compiled.aget_state = AsyncMock(return_value=fake_state)
+        compiled.aupdate_state = AsyncMock(return_value=None)
+
+        await _rewind_suspended_checkpoint(compiled, {"configurable": {"thread_id": "t"}})
+
+        compiled.aupdate_state.assert_awaited_once()
+        kwargs = compiled.aupdate_state.await_args.kwargs
+        # The helper passes the state-update positionally and as_node by kwarg.
+        # Pull values/as_node from whichever form was used.
+        args = compiled.aupdate_state.await_args.args
+        if "values" in kwargs:
+            updates = kwargs["values"]
+        else:
+            updates = args[1]
+        assert kwargs.get("as_node") == "human_intervention_node"
+        assert updates["node_state"]["hitl_suspend"] is False
+        assert updates["node_state"]["hitl_resolved"] is True
+        # Loop counter is reset so one more repair cycle is allowed.
+        assert updates["loop_counter"]["total_repairs"] >= 1
+        assert updates["loop_counter"]["repair"] == 0
+
+    @pytest.mark.asyncio
+    async def test_rewind_suspended_checkpoint_skips_when_mid_flight(self):
+        # Graph paused mid-node (state.next non-empty) should NOT be
+        # rewound — normal LangGraph resume handles it.
+        from harness.graph import _rewind_suspended_checkpoint
+        from unittest.mock import AsyncMock, MagicMock
+
+        fake_state = MagicMock()
+        fake_state.next = ("compiler_node",)
+        fake_state.values = {"node_state": {"hitl_suspend": True}}
+        compiled = MagicMock()
+        compiled.aget_state = AsyncMock(return_value=fake_state)
+        compiled.aupdate_state = AsyncMock(return_value=None)
+
+        await _rewind_suspended_checkpoint(compiled, {"configurable": {"thread_id": "t"}})
+
+        compiled.aupdate_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rewind_suspended_checkpoint_skips_when_not_suspended(self):
+        # Graph ended naturally (exit 0, abandon, etc.) → no rewind needed.
+        from harness.graph import _rewind_suspended_checkpoint
+        from unittest.mock import AsyncMock, MagicMock
+
+        fake_state = MagicMock()
+        fake_state.next = ()
+        fake_state.values = {"node_state": {"hitl_suspend": False}}
+        compiled = MagicMock()
+        compiled.aget_state = AsyncMock(return_value=fake_state)
+        compiled.aupdate_state = AsyncMock(return_value=None)
+
+        await _rewind_suspended_checkpoint(compiled, {"configurable": {"thread_id": "t"}})
+
+        compiled.aupdate_state.assert_not_awaited()
 
     def test_format_diagnostics_for_repair(self):
         from harness.graph import _format_diagnostics_for_repair

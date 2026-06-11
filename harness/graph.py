@@ -4281,6 +4281,82 @@ def compile_graph(checkpointer: Any = None) -> Any:
 # 13. Graph Execution Entry Point
 # ---------------------------------------------------------------------------
 
+async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, Any]) -> None:
+    """If the resumed checkpoint ended at END via hitl_suspend, rewind it.
+
+    LangGraph treats Save & Quit ([s]) as a normal terminal transition: the
+    suspend flag flips on, ``route_after_hitl`` routes to ``__end__``, and
+    the next ``ainvoke(None)`` short-circuits because there's no pending
+    work. The fix is to stamp a "resumed" state onto the checkpoint as if
+    ``human_intervention_node`` had just returned with the user pressing
+    [r] Resume — outgoing edges re-fire and the graph routes back to
+    ``compiler_node``.
+
+    A no-op when the checkpoint isn't in the suspended-terminal state:
+        - state.next is non-empty: graph is paused mid-flight; normal resume.
+        - hitl_suspend is False: graph ended naturally (exit 0, abandon, etc.).
+    """
+    try:
+        state = await compiled_graph.aget_state(config)
+    except Exception as exc:  # noqa: BLE001 — defensive; never block resume
+        logger.debug("[run_graph] Could not read checkpoint state for rewind check: %s", exc)
+        return
+
+    if state is None:
+        return
+    # state.next is a tuple of pending node names; empty when at END.
+    if getattr(state, "next", None):
+        return
+    values = getattr(state, "values", None) or {}
+    node_state = values.get("node_state", {}) or {}
+    if not node_state.get("hitl_suspend"):
+        return
+
+    # Mirror the [r] Resume branch of hitl_menu_loop: clear suspend flags,
+    # mark HITL resolved, reset loop counter to allow one more repair cycle.
+    cleared = dict(node_state)
+    cleared["hitl_suspend"] = False
+    cleared["hitl_active"] = False
+    cleared["hitl_awaiting_input"] = False
+    cleared["hitl_resolved"] = True
+
+    gw = get_gateway()
+    max_repair = (
+        int(getattr(gw.config, "max_patch_repair_iterations", 3))
+        if gw is not None else 3
+    )
+    # total_repairs = max-1 → one more repair attempt before HITL re-triggers.
+    next_total = max(0, max_repair - 1)
+
+    logger.info(
+        "[run_graph] Resume rewind: prior session ended via Save & Quit. "
+        "Clearing hitl_suspend and resetting loop counter (total_repairs=%d) "
+        "so the graph re-enters compiler_node.",
+        next_total,
+    )
+
+    try:
+        await compiled_graph.aupdate_state(
+            config,
+            {
+                "node_state": cleared,
+                "loop_counter": {
+                    "patching": 0,
+                    "repair": 0,
+                    "compiler": 0,
+                    "total_repairs": next_total,
+                },
+            },
+            as_node="human_intervention_node",
+        )
+    except Exception as exc:  # noqa: BLE001 — log but don't crash resume
+        logger.warning(
+            "[run_graph] Failed to rewind suspended checkpoint: %s. "
+            "Resume will likely no-op; user may need to start a fresh session.",
+            exc,
+        )
+
+
 async def run_graph(
     *,
     workspace_path: str,
@@ -4414,6 +4490,17 @@ async def run_graph(
             "[run_graph] Resume mode: invoking with no input update; "
             "the graph will continue from the last checkpointed node."
         )
+        # Save & Quit ([s] in hitl_menu_loop) routes through route_after_hitl
+        # to __end__, leaving the checkpoint at the terminal pseudo-node with
+        # node_state.hitl_suspend=True. A naive ainvoke(None) on that
+        # checkpoint returns immediately — LangGraph sees no pending work —
+        # so the user's `harness resume` would no-op (Final exit_code=N,
+        # 0 nodes executed). Rewind the checkpoint as if
+        # human_intervention_node just produced a "resume" outcome
+        # (hitl_suspend cleared, loop counter rolled back), so the outgoing
+        # edge from HITL re-fires and routes to compiler_node — identical
+        # to the user having pressed [r] Resume instead of [s] Save & Quit.
+        await _rewind_suspended_checkpoint(compiled_graph, config)
     else:
         invoke_input = initial_state
 

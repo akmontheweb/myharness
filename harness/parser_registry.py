@@ -297,8 +297,27 @@ class PythonParser(BaseLanguageParser):
     """
     Parses Python traceback and error output.
 
-    Extracts file/line/file information from standard Python exception output
-    including SyntaxError, ImportError, ModuleNotFoundError, etc.
+    Handles three distinct shapes:
+
+    1. Standard CPython traceback (any unhandled exception):
+           Traceback (most recent call last):
+             File "/path/x.py", line 42, in func
+           ModuleNotFoundError: No module named 'foo'
+
+    2. Pytest collection error (exit code 4) — pytest swaps the standard
+       traceback for its own short form and prefixes error lines with ``E``:
+           ImportError while loading conftest '/path/tests/conftest.py'.
+           tests/conftest.py:1: in <module>
+               import foo
+           E   ModuleNotFoundError: No module named 'foo'
+
+    3. Pytest test failure (exit code 1) — short summary at the end:
+           tests/test_x.py:3: AssertionError
+           FAILED tests/test_x.py::test_one - assert 1 == 2
+           ERROR  tests/conftest.py - ModuleNotFoundError: No module named 'foo'
+
+    Without shapes 2 and 3, every pytest failure feeds the repair loop
+    zero diagnostics, which causes the LLM to repair blind.
     """
 
     _TRACEBACK_PATTERN = re.compile(
@@ -308,6 +327,37 @@ class PythonParser(BaseLanguageParser):
     _ERROR_PATTERN = re.compile(
         r'^(\w+(?:Error|Warning|Exception)):\s*(.+)$',
         re.MULTILINE,
+    )
+
+    # Pytest frame: "tests/conftest.py:1: in <module>"
+    # Distinct from generic "file:line:col: error: msg" because the tail is
+    # "in <name>" (no column, no "error:"/"warning:" keyword).
+    _PYTEST_FRAME_PATTERN = re.compile(
+        r'^(?P<file>[^\s:][^:]*?\.py):(?P<line>\d+):\s+in\s+(?P<func>.+)$'
+    )
+    # Pytest terminal line: "tests/test_x.py:3: AssertionError"
+    # File:line followed by the bare exception type — emitted at the bottom
+    # of pytest's per-failure block.
+    _PYTEST_FAIL_LINE_PATTERN = re.compile(
+        r'^(?P<file>[^\s:][^:]*?\.py):(?P<line>\d+):\s+'
+        r'(?P<type>\w+(?:Error|Warning|Exception))\s*$'
+    )
+    # Pytest "E   " line — error name and message at the deepest level.
+    _PYTEST_E_PATTERN = re.compile(
+        r'^E\s+(?P<type>\w+(?:Error|Warning|Exception)):\s*(?P<msg>.+)$'
+    )
+    # Pytest "short test summary info" lines at run end:
+    #   FAILED tests/foo.py::test_x - AssertionError: assert ...
+    #   ERROR  tests/conftest.py - ModuleNotFoundError: No module named 'x'
+    # ERROR rows omit the "::test" suffix (collection-time failures).
+    _PYTEST_SUMMARY_PATTERN = re.compile(
+        r'^(?P<kind>FAILED|ERROR)\s+(?P<file>[^\s:]+\.py)(?:::\S+)?\s+-\s+'
+        r'(?P<rest>.+)$'
+    )
+    # Conftest header pytest prints before the short frame:
+    #   "ImportError while loading conftest '/.../tests/conftest.py'."
+    _CONFTEST_HEADER_PATTERN = re.compile(
+        r"^(?P<type>\w+(?:Error|Exception))\s+while loading conftest\s+'(?P<file>.+?)'\.\s*$"
     )
 
     # Stdlib and virtual-env path fragments that should be deprioritised
@@ -325,19 +375,15 @@ class PythonParser(BaseLanguageParser):
         return not any(frag in filepath for frag in cls._STDLIB_FRAGMENTS)
 
     @staticmethod
-    def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
-        diagnostics: list[DiagnosticObject] = []
-        lines = raw_output.splitlines()
-
-        # Collect all traceback frames (file, line, function).
-        # The "last user frame" — the deepest non-stdlib frame — is
-        # more useful than the absolute last frame, which may be inside
-        # the try/except handler or a stdlib wrapper.
+    def _parse_standard_traceback(lines: list[str]) -> Optional[DiagnosticObject]:
+        """Extract a diagnostic from a CPython ``Traceback ...`` block."""
         frames: list[tuple[str, int, str]] = []
         for line in lines:
             match = PythonParser._TRACEBACK_PATTERN.match(line.strip())
             if match:
                 frames.append((match.group(1), int(match.group(2)), match.group(3) or ""))
+        if not frames:
+            return None
 
         # Prefer the innermost user-code frame; fall back to the last frame.
         best_file, best_line, best_func = "", 0, ""
@@ -345,10 +391,9 @@ class PythonParser(BaseLanguageParser):
             if PythonParser._is_user_frame(filepath):
                 best_file, best_line, best_func = filepath, lineno, func
                 break
-        if not best_file and frames:
+        if not best_file:
             best_file, best_line, best_func = frames[-1]
 
-        # Find the error message
         error_type = "Exception"
         error_msg = ""
         for line in lines:
@@ -358,18 +403,148 @@ class PythonParser(BaseLanguageParser):
                 error_msg = match.group(2)
                 break
 
-        if best_file:
-            diagnostics.append(DiagnosticObject(
-                file=best_file,
-                line=best_line,
+        return DiagnosticObject(
+            file=best_file,
+            line=best_line,
+            column=0,
+            severity="error",
+            error_code=error_type,
+            message=error_msg or best_func,
+            semantic_context="",
+        )
+
+    @staticmethod
+    def _parse_pytest_failure_block(lines: list[str]) -> list[DiagnosticObject]:
+        """Walk pytest's per-failure short traceback layout.
+
+        Pytest emits, per failure:
+            <file>:<line>: in <func>           (one or more frames)
+            E   <ErrorType>: <message>          (the actual error)
+            ...
+            <file>:<line>: <ErrorType>          (terminal "fail line", optional)
+
+        We pair each ``E   ...`` line with the *nearest preceding* frame line
+        in the same stanza — that's the user frame the assertion came from.
+        Also catches the conftest-load header so the conftest path is
+        attached even when pytest's frame is below the header.
+        """
+        diags: list[DiagnosticObject] = []
+        last_frame: Optional[tuple[str, int]] = None
+        conftest_path: Optional[str] = None
+
+        for line in lines:
+            stripped = line.rstrip()
+
+            header = PythonParser._CONFTEST_HEADER_PATTERN.match(stripped.strip())
+            if header:
+                conftest_path = header.group("file")
+                continue
+
+            frame = PythonParser._PYTEST_FRAME_PATTERN.match(stripped.strip())
+            if frame:
+                last_frame = (frame.group("file"), int(frame.group("line")))
+                continue
+
+            # Terminal "file:line: ErrorType" (no message, no E-line follow-up)
+            term = PythonParser._PYTEST_FAIL_LINE_PATTERN.match(stripped.strip())
+            if term:
+                diags.append(DiagnosticObject(
+                    file=term.group("file"),
+                    line=int(term.group("line")),
+                    column=0,
+                    severity="error",
+                    error_code=term.group("type"),
+                    message=term.group("type"),
+                    semantic_context="",
+                ))
+                last_frame = None
+                continue
+
+            e_line = PythonParser._PYTEST_E_PATTERN.match(stripped)
+            if e_line:
+                if last_frame is not None:
+                    file_path, lineno = last_frame
+                elif conftest_path is not None:
+                    file_path, lineno = conftest_path, 0
+                else:
+                    continue
+                diags.append(DiagnosticObject(
+                    file=file_path,
+                    line=lineno,
+                    column=0,
+                    severity="error",
+                    error_code=e_line.group("type"),
+                    message=e_line.group("msg"),
+                    semantic_context="",
+                ))
+                last_frame = None
+                conftest_path = None
+        return diags
+
+    @staticmethod
+    def _parse_pytest_summary(lines: list[str]) -> list[DiagnosticObject]:
+        """Extract one diagnostic per "FAILED ..." / "ERROR ..." summary row."""
+        diags: list[DiagnosticObject] = []
+        for line in lines:
+            m = PythonParser._PYTEST_SUMMARY_PATTERN.match(line.strip())
+            if not m:
+                continue
+            rest = m.group("rest").strip()
+            err_match = PythonParser._ERROR_PATTERN.match(rest)
+            if err_match:
+                error_type = err_match.group(1)
+                message = err_match.group(2)
+            else:
+                # Bare-assert form ("assert 1 == 2") with no ErrorType prefix.
+                error_type = "AssertionError" if m.group("kind") == "FAILED" else "Error"
+                message = rest
+            diags.append(DiagnosticObject(
+                file=m.group("file"),
+                line=0,
                 column=0,
                 severity="error",
                 error_code=error_type,
-                message=error_msg or best_func,
+                message=message,
                 semantic_context="",
             ))
+        return diags
 
-        return diagnostics
+    @staticmethod
+    def _dedup(diags: list[DiagnosticObject]) -> list[DiagnosticObject]:
+        """Merge duplicate (file, line, error_code) entries; keep richer ones.
+
+        Summary lines lack a line number (line=0) while per-failure blocks
+        carry the exact line. When both surface the same failure, we keep
+        the one with the line number and prefer the message that isn't just
+        the error type repeated.
+        """
+        by_key: dict[tuple[str, str], DiagnosticObject] = {}
+        for d in diags:
+            key = (d.file, d.error_code)
+            existing = by_key.get(key)
+            if existing is None:
+                by_key[key] = d
+                continue
+            # Prefer the entry with a concrete line number.
+            if d.line and not existing.line:
+                by_key[key] = d
+            elif d.line == existing.line and len(d.message) > len(existing.message):
+                by_key[key] = d
+        return list(by_key.values())
+
+    @staticmethod
+    def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
+        lines = raw_output.splitlines()
+        diagnostics: list[DiagnosticObject] = []
+
+        standard = PythonParser._parse_standard_traceback(lines)
+        if standard is not None:
+            diagnostics.append(standard)
+
+        diagnostics.extend(PythonParser._parse_pytest_failure_block(lines))
+        diagnostics.extend(PythonParser._parse_pytest_summary(lines))
+
+        return PythonParser._dedup(diagnostics)
 
 
 class JavaParser(BaseLanguageParser):
