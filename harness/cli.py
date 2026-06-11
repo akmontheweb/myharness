@@ -327,6 +327,14 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "metrics": frozenset({
         "burn_rate_window_minutes", "metrics_dir",
     }),
+    # Speculative branching parameters consumed by harness/speculative.py.
+    # enabled defaults to True (the node always runs); num_variants is the
+    # fork count; temperature controls per-variant diversity (sweet spot
+    # 0.2-0.4 for code); selection_strategy is the winner-pick rule.
+    "speculative": frozenset({
+        "enabled", "num_variants", "temperature",
+        "selection_strategy", "worktree_base_dir",
+    }),
 }
 
 
@@ -385,6 +393,11 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "logging.backup_count": (int,),
     "test_generation.enabled": (bool,),
     "test_generation.max_iterations": (int,),
+    "speculative.enabled": (bool,),
+    "speculative.num_variants": (int,),
+    "speculative.temperature": (int, float),
+    "speculative.selection_strategy": (str,),
+    "speculative.worktree_base_dir": (str,),
     "metrics.burn_rate_window_minutes": (int,),
     "metrics.metrics_dir": (str,),
     "deployment.enabled": (bool,),
@@ -410,6 +423,12 @@ _OPTIONAL_ROUTING_FIELDS: tuple[str, ...] = (
 # know how to construct anything.
 _VALID_SANDBOX_BACKENDS: frozenset[str] = frozenset({
     "auto", "docker", "unshare", "bare",
+})
+
+# Speculative-branching winner-pick strategies. Must match the choices
+# handled in harness/speculative.py:_select_winner.
+_VALID_SELECTION_STRATEGIES: frozenset[str] = frozenset({
+    "first_success", "fewest_changes", "all_pass",
 })
 
 # Providers that DON'T need an API key env var (run locally / on-host).
@@ -546,6 +565,33 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
                 f"'sandbox.backend' must be one of "
                 f"{sorted(_VALID_SANDBOX_BACKENDS)}, got {backend!r}."
             )
+
+    # Speculative branching: validate the strategy enum and sensible
+    # ranges on the two numeric knobs. Section is optional — when absent
+    # the harness uses the historical defaults (3 variants, 0.3 temp,
+    # first_success); when present every key gets strict-checked.
+    spec_cfg = config.get("speculative", {})
+    if isinstance(spec_cfg, dict):
+        strategy = spec_cfg.get("selection_strategy")
+        if isinstance(strategy, str) and strategy not in _VALID_SELECTION_STRATEGIES:
+            errors.append(
+                f"'speculative.selection_strategy' must be one of "
+                f"{sorted(_VALID_SELECTION_STRATEGIES)}, got {strategy!r}."
+            )
+        temp = spec_cfg.get("temperature")
+        if isinstance(temp, (int, float)) and not isinstance(temp, bool):
+            if temp < 0 or temp > 1.5:
+                errors.append(
+                    f"'speculative.temperature' must be in [0.0, 1.5] "
+                    f"(0.2-0.4 recommended for code), got {temp}."
+                )
+        n_var = spec_cfg.get("num_variants")
+        if isinstance(n_var, int) and not isinstance(n_var, bool):
+            if n_var < 1 or n_var > 10:
+                errors.append(
+                    f"'speculative.num_variants' must be in [1, 10] "
+                    f"(3 recommended), got {n_var}."
+                )
 
     # --- 5. Env var presence for every model referenced by routing ---
     referenced_models: set[str] = set()
@@ -1951,6 +1997,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             deployment_config=config.get("deployment", {}),
             sandbox_config=config.get("sandbox", {}),
             test_generation_config=config.get("test_generation", {}),
+            speculative_config=config.get("speculative", {}),
         )
     except Exception:
         logger.exception("Graph execution failed with unhandled exception.")
@@ -2210,6 +2257,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
             deployment_config=config.get("deployment", {}),
             sandbox_config=config.get("sandbox", {}),
             test_generation_config=config.get("test_generation", {}),
+            speculative_config=config.get("speculative", {}),
         )
     except Exception:
         logger.exception("Resume execution failed.")

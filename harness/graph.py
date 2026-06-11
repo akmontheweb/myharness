@@ -107,8 +107,13 @@ class AgentState(TypedDict, total=False):
     generated_tests: list[str]
     # Config carried in state so test_generation_node can read it without
     # round-tripping through cli.py's config loader. Loaded from the
-    # "test_generation" section of cli.json / .harness_config.json.
+    # "test_generation" section of config/config.json.
     test_generation_config: dict[str, Any]
+    # Speculative-execution branching parameters. Loaded from the
+    # "speculative" section of config/config.json. Keys: num_variants
+    # (default 3), temperature (default 0.3), selection_strategy
+    # (default "first_success"; "fewest_changes" / "all_pass" supported).
+    speculative_config: dict[str, Any]
     # Reviewer LLM artifacts. Each is independently populated; either may be
     # absent if the corresponding *_reviewer_primary slot is unset.
     reviewer_comments_requirements: str
@@ -4264,6 +4269,7 @@ async def run_graph(
     deployment_config: Optional[dict[str, Any]] = None,
     sandbox_config: Optional[dict[str, Any]] = None,
     test_generation_config: Optional[dict[str, Any]] = None,
+    speculative_config: Optional[dict[str, Any]] = None,
 ) -> AgentState:
     """
     Execute the full agent graph from start to finish.
@@ -4312,6 +4318,8 @@ async def run_graph(
         initial_state["deployment_config"] = deployment_config  # type: ignore[typeddict-unknown-key]
     if test_generation_config is not None:
         initial_state["test_generation_config"] = test_generation_config  # type: ignore[typeddict-unknown-key]
+    if speculative_config is not None:
+        initial_state["speculative_config"] = speculative_config  # type: ignore[typeddict-unknown-key]
 
     # Pre-flight toolchain adaptation: pick the right docker image (and
     # network bit) NOW so the very first compile lands on, e.g.,

@@ -89,7 +89,11 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
         6. Copy winning files back to main workspace
         7. Clean up temporary worktrees
 
-    Configuration via .harness_config.json:
+    Configuration via the `speculative` section of config/config.json
+    (threaded onto state via cli.py → run_graph(speculative_config=...)).
+    Strict validation lives in cli.py:validate_config_strict; ranges:
+    num_variants ∈ [1, 10], temperature ∈ [0.0, 1.5], selection_strategy
+    ∈ {first_success, fewest_changes, all_pass}.
         {
           "speculative": {
             "enabled": true,
