@@ -91,6 +91,63 @@ def _get_harness_version() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Git mode (--git=enable|disable) — process-wide state
+# ---------------------------------------------------------------------------
+
+# Module-level pin: set once at the top of cmd_run / cmd_resume from
+# args.git and read by every git-aware code path (GitGuardian init,
+# _attempt_git_rollback, _perform_new_build_reset). Module-level instead
+# of threaded as a parameter because the rollback path is nested several
+# function calls deep inside the HITL gate node and the value never
+# changes mid-run.
+_GIT_ENABLED: bool = True
+
+
+def _set_git_enabled(enabled: bool) -> None:
+    global _GIT_ENABLED
+    _GIT_ENABLED = bool(enabled)
+
+
+def _git_enabled() -> bool:
+    return _GIT_ENABLED
+
+
+class _NullGitGuardian:
+    """No-op stand-in for :class:`harness.security.GitGuardian` used when
+    ``--git=disable``. Mirrors every public method GitGuardian exposes so
+    the rest of cmd_run / cmd_resume don't have to gate each call site.
+    Returns benign defaults: ``False`` from booleans, ``None`` from
+    branch lookups. The harness treats those values the same way it would
+    a real GitGuardian against a workspace with no patch branch yet.
+    """
+
+    def __init__(self, workspace_path: str):
+        self.workspace_path = workspace_path
+
+    def is_git_repo(self) -> bool: return False
+    def get_current_branch(self): return None
+    def has_uncommitted_changes(self) -> bool: return False
+    def stash_if_dirty(self) -> bool: return False
+    def pop_stash(self) -> bool: return False
+    def create_patch_branch(self, session_id: str) -> bool: return False
+    def commit_repair_iteration(self, *args, **kwargs) -> bool: return True
+    def commit_all_changes(self, *args, **kwargs) -> bool: return True
+    def rollback(self, *args, **kwargs) -> bool: return False
+    def restore_original_branch(self) -> bool: return False
+
+
+def _make_git_guardian(workspace_path: str):
+    """Return a real ``GitGuardian`` when ``--git=enable`` is in effect,
+    otherwise a no-op :class:`_NullGitGuardian`. One place to swap so the
+    call sites stay clean."""
+    if _git_enabled():
+        from harness.security import GitGuardian
+        return GitGuardian(workspace_path)
+    logger.info("[git] --git=disable — using no-op GitGuardian stub.")
+    return _NullGitGuardian(workspace_path)
+
+
+# ---------------------------------------------------------------------------
 # Workspace lock (P1.7) — single-writer guard
 # ---------------------------------------------------------------------------
 
@@ -217,21 +274,15 @@ def _get_global_config_path() -> str:
     return os.path.join(repo_root, "config", "config.json")
 
 
-def discover_config(workspace_path: Optional[str] = None) -> dict[str, Any]:
-    """Load and strictly validate the canonical config.
+def load_raw_config() -> dict[str, Any]:
+    """Load the canonical config file and strip ``_comment`` keys, but
+    DON'T validate. Used by the setup wizard so it can find missing API
+    key env vars and prompt for them before strict validation runs.
 
-    This MUST be the first deterministic check at every CLI entry. It
-    performs no LLM calls, no network, no file writes — pure read +
-    validate. On any error it raises :class:`ConfigError` with an
-    actionable message and the harness exits before doing anything else.
-
-    The ``workspace_path`` argument is accepted for call-site
-    backwards-compatibility but is unused for config purposes — the
-    harness no longer reads per-workspace ``.harness_config.json``
-    files. If one is present we log a one-shot INFO line noting it
-    will be ignored.
-
-    Returns a fully-validated, comment-stripped config dictionary.
+    Same I/O errors as :func:`discover_config` (missing file, JSON syntax,
+    OS) raise :class:`ConfigError`. Wrong shape (top-level not an object)
+    also raises. Everything else — unknown keys, missing required fields,
+    missing env vars — is left for :func:`validate_config_strict` to flag.
     """
     path = _get_global_config_path()
     if not os.path.isfile(path):
@@ -261,8 +312,27 @@ def discover_config(workspace_path: Optional[str] = None) -> dict[str, Any]:
             f"{path} must contain a JSON object at the top level, got {type(raw).__name__}."
         )
 
-    cfg = _strip_comments(raw)
-    validate_config_strict(cfg, source=path)
+    return _strip_comments(raw)
+
+
+def discover_config(workspace_path: Optional[str] = None) -> dict[str, Any]:
+    """Load and strictly validate the canonical config.
+
+    This MUST be the first deterministic check at every CLI entry. It
+    performs no LLM calls, no network, no file writes — pure read +
+    validate. On any error it raises :class:`ConfigError` with an
+    actionable message and the harness exits before doing anything else.
+
+    The ``workspace_path`` argument is accepted for call-site
+    backwards-compatibility but is unused for config purposes — the
+    harness no longer reads per-workspace ``.harness_config.json``
+    files. If one is present we log a one-shot INFO line noting it
+    will be ignored.
+
+    Returns a fully-validated, comment-stripped config dictionary.
+    """
+    cfg = load_raw_config()
+    validate_config_strict(cfg, source=_get_global_config_path())
 
     # Legacy detection: notify but do not act.
     if workspace_path:
@@ -534,6 +604,47 @@ _VALID_SELECTION_STRATEGIES: frozenset[str] = frozenset({
 _LOCAL_PROVIDERS: frozenset[str] = frozenset({"ollama"})
 
 
+def find_missing_api_keys(config: dict[str, Any]) -> dict[str, list[str]]:
+    """Return ``{env_var: [model_keys needing it]}`` for every model that's
+    actually referenced in ``model_routing`` and whose provider is remote
+    (not in :data:`_LOCAL_PROVIDERS`) and whose ``{PROVIDER}_API_KEY`` env
+    var is unset and which doesn't supply an inline ``api_key`` in config.
+
+    Shared by :func:`validate_config_strict` (to fail fast on missing keys)
+    and the bare-flag setup wizard (to prompt for the keys interactively).
+    Keeping the scan in one place means the validator and the wizard can't
+    drift on which providers are "local" or how env-var names are derived.
+    """
+    models = config.get("models") or {}
+    routing = config.get("model_routing") or {}
+    if not isinstance(models, dict) or not isinstance(routing, dict):
+        return {}
+
+    referenced: set[str] = set()
+    for field in (*_REQUIRED_ROUTING_FIELDS, *_OPTIONAL_ROUTING_FIELDS):
+        val = routing.get(field, "")
+        if isinstance(val, str) and val.strip() and val in models:
+            referenced.add(val)
+
+    missing: dict[str, list[str]] = {}
+    for model_key in sorted(referenced):
+        spec = models.get(model_key)
+        if not isinstance(spec, dict):
+            continue
+        provider = spec.get("provider", "")
+        if not isinstance(provider, str) or not provider.strip():
+            continue
+        if provider.lower() in _LOCAL_PROVIDERS:
+            continue
+        inline_key = spec.get("api_key", "")
+        if isinstance(inline_key, str) and inline_key.strip():
+            continue
+        env_var = f"{provider.upper()}_API_KEY"
+        if not os.environ.get(env_var, "").strip():
+            missing.setdefault(env_var, []).append(model_key)
+    return missing
+
+
 def validate_config_strict(config: dict[str, Any], source: str) -> None:
     """Validate ``config`` strictly. Raise :class:`ConfigError` with a
     consolidated message listing EVERY problem found in one pass.
@@ -760,7 +871,9 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
         if isinstance(val, str) and val.strip() and val in models:
             referenced_models.add(val)
 
-    missing_env: dict[str, list[str]] = {}  # env_var → [model_keys needing it]
+    # Flag any referenced model with an empty/non-string provider — find_missing_api_keys
+    # skips these silently (it can't compute an env var name), so the validator owns
+    # this error message.
     for model_key in sorted(referenced_models):
         spec = models.get(model_key)
         if not isinstance(spec, dict):
@@ -771,13 +884,8 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
                 f"'models.{model_key}.provider' is missing or empty. Set "
                 f"it to one of: openai, anthropic, deepseek, ollama, …"
             )
-            continue
-        if provider.lower() in _LOCAL_PROVIDERS:
-            continue
-        env_var = f"{provider.upper()}_API_KEY"
-        if not os.environ.get(env_var, "").strip():
-            missing_env.setdefault(env_var, []).append(model_key)
 
+    missing_env = find_missing_api_keys(config)
     if missing_env:
         details = "; ".join(
             f"{env_var} (required by model{'s' if len(keys) > 1 else ''}: "
@@ -2298,6 +2406,11 @@ def _perform_new_build_reset(
     that fails is logged but does not abort the harness — GitGuardian
     will still create the patch branch from whatever the working tree
     looks like after this function returns.
+
+    When ``--git=disable`` (``_git_enabled()`` is False), steps 1 and 3
+    are skipped and step 2 runs without a commit — the file deletion
+    still happens so the workspace is cleaned for a fresh run, but no
+    git subprocess calls are made.
     """
     def _git(*args: str) -> "subprocess.CompletedProcess[str]":
         return subprocess.run(
@@ -2305,30 +2418,39 @@ def _perform_new_build_reset(
             capture_output=True, text=True, timeout=60,
         )
 
-    if _git("rev-parse", "--git-dir").returncode != 0:
-        logger.warning("[new_build] %s is not a git repo — skipping reset.", workspace_path)
-        return
+    git_mode = _git_enabled()
 
-    base_branch: Optional[str] = None
-    for candidate in ("master", "main"):
-        if _git("rev-parse", "--verify", "--quiet", candidate).returncode == 0:
-            base_branch = candidate
-            break
-    if base_branch is None:
-        logger.error(
-            "[new_build] Neither 'master' nor 'main' branch exists in %s — "
-            "cannot perform reset. Skipping.", workspace_path,
-        )
-        return
+    if git_mode:
+        if _git("rev-parse", "--git-dir").returncode != 0:
+            logger.warning("[new_build] %s is not a git repo — skipping reset.", workspace_path)
+            return
 
-    logger.info("[new_build] Resetting workspace on base branch '%s'.", base_branch)
-    checkout = _git("checkout", base_branch)
-    if checkout.returncode != 0:
-        logger.error(
-            "[new_build] Failed to checkout '%s': %s — aborting reset.",
-            base_branch, (checkout.stderr or "").strip(),
+        base_branch: Optional[str] = None
+        for candidate in ("master", "main"):
+            if _git("rev-parse", "--verify", "--quiet", candidate).returncode == 0:
+                base_branch = candidate
+                break
+        if base_branch is None:
+            logger.error(
+                "[new_build] Neither 'master' nor 'main' branch exists in %s — "
+                "cannot perform reset. Skipping.", workspace_path,
+            )
+            return
+
+        logger.info("[new_build] Resetting workspace on base branch '%s'.", base_branch)
+        checkout = _git("checkout", base_branch)
+        if checkout.returncode != 0:
+            logger.error(
+                "[new_build] Failed to checkout '%s': %s — aborting reset.",
+                base_branch, (checkout.stderr or "").strip(),
+            )
+            return
+    else:
+        base_branch = None
+        logger.info(
+            "[new_build] --git=disable — clearing workspace files without "
+            "git operations (no checkout, no commit, no branch cleanup)."
         )
-        return
 
     # Preserved at workspace root. .git/ can't be deleted without
     # destroying the repo; the configured product-spec folder is the
@@ -2348,6 +2470,10 @@ def _perform_new_build_reset(
         except OSError as exc:
             logger.warning("[new_build] Could not delete %s: %s", entry, exc)
     logger.info("[new_build] Deleted %d entry/entries from workspace root.", deleted)
+
+    if not git_mode:
+        # File deletion done; nothing else to do without git.
+        return
 
     add = _git("add", "-A")
     if add.returncode != 0:
@@ -2505,7 +2631,19 @@ async def _purge_workspace_checkpoints(
 
 
 def _attempt_git_rollback(workspace_path: str) -> None:
-    """Attempt a git checkout to restore modified files to their original state."""
+    """Attempt a git checkout to restore modified files to their original state.
+
+    No-op when ``--git=disable`` — without a repo there's no rollback target,
+    so the workspace stays in whatever state the failure produced. The log
+    line makes that explicit so the operator knows their files weren't
+    silently restored.
+    """
+    if not _git_enabled():
+        logger.info(
+            "[HITL] Git rollback skipped: --git=disable. Workspace files "
+            "remain in the state the failure left them in."
+        )
+        return
     import subprocess
     try:
         result = subprocess.run(
@@ -2543,12 +2681,38 @@ async def cmd_run(args: argparse.Namespace) -> int:
         harness run -r /path/to/repo -p "Add JWT authentication"
         harness run -r ./myproject -p "Refactor the auth module" --new_build=false
     """
+    # Bare invocation: `harness run` with no --workspace and no --prompt.
+    # Drop into the interactive setup wizard, which fills in args.workspace,
+    # args.prompt, args.git, args.new_build, and args.discover before we
+    # continue. Half-bare (one flag set, the other missing) is the same
+    # error as today — argparse won't catch it now that we dropped
+    # required=True, so we enforce both-or-neither here explicitly.
+    workspace_given = getattr(args, "workspace", None) is not None
+    prompt_given = getattr(args, "prompt", None) is not None
+    if not workspace_given and not prompt_given:
+        from harness.wizard import run_setup_wizard
+        run_setup_wizard(args)
+    elif workspace_given ^ prompt_given:
+        missing = "--prompt/-p" if not prompt_given else "--workspace/-w"
+        print(
+            f"\nerror: {missing} is required when the other is given. "
+            f"To use the interactive setup, omit BOTH flags.\n",
+            file=sys.stderr,
+        )
+        return 2
+
     workspace_path = os.path.abspath(args.workspace)
     if not os.path.isdir(workspace_path):
         logger.error("Workspace path does not exist: %s", workspace_path)
         return 1
     if _refuse_if_workspace_is_harness_root(workspace_path):
         return 1
+
+    # Record git mode for every downstream code path that touches git
+    # (GitGuardian init, _attempt_git_rollback, _perform_new_build_reset).
+    # Default to enabled when the attribute is missing — keeps tests and
+    # programmatic callers that construct args manually working unchanged.
+    _set_git_enabled(getattr(args, "git", "enable") == "enable")
 
     # FIRST: deterministic config check. Reads + validates the canonical
     # config file with no side effects. Raises ConfigError (caught by
@@ -2765,9 +2929,11 @@ async def cmd_run(args: argparse.Namespace) -> int:
         # can't accidentally match (and delete) the run we're about to start.
         await _purge_workspace_checkpoints(workspace_path, config)
 
-    # Initialize GitGuardian for branch lifecycle management
-    from harness.security import GitGuardian
-    git_guardian = GitGuardian(workspace_path)
+    # Initialize GitGuardian for branch lifecycle management. When
+    # --git=disable, _make_git_guardian returns a no-op stub so the
+    # downstream rollback/pop_stash call sites don't need to gate
+    # individually.
+    git_guardian = _make_git_guardian(workspace_path)
     git_guardian.stash_if_dirty()
     git_guardian.create_patch_branch(session_id)
 
@@ -3098,6 +3264,11 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
     if _refuse_if_workspace_is_harness_root(workspace_path):
         return 1
+
+    # Record git mode for the resumed session — same contract as cmd_run.
+    # See the comment in cmd_run for why this is module-level state.
+    _set_git_enabled(getattr(args, "git", "enable") == "enable")
+
     config = discover_config(workspace_path)
     persistence_cfg = config.get("persistence", {})
     db_path = persistence_cfg.get("db_path", "~/.harness/checkpoints.db")
@@ -3256,9 +3427,9 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     # the checkpoint) and just checks it out — same primitive on both
     # paths. If the operator deleted the branch between suspend ↔ resume
     # we recreate it; if they switched to a different branch we re-attach
-    # to the agent one.
-    from harness.security import GitGuardian
-    git_guardian = GitGuardian(workspace_path)
+    # to the agent one. When --git=disable, _make_git_guardian returns a
+    # no-op stub matching the same interface.
+    git_guardian = _make_git_guardian(workspace_path)
     git_guardian.stash_if_dirty()
     git_guardian.create_patch_branch(args.session_id)
 
@@ -4372,14 +4543,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="./docs",
         help="Directory to write SPEC_REQUIREMENTS.md (default: ./docs).",
     )
+    # --workspace and --prompt are NOT required at the argparse level so that
+    # `harness run` with no flags can drop the user into the interactive
+    # setup wizard (harness.wizard.run_setup_wizard). The handler enforces
+    # "both or neither" — passing only one still errors out the same way.
     run_parser.add_argument(
         "--workspace", "-w", "-r",
-        required=True,
+        default=None,
         help="Absolute or relative path to the target repository root.",
     )
     run_parser.add_argument(
         "--prompt", "-p",
-        required=True,
+        default=None,
         help="The engineering task description (e.g., 'Refactor the auth module to use JWT').",
     )
     run_parser.add_argument(
@@ -4518,6 +4693,23 @@ def build_parser() -> argparse.ArgumentParser:
             "--new_build is false."
         ),
     )
+    # --git enable|disable. Default 'enable' preserves today's behavior
+    # (workspace is a git repo, GitGuardian stashes/branches/rolls back).
+    # 'disable' skips every git-aware path so users whose target repo
+    # isn't under git can still run the harness. Security scanners like
+    # gitleaks still run (they scan files, not history).
+    run_parser.add_argument(
+        "--git",
+        choices=["enable", "disable"],
+        default="enable",
+        help=(
+            "Whether the workspace is a git repo. 'enable' (default) uses "
+            "GitGuardian for stash/patch-branch/rollback and requires the "
+            "workspace to be a git repo. 'disable' skips every git-aware "
+            "step — pick this when the target repo isn't under git. "
+            "Security scanners (gitleaks, etc.) still run either way."
+        ),
+    )
 
     # --- `harness resume` ---
     resume_parser = subparsers.add_parser("resume", help="Resume a crashed or interrupted session from its checkpoint")
@@ -4552,6 +4744,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Enable debug-level logging.",
+    )
+    resume_parser.add_argument(
+        "--git",
+        choices=["enable", "disable"],
+        default="enable",
+        help=(
+            "Whether the workspace is a git repo. Should match the value "
+            "used when the session was originally started; passing a "
+            "different value than the original run may corrupt state."
+        ),
     )
 
     # --- `harness status` ---
