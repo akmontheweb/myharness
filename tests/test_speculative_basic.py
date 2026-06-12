@@ -202,22 +202,23 @@ class TestSpeculativeBuildCommandAdaptation:
     with raw state['build_command'] / state['sandbox_config'] without
     running the same late-bind detection compiler_node already had. On
     a greenfield Python workspace with the default `make build`, every
-    variant compiled against ubuntu:22.04 and exited 127 — the entire
-    speculative round was guaranteed budget waste.
+    variant compiled against a base image with no pip / no make and
+    exited 127 — the entire speculative round was guaranteed budget waste.
 
     The fix runs ``_detect_default_build_command`` plus
     ``_apply_toolchain_adaptation`` once up-front and threads the
-    resolved values through to each variant executor. This test
-    exercises just the late-bind path — full speculative_node is too
-    heavy for a unit test, so we verify the building blocks behave
-    correctly on the same shape of input.
+    resolved values through to each variant executor. The image half of
+    the adaptation is now retired — the harness ships a single
+    kitchen-sink BUILDER_IMAGE — but the build-command late-bind and the
+    network / read_only_root flips still flow through this same call.
     """
 
     def test_detect_and_adapt_for_greenfield_python_workspace(self, tmp_path):
         """Greenfield Python workspace + ``make build`` default should
-        end up with: install+pytest command, python:3.12-slim image,
-        network auto-enabled (adapter-synthesised install bypasses the
-        user opt-in)."""
+        late-bind to an install+pytest command and auto-enable network
+        (adapter-synthesised install bypasses the user opt-in). The image
+        is no longer dispatched per-command — BUILDER_IMAGE covers
+        everything."""
         from harness.cli import _detect_default_build_command
         from harness.graph import _apply_toolchain_adaptation
 
@@ -229,24 +230,23 @@ class TestSpeculativeBuildCommandAdaptation:
         detected = _detect_default_build_command(str(tmp_path))
         assert detected is not None and "pip install pytest" in detected
 
-        cfg, allow_net, img_adapted, net_adapted, _ro = _apply_toolchain_adaptation(
+        _cfg, allow_net, img_adapted, net_adapted, _ro = _apply_toolchain_adaptation(
             detected,
-            {"docker_image": "ubuntu:22.04"},
+            {},
             allow_network=False,
             command_is_adapter_synthesised=True,
         )
-        assert img_adapted
-        assert cfg["docker_image"] == "python:3.12-slim"
+        assert not img_adapted  # one-image-fits-all: no per-command swap
         assert net_adapted
         assert allow_net is True
 
     def test_per_variant_late_bind_against_worktree(self, tmp_path):
         """Per-variant late-bind: when the LLM has written real source
         markers into the *worktree* but the original workspace was still
-        greenfield at speculate_node entry, re-running detect+adapt
-        against the worktree picks up the new toolchain. This is the
-        path inside ``_compile_variant`` that prevents the "all 3 fail
-        with exit 127 against ubuntu:22.04" outcome on greenfield runs.
+        greenfield at speculate_node entry, re-running detect picks up
+        the new build command. The kitchen-sink BUILDER_IMAGE means
+        we never burn a variant on a wrong image — both halves of the
+        old failure mode (missing make AND missing pip) are baked in.
         """
         from harness.cli import _detect_default_build_command
         from harness.graph import _apply_toolchain_adaptation
@@ -268,20 +268,19 @@ class TestSpeculativeBuildCommandAdaptation:
         assert "pip install -e ." in per_variant_build
         assert "pytest" in per_variant_build
 
-        cfg, allow_net, img_adapted, _net, _ro = _apply_toolchain_adaptation(
+        _cfg, _allow_net, img_adapted, _net, _ro = _apply_toolchain_adaptation(
             per_variant_build,
-            {"docker_image": "ubuntu:22.04"},
+            {},
             allow_network=False,
             command_is_adapter_synthesised=False,
         )
-        assert img_adapted
-        assert cfg["docker_image"] == "python:3.12-slim"
+        assert not img_adapted  # one-image-fits-all: no per-command swap
 
     def test_per_variant_late_bind_is_idempotent_with_workspace_time(self, tmp_path):
         """Chaining the workspace-time pass (greenfield, no-op) into the
         per-variant pass (worktree has markers) yields the same final
-        toolchain a single per-variant pass would, with no double-flip
-        of network/image. _apply_toolchain_adaptation is documented as
+        sandbox state a single per-variant pass would, with no double-flip
+        of network. _apply_toolchain_adaptation is documented as
         idempotent — this test pins that contract for the new code path.
         """
         from harness.cli import _detect_default_build_command
@@ -296,28 +295,22 @@ class TestSpeculativeBuildCommandAdaptation:
         # Workspace-time pass: nothing to detect (greenfield workspace),
         # so build_command stays "make build". Under the toolchain-adapter
         # behavior the workspace-time pass on `make build`:
-        #   - swaps ubuntu:22.04 → buildpack-deps:bookworm (make-bearing image)
         #   - flips allow_network → True via the make bypass (the operator
         #     types `make build` but the install step that needs network
         #     is inside the LLM-written Makefile recipe, semantically the
         #     same as an adapter-synthesised command)
-        # Both fire in the same call.
+        # (Image is no longer swapped — BUILDER_IMAGE covers `make`.)
         ws_build = "make build"
         ws_late = _detect_default_build_command(str(workspace))
         assert ws_late is None
         ws_cfg, ws_net, ws_img_adapted, ws_net_adapted, _ = _apply_toolchain_adaptation(
-            ws_build, {"docker_image": "ubuntu:22.04"}, allow_network=False,
+            ws_build, {}, allow_network=False,
         )
-        assert ws_img_adapted is True
+        assert ws_img_adapted is False  # kitchen-sink: no per-command swap
         assert ws_net_adapted is True
         assert ws_net is True
-        assert ws_cfg["docker_image"] == "buildpack-deps:bookworm"
 
-        # Per-variant pass: detects the worktree's pyproject. The
-        # buildpack-deps:bookworm image carried over from the workspace
-        # pass isn't in _BARE_IMAGE_DEFAULTS, so the swap doesn't fire
-        # and the image stays at buildpack-deps:bookworm (which ships
-        # Python too, so pyproject-based builds still work). Network was
+        # Per-variant pass: detects the worktree's pyproject. Network was
         # already flipped on by the workspace pass, so the per-variant
         # bypass is a no-op for the network bit — this is the chained
         # idempotency the test is pinning.
@@ -327,22 +320,18 @@ class TestSpeculativeBuildCommandAdaptation:
             pv_build, ws_cfg, allow_network=ws_net,
             command_is_adapter_synthesised=True,
         )
-        # Image-was-adapted is False because buildpack-deps:bookworm
-        # isn't a bare default; the existing image is preserved.
         assert pv_img_adapted is False
-        assert pv_cfg["docker_image"] == "buildpack-deps:bookworm"
         # Network already on from the workspace pass → no re-flag.
         assert pv_net_adapted is False
         assert pv_net is True
 
         # Idempotency: calling again with the per-variant inputs is a no-op.
-        repeat_cfg, repeat_net, r_img, r_net, _ = _apply_toolchain_adaptation(
+        _repeat_cfg, repeat_net, r_img, r_net, _ = _apply_toolchain_adaptation(
             pv_build, pv_cfg, allow_network=pv_net,
             command_is_adapter_synthesised=True,
         )
         assert r_img is False
         assert r_net is False
-        assert repeat_cfg["docker_image"] == "buildpack-deps:bookworm"
         assert repeat_net is True
 
 

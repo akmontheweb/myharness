@@ -29,6 +29,7 @@ from typing import Any, Optional
 
 from harness.gateway import NodeRole
 from harness.patcher import process_llm_patch_output, PatchResult
+from harness.sandbox import BUILDER_IMAGE
 
 logger = logging.getLogger(__name__)
 
@@ -416,7 +417,7 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
                     f"\n[speculative-hint] exit 127 typically means the shell could not "
                     f"find a binary in the build command. Resolved build_command="
                     f"{per_variant_build!r}, docker_image="
-                    f"{per_variant_sandbox.get('docker_image', 'ubuntu:22.04')!r}. "
+                    f"{per_variant_sandbox.get('docker_image', BUILDER_IMAGE)!r}. "
                     f"Either the toolchain isn't installed in that image or the worktree "
                     f"has no source markers the harness can detect."
                 )

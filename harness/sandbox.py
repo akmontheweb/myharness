@@ -40,6 +40,21 @@ from harness.trust import SCRUBBED_BUILD_ENV_VARS as _SCRUBBED_BUILD_ENV_VARS  #
 logger = logging.getLogger(__name__)
 
 
+# The harness's kitchen-sink builder image. One image with every toolchain
+# the supported stacks need (Python 3.11 + pip + venv, Java JDK 21 + Maven +
+# Gradle, Node 20 LTS + npm + yarn + pnpm + tsc, SQLite, Playwright +
+# Chromium, plus make/gcc/git/curl). Built from
+# ``harness/vendor/Dockerfile.builder``. Pinning here means the sandbox
+# never needs to swap images or apt-get inside the container at runtime —
+# the latter is impossible under ``--user $UID:$GID`` mode anyway.
+#
+# Replace the ``:latest`` tag with the pushed digest
+# (e.g. ``ghcr.io/<owner>/harness-builder@sha256:<digest>``) once the
+# image is published; the local ``harness-builder:latest`` tag works for
+# a local ``docker build harness/vendor/`` while iterating.
+BUILDER_IMAGE = "harness-builder:latest"
+
+
 # ---------------------------------------------------------------------------
 # 1. Types
 # ---------------------------------------------------------------------------
@@ -405,7 +420,7 @@ class DockerBackend(SandboxBackend):
 
     def __init__(
         self,
-        image: str = "ubuntu:22.04",
+        image: str = BUILDER_IMAGE,
         memory_limit: str = "512m",
         cpu_limit: str = "1.0",
         pids_limit: int = 100,
@@ -727,48 +742,6 @@ class DockerBackend(SandboxBackend):
             wrapped_cmd = self._wrap_shell_cmd_with_ownership_restore(
                 wrapped_cmd, workspace_path,
             )
-
-        # Deterministic toolchain bootstrap: make sure `make` is on PATH
-        # before the operator's command runs. The default build command is
-        # `make build` and the toolchain-image adapter sometimes lands us
-        # on a slim image (python:3.12-slim, node:20-slim) that doesn't
-        # ship `make` — session 51ecb569 burned 5 LLM repair iterations
-        # on `sh: 1: make: not found` because no patch can fix a missing
-        # system binary. Prepending the install probe makes the failure
-        # mode impossible in the common (root-container) case and keeps
-        # the existing graph-level env_misconfig short-circuit as the
-        # safety net for the rest.
-        #
-        # Design notes:
-        # - `command -v make` is the fast path: ~0ms on images that
-        #   already ship make (buildpack-deps:bookworm, full python:3.12).
-        # - apt-get → apk → yum dispatch covers debian/ubuntu/slim,
-        #   alpine, and rhel-derivative images.
-        # - The probe is EXPECTED to succeed for `make <target>` commands
-        #   because `_build_command_needs_network` enables network (and
-        #   `_apply_toolchain_adaptation` already swaps ubuntu:22.04 →
-        #   buildpack-deps:bookworm). The `|| true` shoulder is the final
-        #   guardrail for the residual cases: non-root container mode
-        #   (apt-get refuses without privileges), a workspace-config
-        #   `allow_network=False` hard-pin that survived adaptation, or
-        #   an exotic image where neither apt-get/apk/yum is the package
-        #   manager. In those cases the build continues; if make is
-        #   actually missing, the residual failure surfaces through
-        #   `_is_env_misconfig` and routes to HITL.
-        # - `;` (not `&&`) so the build command runs even if the probe
-        #   exits non-zero in an unexpected way.
-        make_bootstrap = (
-            "( command -v make >/dev/null 2>&1 "
-            "|| ( command -v apt-get >/dev/null 2>&1 "
-            "    && apt-get update -qq "
-            "    && apt-get install -y -qq --no-install-recommends make ) "
-            "|| ( command -v apk >/dev/null 2>&1 "
-            "    && apk add --no-cache make ) "
-            "|| ( command -v yum >/dev/null 2>&1 "
-            "    && yum install -y -q make ) "
-            "|| true ) 2>/dev/null ;"
-        )
-        wrapped_cmd = f"{make_bootstrap} {wrapped_cmd}"
 
         cmd.append(self.image)
         cmd.extend(["sh", "-c", wrapped_cmd])
@@ -1752,7 +1725,7 @@ class SandboxExecutor:
         {
           "sandbox": {
             "backend": "auto",          // "auto", "unshare", "docker", "bare"
-            "docker_image": "ubuntu:22.04",
+            "docker_image": "harness-builder:latest",
             "docker_memory_limit": "512m",
             "docker_cpu_limit": "1.0",
             "docker_pids_limit": 100,

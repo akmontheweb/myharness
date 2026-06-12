@@ -1161,12 +1161,10 @@ class TestSandboxBackend:
         )
         payload = cmd[-1]
         assert "chown" not in payload
-        # The make bootstrap prelude is prepended unconditionally (see
-        # sandbox.py:_build_docker_command); the operator command runs
-        # after it. The contract this test is enforcing is "no chown
-        # trailer when restore_workspace_ownership=False" — the bootstrap
-        # is orthogonal.
-        assert payload.endswith(" pytest -q")
+        # With the make_bootstrap prelude gone (kitchen-sink image already
+        # ships make), the payload is exactly the operator command — no
+        # prefix, no suffix, no trailer.
+        assert payload == "pytest -q"
 
     def test_docker_cmd_no_trailer_on_non_linux_host(self, monkeypatch):
         # On macOS / Windows, Docker Desktop's FUSE layer already remaps
@@ -1356,67 +1354,25 @@ class TestSandboxBackend:
         assert isinstance(executor.backend, DockerBackend)
         assert executor.backend.restore_workspace_ownership is False
 
-    def test_docker_cmd_includes_make_bootstrap(self, monkeypatch):
-        # Layer 1 of the make-not-found fix (see session 51ecb569 logs):
-        # every container we spin up gets a `command -v make ||
-        # apt-get/apk/yum install make` prelude so the build can never
-        # fail with "sh: 1: make: not found" in a make-less image. The
-        # prelude is the fast path on images that already ship make
-        # (command -v exits 0 in <1ms) and a one-time apt/apk install on
-        # slim/alpine images.
+    def test_docker_cmd_has_no_make_bootstrap_anymore(self, monkeypatch):
+        # The in-container `apt-get install make` prelude (added in
+        # commit e5fb60d for slim images) is gone — the kitchen-sink
+        # BUILDER_IMAGE already ships make, so prepending an install
+        # probe to every container would just add noise. This regression
+        # test pins the absence so a future "be safe and add it back"
+        # refactor would have to update this assertion deliberately.
         from harness.sandbox import DockerBackend
         monkeypatch.setattr(os, "getuid", lambda: 0)
-        backend = DockerBackend(image="python:3.12-slim")
+        backend = DockerBackend(image="harness-builder:latest")
         cmd = backend._build_docker_command(
             "make build", "/work", allow_network=True,
             cache_mounts=[], extra_env={}, timeout_seconds=60,
         )
         payload = cmd[-1]
-        # The probe + each package-manager branch must be present.
-        assert "command -v make" in payload
-        assert "apt-get install -y -qq --no-install-recommends make" in payload
-        assert "apk add --no-cache make" in payload
-        assert "yum install -y -q make" in payload
-        # Failures from the probe must NOT block the build (`|| true` +
-        # `;` separator).
-        assert "|| true" in payload
-        # The operator's command still runs after the prelude.
+        assert "command -v make" not in payload
+        assert "apt-get install -y -qq --no-install-recommends make" not in payload
+        # The operator's command still runs.
         assert "make build" in payload
-
-    def test_docker_cmd_make_bootstrap_runs_before_user_command(self, monkeypatch):
-        # The prelude MUST appear before the operator-typed command in
-        # the wrapped shell payload. Otherwise the build would fire first
-        # and the install would happen too late to help.
-        from harness.sandbox import DockerBackend
-        monkeypatch.setattr(os, "getuid", lambda: 0)
-        backend = DockerBackend(image="python:3.12-slim")
-        cmd = backend._build_docker_command(
-            "make build", "/work", allow_network=True,
-            cache_mounts=[], extra_env={}, timeout_seconds=60,
-        )
-        payload = cmd[-1]
-        assert payload.index("command -v make") < payload.index("make build")
-
-    def test_docker_cmd_make_bootstrap_also_present_in_host_user_mode(self, monkeypatch):
-        # Linux non-root host mode passes --user $UID:$GID, so apt-get
-        # inside the container will fail with EPERM. The prelude is
-        # still emitted unconditionally — the `|| true` swallows the
-        # failure cleanly and the residual `sh: 1: make: not found` is
-        # caught by Layer 2 (graph._is_env_misconfig). Test asserts the
-        # prelude is present in this mode so a future refactor doesn't
-        # accidentally gate it on root.
-        from harness.sandbox import DockerBackend
-        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
-        monkeypatch.setattr(os, "getuid", lambda: 1000)
-        monkeypatch.setattr(os, "getgid", lambda: 1000)
-        backend = DockerBackend(image="python:3.12-slim")
-        cmd = backend._build_docker_command(
-            "make build", "/work", allow_network=True,
-            cache_mounts=[], extra_env={}, timeout_seconds=60,
-        )
-        payload = cmd[-1]
-        assert "command -v make" in payload
-        assert "|| true" in payload
 
     # ------------------------------------------------------------------
     # Windows compatibility — three regression nets for the POSIX-only
@@ -3482,86 +3438,83 @@ all: build test
 class TestToolchainAdaptation:
     """Regression: sandbox image adaptation used to fire inside compiler_node
     only — wasting the first build on the wrong base image — and was also
-    not idempotent across rounds."""
+    not idempotent across rounds.
 
-    def test_adapts_ubuntu_to_python_for_pytest(self):
+    The image-swap half is now retired: the harness ships a single
+    kitchen-sink BUILDER_IMAGE that bakes every supported toolchain, so
+    there is no per-command image to pick. ``_apply_toolchain_adaptation``
+    no longer flips ``image_was_adapted`` — DockerBackend's default ``image``
+    argument selects ``BUILDER_IMAGE`` directly. The network and
+    read_only_root halves still adapt as before.
+    """
+
+    def test_toolchain_image_is_always_builder_image(self):
+        # Single-image kitchen-sink design: every command resolves to the
+        # same builder image regardless of toolchain hints in the command.
+        from harness.graph import _toolchain_image_for
+        from harness.sandbox import BUILDER_IMAGE
+        for cmd in (
+            "python3 -m pytest -q",
+            "make build",
+            "npm install && npm test",
+            "mvn test",
+            "cargo build",
+            "go test ./...",
+        ):
+            assert _toolchain_image_for(cmd) == BUILDER_IMAGE
+
+    def test_docker_backend_default_image_is_builder_image(self):
+        # The sandbox's default flows through DockerBackend's ``image``
+        # arg, which now defaults to BUILDER_IMAGE. So when the operator
+        # doesn't pin docker_image, the kitchen-sink is used automatically.
+        from harness.sandbox import BUILDER_IMAGE, DockerBackend
+        backend = DockerBackend()
+        assert backend.image == BUILDER_IMAGE
+
+    def test_image_was_adapted_is_permanently_false(self):
+        # The image-swap branch of _apply_toolchain_adaptation is retired —
+        # one image fits every command. img_adapted stays False across
+        # every command/image combo we used to swap on.
         from harness.graph import _apply_toolchain_adaptation
-        cfg, allow_net, img_adapted, net_adapted, ro_adapted = (
-            _apply_toolchain_adaptation(
-                "python3 -m pytest -q", {"docker_image": "ubuntu:22.04"}, False,
-            )
-        )
-        assert img_adapted
-        assert cfg["docker_image"] == "python:3.12-slim"
-        # pytest doesn't install packages — no network or read_only_root flip
-        assert not net_adapted
-        assert allow_net is False
-        assert not ro_adapted
-        assert "read_only_root" not in cfg
+        for cmd in ("python3 -m pytest -q", "make build", "npm install"):
+            for image in (None, "ubuntu:22.04", "python:3.12-slim",
+                          "my-org/custom:1.0"):
+                cfg = {} if image is None else {"docker_image": image}
+                _cfg, _allow, img_adapted, _net, _ro = (
+                    _apply_toolchain_adaptation(cmd, cfg, False)
+                )
+                assert not img_adapted, (
+                    f"image_was_adapted must stay False; got True for "
+                    f"cmd={cmd!r}, image={image!r}"
+                )
 
-    def test_make_build_swaps_to_image_with_make(self):
-        # Fix 2 (session b6fe5c6e backstop): when the resolved build
-        # command is `make ...`, ubuntu:22.04 doesn't ship `make` →
-        # exit 127. Adaptation must pick an image that has it.
-        from harness.graph import _apply_toolchain_adaptation, _toolchain_image_for
-        # Direct helper check
-        assert _toolchain_image_for("make build") == "buildpack-deps:bookworm"
-        assert _toolchain_image_for("make") == "buildpack-deps:bookworm"
-        assert _toolchain_image_for("make test") == "buildpack-deps:bookworm"
-        # End-to-end through adapter
-        cfg, _allow_net, img_adapted, _net, _ro = _apply_toolchain_adaptation(
-            "make build", {"docker_image": "ubuntu:22.04"}, False,
-        )
-        assert img_adapted
-        assert cfg["docker_image"] == "buildpack-deps:bookworm"
-
-    def test_make_target_does_not_clobber_python_image_when_user_set(self):
-        # Idempotency: when the operator already configured a non-bare
-        # image (e.g. their own custom builder), make-based commands
-        # should NOT silently overwrite it. Only bare defaults get flipped.
+    def test_explicit_operator_pin_is_respected(self):
+        # When the operator hard-pins a custom image (corporate registry,
+        # locked-down CI base, etc.), the adapter must pass it through
+        # unchanged. The kitchen-sink default only fills in when nothing
+        # is set, via DockerBackend's image default.
         from harness.graph import _apply_toolchain_adaptation
-        cfg, _allow_net, img_adapted, _net, _ro = _apply_toolchain_adaptation(
-            "make build", {"docker_image": "my-org/custom-builder:1.0"}, False,
+        cfg, _allow, _img, _net, _ro = _apply_toolchain_adaptation(
+            "python3 -m pytest -q",
+            {"docker_image": "my-org/custom-python:1.0"},
+            False,
         )
-        assert not img_adapted
-        assert cfg["docker_image"] == "my-org/custom-builder:1.0"
-
-    def test_make_build_swaps_python_slim_to_buildpack_deps(self):
-        # Session b8475cf0 regression: when the user's global config has
-        # `docker_image: python:3.12-slim` (a common default for python
-        # projects) and the resolved build_command is `make build`, the
-        # python-slim image doesn't ship make. The in-container apt-get
-        # bootstrap can't recover either — restore_workspace_ownership
-        # passes --user $UID:$GID and apt-get refuses without privileges,
-        # so the build exits 127 with "make: not found" in ~200ms and
-        # short-circuits straight to HITL. Adaptation must catch this by
-        # treating the harness's own auto-selected toolchain images
-        # (python-slim, node-slim, etc.) as default-ish — swappable when
-        # the build implies a different toolchain.
-        from harness.graph import _apply_toolchain_adaptation
-        for slim in ("python:3.12-slim", "node:20-slim", "rust:1.79-slim", "golang:1.22"):
-            cfg, _allow_net, img_adapted, _net, _ro = _apply_toolchain_adaptation(
-                "make build", {"docker_image": slim}, True,
-            )
-            assert img_adapted, f"{slim} should swap for make build"
-            assert cfg["docker_image"] == "buildpack-deps:bookworm"
+        assert cfg["docker_image"] == "my-org/custom-python:1.0"
 
     def test_adapts_network_for_pip_install(self):
         # P1.3 closeout: auto-network on pip-install detection now requires
         # explicit opt-in via sandbox.auto_enable_network_for_install. Pass
         # it here so the historical behaviour is preserved end-to-end.
         from harness.graph import _apply_toolchain_adaptation
-        cfg, allow_net, img_adapted, net_adapted, ro_adapted = (
+        cfg, allow_net, _img, net_adapted, ro_adapted = (
             _apply_toolchain_adaptation(
                 "pip install -r requirements.txt && pytest",
                 {
-                    "docker_image": "ubuntu:22.04",
                     "auto_enable_network_for_install": True,
                 },
                 False,
             )
         )
-        assert img_adapted
         assert net_adapted
         assert allow_net is True
         # Install command must also flip read_only_root → False, otherwise
@@ -3581,21 +3534,6 @@ class TestToolchainAdaptation:
         )
         assert not net_adapted
         assert allow_net is False
-
-    def test_idempotent_when_already_adapted(self):
-        # Calling twice should not re-flag image_was_adapted — otherwise
-        # compiler_node would log a noisy adaptation message every round
-        # even though the config is already correct.
-        from harness.graph import _apply_toolchain_adaptation
-        cfg1, _, img1, _, _ = _apply_toolchain_adaptation(
-            "pytest -q", {"docker_image": "ubuntu:22.04"}, False,
-        )
-        assert img1
-        cfg2, _, img2, _, _ = _apply_toolchain_adaptation(
-            "pytest -q", cfg1, False,
-        )
-        assert not img2, "second call should be a no-op"
-        assert cfg2["docker_image"] == cfg1["docker_image"]
 
     def test_preserves_user_chosen_non_bare_image(self):
         # If the user picked a specific image (not one of the bare defaults),
@@ -3753,24 +3691,24 @@ class TestToolchainAdaptation:
             "allow_network was already True; bypass must not re-flag adaptation"
         )
 
-    def test_apply_toolchain_adaptation_make_image_network_readonly_compose(self):
-        """Single call with cur_image=ubuntu:22.04 and `make build`:
-        image swaps to buildpack-deps:bookworm, network flips on (via
-        the new make bypass), and read_only_root flips to False (the
-        install-branch at the bottom of `_apply_toolchain_adaptation`
-        now covers `make` because `needs_install` returns True). All
-        three adapters must compose without one stepping on another.
+    def test_apply_toolchain_adaptation_make_network_readonly_compose(self):
+        """Single call with `make build`: network flips on (via the make
+        bypass) and read_only_root flips to False (the install-branch at
+        the bottom of `_apply_toolchain_adaptation` covers `make` because
+        `needs_install` returns True). Both flips must compose without one
+        stepping on the other. (The image half is no longer swapped — the
+        kitchen-sink BUILDER_IMAGE has make + every other toolchain baked
+        in, picked up from DockerBackend's default.)
         """
         from harness.graph import _apply_toolchain_adaptation
         cfg, allow_net, img_adapted, net_adapted, ro_adapted = (
             _apply_toolchain_adaptation(
                 "make build",
-                {"docker_image": "ubuntu:22.04"},  # no opt-in
+                {},  # no opt-in, no docker_image — DockerBackend defaults to BUILDER_IMAGE
                 False,
             )
         )
-        assert img_adapted
-        assert cfg["docker_image"] == "buildpack-deps:bookworm"
+        assert not img_adapted  # one-image-fits-all: no per-command swap
         assert net_adapted
         assert allow_net is True
         assert ro_adapted
@@ -5957,12 +5895,13 @@ class TestCLI:
         assert "build_command" not in result
 
     @pytest.mark.asyncio
-    async def test_compiler_node_swaps_image_and_network_for_python_build(self, monkeypatch):
-        # Regression: when the build command adapts to python AND the
-        # sandbox image is still the historical bare ubuntu:22.04 default,
-        # compiler_node must also swap the image to a python toolchain
-        # image and enable network so pip can install deps. Otherwise
-        # python3 -m pytest still exits 127 forever.
+    async def test_compiler_node_enables_network_for_python_build(self, monkeypatch):
+        # Regression: when the build command adapts to a python install,
+        # compiler_node must enable network so pip can reach the index.
+        # The kitchen-sink BUILDER_IMAGE means there's no separate "swap
+        # to a python image" step — every supported toolchain is baked
+        # into one image — but the network half of the adaptation still
+        # has to fire.
         from harness import graph as graph_mod
         from harness.sandbox import BuildResult
 
@@ -5989,24 +5928,21 @@ class TestCLI:
                 # P1.3: opt in explicitly so the auto-flip is allowed for
                 # this test. Default in real configs is False.
                 "sandbox_config": {
-                    "docker_image": "ubuntu:22.04",
                     "auto_enable_network_for_install": True,
                 },
             }
             result = await graph_mod.compiler_node(state)
 
         assert "pip install" in captured["cmd"]
-        assert captured["sandbox_config"]["docker_image"] == "python:3.12-slim"
         assert captured["allow_network"] is True
-        assert result["sandbox_config"]["docker_image"] == "python:3.12-slim"
         assert result["allow_network"] is True
 
     @pytest.mark.asyncio
-    async def test_compiler_node_swaps_image_on_resume_with_already_adapted_command(self, monkeypatch):
+    async def test_compiler_node_enables_network_on_resume_with_already_adapted_command(self, monkeypatch):
         # Regression: a session resumed from a checkpoint where build_command
-        # is ALREADY 'python3 -m pytest -q' (adapted by a previous run) but
-        # sandbox_config still has the bare ubuntu image — the swap must
-        # still fire on its own, not gate behind 'was just adapted this turn'.
+        # is ALREADY 'python3 -m pytest -q' (adapted by a previous run) —
+        # the network adaptation must still fire on its own, not gate behind
+        # 'was just adapted this turn'.
         from harness import graph as graph_mod
         from harness.sandbox import BuildResult
 
@@ -6032,15 +5968,13 @@ class TestCLI:
                 "messages": [],
                 # P1.3: opt in explicitly so the auto-flip is allowed.
                 "sandbox_config": {
-                    "docker_image": "ubuntu:22.04",
                     "auto_enable_network_for_install": True,
                 },
             }
             result = await graph_mod.compiler_node(state)
 
-        assert captured["sandbox_config"]["docker_image"] == "python:3.12-slim"
         assert captured["allow_network"] is True
-        assert result["sandbox_config"]["docker_image"] == "python:3.12-slim"
+        assert result["allow_network"] is True
 
     @pytest.mark.asyncio
     async def test_compiler_node_preserves_user_chosen_image(self, monkeypatch):

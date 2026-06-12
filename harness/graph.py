@@ -29,6 +29,8 @@ from typing import Any, Iterable, Literal, Optional
 
 from typing_extensions import TypedDict
 
+from harness.sandbox import BUILDER_IMAGE
+
 logger = logging.getLogger(__name__)
 
 
@@ -1345,33 +1347,21 @@ Generate your patches NOW. Only the blocks above. No other text."""
 
 
 def _toolchain_image_for(build_command: str) -> Optional[str]:
-    """Pick a sandbox image that ships with the toolchain implied by the
-    given build command. Returns None when we have no opinion (so caller
-    keeps whatever is configured).
+    """Return the harness builder image for any build command.
 
-    The ``make ...`` mapping is a backstop for Fix 1 (see
-    ``harness/cli.py::_makefile_has_target``). When the operator's
-    ``Makefile`` legitimately declares a ``build:`` target,
-    ``_detect_default_build_command`` returns ``"make build"`` — and
-    ``ubuntu:22.04`` (the default bare image) doesn't ship ``make`` in
-    its base layer, producing the same exit-127 crash we fixed for the
-    no-``build:``-target case. ``buildpack-deps:bookworm`` ships
-    ``make``, ``gcc``, ``git``, ``curl``, and a Python interpreter —
-    enough for the most common ``make build`` recipes.
+    The harness now ships a single kitchen-sink image
+    (``harness/vendor/Dockerfile.builder``) that bakes Python + pip,
+    Java JDK + Maven + Gradle, Node + npm/yarn/pnpm, SQLite, Playwright +
+    Chromium, and the make/gcc/git glue all into one container. So there
+    is no longer any per-command image dispatch — every supported stack's
+    toolchain is already present.
+
+    Kept as a function (returning the constant) so callers that branch
+    on ``desired_image`` to set ``sandbox_config["docker_image"]`` when
+    it's unset still work without changes.
     """
-    cmd = build_command.lower()
-    stripped = cmd.strip()
-    if stripped.startswith("make ") or stripped == "make":
-        return "buildpack-deps:bookworm"
-    if "python3" in cmd or "pip " in cmd or "pytest" in cmd or "poetry" in cmd:
-        return "python:3.12-slim"
-    if "npm " in cmd or "yarn " in cmd or "pnpm " in cmd or "node " in cmd:
-        return "node:20-slim"
-    if "cargo " in cmd:
-        return "rust:1.79-slim"
-    if cmd.strip().startswith("go ") or " go build" in cmd or " go test" in cmd:
-        return "golang:1.22"
-    return None
+    del build_command  # No longer dispatches on command shape.
+    return BUILDER_IMAGE
 
 
 def _command_is_make(build_command: str) -> bool:
@@ -2690,30 +2680,6 @@ def _env_misconfig_hint(symbol: str, build_command: str) -> str:
     )
 
 
-# Images we treat as "default-ish" — safe to swap when the build command
-# implies a different toolchain. Two groups:
-#
-#   1. Truly bare bases (ubuntu/debian) that ship no language runtime.
-#   2. Slim language images — these are exactly the values `_toolchain_image_for`
-#      itself emits for non-make commands. Including them here means a user
-#      who set `docker_image: python:3.12-slim` as their global default and
-#      runs a `make build` gets auto-promoted to `buildpack-deps:bookworm`
-#      (which has make + python3 + gcc). Without this the slim image lacks
-#      make and the bootstrap probe in DockerBackend can't apt-get install
-#      it either: when --user $UID:$GID is on (restore_workspace_ownership
-#      default), apt-get fails with "permission denied" in ~200ms and the
-#      build crashes with exit 127 "make: not found" — observed in session
-#      b8475cf0 burning straight through to HITL without any LLM repair.
-#
-# Same-image case (python:3.12-slim and the resolved toolchain is also
-# python:3.12-slim) is a no-op — _apply_toolchain_adaptation guards with
-# `cur_image != toolchain_image` before writing.
-_BARE_IMAGE_DEFAULTS = frozenset({
-    "ubuntu:22.04", "ubuntu:latest", "debian:12", "debian:latest",
-    "python:3.12-slim", "node:20-slim", "rust:1.79-slim", "golang:1.22",
-})
-
-
 def _apply_toolchain_adaptation(
     build_command: str,
     sandbox_config: Optional[dict[str, Any]],
@@ -2731,8 +2697,10 @@ def _apply_toolchain_adaptation(
 
     Calling twice with the same inputs returns *_was_adapted=False on
     the second call — each conditional only fires when its precondition is
-    still true (image is a known-bare default, allow_network still False,
-    read_only_root unset / still True).
+    still true (allow_network still False, read_only_root unset / still
+    True). ``image_was_adapted`` is permanently False — the harness's
+    one-image-fits-all builder is selected by DockerBackend's default and
+    needs no per-command swap.
 
     P1.3: the network auto-enable on a pip/npm install heuristic is gated
     by ``sandbox.auto_enable_network_for_install`` (default ``false``).
@@ -2756,26 +2724,26 @@ def _apply_toolchain_adaptation(
     that actually runs — including any ``pip install -r requirements.txt``
     — is authored by the LLM per the Makefile skill
     (``harness/skills/makefile_python.md``). Treating it like an operator-
-    typed install would silently route to the warn-and-fail branch and
-    burn the ``make`` bootstrap's apt-get probe (which itself needs
-    network) at the same time. Bypassing the opt-in keeps the
-    deterministic-build promise; the workspace-config ``allow_network``
-    hard-pin still wins for genuine airgap operators.
+    typed install would silently route to the warn-and-fail branch.
+    Bypassing the opt-in keeps the deterministic-build promise; the
+    workspace-config ``allow_network`` hard-pin still wins for genuine
+    airgap operators.
     """
     cfg = dict(sandbox_config or {})
     image_was_adapted = False
     network_was_adapted = False
     ro_root_was_adapted = False
 
-    cur_image = cfg.get("docker_image", "ubuntu:22.04")
-    toolchain_image = _toolchain_image_for(build_command)
-    if (
-        toolchain_image
-        and cur_image in _BARE_IMAGE_DEFAULTS
-        and cur_image != toolchain_image
-    ):
-        cfg["docker_image"] = toolchain_image
-        image_was_adapted = True
+    # The harness ships a single kitchen-sink builder image
+    # (``harness/vendor/Dockerfile.builder``, exported as
+    # ``harness.sandbox.BUILDER_IMAGE``) that bakes every supported
+    # toolchain. DockerBackend already defaults its ``image`` argument to
+    # ``BUILDER_IMAGE``, so when ``cfg["docker_image"]`` is unset the
+    # sandbox uses the right image without anything happening here.
+    # Explicit operator pins (custom corporate registries, locked-down CI
+    # bases) are respected by passing through whatever cfg already has.
+    # ``image_was_adapted`` therefore always stays ``False``; it remains
+    # in the return tuple for caller compatibility.
 
     new_allow_network = allow_network
     needs_install = _build_command_needs_network(build_command)
@@ -2910,7 +2878,7 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     # When the build_command was just adapter-synthesised, tell the
     # toolchain adapter so it can bypass the user-opt-in network gate —
     # the operator never typed this command, the harness invented it.
-    prev_image = sandbox_cfg.get("docker_image", "ubuntu:22.04")
+    prev_image = sandbox_cfg.get("docker_image", BUILDER_IMAGE)
     (
         sandbox_cfg,
         allow_network,
@@ -3104,7 +3072,7 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
                 "semantic_context": (
                     f"Missing runtime: {env_misconfig_symbol}. "
                     f"Build command: {build_cmd}. "
-                    f"docker_image: {sandbox_cfg.get('docker_image', 'ubuntu:22.04')}."
+                    f"docker_image: {sandbox_cfg.get('docker_image', BUILDER_IMAGE)}."
                 ),
                 # Structured fields the autofix + repair-prompt builders read
                 # without re-parsing the human-readable message.
@@ -6259,12 +6227,15 @@ async def run_graph(
             compiler_config.get("run_prod_import_smoke_check", True)
         )
 
-    # Pre-flight toolchain adaptation: pick the right docker image (and
-    # network bit) NOW so the very first compile lands on, e.g.,
-    # python:3.12-slim instead of wasting a build cycle on ubuntu:22.04
-    # exiting 127 with "python3: not found". compiler_node's own call to
-    # the same helper is idempotent — it becomes a no-op once we've
-    # pre-adapted here.
+    # Pre-flight toolchain adaptation: flip ``allow_network`` and
+    # ``read_only_root`` to match the build command's install needs NOW so
+    # the very first compile doesn't waste a cycle on an offline / RO root
+    # for a command that needs ``pip install`` / ``npm install``. The
+    # ``docker_image`` half of toolchain adaptation is now a no-op — the
+    # harness's kitchen-sink BUILDER_IMAGE has every supported toolchain,
+    # so there's no per-command image to pick. compiler_node's own call to
+    # this helper is idempotent — it becomes a no-op once we've pre-adapted
+    # here.
     (
         adapted_cfg,
         adapted_allow_network,
