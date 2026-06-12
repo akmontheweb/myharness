@@ -3,9 +3,16 @@ Interactive setup wizard for bare ``harness run`` invocations.
 
 When the user types ``harness run`` with no flags, ``cmd_run`` calls
 :func:`run_setup_wizard` to walk them through the minimum set of choices
-needed to start a run: API keys (a prerequisite for any LLM call), then
-workspace, prompt, --git mode, --new-build, and --discover. Everything
-else falls back to the argparse defaults.
+needed to start a run. The wizard first asks whether this is a new
+session or a resume of an existing checkpointed session:
+
+- "new"    → API keys, workspace, prompt, --git, --new-build, --discover.
+- "resume" → session id (picked from a recent-sessions list or typed
+             free-text); ``cmd_run`` then delegates to ``cmd_resume``.
+
+:func:`run_setup_wizard` returns a mode string (``"run"`` or ``"resume"``)
+so the caller can dispatch correctly. ``args`` is mutated in place either
+way.
 
 The wizard does NOT persist anything. Each bare ``harness run`` re-asks
 every question. Model routing, sandbox backend, lintgate, deployment,
@@ -28,22 +35,25 @@ import sys
 logger = logging.getLogger(__name__)
 
 
-def run_setup_wizard(args: argparse.Namespace) -> argparse.Namespace:
+def run_setup_wizard(args: argparse.Namespace) -> str:
     """Drive the interactive setup flow and mutate ``args`` in place.
 
     Order:
-        0. API key check — prompt for any missing ``{PROVIDER}_API_KEY``
+        0. New vs resume. ``resume`` skips the rest of the wizard, asks for
+           a session id, and returns ``"resume"`` so the caller delegates
+           to :func:`harness.cli.cmd_resume`. ``new`` continues below.
+        1. API key check — prompt for any missing ``{PROVIDER}_API_KEY``
            env vars for models referenced by ``model_routing``.
-        1. Workspace path.
-        2. Engineering prompt / task.
-        3. ``--git enable|disable``.
-        4. ``--new-build true|false``.
-        5. ``--discover true|false``.
-        6. Summary + confirm. ``n`` loops back into the wizard from step 1.
+        2. Workspace path.
+        3. Engineering prompt / task.
+        4. ``--git enable|disable``.
+        5. ``--new-build true|false``.
+        6. ``--discover true|false``.
+        7. Summary + confirm. ``n`` loops back into the wizard from step 2.
 
-    Returns ``args`` for caller convenience. Raises ``SystemExit(2)`` when
-    invoked non-interactively or when the user declines to provide a
-    required API key.
+    Returns ``"run"`` for a fresh run or ``"resume"`` to delegate to
+    ``cmd_resume``. Raises ``SystemExit(2)`` when invoked non-interactively
+    or when the user declines to provide a required API key.
     """
     # Imported lazily so the wizard module doesn't drag cli.py's import
     # graph into every script that just wants to query argparse defaults.
@@ -71,19 +81,34 @@ def run_setup_wizard(args: argparse.Namespace) -> argparse.Namespace:
         "answers will be persisted — every bare `harness run` re-asks.\n"
     )
 
-    # ------------------------------------------------------------------
-    # Step 0: API key prerequisite check
-    # ------------------------------------------------------------------
+    # Config is loaded once and reused for the API-key check and for the
+    # checkpoint-db path that the session picker reads.
     try:
         config = load_raw_config()
     except ConfigError as exc:
         print(f"\n{exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
+    # ------------------------------------------------------------------
+    # Step 0: new session vs resume existing session
+    # ------------------------------------------------------------------
+    if _ask_session_mode(channel) == "resume":
+        # Resumed sessions reuse the keys validated by the original run.
+        # If a key has been unset since, cmd_resume's first LLM dispatch
+        # will surface the error — no point re-prompting here.
+        db_path = config.get("persistence", {}).get(
+            "db_path", "~/.harness/checkpoints.db",
+        )
+        args.session_id = _ask_session_id(channel, db_path)
+        return "resume"
+
+    # ------------------------------------------------------------------
+    # Step 1: API key prerequisite check (new sessions only)
+    # ------------------------------------------------------------------
     _check_and_prompt_api_keys(config)
 
     # ------------------------------------------------------------------
-    # Steps 1-5: runtime choices, with a summary-confirm loop
+    # Steps 2-6: runtime choices, with a summary-confirm loop
     # ------------------------------------------------------------------
     while True:
         workspace = _ask_workspace(channel)
@@ -107,11 +132,11 @@ def run_setup_wizard(args: argparse.Namespace) -> argparse.Namespace:
     # cmd_run would otherwise show.
     if new_build:
         args.assume_yes = True
-    return args
+    return "run"
 
 
 # ---------------------------------------------------------------------------
-# Step 0 — API keys
+# Step 1 — API keys
 # ---------------------------------------------------------------------------
 
 def _check_and_prompt_api_keys(config: dict) -> None:
@@ -153,6 +178,170 @@ def _check_and_prompt_api_keys(config: dict) -> None:
                 file=sys.stderr,
             )
             raise SystemExit(2)
+
+
+# ---------------------------------------------------------------------------
+# Step 0 — new vs resume
+# ---------------------------------------------------------------------------
+
+def _ask_session_mode(channel) -> str:
+    """Ask whether to start a new session or resume an existing one.
+
+    Returns ``"run"`` (new) or ``"resume"``. Default is ``"run"`` so a
+    user who hits Enter through every prompt gets today's behavior.
+    """
+    print("\nStep 0: Start a new session or resume an existing one?")
+    print("  n = new session (walk through full setup, fresh checkpoint)")
+    print("  r = resume existing session (restore from checkpoint by session id)")
+    choice = channel.prompt(
+        "Choose [n/r]", options=["n", "r"], default="n",
+    ).strip().lower()
+    return "resume" if choice == "r" else "run"
+
+
+def _list_recent_sessions_sync(
+    db_path: str, limit: int = 10,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(thread_id, workspace_path, created_ts, updated_ts)]`` for
+    the most recently updated sessions in the checkpoint DB.
+
+    ``created_ts`` comes from the *earliest* checkpoint row for the thread;
+    ``updated_ts`` from the *latest*. Both are raw ISO-8601 strings — the
+    caller is responsible for formatting (or accepting ``""`` when the blob
+    is corrupted or missing a ``ts`` field).
+
+    Synchronous mirror of :func:`harness.storage.list_all_sessions`'s SELECT
+    so the wizard can render a picker without spinning up an async runtime
+    from inside the already-running ``cmd_run`` event loop.
+
+    Returns an empty list when the DB is missing, empty, or unreadable.
+    """
+    expanded = os.path.expanduser(db_path)
+    if not os.path.isfile(expanded):
+        return []
+
+    try:
+        from harness.storage import _deserialize_checkpoint_blob
+    except ImportError:
+        return []
+
+    import sqlite3
+
+    rows: list[tuple[str, str, str, str]] = []
+    try:
+        with sqlite3.connect(expanded) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                """SELECT c.thread_id, c.checkpoint
+                   FROM checkpoints c
+                   INNER JOIN (
+                       SELECT thread_id, MAX(checkpoint_id) AS max_cp_id
+                       FROM checkpoints
+                       GROUP BY thread_id
+                   ) AS latest ON c.thread_id = latest.thread_id
+                              AND c.checkpoint_id = latest.max_cp_id
+                   ORDER BY c.checkpoint_id DESC
+                   LIMIT ?""",
+                (limit,),
+            )
+            latest_rows = cursor.fetchall()
+
+            # Earliest-checkpoint ts per thread for the "created" column.
+            # Up to 10 thread_ids → 10 indexed lookups, cheap to issue
+            # one-at-a-time and keeps the query trivial to read.
+            for row in latest_rows:
+                thread_id = row["thread_id"]
+                workspace_path = ""
+                updated_ts = ""
+                try:
+                    cp = _deserialize_checkpoint_blob(row["checkpoint"])
+                    updated_ts = str(cp.get("ts", "") or "")
+                    channel_values = cp.get("channel_values", {})
+                    if isinstance(channel_values, dict):
+                        wp = channel_values.get("workspace_path", "")
+                        if isinstance(wp, dict):
+                            wp = wp.get("value", "")
+                        workspace_path = str(wp) if wp else ""
+                except Exception:
+                    # Corrupt blob — still show the thread id so the
+                    # operator can purge it or pick a different session.
+                    pass
+
+                created_ts = ""
+                try:
+                    first = conn.execute(
+                        "SELECT checkpoint FROM checkpoints "
+                        "WHERE thread_id = ? "
+                        "ORDER BY checkpoint_id ASC LIMIT 1",
+                        (thread_id,),
+                    ).fetchone()
+                    if first is not None:
+                        first_cp = _deserialize_checkpoint_blob(first["checkpoint"])
+                        created_ts = str(first_cp.get("ts", "") or "")
+                except Exception:
+                    pass
+
+                rows.append((thread_id, workspace_path, created_ts, updated_ts))
+    except sqlite3.Error:
+        return []
+    return rows
+
+
+def _ask_session_id(channel, db_path: str) -> str:
+    """Prompt for a session id. Show a numbered list of recent sessions
+    when the checkpoint DB has any; the operator can pick a number or
+    type any session id directly.
+
+    Re-prompts on empty input. No existence check — ``cmd_resume``
+    validates and prints a clean error for unknown ids.
+    """
+    try:
+        from harness.storage import _format_checkpoint_ts
+    except ImportError:
+        def _format_checkpoint_ts(ts: str) -> str:  # type: ignore[misc]
+            return ts or "(unknown)"
+
+    recent = _list_recent_sessions_sync(db_path, limit=10)
+
+    if recent:
+        print("\nRecent checkpointed sessions (most recent first):")
+        for i, (thread_id, workspace_path, created_ts, updated_ts) in enumerate(
+            recent, start=1,
+        ):
+            created = _format_checkpoint_ts(created_ts)
+            updated = _format_checkpoint_ts(updated_ts)
+            where = workspace_path or "(workspace unknown)"
+            print(f"  {i:>2}. {thread_id}")
+            # When a session has only one checkpoint, created == updated;
+            # collapse to a single line so the picker stays scannable.
+            if created == updated:
+                print(f"      {created}  {where}")
+            else:
+                print(f"      created {created}  updated {updated}")
+                print(f"      {where}")
+        print(
+            "\nPick a number from the list, or paste a session id directly."
+        )
+    else:
+        print(
+            "\nNo checkpointed sessions found in the database "
+            f"({db_path}). Paste a session id to attempt a resume anyway."
+        )
+
+    while True:
+        raw = channel.notes("Session id (or list number)").strip()
+        if not raw:
+            print("  The session id can't be empty. Try again.")
+            continue
+        if recent and raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(recent):
+                return recent[idx - 1][0]
+            print(
+                f"  {idx} is out of range (1-{len(recent)}). Try again."
+            )
+            continue
+        return raw
 
 
 # ---------------------------------------------------------------------------

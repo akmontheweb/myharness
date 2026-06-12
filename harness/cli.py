@@ -2684,14 +2684,17 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # Bare invocation: `harness run` with no --workspace and no --prompt.
     # Drop into the interactive setup wizard, which fills in args.workspace,
     # args.prompt, args.git, args.new_build, and args.discover before we
-    # continue. Half-bare (one flag set, the other missing) is the same
-    # error as today — argparse won't catch it now that we dropped
-    # required=True, so we enforce both-or-neither here explicitly.
+    # continue — OR, when the operator picks "resume existing session",
+    # sets args.session_id and tells us to hand off to cmd_resume instead.
+    # Half-bare (one flag set, the other missing) is the same error as
+    # today — argparse won't catch it now that we dropped required=True,
+    # so we enforce both-or-neither here explicitly.
     workspace_given = getattr(args, "workspace", None) is not None
     prompt_given = getattr(args, "prompt", None) is not None
     if not workspace_given and not prompt_given:
         from harness.wizard import run_setup_wizard
-        run_setup_wizard(args)
+        if run_setup_wizard(args) == "resume":
+            return await cmd_resume(args)
     elif workspace_given ^ prompt_given:
         missing = "--prompt/-p" if not prompt_given else "--workspace/-w"
         print(
