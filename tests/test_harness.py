@@ -3000,6 +3000,97 @@ class TestAgentState:
         result = asyncio.run(_scenario())
         assert result == "abc12345-deadbeef"
 
+    def test_reset_iteration_counters_clears_missing_dep_trackers(self):
+        # Bug A fix: HITL [r] Resume signals "operator addressed the
+        # root cause." The MISSING_DEP recurrence counter and the
+        # last-seen symbol MUST start from scratch after a Resume,
+        # otherwise the next compiler pass immediately re-trips the
+        # bypass guard (session 90d3a8d2: image changed, but counter
+        # was at 3 and instantly re-escalated back to HITL).
+        from harness.cli import _reset_iteration_counters
+        before = {
+            "patching": 5,
+            "repair": 4,
+            "compiler": 9,
+            "total_repairs": 4,
+            "missing_dep_consecutive_same": 3,
+            "missing_dep_last_symbol": "pip",
+            # Diagnostic trackers we DO want to preserve.
+            "replace_block_misses_per_file": {"foo.py": 2},
+            "consecutive_zero_patch_rounds": 1,
+        }
+        after = _reset_iteration_counters(before, total_repairs=2)
+        # Iteration counters reset.
+        assert after["patching"] == 0
+        assert after["repair"] == 0
+        assert after["compiler"] == 0
+        assert after["total_repairs"] == 2
+        # MISSING_DEP trackers reset — this is the new behaviour.
+        assert after["missing_dep_consecutive_same"] == 0
+        assert after["missing_dep_last_symbol"] == ""
+        # Diagnostic trackers preserved (unchanged from prior fix).
+        assert after["replace_block_misses_per_file"] == {"foo.py": 2}
+        assert after["consecutive_zero_patch_rounds"] == 1
+
+    def test_refresh_session_config_into_state_picks_up_image_change(
+        self, monkeypatch, tmp_path,
+    ):
+        # Bug B fix: HITL [r] Resume must re-read config.json from disk
+        # so operator edits (e.g. sandbox.docker_image) reach the live
+        # state. Without this the next iteration runs against whatever
+        # sandbox_config was checkpointed at run_graph start.
+        from harness import cli as cli_module
+        # Stub discover_config so we don't depend on the real config
+        # discovery walking up directories — keeps the test hermetic.
+        fresh = {
+            "sandbox": {"docker_image": "python:3.12-slim", "backend": "auto"},
+            "build_command": "python3 -m pytest -q",
+            "allow_network": True,
+        }
+        monkeypatch.setattr(cli_module, "discover_config", lambda _ws: fresh)
+
+        state: dict = {
+            "workspace_path": str(tmp_path),
+            "sandbox_config": {"docker_image": "buildpack-deps:bookworm", "backend": "auto"},
+            "build_command": "make build",
+            "allow_network": False,
+        }
+        cli_module._refresh_session_config_into_state(state)
+        assert state["sandbox_config"]["docker_image"] == "python:3.12-slim"
+        assert state["build_command"] == "python3 -m pytest -q"
+        assert state["allow_network"] is True
+
+    def test_refresh_session_config_into_state_is_noop_without_workspace(self, monkeypatch):
+        from harness import cli as cli_module
+        called = {"count": 0}
+        def _fake_discover(_ws):
+            called["count"] += 1
+            return {}
+        monkeypatch.setattr(cli_module, "discover_config", _fake_discover)
+        state: dict = {"sandbox_config": {"docker_image": "x"}}
+        cli_module._refresh_session_config_into_state(state)
+        # No workspace_path → no discovery, no mutation.
+        assert called["count"] == 0
+        assert state["sandbox_config"] == {"docker_image": "x"}
+
+    def test_refresh_session_config_into_state_survives_discover_failure(
+        self, monkeypatch, tmp_path,
+    ):
+        # discover_config raising must not crash the HITL loop — we
+        # want the operator to keep their menu, even with a busted
+        # config.json (they may have just typoed JSON).
+        from harness import cli as cli_module
+        def _boom(_ws):
+            raise RuntimeError("syntax error in config.json")
+        monkeypatch.setattr(cli_module, "discover_config", _boom)
+        state: dict = {
+            "workspace_path": str(tmp_path),
+            "sandbox_config": {"docker_image": "buildpack-deps:bookworm"},
+        }
+        cli_module._refresh_session_config_into_state(state)  # must not raise
+        # State left untouched.
+        assert state["sandbox_config"] == {"docker_image": "buildpack-deps:bookworm"}
+
     def test_route_after_hitl_resume(self):
         from harness.graph import route_after_hitl
         with tempfile.TemporaryDirectory() as tmpdir:

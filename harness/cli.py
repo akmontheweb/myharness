@@ -1272,13 +1272,86 @@ def _reset_iteration_counters(
     misses per file, so resetting that counter to zero on every resume meant
     the LLM never received the "use a different operation" directive and went
     straight back to the same broken REPLACE_BLOCK pattern.
+
+    Two counters ARE reset alongside the iteration counters because they
+    track the very condition the operator just intervened to address:
+
+    - ``missing_dep_consecutive_same``: counts consecutive same-symbol
+      MISSING_DEP recurrences. If we don't reset it, the next compiler
+      pass after a `[r]` Resume immediately re-trips the bypass guard
+      and routes straight back to HITL — exactly the loop session
+      90d3a8d2 got stuck in after the operator changed the image.
+    - ``missing_dep_last_symbol``: the symbol we were tracking. Cleared
+      so a different MISSING_DEP after resume starts fresh.
     """
     base = dict(loop_counter or {})
     base["patching"] = 0
     base["repair"] = 0
     base["compiler"] = 0
     base["total_repairs"] = total_repairs
+    base["missing_dep_consecutive_same"] = 0
+    base["missing_dep_last_symbol"] = ""
     return base
+
+
+def _refresh_session_config_into_state(state: dict[str, Any]) -> None:
+    """Re-read the on-disk config for ``state["workspace_path"]`` and
+    propagate the keys that drive build behaviour into the live state.
+
+    Called from the HITL ``[r]`` Resume branch (and any future branch where
+    the operator might have edited config between triggers). Without this,
+    the state's ``sandbox_config`` / ``build_command`` are frozen at the
+    values checkpointed when ``run_graph`` was first invoked — operator
+    edits to ``config.json`` between HITL triggers never reach the next
+    iteration's compiler_node.
+
+    Best-effort: any error during config rediscovery is logged at debug
+    and the state is left untouched (better to retry the build with the
+    stale image than to crash the HITL loop). The handful of keys we
+    refresh are the ones an operator typically edits to resolve a build
+    failure flagged by HITL — image, build command, network policy.
+    """
+    workspace_path = state.get("workspace_path")
+    if not workspace_path:
+        return
+    try:
+        fresh_config = discover_config(workspace_path)
+    except Exception as exc:  # noqa: BLE001 — never block HITL on config error
+        logger.debug(
+            "[HITL] Could not refresh on-disk config for workspace %s: %s",
+            workspace_path, exc,
+        )
+        return
+
+    new_sandbox = dict(fresh_config.get("sandbox", {}) or {})
+    old_sandbox = dict(state.get("sandbox_config") or {})
+    if new_sandbox and new_sandbox != old_sandbox:
+        state["sandbox_config"] = new_sandbox
+        changed_keys = sorted(
+            k for k in set(old_sandbox) | set(new_sandbox)
+            if old_sandbox.get(k) != new_sandbox.get(k)
+        )
+        logger.info(
+            "[HITL] sandbox_config refreshed from disk. Changed keys: %s",
+            changed_keys,
+        )
+
+    new_build_cmd = fresh_config.get("build_command")
+    old_build_cmd = state.get("build_command")
+    if isinstance(new_build_cmd, str) and new_build_cmd and new_build_cmd != old_build_cmd:
+        state["build_command"] = new_build_cmd
+        logger.info(
+            "[HITL] build_command refreshed from disk: %r -> %r",
+            old_build_cmd, new_build_cmd,
+        )
+
+    new_allow_network = fresh_config.get("allow_network")
+    if isinstance(new_allow_network, bool) and new_allow_network != state.get("allow_network"):
+        state["allow_network"] = new_allow_network
+        logger.info(
+            "[HITL] allow_network refreshed from disk: %s",
+            new_allow_network,
+        )
 
 
 def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
@@ -1377,6 +1450,16 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             state["loop_counter"] = _reset_iteration_counters(
                 state.get("loop_counter"), total_repairs=2,
             )
+            # Re-read on-disk config so operator edits between HITL triggers
+            # (sandbox.docker_image, build_command, etc.) reach the in-memory
+            # state. Without this the [r] Resume keeps using whatever
+            # sandbox_config was checkpointed at the start of run_graph —
+            # exactly the trap session 90d3a8d2 fell into: operator changed
+            # docker_image from buildpack-deps:bookworm to python:3.12-slim
+            # in config.json, but the state still pointed at the old image
+            # so the build kept hitting "missing pip" and ping-ponging
+            # straight back to HITL.
+            _refresh_session_config_into_state(state)
             logger.info("[HITL] Developer chose to resume. Loop counter reset to 2. Routing to compiler_node.")
             return state
 
