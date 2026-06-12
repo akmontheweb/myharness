@@ -7,10 +7,10 @@
     "_allow_network_comment": "Default for whether the build sandbox is allowed network access. compiler_node auto-flips to true when the build command contains 'pip install', 'npm install', etc. Override per-run via --allow-network.",
     "allow_network": true,
 
-    "_manifest_file_comment": "Filename the harness looks for in the workspace root when synthesizing SPEC_REQUIREMENTS.md from raw product notes. Override per-run via --manifest.",
-    "manifest_file": "product_spec.txt",
+    "_product_spec_dir_comment":"MANDATORY. NAME of the folder at the workspace root that holds the product specification .txt files. Must be a bare folder name — no path separators, no absolute paths, no `..`. The folder MUST live at `<workspace>/<product_spec_dir>/`. The harness reads every .txt file (alphabetical order) and consolidates them before LLM synthesis. `harness run` and `harness doctor` REFUSE to start when this key is missing, malformed, or when the named folder is missing / empty at the workspace root.",
+    "product_spec_dir": "product_spec",
 
-    "_sandbox_comment": "Build-sandbox isolation. 'backend' is the isolation strategy: 'auto' picks docker if installed else unshare(8) else bare-subprocess. 'docker_image' is the base container image (compiler_node auto-swaps to python:3.12-slim / node:20-slim / etc. based on the toolchain implied by build_command). Memory / CPU / PID limits cap container resource use. readonly_cache_mounts are host directories bind-mounted read-only into the container so package managers find their warm caches. timeout_seconds is the hard cap on a single build run. pgid_kill_on_timeout=true sends SIGKILL to the process group on timeout. restore_workspace_ownership=true causes the harness to either pass --user $UID:$GID to docker (Linux non-root host) or run a chown trailer so the bind-mounted workspace doesn't end up root-owned.",
+    "_sandbox_comment": "Build-sandbox isolation. 'backend' is the isolation strategy: 'auto' picks docker if installed else unshare(8) else bare-subprocess. 'docker_image' is the base container image (compiler_node auto-swaps to python:3.12-slim / node:20-slim / etc. based on the toolchain implied by build_command). Memory / CPU / PID limits cap container resource use. readonly_cache_mounts are host directories bind-mounted read-only into the container so package managers find their warm caches. timeout_seconds is the hard cap on a single build run. pgid_kill_on_timeout=true sends SIGKILL to the process group on timeout. restore_workspace_ownership=true causes the harness to either pass --user $UID:$GID to docker (Linux non-root host) or run a chown trailer so the bind-mounted workspace doesn't end up root-owned. cache_volumes=true swaps each readonly_cache_mounts entry for a writable Docker named volume scoped to the session id — pip/npm/cargo can then persist downloads across containers and the next compile in the session reuses them. The speculative path runs a single sequential warm-up install before variants fan out to keep the cache race-free. Use `harness cache clear` to remove the volumes. Default off for one release while we observe.",
     "sandbox": {
         "backend": "auto",
         "docker_image": "ubuntu:22.04",
@@ -28,20 +28,23 @@
             "~/.gradle",
             "~/.pub-cache"
         ],
+        "cache_volumes": false,
+        "cache_volumes_prefix": "harness",
         "timeout_seconds": 300,
         "pgid_kill_on_timeout": true,
         "restore_workspace_ownership": true
     },
 
-    "_token_budget_comment": "Spend caps. hard_cap_usd is the per-session dollar ceiling — the gateway refuses dispatches once spend reaches it. Override per-run via --budget. context_window_threshold_pct triggers context compaction when the message list fills this fraction of the model's window.",
+    "_token_budget_comment": "Spend caps. hard_cap_usd is the per-session dollar ceiling — the gateway refuses dispatches once spend reaches it. Override per-run via --budget. context_window_threshold_pct triggers context compaction when the message list fills this fraction of the model's window. stages (optional) is a soft per-stage budget split — maps NodeRole name to a fraction of hard_cap_usd, e.g. {\"planning\":0.2,\"patching\":0.2,\"repair\":0.5,\"doc_reviewer\":0.05,\"code_reviewer\":0.05}. Today this only emits a warning when a stage exceeds its share; hard enforcement is a follow-up.",
     "token_budget": {
         "hard_cap_usd": 2.00,
-        "context_window_threshold_pct": 0.85
+        "context_window_threshold_pct": 0.85,
+        "stages": {}
     },
 
     "_node_throttle_comment": "Per-loop iteration ceilings. max_patch_repair_iterations caps build-repair retries before HITL. max_doc_review_cycles / max_code_review_cycles cap the adversarial reviewer revisions. max_discovery_iterations caps the requirements/architecture interview loop.",
     "node_throttle": {
-        "max_patch_repair_iterations": 3,
+        "max_patch_repair_iterations": 5,
         "max_doc_review_cycles": 1,
         "max_code_review_cycles": 1,
         "max_discovery_iterations": 10
@@ -174,6 +177,15 @@
         "format_modified_files": false
     },
 
+    "_speculative_comment": "Multi-variant speculative compilation. When enabled=true, the speculative_node forks num_variants parallel LLM dispatches (each at the configured temperature), applies each variant's patches in an isolated git worktree, and compiles each in parallel. The first variant that compiles cleanly wins and gets merged back. When all variants fail, the salvage path optionally merges the best-of-failing back (subject to a quality gate in _pick_salvage_variant). Default off because in practice the winner case rarely fires on greenfield Python-ish projects — variants converge on the same wrong solution at temperature=0.3, salvage merges incoherent partial work, and the repair loop can't recover. Flip enabled=true for workloads where parallel exploration earns its 3× LLM cost (e.g. steady-state codebases with bounded micro-fixes). selection_strategy ∈ {first_success, fewest_changes, all_pass}; num_variants ∈ [1, 10]; temperature ∈ [0.0, 1.5].",
+    "speculative": {
+        "enabled": false,
+        "num_variants": 3,
+        "temperature": 0.3,
+        "selection_strategy": "first_success",
+        "worktree_base_dir": "/tmp/.harness/speculative"
+    },
+
     "_test_generation_comment": "Auto-generate stack-specific unit tests for modified source files after patching. enabled=false disables the test_generation_node entirely. max_iterations caps retries.",
     "test_generation": {
         "enabled": true,
@@ -184,5 +196,21 @@
     "metrics": {
         "burn_rate_window_minutes": 10,
         "metrics_dir": "~/.harness/metrics"
+    },
+
+    "_debug_comment": "Observability flags for post-mortem analysis. dump_llm_calls=true writes every LLM dispatch (across all roles: planning, patching, repair, doc/code review, test generation, discovery, etc.) as a single .txt file in ~/.harness/debug containing the exact input messages and the response. dump_max_files caps directory size; oldest files (by mtime) are pruned on each write. The deprecated dump_repair_prompts key is honoured as an alias for dump_llm_calls.",
+    "debug": {
+        "dump_llm_calls": false,
+        "dump_max_files": 5000
+    },
+
+    "_compiler_comment": "Pre-build smoke checks. run_prod_import_smoke_check=true makes compiler_node first attempt to import every production module inside the sandbox before running the actual build, so module-level errors surface as [prod-import] diagnostics ahead of any cascade-amplified test failures.",
+    "compiler": {
+        "run_prod_import_smoke_check": true
+    },
+
+    "_patcher_comment": "Patcher behaviour. enforce_read_before_edit=true makes the patcher reject REPLACE_BLOCK / DELETE_BLOCK / INSERT_AT_BLOCK on any file the LLM has not been shown this turn (via pre-flight content, READ_FILE results, or a prior closest-match window). Mirrors Claude Code's Read-before-Edit invariant — flip on after verifying the LLM emits READ_FILE for unfamiliar files. Drift detection (sha256 comparison) runs unconditionally whenever the host has recorded a hash.",
+    "patcher": {
+        "enforce_read_before_edit": false
     }
 }

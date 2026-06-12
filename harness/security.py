@@ -155,6 +155,89 @@ class GitGuardian:
         logger.info("[gitguardian] Created patch branch '%s' (from '%s').", self._patch_branch, self._original_branch)
         return True
 
+    def commit_repair_iteration(
+        self,
+        session_id: str,
+        iteration: int,
+        modified_files: list[str],
+        success_count: int,
+        fail_count: int,
+        exit_code: int,
+    ) -> bool:
+        """Commit the working tree mid-loop with a structured per-iteration
+        message. Enables ``git log`` / ``git bisect`` between iterations and
+        clean rollback (the patch branch is deleted on session abandon, so
+        these commits vanish along with the branch).
+
+        Idempotent / best-effort: returns True when nothing needed committing
+        (clean tree, not a git repo, not on an agent patch branch) so the
+        caller never has to gate the call. Failures are logged + swallowed;
+        the repair loop continues regardless.
+
+        Detects the patch branch from ``get_current_branch()`` (rather than
+        the in-process ``_branch_created`` flag) so the caller can construct
+        a fresh ``GitGuardian(workspace)`` without re-running setup. This
+        lets ``repair_node`` invoke it from inside the graph without
+        threading the session-level GitGuardian through state.
+        """
+        if not self.is_git_repo():
+            return True
+        if not modified_files:
+            return True
+        if not self.has_uncommitted_changes():
+            return True
+        current = self.get_current_branch() or ""
+        if not current.startswith("agent/patch-"):
+            # Don't commit unless we're on a harness-managed patch branch —
+            # we never want per-iteration commits to land on the operator's
+            # own working branch.
+            return True
+
+        result = self._git("add", "-A", "--", *modified_files)
+        if result.returncode != 0:
+            logger.warning(
+                "[gitguardian] Per-iteration `git add` failed: %s",
+                result.stderr.strip(),
+            )
+            return False
+
+        # Refuse to commit if staging produced nothing — happens when every
+        # entry in modified_files was already at the latest committed state.
+        staged = self._git("diff", "--cached", "--name-only")
+        if staged.returncode == 0 and not staged.stdout.strip():
+            return True
+
+        message = (
+            f"[harness] Repair iteration {iteration} — "
+            f"session {session_id}\n\n"
+            f"Patches: {success_count} succeeded, {fail_count} failed\n"
+            f"Build exit code (after this iteration's patches): {exit_code}\n"
+            f"Files touched: {len(modified_files)}"
+        )
+        result = self._git("commit", "-m", message)
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            # "nothing to commit" is a benign race — treat as success.
+            if "nothing to commit" in stderr.lower():
+                return True
+            logger.warning(
+                "[gitguardian] Per-iteration commit failed: %s", stderr,
+            )
+            return False
+        # Use the live branch name (current HEAD), not self._patch_branch —
+        # callers that construct a fresh GitGuardian without running
+        # create_patch_branch leave self._patch_branch as None, which
+        # showed up as `'None'` in the log line. The current-branch probe
+        # is cheap and gives the operator the actual branch name they
+        # can `git checkout`.
+        logger.info(
+            "[gitguardian] Committed repair iteration %d on '%s' "
+            "(%d patches, exit %d).",
+            iteration, self.get_current_branch() or "(detached HEAD)",
+            success_count, exit_code,
+        )
+        return True
+
     def commit_all_changes(self, session_id: str, modified_files: list[str], exit_code: int) -> bool:
         """
         Stage and commit changes made during the harness session.

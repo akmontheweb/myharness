@@ -95,6 +95,16 @@ class LLMResponse:
     model: str
     finish_reason: str = "stop"
     raw_response: dict[str, Any] = field(default_factory=dict)
+    # B6 — structured tool-use bridge. Providers that support native
+    # function/tool calling (Anthropic Messages API, OpenAI / DeepSeek /
+    # Ollama OpenAI-compat) populate this list when the LLM emitted
+    # ``tool_use`` / ``tool_calls`` blocks instead of (or alongside)
+    # text patches. Shape: ``[{"name": str, "input": dict[str, Any],
+    # "id": str | None}]``. Empty list means no tool calls — caller
+    # should fall back to parsing ``content`` as the text DSL. Today
+    # only the schema exists; provider wiring is gated behind
+    # ``GatewayConfig.use_structured_tools`` and added in a follow-up.
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -1109,11 +1119,53 @@ class GatewayConfig:
     # patching pass. After this many failed repair attempts the router
     # diverts to HITL instead of looping forever. Clamped to [1, 10] at
     # config load. Wired from node_throttle.max_patch_repair_iterations.
-    max_patch_repair_iterations: int = 3
+    # Default raised from 3 → 5: empirically the TaskDispatcher-shaped
+    # multi-error tasks need >3 iterations to converge even when each
+    # iteration lands real patches (see A5 in the post-mortem). The
+    # speculative path also consumes part of this budget, so 3 leaves no
+    # headroom for actual repair when speculative ends up salvaging.
+    max_patch_repair_iterations: int = 5
     ollama_local_model: str = ""
     ollama_local_backup: str = ""
     force_local_only: bool = False
     hard_cap_usd: float = 2.00
+    # Optional per-stage soft budget allocation (C4 scaffold). Maps
+    # NodeRole values to target fractions of hard_cap_usd. Today only
+    # surfaces warnings when a stage exceeds its share; hard enforcement
+    # is a follow-up. Empty dict = no per-stage warnings.
+    stages: dict[str, float] = field(default_factory=dict)
+    # Observability flag: when true, every LLM dispatch (across ALL roles)
+    # writes its input messages + response to
+    # ~/.harness/debug/<sid>_<seqno>_<role>_<model>.txt for ground-truth
+    # debugging and post-mortem analysis. Wired from debug.dump_llm_calls
+    # in config.json. The legacy debug.dump_repair_prompts flag is honoured
+    # as an alias for backwards compatibility (see load_gateway_config).
+    dump_llm_calls: bool = False
+    # Cap on the number of .txt files kept under ~/.harness/debug. Oldest
+    # (by mtime) are pruned on each write once exceeded. 0 disables pruning.
+    # Wired from debug.dump_max_files in config.json. 5000 keeps roughly
+    # the last 250 runs at ~20 dispatches/run, fitting easily in <100 MB.
+    dump_max_files: int = 5000
+    # B5: when true, the patcher rejects REPLACE_BLOCK / DELETE_BLOCK /
+    # INSERT_AT_BLOCK against any file the LLM has not yet been shown this
+    # turn (via pre-flight injection, READ_FILE resolution, or the patcher's
+    # closest-match window). Mirrors Claude Code's Read-before-Edit
+    # invariant. Default false so existing prompts that rely on memory of
+    # earlier patches keep working; flip to true after the LLM has been
+    # taught to lead with READ_FILE for unfamiliar files. Drift detection
+    # (per-file sha256 comparison) runs unconditionally whenever the host
+    # has recorded a hash for the file.
+    enforce_read_before_edit: bool = False
+    # B6: when true, providers that support native function/tool calling
+    # (Anthropic Messages API, OpenAI / DeepSeek / Ollama OpenAI-compat)
+    # pass the PATCH_TOOLS schema (see harness/tool_schemas.py) as
+    # ``tools=...`` on their chat_completion call, and parse ``tool_use`` /
+    # ``tool_calls`` responses into ``LLMResponse.tool_calls``. The
+    # patching/repair nodes translate each tool call to a PatchBlock and
+    # feed the existing apply pipeline. Falls back to text DSL parsing on
+    # providers that don't support tool-use. Default false until the
+    # per-provider wiring lands and is exercised in production.
+    use_structured_tools: bool = False
     context_window_threshold_pct: float = 0.85
     max_retries: int = 5
     base_delay: float = 1.0
@@ -1130,6 +1182,43 @@ class GatewayConfig:
     # patch blocks both fit.
     max_tokens_default: int = 4096
     max_tokens_per_role: dict[str, int] = field(default_factory=dict)
+
+
+# Filename pattern for universal LLM dumps written by Gateway._dump_llm_call_to_disk.
+# Sequence-numbered, role-tagged, model-tagged so analysis tools can filter/sort.
+_LLM_DUMP_GLOB_PREFIX = ""  # all .txt files in ~/.harness/debug are candidates
+
+
+def _prune_debug_dumps(debug_dir: str, cap: int) -> None:
+    """Keep ``debug_dir`` under ``cap`` files by deleting oldest entries.
+
+    Operates on every ``.txt`` file in the directory — both the universal
+    dumps and any legacy ``repair_<sid>_<iter>.txt`` files from prior
+    sessions. Best-effort: silent on EPERM / file-races.
+    """
+    try:
+        entries: list[tuple[float, str]] = []
+        with os.scandir(debug_dir) as it:
+            for ent in it:
+                if not ent.is_file():
+                    continue
+                if not ent.name.endswith(".txt"):
+                    continue
+                try:
+                    entries.append((ent.stat().st_mtime, ent.path))
+                except OSError:
+                    continue
+        if len(entries) <= cap:
+            return
+        entries.sort()  # oldest first
+        excess = len(entries) - cap
+        for _, path in entries[:excess]:
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+    except FileNotFoundError:
+        return
 
 
 class Gateway:
@@ -1158,6 +1247,15 @@ class Gateway:
         self._circuit_window_seconds: float = 300.0   # 5-minute rolling window
         self._circuit_failure_threshold: int = 3       # open after 3 hits in-window
         self._circuit_open_until: float = 0.0           # epoch seconds; 0 = closed
+        # Per-call dump counters (one monotonic seqno per session). asyncio.Lock
+        # serializes increment so concurrent dispatches from speculative
+        # variants get distinct filenames.
+        import asyncio as _asyncio
+        from itertools import count as _count
+        self._dump_seqnos: dict[str, "_count[int]"] = {}
+        self._dump_seqno_lock = _asyncio.Lock()
+        # Defer the count() factory so the iter is created on first use
+        self._count_factory = _count
 
     async def _get_provider(self, model_key: str) -> BaseLLM:
         """Get or create a cached provider instance."""
@@ -1196,6 +1294,97 @@ class Gateway:
         """Record a 429/503 failure so the circuit breaker can detect bursts."""
         import time as _t
         self._rate_limit_failures.append(_t.monotonic())
+
+    async def _next_dump_seqno(self, session_id: str) -> int:
+        """Allocate the next monotonic seqno for ``session_id`` dumps."""
+        async with self._dump_seqno_lock:
+            counter = self._dump_seqnos.get(session_id)
+            if counter is None:
+                counter = self._count_factory(1)
+                self._dump_seqnos[session_id] = counter
+            return next(counter)
+
+    async def _dump_llm_call_to_disk(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        response: "LLMResponse",
+        role: "NodeRole",
+        cost_usd: float,
+        elapsed_ms: int,
+    ) -> None:
+        """Persist a single LLM dispatch (input messages + response) to
+        ``~/.harness/debug/<sid>_<seqno>_<role>_<model>.txt``.
+
+        Gated by ``config.dump_llm_calls``. Best-effort: any I/O failure logs
+        at debug and returns silently so dispatch is never blocked by dump
+        problems. The file format mirrors the legacy
+        ``_dump_repair_prompt_to_disk`` layout so existing tooling that reads
+        ``repair_<sid>_<iter>.txt`` works on the unified files too.
+        """
+        if not bool(getattr(self.config, "dump_llm_calls", False)):
+            return
+
+        try:
+            from harness.observability import get_active_session_id
+            sid = get_active_session_id() or "unknown"
+        except Exception:  # noqa: BLE001 — observability is best-effort here
+            sid = "unknown"
+
+        seqno = await self._next_dump_seqno(sid)
+        sid_short = (sid.split("-")[0] if "-" in sid else sid) or "unknown"
+        role_str = role.value if hasattr(role, "value") else str(role)
+        model_short = (
+            response.model.replace("/", "-").replace(":", "-")
+            if isinstance(getattr(response, "model", None), str)
+            else "unknown"
+        )
+
+        debug_dir = os.path.expanduser("~/.harness/debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        path = os.path.join(
+            debug_dir,
+            f"{sid_short}_{seqno:04d}_{role_str}_{model_short}.txt",
+        )
+
+        usage = response.usage
+        header = (
+            f"# LLM call {seqno}\n"
+            f"# session: {sid}\n"
+            f"# role: {role_str}  model: {response.model}  "
+            f"finish: {response.finish_reason}\n"
+            f"# tokens_in={usage.input_tokens}  "
+            f"tokens_out={usage.output_tokens}  "
+            f"cached={usage.cached_tokens}  "
+            f"cost=${cost_usd:.6f}  elapsed_ms={elapsed_ms}\n"
+        )
+        sections = [header]
+        for i, msg in enumerate(messages):
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                content = str(content)
+            sections.append(
+                f"\n---\n## input message {i}: role={msg.get('role', '?')}  "
+                f"({len(content)} chars)\n---\n{content}\n"
+            )
+        response_text = response.content if isinstance(response.content, str) else str(response.content)
+        sections.append(
+            f"\n---\n## response  ({len(response_text)} chars)\n---\n{response_text}\n"
+        )
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(sections))
+
+        logger.debug("[gateway] LLM call dumped: %s", path)
+
+        # Retention: keep the dump dir under config.dump_max_files by
+        # deleting the oldest files (mtime). Best-effort.
+        cap = int(getattr(self.config, "dump_max_files", 0) or 0)
+        if cap > 0:
+            try:
+                _prune_debug_dumps(debug_dir, cap)
+            except Exception as exc:  # noqa: BLE001 — never block dispatch
+                logger.debug("[gateway] dump retention skipped: %s", exc)
 
     async def close(self) -> None:
         """Close all open provider HTTP clients."""
@@ -1613,12 +1802,30 @@ class Gateway:
         except Exception:  # noqa: BLE001 — observability must never break dispatch
             pass
 
+        # Universal per-call debug dump: persist input messages + response
+        # text to ~/.harness/debug/<sid>_<seqno>_<role>_<model>.txt when
+        # debug.dump_llm_calls is true. Captures EVERY role (planning,
+        # patching, repair, doc/code review, test gen, discovery, etc.) so
+        # future analysis has the exact bytes the LLM saw and produced.
+        # See _dump_llm_call_to_disk for the format. Best-effort.
+        try:
+            await self._dump_llm_call_to_disk(
+                messages=messages,
+                response=response,
+                role=role,
+                cost_usd=cost,
+                elapsed_ms=elapsed_ms,
+            )
+        except Exception as exc:  # noqa: BLE001 — dump must never break dispatch
+            logger.debug("[gateway] LLM-call dump skipped: %s", exc)
+
         return response, new_budget
 
     def aggregate_tokens(
         self,
         tracker: dict[str, Any],
         usage: TokenUsage,
+        role: Optional[Any] = None,
     ) -> dict[str, Any]:
         """
         Merge token usage from a single LLM call into the cumulative tracker.
@@ -1626,6 +1833,14 @@ class Gateway:
         Args:
             tracker: The current token_tracker dict from AgentState.
             usage: The TokenUsage from a single LLMResponse.
+            role: Optional NodeRole (or string) identifying the stage that
+                spent this. When provided, accumulates into
+                ``tracker["per_stage"][role]``. This is the observability
+                substrate for per-stage budget sub-pools (C4): hard
+                enforcement is a follow-up; today we emit per-stage
+                tallies + soft warnings so the operator can see where
+                budget actually goes. Callers that don't pass role get the
+                same historical behaviour (no per-stage update).
 
         Returns:
             Updated tracker dict.
@@ -1655,6 +1870,24 @@ class Gateway:
         per_model[model_key].setdefault("cache_creation_tokens", 0)
         per_model[model_key]["cache_creation_tokens"] += usage.cache_creation_tokens
         per_model[model_key]["cost_usd"] += usage.cost_usd
+
+        # Per-stage breakdown (additive — caller opt-in via the role param).
+        if role is not None:
+            role_key = role.value if hasattr(role, "value") else str(role)
+            per_stage: dict[str, dict[str, Any]] = tracker.setdefault("per_stage", {})
+            if role_key not in per_stage:
+                per_stage[role_key] = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cached_tokens": 0,
+                    "cost_usd": 0.0,
+                    "calls": 0,
+                }
+            per_stage[role_key]["input_tokens"] += usage.input_tokens
+            per_stage[role_key]["output_tokens"] += usage.output_tokens
+            per_stage[role_key]["cached_tokens"] += usage.cached_tokens
+            per_stage[role_key]["cost_usd"] += usage.cost_usd
+            per_stage[role_key]["calls"] += 1
 
         return tracker
 
@@ -1842,6 +2075,40 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             return 5
         return value
 
+    def _resolve_dump_llm_calls(cfg: dict[str, Any]) -> bool:
+        """Resolve the universal LLM-call dump flag with legacy alias.
+
+        Honors ``debug.dump_llm_calls`` (current name). When that key is
+        absent but the legacy ``debug.dump_repair_prompts`` is present and
+        truthy, treats it as opt-in and emits a one-time deprecation log so
+        operators know to migrate. Default: False (callers must opt in).
+        """
+        debug = cfg.get("debug", {}) or {}
+        if "dump_llm_calls" in debug:
+            return bool(debug.get("dump_llm_calls"))
+        legacy = debug.get("dump_repair_prompts")
+        if legacy:
+            logger.warning(
+                "[gateway] debug.dump_repair_prompts is deprecated; "
+                "honouring it as debug.dump_llm_calls=true. Migrate by "
+                "renaming the key in your config.json."
+            )
+            return True
+        return False
+
+    def _resolve_dump_max_files(cfg: dict[str, Any]) -> int:
+        """Resolve ``debug.dump_max_files`` with a sane default and clamp."""
+        debug = cfg.get("debug", {}) or {}
+        raw = debug.get("dump_max_files", 5000)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 5000
+        if value < 0:
+            return 0
+        # Soft ceiling — anything above 100k is almost certainly a typo.
+        return min(value, 100000)
+
     def _clamp_repair_iterations(raw: Any) -> int:
         """Clamp ``node_throttle.max_patch_repair_iterations`` to [1, 10].
 
@@ -1941,12 +2208,29 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             node_throttle.get("max_discovery_iterations", 10)
         ),
         max_patch_repair_iterations=_clamp_repair_iterations(
-            node_throttle.get("max_patch_repair_iterations", 3)
+            node_throttle.get("max_patch_repair_iterations", 5)
         ),
         ollama_local_model=model_routing.get("ollama_local_model", ""),
         ollama_local_backup=model_routing.get("ollama_local_backup", ""),
         force_local_only=model_routing.get("force_local_only", False),
         hard_cap_usd=token_budget.get("hard_cap_usd", 2.00),
+        stages={
+            str(k): float(v)
+            for k, v in (token_budget.get("stages") or {}).items()
+            if isinstance(v, (int, float))
+        },
+        dump_llm_calls=_resolve_dump_llm_calls(config_dict),
+        dump_max_files=_resolve_dump_max_files(config_dict),
+        enforce_read_before_edit=bool(
+            (config_dict.get("patcher", {}) or {}).get(
+                "enforce_read_before_edit", False,
+            )
+        ),
+        use_structured_tools=bool(
+            (config_dict.get("patcher", {}) or {}).get(
+                "use_structured_tools", False,
+            )
+        ),
         context_window_threshold_pct=token_budget.get("context_window_threshold_pct", 0.85),
         ssl_verify=config_dict.get("ssl_verify", True),
         max_tokens_default=max_tokens_default,

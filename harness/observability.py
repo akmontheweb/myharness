@@ -21,8 +21,65 @@ import logging
 import logging.handlers
 import os
 import sys
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Optional
+
+
+# ---------------------------------------------------------------------------
+# 0. Active-session ContextVar
+# ---------------------------------------------------------------------------
+#
+# Propagates the running session_id to downstream code (most importantly
+# ``Gateway.dispatch``) without threading it through every call. ContextVar
+# is asyncio-aware: concurrent dispatches from speculative variants each see
+# the right session because LangGraph fans out under the same context.
+#
+# Set once at graph entry via ``set_active_session_id`` and reset at exit
+# (use ``with active_session_scope(sid):`` for safety). Defaults to
+# "unknown" when the harness is invoked outside a graph runner (e.g. unit
+# tests) so dump filenames stay sortable even then.
+
+_active_session_id: ContextVar[str] = ContextVar(
+    "harness_active_session_id", default="unknown",
+)
+
+
+def set_active_session_id(session_id: str) -> Any:
+    """Bind ``session_id`` to the current asyncio context.
+
+    Returns the ``ContextVar.Token`` so callers can ``reset`` later. Prefer
+    ``active_session_scope`` for context-manager semantics.
+    """
+    return _active_session_id.set(session_id or "unknown")
+
+
+def get_active_session_id() -> str:
+    """Read the current session_id, or ``"unknown"`` when unset."""
+    return _active_session_id.get()
+
+
+class active_session_scope:  # noqa: N801 — context-manager naming convention
+    """``with`` block that binds and unbinds the active session id.
+
+    Usage::
+
+        with active_session_scope(state["session_id"]):
+            await compiled_graph.ainvoke(...)
+    """
+
+    def __init__(self, session_id: str) -> None:
+        self._session_id = session_id
+        self._token: Optional[Any] = None
+
+    def __enter__(self) -> "active_session_scope":
+        self._token = _active_session_id.set(self._session_id or "unknown")
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._token is not None:
+            _active_session_id.reset(self._token)
+            self._token = None
 
 
 # ---------------------------------------------------------------------------

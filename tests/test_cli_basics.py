@@ -36,7 +36,7 @@ def _min_valid_config() -> dict:
     return {
         "build_command": "make build",
         "allow_network": True,
-        "manifest_file": "product_spec.txt",
+        "product_spec_dir": "product_spec",
         "sandbox": {"backend": "auto"},
         "token_budget": {"hard_cap_usd": 2.0},
         "persistence": {"db_path": "~/.harness/checkpoints.db"},

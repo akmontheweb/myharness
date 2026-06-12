@@ -7,6 +7,7 @@ from harness.parser_registry import (
     GoParser,
     GenericParser,
     JavaParser,
+    PythonParser,
     TypeScriptParser,
     DartParser,
     detect_and_parse,
@@ -220,3 +221,47 @@ class TestParserDispatch:
         diags = detect_and_parse(output, build_command="flutter analyze")
         assert len(diags) == 1
         assert diags[0].file == "lib/a.dart"
+
+
+class TestPythonParserAssertionBody:
+    """Verify pytest plain-`assert` failures keep their message body so the
+    repair LLM sees what the test actually expected (session 2d0164f0).
+    """
+
+    def test_terminal_fail_line_inherits_e_line_message(self):
+        # Pytest short-traceback layout for a plain assert failure:
+        # the E-line carries the actual assertion text, and the terminal
+        # `file:line: ErrorType` line lacks a message body. The parser
+        # must paint the E-line message onto the terminal-line diagnostic
+        # so the repair prompt's `## Compiler Diagnostics` block contains
+        # the assertion expression — not just "AssertionError".
+        output = (
+            "______________ TestModel.test_type_empty_string_raises ______________\n"
+            "    def test_type_empty_string_raises(self):\n"
+            "        with pytest.raises(ValidationError) as exc_info:\n"
+            "            Job(type='', payload={})\n"
+            "        errors = exc_info.value.errors()\n"
+            ">       assert any(\"type must be a non-empty string\" in e[\"msg\"] for e in errors)\n"
+            "E       AssertionError: assert False\n"
+            "E        +  where False = any(<generator>)\n"
+            "\n"
+            "tests/task_dispatcher/test_models.py:59: AssertionError\n"
+        )
+        diags = PythonParser.parse_diagnostics(output)
+        assert diags, "expected at least one diagnostic"
+        # Find the per-failure-block diag (line=59) not any summary aggregate.
+        precise = [d for d in diags if d.line == 59]
+        assert precise, f"expected diagnostic on line 59, got {[(d.file, d.line, d.message) for d in diags]}"
+        d = precise[0]
+        assert d.file == "tests/task_dispatcher/test_models.py"
+        assert d.error_code == "AssertionError"
+        # Critical: the message must include the E-line body, NOT just
+        # the bare error type.
+        assert d.message != "AssertionError", (
+            "regression: terminal fail-line dropped the E-line message body"
+        )
+        assert "assert False" in d.message
+        # The failing source from the `>` marker should land in
+        # semantic_context so the repair prompt can show the LLM exactly
+        # which expression failed.
+        assert "type must be a non-empty string" in d.semantic_context

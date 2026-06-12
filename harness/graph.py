@@ -25,7 +25,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Literal, Optional
+from typing import Any, Iterable, Literal, Optional
 
 from typing_extensions import TypedDict
 
@@ -141,17 +141,19 @@ def create_initial_state(
     Construct the initial graph state with anchored system prompt at messages[0]
     for maximum downstream prefix-caching discounts.
 
-    If spec_override is provided (from --manifest requirement refinement),
-    the SPEC_REQUIREMENTS.md content becomes the system prompt, replacing
-    the default snapshot-based prompt. This makes the approved specification
-    the immutable root context for all downstream nodes.
+    If spec_override is provided (from the product_spec_dir requirement
+    refinement that ran in cmd_run before graph build), the
+    SPEC_REQUIREMENTS.md content becomes the system prompt, replacing
+    the default snapshot-based prompt. This makes the approved
+    specification the immutable root context for all downstream nodes.
     """
     if spec_override:
         system_prompt = spec_override
-        # When a user-approved spec already exists (from pre-flight --manifest
-        # refinement), skip the graph's discovery pipeline completely. Otherwise
-        # write_spec_node would overwrite the approved SPEC_REQUIREMENTS.md with
-        # a minimal conversation-history compilation.
+        # When a user-approved spec already exists (from the pre-flight
+        # product_spec_dir refinement), skip the graph's discovery
+        # pipeline completely. Otherwise write_spec_node would overwrite
+        # the approved SPEC_REQUIREMENTS.md with a minimal
+        # conversation-history compilation.
         skip_discovery = True
     else:
         system_prompt = _build_system_prompt(workspace_path, build_command)
@@ -418,6 +420,39 @@ You are an autonomous coding agent. You will receive tasks and must:
 2. Generate precise code patches using a strict SEARCH/REPLACE syntax.
 3. Only modify files that need changes — never touch unrelated code.
 
+## Edit Invariants — read before writing any REPLACE_BLOCK
+
+These rules are not style guidance — they are the contract the patcher
+enforces. Violating any of them produces a patch that will not apply.
+
+1. **EXACT-BYTE matching.** A REPLACE_BLOCK / DELETE_BLOCK `search:` block
+   must be a verbatim substring of the on-disk file. Whitespace,
+   punctuation, quote style, trailing newlines, and Unicode characters
+   all matter. Do not "clean up" the search text — copy it byte-for-byte.
+
+2. **Strip the line-number prefix.** When file content is shown to you
+   with a `  N| ` prefix (look for `## Current Content of Files You
+   Need to Edit` or any patcher "Closest match" window), the prefix is
+   navigation only. The actual file content starts AFTER `  N| `. Never
+   include `  N| ` in a `search:` block — that string is not in the file.
+
+3. **Indentation is part of the search.** Preserve every leading space
+   and tab exactly as it appears in the line-numbered view. Patches that
+   re-indent or normalize whitespace will miss.
+
+4. **Read before you edit.** If the conversation has not shown you a
+   file's current bytes — either in `## Current Content of Files You
+   Need to Edit` or in a patcher "Closest match" window — you are
+   guessing. Do not guess. Either limit your edit to a file you have
+   been shown, or emit a `READ_FILE` block (see below) and stop. The
+   harness will resolve it and re-dispatch with the content present
+   before counting an iteration.
+
+5. **Use `count:` instead of pasting larger context.** When the same
+   search text would match multiple places, do NOT bloat your search to
+   force uniqueness — set `count: all` to replace every occurrence or
+   `count: first` to replace only the first. (See REPLACE_BLOCK below.)
+
 ## Patch Syntax
 When applying patches, use these exact formats:
 
@@ -425,12 +460,54 @@ When applying patches, use these exact formats:
 ```
 <<<REPLACE_BLOCK>>>
 file: path/to/file.ext
+count: unique          # optional; one of: unique (default) | all | first
 search:
 <exact lines to find>
 replace:
 <exact replacement lines>
 <<<END_REPLACE_BLOCK>>>
 ```
+
+`count:` is OPTIONAL. Values:
+- `unique` (default) — fail when `search` matches more than once. Matches
+  historical strict behaviour.
+- `all` — apply the replacement to every occurrence.
+- `first` — apply only to the first occurrence.
+
+Use `all` / `first` when you need to fix multiple identical lines and
+adding context to make `search` unique would be redundant. Same field
+works on `DELETE_BLOCK`.
+
+### READ_FILE
+```
+<<<READ_FILE>>>
+file: path/to/foo.py
+range: 1-200          # optional; default = whole file (capped)
+<<<END_READ_FILE>>>
+```
+
+Use this when you do not know — or are not sure of — a file's current
+bytes. The harness will:
+
+1. Read the file from disk in the same sandbox the build runs in.
+2. Append the line-numbered current content to the conversation as a
+   user message.
+3. Re-dispatch you in the same iteration, so READ_FILE does NOT consume
+   a repair-loop slot.
+
+You may emit READ_FILE blocks alongside patch blocks in the same
+response; the patches still apply. If you only need to read, emit ONLY
+the READ_FILE block(s) and no patches. Cap: at most two READ_FILE
+resolution rounds per iteration — after that the harness ignores
+further READ_FILE blocks and applies whatever patches you emitted.
+
+When to use READ_FILE:
+- Your REPLACE_BLOCK keeps missing and the diagnostic does not include a
+  "Closest match" window with the file content.
+- The diagnostic points at a file you have not been shown in the
+  conversation.
+- You are about to write a patch but your mental model of the file is
+  stale (e.g. several iterations have happened since you last saw it).
 
 ### CREATE_FILE
 ```
@@ -440,6 +517,40 @@ content:
 <complete file contents>
 <<<END_CREATE_FILE>>>
 ```
+
+**CREATE_FILE vs REPLACE_BLOCK — read this carefully.**
+- `CREATE_FILE` is for files that **do not yet exist**.
+- If a file already exists with the **same** content, `CREATE_FILE` is a safe no-op (used for resumes).
+- If a file already exists with **different** content, `CREATE_FILE` will be **REJECTED** by the patcher with the error "File already exists with different content". The patcher will NOT overwrite.
+- To change an existing file, use **`REPLACE_BLOCK`** (find the exact lines you want to change, replace them with the new lines). If you need to rewrite the whole file, emit one `REPLACE_BLOCK` whose `search:` matches the current file contents.
+- **If you created a file in a previous turn**, that file now exists — any subsequent edit to it must use `REPLACE_BLOCK`, not `CREATE_FILE`. The "## Files currently in workspace" section in your repair prompt (when present) is authoritative on what exists.
+- **Never emit two `CREATE_FILE` blocks for the same path in a single response.** Each path gets exactly one block per response. The patcher applies blocks in order, so the SECOND `CREATE_FILE` for the same path will be REJECTED ("File already exists with different content") even though it was you who just created the file moments earlier. If you need to refine the content as you draft, edit your own response before submitting; if you need two variants, pick the one you want and emit just that. Symptom: an initial patching round logs `Applied N-2/N patches` with the rejected file appearing in the "Failed" list paired with itself.
+
+**Imports — do NOT duplicate.** When you need a symbol that requires a new import:
+- First scan the existing imports in the file for the same symbol (e.g. `AsyncGenerator`, `Optional`, `Path`).
+- If an import for that symbol already exists — even from a different source module — **replace it** with `REPLACE_BLOCK`. Do NOT add a second `from ... import <same_symbol>` line; Python will shadow the first import silently and lint will flag F811 ("redefinition of unused"), but the underlying problem is that future REPLACE_BLOCK searches against the import region keep missing because the file has drifted from your mental model.
+- Concretely: if the file has `from typing import AsyncGenerator` and you want the `collections.abc` version, replace the typing line — don't append the collections.abc line.
+
+**Imports — placement.** Every `import` / `from ... import ...` statement MUST appear at the **top of the file**, above any non-import code (class, def, module-level expression). This applies to NEW files (CREATE_FILE) AND to existing files (REPLACE_BLOCK / INSERT_AT_BLOCK). Concretely:
+- When CREATE_FILE'ing a new module, put every import at the top, before any class / def / assignment.
+- When REPLACE_BLOCK'ing to add a new import, place it next to the existing import block at the top — NEVER at the bottom of the file, NEVER inside a function/class body, NEVER between `def` and `class` definitions further down.
+- If a symbol is only used inside one function and you're tempted to "import locally" — still put it at the top unless you have a documented reason (circular-import workaround, optional-dependency guard).
+- Bottom-of-file imports cause `NameError` at module import time when the bottom-imported symbol is referenced anywhere above its line. Lint will catch it as F811 or F821, but more importantly the test collector will fail before the repair LLM ever sees the actual root cause.
+
+**Makefile — MUST declare a `build:` target.** If you CREATE_FILE a `Makefile` (or `makefile` / `GNUmakefile`) at workspace root, it MUST declare a `build:` target. The harness invokes `make build` by default — a Makefile with `install:`, `test:`, `run:`, etc. but no `build:` target crashes the sandbox immediately:
+- The shell can't find `build` → `make` reports "No rule to make target 'build'"; before that, the base `ubuntu:22.04` image doesn't even ship `make` itself → exit 127 in under a second.
+- Zero diagnostics get extracted, the repair LLM has nothing to act on, the loop spins for 5 iterations and routes to HITL.
+- Minimum acceptable shape for a Python project:
+  ```
+  .PHONY: build test
+  build:
+  	python3 -m pip install -r requirements.txt
+  test:
+  	python3 -m pytest -q
+  ```
+  Use a TAB to indent recipe lines (not spaces — `make` rejects spaces with `*** missing separator. Stop.`).
+- The `build:` target should perform the install / compile step a CI would need to run before tests. Tests live under `test:` (or a separate target wired into `test:`).
+- If you're not sure whether to emit a Makefile at all, DON'T — the harness picks the right install + test command from `pyproject.toml` / `requirements.txt` / `package.json` / etc. A Makefile is only useful when YOU genuinely want operators to run `make build` themselves.
 
 ### DELETE_BLOCK
 ```
@@ -670,6 +781,109 @@ def get_gateway_config() -> Optional[Any]:
 # 3. Memory Cleanse Utility (Module 4)
 # ---------------------------------------------------------------------------
 
+def _emit_per_stage_spend_summary(token_tracker: dict[str, Any]) -> None:
+    """Log per-stage cumulative spend + soft warnings when a stage exceeds
+    its configured share of the total budget. Observability-only (C4 scaffold);
+    hard enforcement is a follow-up.
+
+    Reads the optional ``token_budget.stages`` dict from gateway.config —
+    a map of role name → target fraction. Logs warnings when:
+      - A stage has spent more than its target_fraction × hard_cap_usd.
+      - Speculative/repair combined exceed a hard ratio (caps the historic
+        "speculative ate the repair budget" failure mode).
+    """
+    per_stage = token_tracker.get("per_stage") or {}
+    if not per_stage:
+        return
+    gw = get_gateway()
+    if gw is None:
+        return
+    stages_cfg = getattr(gw.config, "stages", None)
+    hard_cap = float(getattr(gw.config, "hard_cap_usd", 0.0) or 0.0)
+    parts = []
+    for role_key, info in sorted(per_stage.items()):
+        cost = float(info.get("cost_usd", 0.0))
+        calls = int(info.get("calls", 0))
+        parts.append(f"{role_key}=${cost:.4f}({calls}c)")
+        if stages_cfg and hard_cap > 0 and isinstance(stages_cfg, dict):
+            target_frac = stages_cfg.get(role_key)
+            if isinstance(target_frac, (int, float)) and target_frac > 0:
+                target_usd = target_frac * hard_cap
+                if cost > target_usd:
+                    logger.warning(
+                        "[budget] Stage %r spent $%.4f, exceeding its soft "
+                        "target of $%.4f (%.0f%% of hard_cap $%.2f). "
+                        "Observability-only today; consider adjusting "
+                        "token_budget.stages or model_routing.",
+                        role_key, cost, target_usd, target_frac * 100, hard_cap,
+                    )
+    if parts:
+        logger.info("[budget] Per-stage spend: %s", ", ".join(parts))
+
+
+def apply_repair_iteration_cleanse(state: AgentState) -> dict[str, Any]:
+    """Trim mid-loop debugging chatter before a repair iteration ≥ 2.
+
+    Unlike :func:`apply_memory_cleanse` (which fires only on success / HITL
+    and compresses the whole history into a single summary), this trims
+    *between* iterations so iteration N's LLM call doesn't carry the bloat
+    of iterations 1..N-1. We keep:
+
+      - ``messages[0]`` (the anchored system prompt — never trimmed)
+      - the first user message (the original planning prompt — defines the
+        goal the LLM is repairing toward)
+      - the most recent assistant message (the LAST repair turn's patch
+        attempt — the LLM needs to remember what it just tried so its next
+        response is a delta, not a re-do)
+
+    Everything between is dropped. The repair_node will then append a fresh
+    error_summary (diagnostics + patch-failure feedback + workspace inventory
+    + allowlist + new failures), so the LLM sees full structured context
+    *for this turn* without N turns of stale history.
+
+    Returns an empty dict (no-op) when there's nothing to trim — fewer than
+    4 messages or no prior assistant turn yet.
+    """
+    messages: list[MessageDict] = state.get("messages", [])
+    if len(messages) < 4:
+        return {}
+
+    system_prompt = messages[0] if messages else None
+    planning_message: Optional[MessageDict] = None
+    for m in messages[1:]:
+        if m.get("role") == "user":
+            planning_message = m
+            break
+
+    last_assistant: Optional[MessageDict] = None
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            last_assistant = m
+            break
+
+    # Without a prior assistant turn (first repair-iteration cleanse would
+    # find none), there's nothing useful to compress — leave as-is.
+    if last_assistant is None:
+        return {}
+
+    cleansed: list[MessageDict] = []
+    if system_prompt is not None:
+        cleansed.append(system_prompt)
+    if planning_message is not None and planning_message is not system_prompt:
+        cleansed.append(planning_message)
+    cleansed.append(last_assistant)
+
+    if len(cleansed) >= len(messages):
+        return {}  # No-op — nothing trimmed.
+
+    logger.info(
+        "[memory_cleanse] Trimmed mid-loop messages: %d → %d (kept system + "
+        "planning + last assistant; dropped %d intermediate turns).",
+        len(messages), len(cleansed), len(messages) - len(cleansed),
+    )
+    return {"messages": cleansed}
+
+
 def apply_memory_cleanse(state: AgentState, resolution_kind: str = "compiler_success") -> dict[str, Any]:
     """
     Purge verbose intermediate repair-loop messages from the conversation history
@@ -798,9 +1012,11 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
             budget_remaining_usd=budget,
         )
 
-        # Update token tracker
+        # Update token tracker (per-stage attribution: planning)
         token_tracker = state.get("token_tracker", {})
-        token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
+        token_tracker = gateway.aggregate_tokens(
+            token_tracker, response.usage, role=NodeRole.PLANNING,
+        )
 
         # Append the planning response to messages
         messages.append(MessageDict(role="assistant", content=response.content))
@@ -866,8 +1082,76 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
         messages = list(state.get("messages", []))
         budget = state.get("budget_remaining_usd", 2.00)
 
+        # Compute the allowlist UP FRONT so we can both (a) surface it to the
+        # LLM in the format reminder below and (b) feed the same list into
+        # process_llm_patch_output. Without (a), the first patching pass
+        # routinely burns 10+ patches on paths the patcher then rejects
+        # (e.g. `api/__init__.py`, `config.py` at workspace root when the
+        # allowlist is scoped to `task_dispatcher/`). Telling the LLM the
+        # allowed roots BEFORE it writes any patches turns those rejections
+        # into right-first-time placements.
+        workspace = state.get("workspace_path", os.getcwd())
+        allowed_paths = _build_patcher_allowlist(workspace)
+        # Two-phase generation: this node is PHASE 1 — production code
+        # only. A separate test_generation_node fires later (after the
+        # prod-import smoke check verifies production imports cleanly)
+        # and writes tests against the now-known-good prod modules. The
+        # split is a hard-won lesson from sessions 19b28eff, 0a5c6fe8,
+        # etc. — when the LLM emits prod + tests in one shot, test code
+        # contains stale assumptions about prod signatures and the
+        # repair loop wastes iterations triaging "is this a prod bug
+        # cascading through tests, or a test bug?". Phase 1's narrower
+        # scope eliminates that ambiguity at the source.
+        _PHASE1_PRODUCTION_ONLY_NOTE = (
+            "[PHASE 1: PRODUCTION CODE ONLY]\n"
+            "This is the PRODUCTION-CODE generation phase. Do NOT emit "
+            "any test files or test-only fixtures in this pass. A "
+            "dedicated test-generation node runs AFTER your production "
+            "code has been verified to import cleanly — it will write "
+            "all `tests/`, `test/`, `__tests__/`, `conftest.py`, and "
+            "`pytest.ini` files against your finalised prod APIs.\n"
+            "Rules for THIS turn:\n"
+            "  - Do NOT CREATE_FILE under `tests/`, `test/`, "
+            "    `__tests__/`. Patches targeting those paths will be "
+            "    DROPPED by the harness before they reach the patcher.\n"
+            "  - Do NOT CREATE_FILE `conftest.py` or `pytest.ini` at "
+            "    workspace root.\n"
+            "  - DO write a real production implementation: handlers, "
+            "    services, models, config, db, main entry point, "
+            "    requirements.txt, etc.\n"
+            "  - DO write a Makefile / pyproject.toml as needed for "
+            "    the production build to succeed.\n"
+            "Save your test ideas for the dedicated test-generation "
+            "phase that runs next.\n\n"
+        )
+        if allowed_paths:
+            allowlist_preamble = (
+                _PHASE1_PRODUCTION_ONLY_NOTE
+                + "[ALLOWED PATHS]\n"
+                "Every file path in your CREATE_FILE / REPLACE_BLOCK / "
+                "DELETE_BLOCK / INSERT_AT_BLOCK blocks must start with one "
+                "of these prefixes (or match one of these exact files). "
+                "Paths outside this list will be REJECTED by the patcher "
+                "and NOT land on disk. Place new modules under the source "
+                "root prefix (the first directory entry below); test paths "
+                "shown below are reserved for the next phase and must NOT "
+                "receive CREATE_FILE blocks in this turn.\n"
+                + "\n".join(f"- {p}" for p in allowed_paths)
+                + "\n\n"
+            )
+        else:
+            allowlist_preamble = (
+                _PHASE1_PRODUCTION_ONLY_NOTE
+                + "[ALLOWED PATHS]\n"
+                "No layout constraint this round; place files under whatever "
+                "package directory matches your project structure. The "
+                "patcher will still block path traversal (../ or absolute "
+                "paths). Production code only — tests are deferred to the "
+                "next phase.\n\n"
+            )
+
         # Inject a format reminder to ensure the LLM outputs patch blocks
-        _FORMAT_REMINDER = """[CRITICAL FORMAT INSTRUCTION]
+        _FORMAT_REMINDER = allowlist_preamble + """[CRITICAL FORMAT INSTRUCTION]
 You MUST respond using ONLY the patch block syntax below. Do NOT include any explanations,
 markdown code fences, or text outside the blocks. Your entire response must be parseable
 as one or more patch blocks.
@@ -911,24 +1195,43 @@ Generate your patches NOW. Only the blocks above. No other text."""
             budget_remaining_usd=budget,
         )
 
-        # Update token tracker
+        # Update token tracker (per-stage attribution: patching)
         token_tracker = state.get("token_tracker", {})
-        token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
+        token_tracker = gateway.aggregate_tokens(
+            token_tracker, response.usage, role=NodeRole.PATCHING,
+        )
 
-        # Apply patches to disk. Constrain new source files to the detected
-        # source root (e.g. `app/`, `src/`) when one exists, so the LLM
-        # can't accidentally place new modules at workspace root.
-        workspace = state.get("workspace_path", os.getcwd())
+        # Phase 1 defensive filter: strip any blocks the LLM emitted
+        # against test paths despite the system-prompt instructions. The
+        # next phase (test_generation_node) handles tests; carrying them
+        # in here would just confuse the prod-import smoke check and
+        # diverge prod from a known-clean state. Logged so the operator
+        # can see if the LLM keeps trying.
+        filtered_response, dropped_test_blocks = (
+            _filter_test_blocks_from_patch_response(response.content)
+        )
+        if dropped_test_blocks:
+            logger.info(
+                "[patching_node:phase1] Dropped %d test-targeting block(s) "
+                "from this round — test generation happens in the next "
+                "phase. Dropped: %s",
+                len(dropped_test_blocks),
+                ", ".join(dropped_test_blocks[:10]),
+            )
+
+        # Apply patches to disk using the same allowlist we surfaced to the
+        # LLM above — keeps the LLM's expectation and the patcher's enforcement
+        # in lockstep.
         existing_modified = list(state.get("modified_files", []))
-        allowed_paths = _build_patcher_allowlist(workspace)
         patch_results, modified_files = await process_llm_patch_output(
-            response.content,
+            filtered_response,
             workspace,
             existing_modified,
             allowed_paths=allowed_paths,
         )
 
-        # Append the LLM response to messages
+        # Append the LLM response to messages (the original, unfiltered,
+        # so the LLM's own history reflects what it actually emitted).
         messages.append(MessageDict(role="assistant", content=response.content))
 
         # Report patch application results
@@ -954,7 +1257,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
                     r.operation.value
                     if hasattr(r.operation, "value") else str(r.operation)
                 ),
-                "error": (r.error or "")[:800],
+                "error": _store_patch_failure_error(r.error),
             }
             for r in patch_results
             if not r.success and isinstance(r.error, str)
@@ -1018,8 +1321,22 @@ Generate your patches NOW. Only the blocks above. No other text."""
 def _toolchain_image_for(build_command: str) -> Optional[str]:
     """Pick a sandbox image that ships with the toolchain implied by the
     given build command. Returns None when we have no opinion (so caller
-    keeps whatever is configured)."""
+    keeps whatever is configured).
+
+    The ``make ...`` mapping is a backstop for Fix 1 (see
+    ``harness/cli.py::_makefile_has_target``). When the operator's
+    ``Makefile`` legitimately declares a ``build:`` target,
+    ``_detect_default_build_command`` returns ``"make build"`` — and
+    ``ubuntu:22.04`` (the default bare image) doesn't ship ``make`` in
+    its base layer, producing the same exit-127 crash we fixed for the
+    no-``build:``-target case. ``buildpack-deps:bookworm`` ships
+    ``make``, ``gcc``, ``git``, ``curl``, and a Python interpreter —
+    enough for the most common ``make build`` recipes.
+    """
     cmd = build_command.lower()
+    stripped = cmd.strip()
+    if stripped.startswith("make ") or stripped == "make":
+        return "buildpack-deps:bookworm"
     if "python3" in cmd or "pip " in cmd or "pytest" in cmd or "poetry" in cmd:
         return "python:3.12-slim"
     if "npm " in cmd or "yarn " in cmd or "pnpm " in cmd or "node " in cmd:
@@ -1421,16 +1738,771 @@ def _collect_manifest_snippets_for_repair(
     return "\n".join(lines) + "\n"
 
 
+# Marker that the patcher emits when a REPLACE_BLOCK search misses and we
+# attach the line-numbered window of current file content around the
+# closest match (see _find_closest_match in harness/patcher.py). When an
+# error contains this marker we MUST NOT truncate it on the way into
+# node_state["patch_failures"] — the wider window can be up to ~2000
+# chars and is the single most useful signal the LLM has for correcting
+# its next search block. Truncating slices the window mid-line and
+# defeats the purpose, which is what hit session 2f2d48cc-...
+_PATCH_ERROR_WIDER_CONTEXT_MARKER = "Current file content (around closest match):"
+
+
+def _store_patch_failure_error(error_text: str) -> str:
+    """Prepare a patcher error message for storage in node_state.
+
+    When the error includes the wider-context window (marker above), return
+    the full text. Otherwise cap at 3000 chars — generous enough for any
+    "regular" error message but bounded so a runaway log line can't blow
+    the state. The previous 800-char cap was tight enough to slice the
+    wider-context window mid-line in iteration N+1's repair prompt.
+    """
+    err = error_text or ""
+    if _PATCH_ERROR_WIDER_CONTEXT_MARKER in err:
+        return err
+    return err[:3000]
+
+
+_TEST_DIR_PREFIXES = ("tests/", "test/", "__tests__/")
+# Workspace-root files that are test-infrastructure even though they
+# don't live under a test/ prefix. Used by phase-1 patching to drop
+# any LLM blocks that target them — test infrastructure is generated
+# in phase 2 (test_generation_node) after prod imports cleanly.
+_TEST_INFRA_ROOT_FILES = frozenset({"conftest.py", "pytest.ini"})
+
+
+def _is_test_path(path: str) -> bool:
+    """True when ``path`` is somewhere the test-generation phase owns,
+    not the phase-1 production-patching phase."""
+    if not path:
+        return False
+    p = path.strip().lstrip("./")
+    if any(p.startswith(prefix) for prefix in _TEST_DIR_PREFIXES):
+        return True
+    return p in _TEST_INFRA_ROOT_FILES
+
+
+def _filter_test_blocks_from_patch_response(
+    response_content: str,
+) -> tuple[str, list[str]]:
+    """Strip every patch block targeting a test path from the LLM's
+    response. Returns ``(filtered_content, dropped_paths)``.
+
+    Phase 1's job is production code; the harness drops any block the
+    LLM emits against ``tests/``, ``test/``, ``__tests__/``,
+    ``conftest.py``, or ``pytest.ini`` — those are handled by the
+    test-generation phase that runs AFTER prod is verified.
+
+    All four block types (CREATE_FILE, REPLACE_BLOCK, DELETE_BLOCK,
+    INSERT_AT_BLOCK) are handled. The first line inside each block is
+    always ``file: <path>``.
+    """
+    import re as _re
+    block_pattern = _re.compile(
+        r"<<<(CREATE_FILE|REPLACE_BLOCK|DELETE_BLOCK|INSERT_AT_BLOCK)>>>"
+        r"\s*\nfile:\s*([^\n]+)\n"
+        r".*?"
+        r"<<<END_\1>>>\n?",
+        _re.DOTALL,
+    )
+    dropped: list[str] = []
+
+    def _maybe_drop(match: "_re.Match[str]") -> str:
+        path = match.group(2).strip()
+        if _is_test_path(path):
+            dropped.append(f"{match.group(1).lower()}:{path}")
+            return ""
+        return match.group(0)
+
+    filtered = block_pattern.sub(_maybe_drop, response_content)
+    return filtered, dropped
+# Directories the prod-import smoke check should NOT walk into when
+# enumerating production modules. Mix of VCS / cache / build / virtualenv /
+# test-tree names.
+_SMOKE_CHECK_SKIP_DIRS = frozenset({
+    ".git", "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache",
+    "node_modules", "build", "dist", ".venv", "venv", "env",
+    "tests", "test", "__tests__",
+})
+
+
+def _walk_prod_python_modules(workspace_path: str) -> list[str]:
+    """Walk ``workspace_path`` and return dotted module names for every
+    production ``*.py`` file. Skips tests, build dirs, and dotfiles.
+
+    Used by the prod-import smoke check (fix #6 / user's two-phase
+    request): produces the import list the sandbox should ``import ...``
+    before pytest runs. Empty list when no prod sources exist yet.
+    """
+    if not os.path.isdir(workspace_path):
+        return []
+    modules: list[str] = []
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [
+            d for d in dirs
+            if d not in _SMOKE_CHECK_SKIP_DIRS
+            and not d.startswith(".")
+            and not d.endswith(".egg-info")
+        ]
+        for fname in files:
+            if not fname.endswith(".py"):
+                continue
+            full = os.path.join(root, fname)
+            rel = os.path.relpath(full, workspace_path)
+            parts = rel.split(os.sep)
+            if parts[-1] == "__init__.py":
+                if len(parts) == 1:
+                    continue  # root-level __init__.py is degenerate
+                parts = parts[:-1]
+            else:
+                parts[-1] = parts[-1][:-3]  # strip .py
+            if not parts:
+                continue
+            # Skip standalone setup.py / conftest.py / manage.py — they're
+            # scripts, not import targets, and trying to import them
+            # often runs side-effecting top-level code.
+            if len(parts) == 1 and parts[0] in (
+                "setup", "conftest", "manage", "asgi", "wsgi",
+            ):
+                continue
+            modules.append(".".join(parts))
+    return sorted(set(modules))
+
+
+async def _run_prod_import_smoke_check(
+    workspace_path: str,
+    sandbox_config: dict[str, Any],
+    allow_network: bool,
+    install_step: str,
+    session_id: str,
+) -> list[Any]:
+    """Run ``python -c 'import a; import b; ...'`` inside the sandbox
+    against every production module. Returns a list of diagnostic dicts
+    (tagged ``PROD_IMPORT_SMOKE``) for any imports that failed; empty
+    list when every prod module imports cleanly.
+
+    Caller is responsible for routing those diagnostics into
+    ``compiler_errors``. By surfacing prod-import failures BEFORE running
+    the actual build (pytest), the repair LLM sees production-side errors
+    in isolation, without the cascade amplification that happens when
+    pytest tries to collect tests that import broken prod modules.
+
+    Requires ``install_step`` (e.g. ``python3 -m pip install -r
+    requirements.txt``) so the imports have dependencies available.
+    """
+    modules = _walk_prod_python_modules(workspace_path)
+    if not modules:
+        return []
+    # Build a Python script that imports each module under try/except so
+    # one failure doesn't abort the rest. Failures are printed in a
+    # parseable format the caller can grep.
+    py_lines = [
+        "import sys",
+        f"_mods = {modules!r}",
+        "_fails = []",
+        "for _m in _mods:",
+        "    try:",
+        "        __import__(_m)",
+        "    except BaseException as _e:",
+        "        _fails.append((_m, type(_e).__name__, str(_e)))",
+        "if _fails:",
+        "    print('=== PROD_IMPORT_SMOKE_FAILURES ===')",
+        "    for _m, _et, _msg in _fails:",
+        "        print(f'FAIL: {_m}: {_et}: {_msg}')",
+        "    sys.exit(1)",
+        "print('=== PROD_IMPORT_SMOKE_OK ===')",
+    ]
+    py_script = "\n".join(py_lines)
+    # Use python3 -c with the script. Escape double quotes minimally;
+    # we use single-quoted f-strings inside.
+    cmd = f"{install_step} && python3 -c \"{py_script}\""
+
+    from harness.sandbox import SandboxExecutor
+    executor = SandboxExecutor(
+        workspace_path=workspace_path,
+        allow_network=allow_network,
+        sandbox_config=sandbox_config,
+        session_id=session_id,
+    )
+    logger.info(
+        "[prod-smoke] Running prod-import smoke check across %d module(s).",
+        len(modules),
+    )
+    result = await executor.run(cmd)
+    if result.exit_code == 0:
+        logger.info(
+            "[prod-smoke] All %d production module(s) imported cleanly.",
+            len(modules),
+        )
+        return []
+    # Parse FAIL: lines from the output. The smoke script prints them
+    # one per line right after the FAILURES header.
+    diagnostics: list[dict[str, Any]] = []
+    seen = False
+    for line in (result.raw_output or "").splitlines():
+        if "PROD_IMPORT_SMOKE_FAILURES" in line:
+            seen = True
+            continue
+        if not seen:
+            continue
+        if not line.startswith("FAIL:"):
+            continue
+        # Parse "FAIL: <module>: <ExceptionType>: <message>"
+        body = line[len("FAIL:"):].strip()
+        # Split into at most 3 parts
+        try:
+            module, exc_type, message = [p.strip() for p in body.split(":", 2)]
+        except ValueError:
+            module, exc_type, message = body, "ImportError", body
+        diagnostics.append({
+            "error_code": f"PROD_IMPORT_SMOKE:{exc_type}",
+            "message": (
+                f"Production module `{module}` failed to import "
+                f"({exc_type}): {message}"
+            ),
+            "file": module.replace(".", "/") + ".py",
+            "line": 0,
+            "column": 0,
+            "severity": "error",
+            "semantic_context": "",
+        })
+    if not diagnostics:
+        # Fall back to a single coarse diagnostic carrying the tail of
+        # the output so the LLM has something to work with.
+        diagnostics.append({
+            "error_code": "PROD_IMPORT_SMOKE",
+            "message": (result.raw_output or "")[-1500:],
+            "file": "<prod-import-smoke>",
+            "line": 0,
+            "column": 0,
+            "severity": "error",
+            "semantic_context": "",
+        })
+    logger.warning(
+        "[prod-smoke] %d production module(s) failed to import. Surfacing "
+        "as diagnostics; the actual build (pytest) will NOT run this "
+        "round — repair must fix prod imports first.",
+        len(diagnostics),
+    )
+    return diagnostics
+# Error codes that almost certainly mean "test fails to import / collect
+# because something in production is wrong." These point the cascade at
+# production code, not the test file itself.
+_PROD_CASCADE_ERROR_CODES = (
+    "ImportError", "ModuleNotFoundError", "NameError", "AttributeError",
+    "SyntaxError", "TypeError",
+    "F821", "F401", "E0401", "E0602", "E0001",
+    "TEST_FAILURE:IMPORTERROR", "TEST_FAILURE:MODULENOTFOUND",
+)
+
+
+def _corresponding_prod_paths_for_test(
+    test_path: str, workspace_path: str,
+) -> list[str]:
+    """Best-effort mapping from a test-file path to candidate production
+    file paths in the workspace.
+
+    Heuristic: strip ``test_`` from the basename, drop the leading
+    ``tests/`` (or ``test/`` / ``__tests__/``), then look for matches in
+    common source layouts (``<stem>.py`` at root, ``<src>/<stem>.py``,
+    ``<package>/<stem>.py``). Returns paths that actually exist on disk.
+
+    Used by the test-cascade reframe (fix #5) to attach the relevant
+    production module's content to the repair prompt so the LLM can see
+    whether the symbol the test imports actually exists.
+    """
+    if not test_path:
+        return []
+    # Strip the test-dir prefix.
+    rel = test_path
+    for prefix in _TEST_DIR_PREFIXES:
+        if rel.startswith(prefix):
+            rel = rel[len(prefix):]
+            break
+    # Strip "test_" from the basename, then keep the parent path.
+    parts = rel.split("/")
+    if not parts:
+        return []
+    basename = parts[-1]
+    if basename.startswith("test_"):
+        basename = basename[len("test_"):]
+    elif basename.endswith("_test.py"):
+        basename = basename[:-len("_test.py")] + ".py"
+    parts[-1] = basename
+    stem_rel = "/".join(parts)
+    # Common source-root prefixes to probe.
+    candidates: list[str] = [stem_rel]
+    for src in ("src", "app", "lib"):
+        candidates.append(f"{src}/{stem_rel}")
+    # Also probe at workspace root with just the basename (for flat layouts).
+    candidates.append(basename)
+    # Deduplicate while preserving order.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for c in candidates:
+        if c in seen:
+            continue
+        seen.add(c)
+        deduped.append(c)
+    # Filter to those that actually exist.
+    found: list[str] = []
+    for c in deduped:
+        full = os.path.join(workspace_path, c)
+        if os.path.isfile(full):
+            found.append(c)
+    return found
+
+
+def _format_test_collection_cascade_section(
+    errors: list[Any], workspace_path: str,
+) -> str:
+    """Detect pytest test-collection cascade errors and emit a section
+    that (a) reframes the situation for the LLM and (b) attaches the
+    current content of the most likely corresponding production files.
+
+    Trigger: ≥ 1 diagnostic whose file path lives under ``tests/`` AND
+    whose error_code matches a production-cascade pattern (ImportError,
+    ModuleNotFoundError, NameError, AttributeError, F821, F401, ...).
+
+    Returns empty string when no trigger fires.
+    """
+    if not errors:
+        return ""
+    candidates: list[tuple[str, str]] = []  # (test_path, code)
+    for e in errors:
+        path = str(e.get("file", "") or "")
+        if not any(path.startswith(p) for p in _TEST_DIR_PREFIXES):
+            continue
+        code = str(e.get("error_code", "") or "")
+        upper = code.upper()
+        if not any(upper.startswith(p.upper()) for p in _PROD_CASCADE_ERROR_CODES):
+            continue
+        candidates.append((path, code))
+    if not candidates:
+        return ""
+
+    # Map each unique test-file path to the candidate prod files.
+    test_paths = sorted({p for p, _ in candidates})
+    prod_attachments: dict[str, str] = {}  # prod_rel -> content
+    for tp in test_paths:
+        for prod_rel in _corresponding_prod_paths_for_test(tp, workspace_path):
+            if prod_rel in prod_attachments:
+                continue
+            full = os.path.join(workspace_path, prod_rel)
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except OSError:
+                continue
+            # Cap each attachment so the prompt doesn't blow up.
+            if len(content) > 6000:
+                content = content[:6000] + "\n# ...(truncated)\n"
+            prod_attachments[prod_rel] = content
+
+    lines = [
+        "\n## Test-collection cascade hint",
+        (
+            "Some of the diagnostics below point at TEST files but the "
+            "shape (ImportError / ModuleNotFoundError / NameError / "
+            "F821 / F401) suggests the underlying bug is in PRODUCTION "
+            "code that the test is trying to import. Pytest reports the "
+            "frame where the import raised — that's the test file — "
+            "but the FIX usually belongs in the production module.\n"
+            "Order of triage: (1) check whether the imported symbol "
+            "actually exists in the production source below, (2) if "
+            "not, add / rename it in PRODUCTION, (3) only edit the "
+            "test file if the test's own import path is genuinely wrong."
+        ),
+    ]
+    if prod_attachments:
+        lines.append(
+            "\nProduction source files that correspond to the failing test(s) "
+            "(use these to verify the imported symbols actually exist):"
+        )
+        for rel, content in prod_attachments.items():
+            lang = "python" if rel.endswith(".py") else "text"
+            lines.append(f"\n### `{rel}`\n```{lang}\n{content.rstrip()}\n```")
+    else:
+        lines.append(
+            "\n(Could not auto-locate the corresponding production source — "
+            "search the workspace inventory below for the module the test "
+            "tried to import.)"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _format_replace_block_miss_directive(rb_misses: dict[str, int]) -> str:
+    """When a file has ≥ 2 consecutive REPLACE_BLOCK misses, emit a
+    directive telling the LLM to break the pattern by using a different
+    operation on its next attempt at that file.
+
+    Sessions 19b28eff and 0a5c6fe8 stuck in HITL because the LLM kept
+    emitting REPLACE_BLOCK for the same file across iterations even
+    though the searches never matched. Forcing the LLM out of that
+    pattern with an explicit "use a different operation" instruction
+    breaks the loop deterministically.
+
+    Returns empty string when no file is in the danger zone.
+    """
+    if not rb_misses:
+        return ""
+    stuck = sorted(f for f, n in rb_misses.items() if n >= 2)
+    if not stuck:
+        return ""
+    lines = [
+        "\n## REPLACE_BLOCK pattern-repetition trap",
+        (
+            "You have failed REPLACE_BLOCK on the following file(s) TWO "
+            "OR MORE times in a row. Your next attempt MUST NOT use "
+            "REPLACE_BLOCK for any of these files. Instead use either:\n"
+            "  (a) `DELETE_BLOCK` to remove the offending lines + "
+            "`INSERT_AT_BLOCK` to put the corrected lines back, OR\n"
+            "  (b) `DELETE_BLOCK` on the entire current content of the "
+            "file + `CREATE_FILE` with the new full content.\n"
+            "Either path forces a different patcher code path that won't "
+            "miss the way your REPLACE_BLOCK search has. Affected files:"
+        ),
+    ]
+    for f in stuck:
+        lines.append(f"- `{f}` (consecutive REPLACE_BLOCK misses: {rb_misses[f]})")
+    return "\n".join(lines) + "\n"
+
+
+def _extract_wider_context_from_failure(failure: Any) -> tuple[str, Optional[str]]:
+    """Split a patch_failure error into ``(text_without_wider_context,
+    wider_context_block)``.
+
+    The patcher emits errors of shape:
+
+        Search block not found in foo.py. ...explanation...
+        Current file content (around closest match):
+         1| line 1
+         2| line 2
+         ...
+
+    The portion after the marker is the most useful signal for the next
+    repair iteration. Splitting lets us promote that portion to a
+    top-of-prompt "Current Content of Files You Need to Edit" section
+    while keeping the bare error message in the per-failure block.
+    Returns ``(original_error, None)`` when no marker is present.
+    """
+    err = (failure.get("error", "") if isinstance(failure, dict) else "") or ""
+    marker = _PATCH_ERROR_WIDER_CONTEXT_MARKER
+    idx = err.find(marker)
+    if idx < 0:
+        return err, None
+    prefix = err[:idx].rstrip()
+    content_start = idx + len(marker)
+    if content_start < len(err) and err[content_start] == "\n":
+        content_start += 1
+    wider = err[content_start:].rstrip()
+    return prefix, wider or None
+
+
+_PREFLIGHT_FILE_LINE_CAP = 300
+_PREFLIGHT_FILE_CHAR_CAP = 6000
+_PREFLIGHT_SECTION_CHAR_CAP = 24000
+
+
+def _render_file_with_line_numbers(
+    path: str,
+    *,
+    max_lines: int = _PREFLIGHT_FILE_LINE_CAP,
+    max_chars: int = _PREFLIGHT_FILE_CHAR_CAP,
+) -> Optional[str]:
+    """Read ``path`` and return its content with ``  N|`` line-number
+    prefixes, bounded by ``max_lines`` and ``max_chars``. Returns ``None``
+    when the file is missing, unreadable, or empty — best-effort.
+
+    Mirrors the formatting of ``patcher._find_closest_match`` so the
+    pre-flight ``## Current Content of Files You Need to Edit`` section
+    looks identical to the patcher's post-miss closest-match window. The
+    LLM sees one consistent layout regardless of whether the content
+    arrived proactively or after a failed REPLACE_BLOCK.
+    """
+    rendered, _ = _render_file_with_line_numbers_and_hash(
+        path, max_lines=max_lines, max_chars=max_chars,
+    )
+    return rendered
+
+
+def _render_file_with_line_numbers_and_hash(
+    path: str,
+    *,
+    max_lines: int = _PREFLIGHT_FILE_LINE_CAP,
+    max_chars: int = _PREFLIGHT_FILE_CHAR_CAP,
+) -> tuple[Optional[str], Optional[str]]:
+    """Same as ``_render_file_with_line_numbers`` but also returns the
+    sha256 hex digest of the file's *full* bytes — even when the rendered
+    view is truncated. The hash always reflects what is on disk so the
+    B5 drift detector compares like-for-like.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None, None
+    if not text:
+        return None, None
+    import hashlib
+    # Hash the raw on-disk bytes (re-read as binary for fidelity — the text
+    # read above used errors="replace" and may have substituted characters).
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        file_hash: Optional[str] = h.hexdigest()
+    except OSError:
+        file_hash = None
+    text_lines = text.splitlines()
+    if not text_lines:
+        return None, file_hash
+    if len(text_lines) > max_lines:
+        text_lines = text_lines[:max_lines]
+        truncated_lines = True
+    else:
+        truncated_lines = False
+    width = max(2, len(str(max(1, len(text_lines)))))
+    rendered = "\n".join(
+        f"{(i + 1):>{width}}| {text_lines[i]}" for i in range(len(text_lines))
+    )
+    if truncated_lines:
+        rendered += "\n...(truncated to first %d lines)" % max_lines
+    if len(rendered) > max_chars:
+        rendered = rendered[:max_chars] + "\n...(truncated to first %d chars)" % max_chars
+    return rendered, file_hash
+
+
+def _format_current_file_content(failures: list[Any]) -> str:
+    """Collect every wider-context file-content block from prior patch
+    failures into a single top-of-prompt section.
+
+    Promotes the line-numbered file content from `node_state["patch_failures"]`
+    to its own top-level Markdown section so the LLM sees it BEFORE the
+    diagnostics, patch-failure summaries, allowlist, and inventory. The
+    previous structure buried the file content inside the patch-failures
+    block; sessions 19b28eff, 0a5c6fe8 still hit HITL because the LLM was
+    anchoring on its own prior bad search rather than the actual file
+    content. Lifting this content to a prominent slot is the structural
+    fix for that drift.
+
+    Dedupes by filepath — if multiple failures on the same file carry
+    the same wider context, we show it once.
+    """
+    if not failures:
+        return ""
+    seen: dict[str, str] = {}
+    for f in failures:
+        if not isinstance(f, dict):
+            continue
+        file_ref = f.get("file", "?")
+        _, wider = _extract_wider_context_from_failure(f)
+        if wider and file_ref not in seen:
+            seen[file_ref] = wider
+    if not seen:
+        return ""
+    lines = [
+        "\n## Current Content of Files You Need to Edit",
+        (
+            "Your last response's REPLACE_BLOCK search blocks did not "
+            "match the on-disk content. The line-numbered views below are "
+            "the **actual current content** of each file. Build your next "
+            "REPLACE_BLOCK search by copying lines from here verbatim "
+            "(WITHOUT the `  N| ` line-number prefix). Do NOT invent "
+            "search strings that aren't in the file."
+        ),
+    ]
+    for file_ref, wider in seen.items():
+        lines.append(f"\n### `{file_ref}`\n```\n{wider}\n```")
+    return "\n".join(lines) + "\n"
+
+
+def _format_preflight_file_content(
+    files: list[tuple[str, str]],
+    *,
+    intro: Optional[str] = None,
+) -> str:
+    """Front-load a ``## Current Content of Files You Need to Edit`` section
+    from a list of (rel_path, line_numbered_content) pairs.
+
+    Used by ``patching_node``, ``test_generation_node``, and ``repair_node``
+    iter-1 to give the LLM the actual file bytes BEFORE its first patch
+    attempt. Without this section the LLM hallucinates search strings from
+    its mental model of files it has never seen (root cause behind the
+    100-run failure streak on session 2d0164f0).
+
+    Dedupes by filepath (first wins) and stops adding files once the
+    rendered total crosses ``_PREFLIGHT_SECTION_CHAR_CAP`` so big projects
+    don't blow the prompt budget.
+    """
+    if not files:
+        return ""
+    seen: dict[str, str] = {}
+    for rel_path, content in files:
+        if not content or rel_path in seen:
+            continue
+        seen[rel_path] = content
+    if not seen:
+        return ""
+    if intro is None:
+        intro = (
+            "The line-numbered views below are the **actual current "
+            "content** of files you may need to edit. Build any "
+            "REPLACE_BLOCK / DELETE_BLOCK search by copying lines from "
+            "here verbatim (WITHOUT the `  N| ` line-number prefix). Do "
+            "NOT guess at what these files contain — use exactly what "
+            "you see below."
+        )
+    lines = [
+        "\n## Current Content of Files You Need to Edit",
+        intro,
+    ]
+    accumulated = sum(len(s) for s in lines)
+    truncated_at: Optional[str] = None
+    for rel_path, content in seen.items():
+        block = f"\n### `{rel_path}`\n```\n{content}\n```"
+        if accumulated + len(block) > _PREFLIGHT_SECTION_CHAR_CAP:
+            truncated_at = rel_path
+            break
+        lines.append(block)
+        accumulated += len(block)
+    if truncated_at is not None:
+        lines.append(
+            f"\n(omitted further files starting at `{truncated_at}` to "
+            f"keep this section under {_PREFLIGHT_SECTION_CHAR_CAP // 1000}k "
+            f"chars — emit a READ_FILE block for any other file you need.)"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _resolve_read_blocks(
+    read_blocks: list[tuple[str, Optional[tuple[int, int]]]],
+    workspace_path: str,
+    *,
+    record_hashes_into: Optional[dict[str, str]] = None,
+) -> str:
+    """Resolve a list of ``parse_read_blocks`` outputs into a user-message
+    payload containing line-numbered current content for each file.
+
+    Returns an empty string when nothing could be resolved (no files exist
+    or all reads errored), so callers can append unconditionally.
+
+    When ``record_hashes_into`` is supplied, every successfully-read file's
+    sha256 is recorded so the patcher's B5 drift detector knows what the
+    LLM has actually been shown.
+    """
+    if not read_blocks:
+        return ""
+    sections: list[str] = []
+    for rel_path, rng in read_blocks:
+        abs_path = os.path.join(workspace_path, rel_path)
+        if rng is None:
+            rendered, file_hash = _render_file_with_line_numbers_and_hash(abs_path)
+            if record_hashes_into is not None and file_hash is not None:
+                record_hashes_into[rel_path] = file_hash
+        else:
+            # Window mode: render a sub-range. Re-use the renderer's
+            # bounded reader by reading the whole file, then slicing.
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                sections.append(
+                    f"\n### `{rel_path}` (range {rng[0]}-{rng[1]})\n"
+                    f"```\n(file not found or unreadable)\n```"
+                )
+                continue
+            all_lines = text.splitlines()
+            lo = max(1, rng[0])
+            hi = min(len(all_lines), rng[1])
+            if lo > hi:
+                rendered = "(empty range)"
+            else:
+                width = max(2, len(str(hi)))
+                rendered = "\n".join(
+                    f"{i:>{width}}| {all_lines[i - 1]}" for i in range(lo, hi + 1)
+                )
+            # Drift detection still uses the FULL on-disk hash even when the
+            # rendered view is a range — the patcher checks the whole file
+            # has not changed, regardless of which slice the LLM was shown.
+            if record_hashes_into is not None:
+                import hashlib
+                try:
+                    h = hashlib.sha256()
+                    with open(abs_path, "rb") as bf:
+                        for chunk in iter(lambda: bf.read(65536), b""):
+                            h.update(chunk)
+                    record_hashes_into[rel_path] = h.hexdigest()
+                except OSError:
+                    pass
+        if rendered is None:
+            sections.append(
+                f"\n### `{rel_path}`\n```\n(file not found or unreadable)\n```"
+            )
+        else:
+            header = (
+                f"\n### `{rel_path}` (range {rng[0]}-{rng[1]})"
+                if rng is not None else f"\n### `{rel_path}`"
+            )
+            sections.append(f"{header}\n```\n{rendered}\n```")
+    intro = (
+        "## READ_FILE results\n"
+        "You requested the current content of the following file(s). Use "
+        "these line-numbered views — WITHOUT the `  N| ` prefix — as the "
+        "source of truth for any REPLACE_BLOCK / DELETE_BLOCK search you "
+        "now write. Do NOT emit another READ_FILE for these same files in "
+        "your next response; just write the patches."
+    )
+    return intro + "\n" + "\n".join(sections) + "\n"
+
+
+def _collect_workspace_file_content(
+    workspace_path: str,
+    rel_paths: Iterable[str],
+    *,
+    max_files: int = 12,
+    record_hashes_into: Optional[dict[str, str]] = None,
+) -> list[tuple[str, str]]:
+    """Read each ``rel_paths`` entry under ``workspace_path`` and return
+    ``(rel_path, line_numbered_content)`` pairs. Silently skips files that
+    don't exist or can't be rendered. Caps at ``max_files`` so large
+    inventories don't blow token budgets — the LLM can READ_FILE
+    explicitly for anything else.
+
+    When ``record_hashes_into`` is supplied, the sha256 of each
+    rendered file's on-disk bytes is stored at ``record_hashes_into[rel]``.
+    The caller persists this dict into ``node_state.files_seen_by_llm`` so
+    the patcher's B5 drift detector can later confirm the file hasn't
+    changed since the LLM was shown its content.
+    """
+    out: list[tuple[str, str]] = []
+    for rel in rel_paths:
+        if len(out) >= max_files:
+            break
+        if not isinstance(rel, str) or not rel.strip():
+            continue
+        abs_path = os.path.join(workspace_path, rel)
+        rendered, file_hash = _render_file_with_line_numbers_and_hash(abs_path)
+        if rendered is None:
+            continue
+        out.append((rel, rendered))
+        if record_hashes_into is not None and file_hash is not None:
+            record_hashes_into[rel] = file_hash
+    return out
+
+
 def _format_prior_patch_failures(failures: list[Any]) -> str:
     """Format prior-attempt patch failures into a Markdown block for the
     repair LLM prompt. Empty string when there are no failures so callers
     can string-append unconditionally.
 
-    Each failure dict carries ``file``, ``operation``, and ``error``. The
-    error message normally includes the patcher's "Closest match" suggestion
-    — the single most useful signal for the LLM to correct a bad SEARCH block.
-    Without surfacing this, the repair loop just re-emits the same broken
-    patch (see the requirements.txt 5-round failure in the issue logs).
+    The wider-context file-content portion of each failure is extracted
+    and emitted SEPARATELY by :func:`_format_current_file_content` so it
+    can live in a more prominent top-of-prompt section; this block keeps
+    only the patcher's diagnostic prose. A short pointer is added when
+    file content for the same path lives in the top section.
     """
     if not failures:
         return ""
@@ -1440,16 +2512,26 @@ def _format_prior_patch_failures(failures: list[Any]) -> str:
             "Your last attempt produced patches that the patcher could not "
             "apply. The exact reasons are below — read them carefully. Do "
             "NOT re-emit the same SEARCH block verbatim: either match the "
-            "actual file bytes shown in the closest-match snippet, add more "
-            "context lines if your search was ambiguous, or switch operations "
-            "(e.g. INSERT_AT_BLOCK instead of REPLACE_BLOCK when the target "
+            "actual file bytes shown in the `## Current Content of Files "
+            "You Need to Edit` section above, add more context lines if "
+            "your search was ambiguous, or switch operations (e.g. "
+            "INSERT_AT_BLOCK instead of REPLACE_BLOCK when the target "
             "line doesn't yet exist)."
         ),
     ]
     for f in failures:
         file_ref = f.get("file", "?") if isinstance(f, dict) else "?"
         op_ref = f.get("operation", "replace_block") if isinstance(f, dict) else "replace_block"
-        err_ref = (f.get("error", "") if isinstance(f, dict) else "").strip()
+        prefix, wider = _extract_wider_context_from_failure(f)
+        err_ref = prefix.strip()
+        if not err_ref:
+            err_ref = f"({op_ref} on `{file_ref}` failed)"
+        if wider:
+            err_ref += (
+                f"\n(see the `## Current Content of Files You Need "
+                f"to Edit` section for the actual content of "
+                f"`{file_ref}`)"
+            )
         lines.append(
             f"\n### `{file_ref}` ({op_ref})\n```\n{err_ref}\n```"
         )
@@ -1774,6 +2856,60 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             build_cmd,
         )
 
+    # Fix #6 / two-phase: prod-import smoke check BEFORE running the
+    # actual build. Verifies every production module imports cleanly so
+    # the LLM never has to disambiguate "is this a prod bug cascading
+    # through tests, or a test bug?" — prod errors surface first, on
+    # their own, with a [PROD_IMPORT_SMOKE] error_code tag the repair
+    # node + cascade hints recognise.
+    gw_for_cfg = get_gateway()
+    smoke_enabled = True
+    if gw_for_cfg is not None:
+        # The flag lives under config.compiler.run_prod_import_smoke_check
+        # but the gateway config doesn't carry an arbitrary nested
+        # section, so we re-read it from the raw config dict via
+        # discover_config-stashed state. Default true (matches the
+        # documented config behaviour).
+        smoke_enabled = bool(state.get("run_prod_import_smoke_check", True))
+    if (
+        smoke_enabled
+        and "pip install" in build_cmd
+        and "pytest" in build_cmd
+    ):
+        # Reuse the install step from the build_cmd so we don't double-
+        # install. Take everything up to the first `&&` as the install
+        # phase, the rest (pytest) is the actual build we'd run otherwise.
+        install_step = build_cmd.split("&&")[0].strip()
+        smoke_errors = await _run_prod_import_smoke_check(
+            workspace_path=workspace,
+            sandbox_config=sandbox_cfg,
+            allow_network=allow_network,
+            install_step=install_step,
+            session_id=state.get("session_id", "unknown"),
+        )
+        if smoke_errors:
+            # Short-circuit: skip the actual build until prod imports
+            # are clean. compiler_errors carries the smoke failures
+            # alone — no test cascade for the LLM to wade through.
+            # Merge into the existing node_state so cross-iteration signals
+            # (patch_failures, allowlist_rejections, allowed_paths) survive
+            # for the next repair_node — see graph.py:2755 fix.
+            short_circuit_state = dict(state.get("node_state", {}) or {})
+            short_circuit_state["current_node"] = "compiler"
+            short_circuit_state["prod_smoke_failed"] = True
+            short_circuit_state["last_build_output"] = (
+                "Prod-import smoke check failed. The actual build "
+                "(pytest) was not run because production modules "
+                "could not be imported cleanly. Fix the import "
+                "errors above before pytest is attempted."
+            )
+            return {
+                "exit_code": 1,
+                "compiler_errors": smoke_errors,
+                "node_state": short_circuit_state,
+                "loop_counter": loop_counter,
+            }
+
     # Delegate to the sandbox module for actual execution.
     from harness.sandbox import SandboxExecutor
 
@@ -1890,11 +3026,16 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
                 "miss_kind": miss_kind,
             }]
 
-    # Build the return dictionary
-    node_state: dict[str, Any] = {
-        "current_node": "compiler",
-        "last_build_output": raw_log,
-    }
+    # Build the return dictionary by MERGING into the existing node_state,
+    # not replacing it. Cross-iteration signals like patch_failures (the
+    # patcher's "Current file content around closest match" window),
+    # allowlist_rejections, and allowed_paths live on node_state and must
+    # survive compiler_node between repair iterations — otherwise the next
+    # repair_node has no view of the actual file bytes and the LLM
+    # hallucinates SEARCH strings (sessions 19b28eff, 0a5c6fe8, 2d0164f0).
+    node_state: dict[str, Any] = dict(state.get("node_state", {}) or {})
+    node_state["current_node"] = "compiler"
+    node_state["last_build_output"] = raw_log
     # Only set the short-circuit flag for symbols the LLM truly can't fix.
     # Repairable symbols carry their diagnostic into repair_node normally.
     if env_misconfig_symbol and not env_misconfig_is_repairable:
@@ -1971,6 +3112,21 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     loop_counter["repair"] = loop_counter.get("repair", 0) + 1
     loop_counter["total_repairs"] = loop_counter.get("total_repairs", 0) + 1
 
+    # Failure-path memory cleanse: from the SECOND repair iteration onward,
+    # trim the message list so iteration N's LLM call doesn't carry the bloat
+    # of 1..N-1. apply_memory_cleanse fires only on success/HITL; this
+    # complement runs between failed iterations. The fresh error_summary
+    # (diagnostics + patch-failures + workspace inventory + allowlist) is
+    # appended below as a new user message regardless, so the LLM always
+    # sees full structured context for the current turn.
+    if loop_counter["total_repairs"] >= 2:
+        cleanse_update = apply_repair_iteration_cleanse(state)
+        if cleanse_update:
+            # Mutate the state's messages view in-place so the rest of this
+            # node (which reads state.get("messages")) sees the trimmed list.
+            state = dict(state)
+            state["messages"] = cleanse_update["messages"]
+
     # Build a concise repair prompt from structured diagnostics. Drop any
     # diagnostic the parsers flagged as warning-severity — DeprecationWarning,
     # PendingDeprecationWarning, ruff style nits, pip notices — none of these
@@ -2033,7 +3189,73 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
 
     # The LLM only sees the unhandled tail.
     errors = unhandled
-    error_summary = _format_diagnostics_for_repair(errors)
+
+    # Promote the wider-context file-content snippets from prior patch
+    # failures to a top-of-prompt section BEFORE the diagnostic block.
+    # The LLM's anchoring behaviour benefits from seeing the actual
+    # current file content first; sessions 19b28eff and 0a5c6fe8 stuck
+    # in HITL because the LLM was anchoring on its own previous bad
+    # search instead of the file content (which used to be buried inside
+    # the patch-failures block at the bottom of the summary).
+    error_summary = _format_current_file_content(
+        state.get("node_state", {}).get("patch_failures") or []
+    )
+    # files_seen_by_llm carries (rel_path → sha256) for every file whose
+    # bytes the LLM has been shown this turn (pre-flight inject + READ_FILE
+    # resolves). Used by the patcher's B5 drift detector to reject patches
+    # against a file that changed under the LLM's mental model. Seeded from
+    # the prior node_state so multi-iteration sessions accumulate the record.
+    files_seen_by_llm: dict[str, str] = dict(
+        state.get("node_state", {}).get("files_seen_by_llm") or {}
+    )
+    # B1 pre-flight: on iter 1 (or any time there are no prior
+    # patch_failures to source the closest-match window from), proactively
+    # include line-numbered content for every file the diagnostics point
+    # at. Claude Code gets this for free via Read-before-Edit; we have to
+    # inject it explicitly. Without this the LLM hallucinates SEARCH
+    # strings from its mental model of files it has never been shown —
+    # root cause behind the 100-run failure streak on session 2d0164f0.
+    if not error_summary:
+        diag_files: list[str] = []
+        for e in errors or []:
+            f = (e.get("file") or "").strip() if isinstance(e, dict) else ""
+            if not f or f == "<sandbox>" or f == "<test_runner>":
+                continue
+            if f not in diag_files:
+                diag_files.append(f)
+        if diag_files:
+            preflight_pairs = _collect_workspace_file_content(
+                workspace_path, diag_files,
+                record_hashes_into=files_seen_by_llm,
+            )
+            error_summary += _format_preflight_file_content(
+                preflight_pairs,
+                intro=(
+                    "These are the **actual current bytes** of the files "
+                    "your diagnostics point at. The LLM has not patched "
+                    "these yet (or the patcher applied them cleanly with "
+                    "no miss), so there is no closest-match window from a "
+                    "prior failure to anchor on. Use these line-numbered "
+                    "views — WITHOUT the `  N| ` prefix — as the source of "
+                    "truth for any REPLACE_BLOCK / DELETE_BLOCK search "
+                    "you write."
+                ),
+            )
+    # Fix #3: if any file has accumulated ≥ 2 consecutive REPLACE_BLOCK
+    # misses, force the LLM out of the pattern with an explicit "use a
+    # different operation" directive before the diagnostics.
+    error_summary += _format_replace_block_miss_directive(
+        loop_counter.get("replace_block_misses_per_file") or {}
+    )
+    # Fix #5: when diagnostics point at test files but the error shape
+    # looks like a production-cascade (ImportError / NameError / F821 /
+    # ...), prepend a reframe + attach the most likely corresponding
+    # production file content. Steers the LLM at root cause instead of
+    # symptom-patching the test.
+    error_summary += _format_test_collection_cascade_section(
+        errors, workspace_path,
+    )
+    error_summary += _format_diagnostics_for_repair(errors)
 
     gateway = get_gateway()
     if gateway is None:
@@ -2099,6 +3321,57 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         state.get("node_state", {}).get("patch_failures") or []
     )
 
+    # Workspace inventory: the single biggest cause of stuck repair loops is
+    # the LLM CREATE_FILE-ing files that already exist (from the initial
+    # patching pass or from a salvaged speculative variant). The patcher
+    # rejects those with "File already exists with different content" and
+    # the LLM, having no idea what's on disk, keeps emitting the same
+    # CREATE_FILE next round. Surfacing the current modified_files list
+    # alongside the system-prompt rule about CREATE_FILE-vs-REPLACE_BLOCK
+    # kills the guessing.
+    inventory_files = sorted({p for p in (state.get("modified_files") or []) if p})
+    if inventory_files:
+        SNAPSHOT_CAP = 50
+        shown = inventory_files[:SNAPSHOT_CAP]
+        extra = max(0, len(inventory_files) - SNAPSHOT_CAP)
+        error_summary += (
+            "\n## Files currently in workspace\n"
+            "These files have been created or modified earlier in this "
+            "session and now exist on disk. **CREATE_FILE on any of them "
+            "will be REJECTED** — use REPLACE_BLOCK to modify them:\n"
+            + "\n".join(f"- {p}" for p in shown)
+        )
+        if extra:
+            error_summary += f"\n- (+ {extra} more not shown)"
+        error_summary += "\n"
+
+    # Current allowlist snapshot. The system prompt is anchored at messages[0]
+    # and never refreshed, so on greenfield starts the LLM saw "no layout
+    # constraint" but by iteration 2 the workspace has a materialised source
+    # root the patcher will now enforce. Re-detecting the allowlist here and
+    # surfacing it unconditionally (not only when there are rejections) lets
+    # the LLM see the same rules the patcher applies *this round*.
+    try:
+        current_allowed = _build_patcher_allowlist(workspace_path)
+    except Exception:  # noqa: BLE001 — diagnostics, never let this fail repair
+        current_allowed = None
+    if current_allowed:
+        error_summary += (
+            "\n## Allowed roots (current)\n"
+            "The patcher will reject any CREATE_FILE / REPLACE_BLOCK targeting "
+            "paths outside these roots:\n"
+            + "\n".join(f"- {p}" for p in current_allowed)
+            + "\n"
+        )
+    else:
+        error_summary += (
+            "\n## Allowed roots (current)\n"
+            "Workspace layout is unconstrained this round; the patcher only "
+            "enforces path-traversal safety. Place new modules under whatever "
+            "package directory matches the existing files in the workspace "
+            "inventory above.\n"
+        )
+
     # If no structured diagnostics, include the raw build output so the LLM can see the actual error
     if not errors:
         raw_output = state.get("node_state", {}).get("last_build_output", "")
@@ -2135,7 +3408,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # expensive model when the cheap one has had every chance.
         # N comes from the operator's config (node_throttle.max_patch_repair_iterations).
         total_repairs = loop_counter["total_repairs"]
-        max_repair_attempts = int(getattr(gateway.config, "max_patch_repair_iterations", 3))
+        max_repair_attempts = int(getattr(gateway.config, "max_patch_repair_iterations", 5))
         use_escalation = total_repairs >= max(1, max_repair_attempts - 1)
 
         if use_escalation:
@@ -2241,40 +3514,101 @@ Quality: Write modular, production-ready code with proper error handling, type h
 Generate your fix patches NOW. Only the blocks above. No other text."""
         messages.append({"role": "user", "content": _REPAIR_FORMAT_REMINDER})
 
+        # Universal LLM-call dump (config.debug.dump_llm_calls) writes the
+        # input messages + response to ~/.harness/debug after the dispatch
+        # returns. Handled centrally in Gateway.dispatch — no longer the
+        # repair-node's responsibility. Filenames now look like
+        # <sid>_<seqno>_<role>_<model>.txt and cover ALL roles.
+
         # Use the non-mutating model_override path so concurrent dispatches
         # don't see each other's transient config mutations and exceptions
         # don't leave gateway.config in an inconsistent state.
-        if use_escalation and escalation_model:
-            response, new_budget = await gateway.dispatch(
-                messages=list(messages),
+        async def _dispatch_repair(
+            cur_messages: list[MessageDict], cur_budget: float,
+        ) -> tuple[Any, float]:
+            if use_escalation and escalation_model:
+                return await gateway.dispatch(
+                    messages=list(cur_messages),
+                    role=NodeRole.REPAIR,
+                    budget_remaining_usd=cur_budget,
+                    model_override=escalation_model,
+                )
+            return await gateway.dispatch(
+                messages=list(cur_messages),
                 role=NodeRole.REPAIR,
-                budget_remaining_usd=budget,
-                model_override=escalation_model,
-            )
-        else:
-            response, new_budget = await gateway.dispatch(
-                messages=list(messages),
-                role=NodeRole.REPAIR,
-                budget_remaining_usd=budget,
+                budget_remaining_usd=cur_budget,
             )
 
-        # Update token tracker
+        workspace = state.get("workspace_path", os.getcwd())
+        response, new_budget = await _dispatch_repair(messages, budget)
+
+        # READ_FILE inline resolve (B3): if the LLM emitted READ_FILE blocks
+        # instead of (or alongside) patch blocks, resolve them here without
+        # consuming a repair iteration. The model fans out a single
+        # "show me the file → write the patch" round in one logical turn,
+        # matching how Claude Code's Read-before-Edit feels. Capped at
+        # READ_FILE_MAX_RESOLVES so the LLM can't loop forever asking for
+        # files instead of patching.
+        from harness.patcher import (
+            parse_read_blocks as _parse_read_blocks,
+            strip_read_blocks as _strip_read_blocks,
+        )
+        READ_FILE_MAX_RESOLVES = 2
+        for _resolve_round in range(READ_FILE_MAX_RESOLVES):
+            read_reqs = _parse_read_blocks(response.content)
+            if not read_reqs:
+                break
+            # Persist the LLM's READ_FILE request as an assistant turn so the
+            # next dispatch sees what was asked, and inject our resolution as
+            # a follow-up user message.
+            messages.append(MessageDict(
+                role="assistant", content=response.content,
+            ))
+            resolution = _resolve_read_blocks(
+                read_reqs, workspace,
+                record_hashes_into=files_seen_by_llm,
+            )
+            messages.append(MessageDict(role="user", content=resolution))
+            logger.info(
+                "[repair_node] READ_FILE resolved for %d file(s): %s. "
+                "Re-dispatching without consuming an iteration.",
+                len(read_reqs), [r[0] for r in read_reqs],
+            )
+            response, new_budget = await _dispatch_repair(messages, new_budget)
+        # If the LLM is still emitting READ_FILE after the cap, ignore them
+        # (strip below) and let the rest of the response apply. The cap log
+        # above is the operator's signal that the loop got chatty.
+
+        # Update token tracker (per-stage attribution: repair). Reflects
+        # the FINAL response after any READ_FILE resolutions.
         token_tracker = state.get("token_tracker", {})
-        token_tracker = gateway.aggregate_tokens(token_tracker, response.usage)
+        token_tracker = gateway.aggregate_tokens(
+            token_tracker, response.usage, role=NodeRole.REPAIR,
+        )
 
         # Apply the fix patches to disk. Seed the modified-files list with
         # files the autofix pass already touched so they survive the LLM
         # round-trip into state. Same source-root allowlist as patching_node
         # so the repair LLM can't widen the surface area by writing new
         # modules outside the configured layout.
-        workspace = state.get("workspace_path", os.getcwd())
         existing_modified = list(autofix_modified_files)
         allowed_paths = _build_patcher_allowlist(workspace)
+        # Strip any residual READ_FILE blocks so the patcher doesn't try to
+        # parse them as patches and so commit messages stay clean.
+        patch_payload = _strip_read_blocks(response.content)
+        # B5 enforce flag: opt-in via gateway config. False by default so we
+        # don't break callers that haven't been updated to emit READ_FILE.
+        gw_cfg = getattr(gateway, "config", None)
+        enforce_read = bool(
+            getattr(gw_cfg, "enforce_read_before_edit", False)
+        )
         patch_results, modified_files = await process_llm_patch_output(
-            response.content,
+            patch_payload,
             workspace,
             existing_modified,
             allowed_paths=allowed_paths,
+            files_seen_by_llm=files_seen_by_llm,
+            enforce_read_before_edit=enforce_read,
         )
 
         # Append the LLM response to messages
@@ -2283,6 +3617,16 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # Report results
         success_count = sum(1 for r in patch_results if r.success)
         fail_count = len(patch_results) - success_count
+        # Real successes exclude resume-safe idempotency no-ops (file already
+        # at target state). The repair loop's consecutive-zero tripwire and
+        # the per-iteration commit must look at real progress, not at the LLM
+        # re-emitting already-applied patches. See harness/patcher.py for the
+        # five no-op return sites (CREATE_FILE/REPLACE_BLOCK/DELETE_BLOCK and
+        # INSERT_AT_BLOCK BEFORE/AFTER).
+        no_op_count = sum(
+            1 for r in patch_results if r.success and getattr(r, "no_op", False)
+        )
+        real_success_count = success_count - no_op_count
         # Track allowlist rejections so the *next* repair iteration sees the
         # exact paths and reason and stops re-proposing them. Without this,
         # the LLM has no signal that its patches keep vanishing.
@@ -2297,6 +3641,9 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # full error including the patcher's closest-match suggestion. The
         # LLM otherwise only sees "Failed: foo.txt" and proposes the same
         # bad patch again — see the requirements.txt loop in the issue logs.
+        # _store_patch_failure_error keeps wider-context messages whole
+        # (the file-content window the LLM needs to write a correct
+        # SEARCH block) and caps everything else at 3000 chars.
         patch_failures = [
             {
                 "file": r.file,
@@ -2304,13 +3651,18 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                     r.operation.value
                     if hasattr(r.operation, "value") else str(r.operation)
                 ),
-                "error": (r.error or "")[:800],
+                "error": _store_patch_failure_error(r.error),
             }
             for r in patch_results
             if not r.success and isinstance(r.error, str)
             and "not in skill allowlist" not in r.error
         ][:5]
         status_msg = f"[System]: Repair attempt {loop_counter['total_repairs']}: applied {success_count}/{len(patch_results)} patches."
+        if no_op_count > 0:
+            status_msg += (
+                f" {no_op_count} were idempotency no-ops (target file already "
+                f"at expected state — no actual change made)."
+            )
         if fail_count > 0:
             failed_files = [r.file for r in patch_results if not r.success]
             status_msg += f" Failed: {', '.join(failed_files)}."
@@ -2322,16 +3674,79 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             )
         messages.append(MessageDict(role="system", content=status_msg))
 
+        # Consecutive-zero-patch tripwire: track how many repair rounds in
+        # a row landed zero patches. Two in a row means the loop is stuck
+        # (LLM keeps emitting bad blocks, patcher keeps rejecting them) and
+        # further iterations just burn budget. route_after_compiler short-
+        # circuits to HITL when this counter hits the threshold.
+        #
+        # Use real_success_count (success minus no-ops) so a DELETE_BLOCK on
+        # an already-deleted file — or any other idempotency no-op — does NOT
+        # reset the tripwire. Without this guard the LLM can mask a stuck
+        # loop by re-emitting patches that have nothing to apply.
+        if real_success_count == 0:
+            loop_counter["consecutive_zero_patch_rounds"] = (
+                loop_counter.get("consecutive_zero_patch_rounds", 0) + 1
+            )
+        else:
+            loop_counter["consecutive_zero_patch_rounds"] = 0
+
+        # Per-file REPLACE_BLOCK miss tracker (fix #3). Bump for each
+        # failed REPLACE_BLOCK, clear for any file with a successful
+        # operation this round. The next iteration's prompt will direct
+        # the LLM to use a different operation on any file at ≥ 2
+        # consecutive misses — see _format_replace_block_miss_directive.
+        rb_misses = dict(loop_counter.get("replace_block_misses_per_file", {}) or {})
+        for r in patch_results:
+            op_str = (
+                r.operation.value if hasattr(r.operation, "value") else str(r.operation)
+            )
+            if op_str != "replace_block":
+                continue
+            if r.success:
+                rb_misses.pop(r.file, None)
+            elif (
+                isinstance(r.error, str)
+                and "not in skill allowlist" not in r.error
+            ):
+                rb_misses[r.file] = rb_misses.get(r.file, 0) + 1
+        loop_counter["replace_block_misses_per_file"] = rb_misses
+
+        # Per-iteration commit (C3): when this round landed any patches,
+        # commit the working tree with a structured per-iteration message
+        # so the operator can `git log` / `git bisect` between iterations
+        # and individual rounds are easy to revert. Best-effort: failures
+        # are logged + swallowed inside commit_repair_iteration, which is
+        # also a no-op when we're not on a harness patch branch.
+        # Gate on real_success_count to skip empty commits when this round
+        # only landed idempotency no-ops on already-correct files.
+        if real_success_count > 0:
+            try:
+                from harness.security import GitGuardian as _GitGuardian
+                session_id = state.get("session_id", "unknown")
+                _GitGuardian(workspace).commit_repair_iteration(
+                    session_id=session_id,
+                    iteration=loop_counter["total_repairs"],
+                    modified_files=list(modified_files),
+                    success_count=success_count,
+                    fail_count=fail_count,
+                    exit_code=int(state.get("exit_code", -1)),
+                )
+            except Exception as exc:  # noqa: BLE001 — never let commit break the loop
+                logger.debug("[repair_node] Per-iteration commit skipped: %s", exc)
+
         logger.info(
             "[repair_node] Repair #%d complete. tokens_in=%d tokens_out=%d cost=$%.6f budget_left=$%.4f "
-            "patches=%d succeed=%d fail=%d",
+            "patches=%d succeed=%d no_op=%d fail=%d consecutive_zero=%d",
             loop_counter["total_repairs"],
             response.usage.input_tokens,
             response.usage.output_tokens,
             response.usage.cost_usd,
             new_budget,
-            len(patch_results), success_count, fail_count,
+            len(patch_results), real_success_count, no_op_count, fail_count,
+            loop_counter["consecutive_zero_patch_rounds"],
         )
+        _emit_per_stage_spend_summary(token_tracker)
 
         return {
             "messages": messages,
@@ -2340,6 +3755,7 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             "budget_remaining_usd": new_budget,
             "loop_counter": loop_counter,
             "node_state": {
+                **(state.get("node_state") or {}),
                 "current_node": "repair",
                 "repair_context": error_summary,
                 "repair_success": success_count,
@@ -2347,6 +3763,9 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
                 "allowlist_rejections": allowlist_rejections,
                 "patch_failures": patch_failures,
                 "allowed_paths": allowed_paths,
+                # B5: persist what the LLM has been shown so the next
+                # repair iteration's drift detector has the full record.
+                "files_seen_by_llm": files_seen_by_llm,
             },
         }
     except RuntimeError as exc:
@@ -2423,7 +3842,7 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
     # banner says something else.
     gw = get_gateway()
     max_repair = (
-        int(getattr(gw.config, "max_patch_repair_iterations", 3))
+        int(getattr(gw.config, "max_patch_repair_iterations", 5))
         if gw is not None else 3
     )
     trigger_reason = "unknown"
@@ -2460,21 +3879,173 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _format_diagnostics_for_repair(errors: list[DiagnosticObjectDict]) -> str:
-    """Format structured diagnostics into a concise repair prompt."""
+    """Format structured diagnostics into a concise, **grouped** repair prompt.
+
+    Without grouping, 16 occurrences of "F821 Undefined name 'pytest'" across
+    16 test files render as 16 separate Error N: blocks — the LLM sees noise
+    instead of a pattern. We group by (error_code, message) so the LLM sees
+    the diagnostic shape once and a count of the files it affects. The first
+    occurrence's semantic_context is shown (the others would mostly repeat).
+    Groups are emitted in original error order so the LLM still gets a
+    stable "fix this one first" cue, but with explicit counts.
+    """
     if not errors:
         return "No structured diagnostics available. Check raw build output."
 
-    lines: list[str] = ["## Compiler Diagnostics\n"]
-    for i, err in enumerate(errors, 1):
-        lines.append(
-            f"**Error {i}:** `{err.get('error_code', 'UNKNOWN')}` "
-            f"in `{err.get('file', '?')}:{err.get('line', 0)}:{err.get('column', 0)}` "
-            f"[{err.get('severity', 'error')}]"
+    # Group preserving first-seen order. Key is (error_code, message); the
+    # group's first error keeps its full context for the LLM.
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for err in errors:
+        code = str(err.get("error_code", "UNKNOWN"))
+        msg = str(err.get("message", "No message"))
+        key = (code, msg)
+        if key not in groups:
+            groups[key] = {
+                "code": code,
+                "message": msg,
+                "severity": str(err.get("severity", "error")),
+                "first": err,
+                "locations": [],
+            }
+        groups[key]["locations"].append(
+            f"{err.get('file', '?')}:{err.get('line', 0)}:{err.get('column', 0)}"
         )
-        lines.append(f"  Message: {err.get('message', 'No message')}")
-        context = err.get("semantic_context", "")
+
+    # Rank groups by likely cascade impact so the top-N the LLM sees are the
+    # ones whose fix is most likely to make other errors disappear.
+    # Heuristic order:
+    #   1. Severity error > warning (warnings don't break the build).
+    #   2. "Upstream" kinds first — undefined names, missing imports, missing
+    #      deps. F821/F401 are pyflakes-shaped; ImportError /
+    #      ModuleNotFoundError surface from pytest. Fix one of these and
+    #      multiple downstream diagnostics often vanish at once.
+    #   3. Original first-seen position breaks ties so the LLM still gets a
+    #      stable order across iterations.
+    _UPSTREAM_PREFIXES = (
+        "F821", "F401", "E0001", "E0401", "E0602", "E1101",
+        "MISSING_DEP", "MISSING_IMPORT", "IMPORTERROR", "MODULENOTFOUND",
+        "SYNTAXERR", "TEST_FAILURE:IMPORTERROR",
+    )
+
+    def _severity_rank(g: dict[str, Any]) -> int:
+        return 0 if str(g.get("severity", "error")).lower() == "error" else 1
+
+    def _kind_rank(g: dict[str, Any]) -> int:
+        code = str(g.get("code", "")).upper()
+        return 0 if any(code.startswith(p) for p in _UPSTREAM_PREFIXES) else 1
+
+    # Fix #4: cascade detection. When a group has ≥ 3 occurrences and
+    # every location lives under tests/ (or test/ / __tests__/), the
+    # group is almost certainly a single production-code bug rippling
+    # through every test file that imports it. Tag the group so the
+    # render loop can emit a "cascade hint" pointing the LLM at
+    # production code first. Same for groups whose message references
+    # one identifier (e.g. `Undefined name 'Job'` × 5) — fix the symbol
+    # in production code and every diagnostic vanishes at once.
+    import re as _re
+    _SYMBOL_PATTERN = _re.compile(r"['`]([A-Za-z_][A-Za-z0-9_.]*)['`]")
+
+    def _all_in_tests(group: dict[str, Any]) -> bool:
+        locs = group.get("locations", [])
+        if not locs:
+            return False
+        return all(
+            any(str(loc).startswith(p) for p in _TEST_DIR_PREFIXES)
+            for loc in locs
+        )
+
+    def _shared_symbol(group: dict[str, Any]) -> Optional[str]:
+        msg = str(group.get("message", ""))
+        m = _SYMBOL_PATTERN.search(msg)
+        return m.group(1) if m else None
+
+    for group in groups.values():
+        count = len(group.get("locations", []))
+        if count < 3:
+            continue
+        sym = _shared_symbol(group)
+        all_tests = _all_in_tests(group)
+        if all_tests and sym:
+            group["cascade_hint"] = (
+                f"This pattern hits {count} test files and references the "
+                f"symbol `{sym}`. Root cause is almost certainly in the "
+                f"production module that should export `{sym}` — fix it "
+                f"there first instead of editing the test files. Every "
+                f"diagnostic in this group will resolve at once when the "
+                f"production-side definition is correct."
+            )
+        elif all_tests:
+            group["cascade_hint"] = (
+                f"This pattern hits {count} test files only. Root cause is "
+                f"likely a single production-side error that cascades through "
+                f"every test that imports the affected module. Check the "
+                f"production source before editing any of these test files."
+            )
+        elif sym and count >= 3:
+            group["cascade_hint"] = (
+                f"This diagnostic references symbol `{sym}` in {count} places. "
+                f"If the symbol is supposed to come from one module, fixing "
+                f"that module will collapse all {count} diagnostics. Check "
+                f"that the symbol's source-of-truth definition is correct first."
+            )
+
+    group_list = list(groups.values())
+    ranked = sorted(
+        enumerate(group_list),
+        key=lambda pair: (_severity_rank(pair[1]), _kind_rank(pair[1]), pair[0]),
+    )
+    TOP_N = 3
+    shown = [g for _, g in ranked[:TOP_N]]
+    hidden = [g for _, g in ranked[TOP_N:]]
+
+    lines: list[str] = [
+        f"## Compiler Diagnostics ({len(errors)} total, "
+        f"{len(groups)} distinct shape{'s' if len(groups) != 1 else ''})\n"
+    ]
+    if hidden:
+        lines.append(
+            f"_Showing the top {len(shown)} of {len(groups)} groups ranked by "
+            f"likely cascade impact (fixing an upstream undefined-name / "
+            f"missing-import often resolves multiple downstream errors). "
+            f"Address these first; the {len(hidden)} other group(s) may "
+            f"resolve on their own._\n"
+        )
+    for i, group in enumerate(shown, 1):
+        locs = group["locations"]
+        count = len(locs)
+        # Show up to 4 locations per group so the LLM sees the spread without
+        # a 16-line dump. The leading location is always shown verbatim.
+        if count == 1:
+            loc_display = f"`{locs[0]}`"
+        else:
+            head = ", ".join(f"`{loc}`" for loc in locs[:4])
+            tail = "" if count <= 4 else f" (+ {count - 4} more)"
+            loc_display = head + tail
+        lines.append(
+            f"**Error {i}:** `{group['code']}` × {count} "
+            f"[{group['severity']}]"
+        )
+        lines.append(f"  Message: {group['message']}")
+        lines.append(f"  Locations: {loc_display}")
+        cascade = group.get("cascade_hint")
+        if cascade:
+            lines.append(f"  **Cascade hint:** {cascade}")
+        context = (group["first"].get("semantic_context") or "").strip()
         if context:
-            lines.append(f"  Context:\n```\n{context}\n```")
+            lines.append(f"  Context (first occurrence):\n```\n{context}\n```")
+    if hidden:
+        # One-line summary of the deferred groups so the LLM knows they exist
+        # without bloating the prompt with full context blocks. Each entry
+        # lists code + a short message excerpt + count.
+        tail_lines = ["", f"### Deferred ({len(hidden)} group(s) — fix the top {len(shown)} first):"]
+        for g in hidden:
+            msg = g["message"]
+            if len(msg) > 80:
+                msg = msg[:77] + "..."
+            tail_lines.append(
+                f"- `{g['code']}` × {len(g['locations'])}: {msg}"
+            )
+        lines.extend(tail_lines)
     return "\n".join(lines)
 
 
@@ -2504,7 +4075,7 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     # narrow test scenarios that construct the router in isolation.
     gw = get_gateway()
     max_iterations: int = (
-        int(getattr(gw.config, "max_patch_repair_iterations", 3))
+        int(getattr(gw.config, "max_patch_repair_iterations", 5))
         if gw is not None else 3
     )
 
@@ -2585,6 +4156,21 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         str(err.get("error_code", "")).upper() in autofixable_codes
         for err in compiler_errors
     )
+
+    # No-patches-landed tripwire (A6). Two consecutive repair rounds where
+    # the patcher applied zero patches means the loop is stuck (LLM keeps
+    # emitting blocks the patcher rejects, build state never changes). Don't
+    # let it burn through the rest of max_iterations on a loop that
+    # demonstrably isn't making progress — go straight to HITL with a
+    # specific reason so the operator knows what to fix manually.
+    consecutive_zero = int(loop_counter.get("consecutive_zero_patch_rounds", 0))
+    if consecutive_zero >= 2 and not has_autofixable:
+        logger.warning(
+            "[router] %d consecutive repair iteration(s) landed zero patches. "
+            "Loop is stuck; routing to HITL early (saves %d remaining iteration(s)).",
+            consecutive_zero, max(0, max_iterations - total_repairs),
+        )
+        return _transition("human_intervention_node")
 
     if total_repairs >= max_iterations and not has_autofixable:
         logger.warning(
@@ -4408,7 +5994,7 @@ async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, An
 
     gw = get_gateway()
     max_repair = (
-        int(getattr(gw.config, "max_patch_repair_iterations", 3))
+        int(getattr(gw.config, "max_patch_repair_iterations", 5))
         if gw is not None else 3
     )
     # total_repairs = max-1 → one more repair attempt before HITL re-triggers.
@@ -4461,6 +6047,7 @@ async def run_graph(
     sandbox_config: Optional[dict[str, Any]] = None,
     test_generation_config: Optional[dict[str, Any]] = None,
     speculative_config: Optional[dict[str, Any]] = None,
+    compiler_config: Optional[dict[str, Any]] = None,
 ) -> AgentState:
     """
     Execute the full agent graph from start to finish.
@@ -4511,6 +6098,13 @@ async def run_graph(
         initial_state["test_generation_config"] = test_generation_config  # type: ignore[typeddict-unknown-key]
     if speculative_config is not None:
         initial_state["speculative_config"] = speculative_config  # type: ignore[typeddict-unknown-key]
+    # Plumb the smoke-check flag into state so compiler_node can read it
+    # without reaching out to config (which the graph module doesn't
+    # touch directly today).
+    if compiler_config is not None:
+        initial_state["run_prod_import_smoke_check"] = bool(  # type: ignore[typeddict-unknown-key]
+            compiler_config.get("run_prod_import_smoke_check", True)
+        )
 
     # Pre-flight toolchain adaptation: pick the right docker image (and
     # network bit) NOW so the very first compile lands on, e.g.,
@@ -4590,8 +6184,15 @@ async def run_graph(
     else:
         invoke_input = initial_state
 
-    # Execute the graph — ainvoke streams all state updates and returns final state
-    final_state: AgentState = await compiled_graph.ainvoke(invoke_input, config)  # type: ignore[arg-type,return-value]
+    # Bind the active session_id to the asyncio context so every downstream
+    # Gateway.dispatch (across all roles, all nodes, all concurrent
+    # speculative variants) can read it for per-call debug-dump filenames.
+    # See harness/observability.py: active_session_scope.
+    from harness.observability import active_session_scope
+
+    with active_session_scope(session_id):
+        # Execute the graph — ainvoke streams all state updates and returns final state
+        final_state: AgentState = await compiled_graph.ainvoke(invoke_input, config)  # type: ignore[arg-type,return-value]
 
     logger.info("[run_graph] Graph execution complete. Final exit_code=%d", final_state.get("exit_code", -1))
     return final_state

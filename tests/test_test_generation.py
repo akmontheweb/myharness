@@ -56,7 +56,7 @@ class _StubGateway:
         self.dispatched.append({"messages": list(messages), "role": role})
         return _StubResponse(self._content), budget_remaining_usd - 0.001
 
-    def aggregate_tokens(self, tracker, usage):
+    def aggregate_tokens(self, tracker, usage, role=None):
         out = dict(tracker or {})
         out["total_cost_usd"] = out.get("total_cost_usd", 0.0) + float(usage.cost_usd)
         return out
@@ -445,7 +445,7 @@ class TestRepairFraming:
                 captured["messages"] = list(messages)
                 return StubResp(), budget_remaining_usd
 
-            def aggregate_tokens(self, tracker, usage):
+            def aggregate_tokens(self, tracker, usage, role=None):
                 return tracker or {}
 
         graph_mod.set_gateway(StubGW())

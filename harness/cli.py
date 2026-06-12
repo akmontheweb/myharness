@@ -18,6 +18,9 @@ import asyncio
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import sys
 from typing import Any, Optional
 
@@ -28,6 +31,44 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("harness.cli")
+
+
+# ---------------------------------------------------------------------------
+# Workspace safety
+# ---------------------------------------------------------------------------
+
+def _refuse_if_workspace_is_harness_root(workspace_path: str) -> bool:
+    """Refuse to run when the user has pointed the harness at its own repo.
+
+    The harness writes patches, generated specs, branches, and state files
+    into the workspace it's given. If that workspace is the harness checkout
+    itself, every "fix" overwrites the harness's own source. Compare realpaths
+    so a symlinked alias of either path still trips the check.
+
+    Returns True when the caller should stop. The caller is expected to
+    return a non-zero exit code immediately.
+    """
+    harness_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if os.path.realpath(workspace_path) != os.path.realpath(harness_root):
+        return False
+    print()
+    print("=" * 72)
+    print("Harness root cannot be the repo root")
+    print("=" * 72)
+    print(
+        f"The path you provided ({workspace_path}) is the harness's own\n"
+        f"installation directory. Running the harness against itself would\n"
+        f"overwrite its own source as it generates patches.\n\n"
+        f"Please re-run with --repo / -r pointing at a different location\n"
+        f"(your application's repository).\n"
+    )
+    print("=" * 72)
+    logger.error(
+        "[workspace] Refusing to run: workspace path resolves to the harness "
+        "root itself (%s). Choose a different location.",
+        harness_root,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -265,9 +306,18 @@ def _warn_if_legacy_workspace_config(workspace_path: str) -> None:
 _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "build_command", "allow_network", "sandbox", "token_budget",
     "node_throttle", "models", "model_routing", "persistence",
-    "manifest_file", "redaction", "security", "skills", "deployment",
+    "redaction", "security", "skills", "deployment",
     "speculative", "impact", "lintgate", "logging", "languages",
     "test_generation", "metrics", "llm_dispatch",
+    # Operator-configurable name of the folder at the workspace root that
+    # holds the product spec .txt files. Mandatory in config.json — the
+    # harness refuses to start without it. See _load_consolidated_product_spec.
+    "product_spec_dir",
+    # Observability + debugging knobs. See _dump_repair_prompt_to_disk and
+    # the compiler.run_prod_import_smoke_check flag.
+    "debug", "compiler",
+    # Patcher behaviour knobs (B5: enforce_read_before_edit).
+    "patcher",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -287,9 +337,18 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # Toggled by compiler_node when the build command writes to system
         # locations the read-only root FS would block.
         "read_only_root",
+        # Writable named Docker volumes for the readonly_cache_mounts paths,
+        # scoped to the session id. See _cache_volume_name in sandbox.py.
+        "cache_volumes", "cache_volumes_prefix",
     }),
     "token_budget": frozenset({
         "hard_cap_usd", "context_window_threshold_pct",
+        # Per-stage soft budget allocation. Optional dict mapping NodeRole
+        # values to target fractions of hard_cap_usd. Observability-only
+        # today (warning when a stage exceeds its share); hard enforcement
+        # is a follow-up. Example: {"planning": 0.2, "patching": 0.2,
+        # "repair": 0.5, "doc_reviewer": 0.05, "code_reviewer": 0.05}.
+        "stages",
     }),
     "node_throttle": frozenset({
         "max_patch_repair_iterations",
@@ -328,8 +387,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "burn_rate_window_minutes", "metrics_dir",
     }),
     # Speculative branching parameters consumed by harness/speculative.py.
-    # enabled defaults to True (the node always runs); num_variants is the
-    # fork count; temperature controls per-variant diversity (sweet spot
+    # enabled defaults to FALSE (the node short-circuits to the standard
+    # patching flow). Flip to True per-config when running a workload where
+    # parallel exploration is likely to find a passing variant — see the
+    # speculative.enabled discussion in config.json.example. num_variants is
+    # the fork count; temperature controls per-variant diversity (sweet spot
     # 0.2-0.4 for code); selection_strategy is the winner-pick rule.
     "speculative": frozenset({
         "enabled", "num_variants", "temperature",
@@ -342,6 +404,24 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "llm_dispatch": frozenset({
         "max_tokens_default", "max_tokens_per_role",
     }),
+    # Observability knobs. dump_llm_calls captures every LLM dispatch
+    # (across all roles) to ~/.harness/debug for post-mortem analysis;
+    # dump_max_files caps the directory size. dump_repair_prompts is the
+    # deprecated alias for dump_llm_calls — accepted with a warning.
+    "debug": frozenset({
+        "dump_llm_calls", "dump_max_files", "dump_repair_prompts",
+    }),
+    # Patcher behaviour knobs. enforce_read_before_edit gates the B5
+    # read-before-edit invariant — when true the patcher rejects edits to
+    # files the LLM has not yet been shown this turn. use_structured_tools
+    # gates the B6 native tool-use migration — when true, providers that
+    # support function/tool calling receive the PATCH_TOOLS schema in
+    # their chat_completion call instead of (or alongside) the text DSL.
+    "patcher": frozenset({
+        "enforce_read_before_edit", "use_structured_tools",
+    }),
+    # Pre-build smoke checks (see compiler_node prod-import step).
+    "compiler": frozenset({"run_prod_import_smoke_check"}),
 }
 
 
@@ -352,7 +432,13 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
 _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "build_command": (str,),
     "allow_network": (bool,),
-    "manifest_file": (str,),
+    "product_spec_dir": (str,),
+    "debug.dump_llm_calls": (bool,),
+    "debug.dump_max_files": (int,),
+    "debug.dump_repair_prompts": (bool,),  # deprecated alias for dump_llm_calls
+    "patcher.enforce_read_before_edit": (bool,),
+    "patcher.use_structured_tools": (bool,),
+    "compiler.run_prod_import_smoke_check": (bool,),
     "sandbox.backend": (str,),
     "sandbox.docker_image": (str,),
     "sandbox.docker_memory_limit": (str,),
@@ -365,7 +451,10 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "sandbox.auto_enable_network_for_install": (bool,),
     "sandbox.restore_workspace_ownership": (bool,),
     "sandbox.read_only_root": (bool,),
+    "sandbox.cache_volumes": (bool,),
+    "sandbox.cache_volumes_prefix": (str,),
     "token_budget.hard_cap_usd": (int, float),
+    "token_budget.stages": (dict,),
     "token_budget.context_window_threshold_pct": (int, float),
     "node_throttle.max_patch_repair_iterations": (int,),
     "node_throttle.max_doc_review_cycles": (int,),
@@ -512,6 +601,28 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
             )
 
     # --- 4. Required fields ---
+    # product_spec_dir is mandatory: the harness mandates a folder of .txt
+    # files describing the product, and that folder MUST live at the
+    # workspace root. We enforce both presence and the bare-folder-name
+    # rule here so the operator gets an exit-2 at config-load time
+    # (before lock acquisition, gateway init, GitGuardian, etc.) instead
+    # of a softer runtime failure later. The folder-exists + non-empty
+    # .txt-file check is separate (cmd_run does it after workspace_path
+    # is known).
+    spec_dir = config.get("product_spec_dir")
+    if spec_dir is None:
+        errors.append(
+            "'product_spec_dir' is required. Set a top-level string key in "
+            "config.json with the NAME of a folder at the workspace root "
+            "that holds the product-specification .txt files. The name must "
+            "be a bare folder name — no path separators, no absolute paths, "
+            "no `..`. Example: \"product_spec_dir\": \"product_spec\"."
+        )
+    else:
+        name_error = _validate_product_spec_dir_name(spec_dir)
+        if name_error is not None:
+            errors.append(f"'product_spec_dir' {name_error}.")
+
     models = config.get("models")
     if not isinstance(models, dict) or not models:
         errors.append(
@@ -706,12 +817,50 @@ def _walk_dotted(config: dict[str, Any], dotted_path: str) -> tuple[bool, Any]:
     return True, cur
 
 
+def _makefile_has_target(workspace_path: str, target: str) -> bool:
+    """Return True if any Makefile / makefile / GNUmakefile at the
+    workspace root declares ``<target>:`` as a Make target.
+
+    Used by :func:`_detect_default_build_command` to avoid the
+    `make build` → exit 127 crash that hits when an LLM-generated
+    Makefile is present but doesn't declare a ``build:`` target — the
+    sandbox tries ``make build``, ``make`` reports "No rule to make
+    target 'build'", and (on ``ubuntu:22.04``, the default bare image)
+    `make` isn't even installed, producing a 0.21-second exit-127 with
+    zero diagnostics for the repair LLM to act on. See session
+    `b6fe5c6e` for the worked example.
+
+    Target lines in Make grammar live at the start of a line: ``build:``
+    (or ``build: deps``). Recipe lines (tab-indented) underneath
+    aren't the target itself. We match ``^<target>:`` with the
+    multiline flag. Reads files best-effort; on I/O error we treat the
+    Makefile as absent and let the caller fall through.
+    """
+    import re as _re
+    for name in ("Makefile", "makefile", "GNUmakefile"):
+        path = os.path.join(workspace_path, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            continue
+        if _re.search(rf"^{_re.escape(target)}:", content, _re.MULTILINE):
+            return True
+    return False
+
+
 def _detect_default_build_command(workspace_path: str) -> Optional[str]:
     """Pick a sensible build command by sniffing workspace markers.
 
     Returns None when the workspace gives no hint — caller falls back to
     the historical default. Probed in priority order so a polyglot repo
-    with a Makefile still uses it.
+    with a Makefile (that actually declares a ``build:`` target) still
+    uses it. A Makefile present but missing the ``build:`` target is
+    treated as if it weren't there — we fall through to manifest-based
+    detection so the operator gets an actionable build command instead
+    of an instant exit-127 in a make-less sandbox image.
     """
     if not workspace_path or not os.path.isdir(workspace_path):
         return None
@@ -719,7 +868,7 @@ def _detect_default_build_command(workspace_path: str) -> Optional[str]:
     def has(name: str) -> bool:
         return os.path.exists(os.path.join(workspace_path, name))
 
-    if has("Makefile") or has("makefile") or has("GNUmakefile"):
+    if _makefile_has_target(workspace_path, "build"):
         return "make build"
     if has("pyproject.toml"):
         return "python3 -m pip install -e . && python3 -m pytest -q"
@@ -1109,6 +1258,29 @@ def discovery_interview_loop(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _reset_iteration_counters(
+    loop_counter: Optional[dict[str, Any]], *, total_repairs: int = 0,
+) -> dict[str, Any]:
+    """Reset only the iteration counters in ``loop_counter`` while preserving
+    diagnostic trackers (``replace_block_misses_per_file``,
+    ``consecutive_zero_patch_rounds``, etc.) that the repair loop relies on
+    for prompt directives across HITL resume.
+
+    Wiping the whole dict here (the original behavior) was the root cause
+    behind sessions like 2d0164f0 ping-ponging through HITL: the
+    ``_format_replace_block_miss_directive`` only fires at ≥2 consecutive
+    misses per file, so resetting that counter to zero on every resume meant
+    the LLM never received the "use a different operation" directive and went
+    straight back to the same broken REPLACE_BLOCK pattern.
+    """
+    base = dict(loop_counter or {})
+    base["patching"] = 0
+    base["repair"] = 0
+    base["compiler"] = 0
+    base["total_repairs"] = total_repairs
+    return base
+
+
 def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
     """
     Interactive stdin menu for the human_intervention_node.
@@ -1196,8 +1368,15 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             node_state["hitl_awaiting_input"] = False
             node_state["hitl_resolved"] = True
             state["node_state"] = node_state
-            # Reset total_repairs to 2 so route_after_compiler allows one more repair_node pass
-            state["loop_counter"] = {"patching": 0, "repair": 0, "compiler": 0, "total_repairs": 2}
+            # Reset iteration counters but preserve diagnostic trackers
+            # (replace_block_misses_per_file, consecutive_zero_patch_rounds) so
+            # the next repair iteration still sees the "use a different operation"
+            # directive that broke the LLM out of REPLACE_BLOCK pattern-repetition.
+            # Wiping them here re-opened the HITL ping-pong that this resume is
+            # meant to escape — sessions 19b28eff, 0a5c6fe8, 2d0164f0.
+            state["loop_counter"] = _reset_iteration_counters(
+                state.get("loop_counter"), total_repairs=2,
+            )
             logger.info("[HITL] Developer chose to resume. Loop counter reset to 2. Routing to compiler_node.")
             return state
 
@@ -1209,8 +1388,10 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 messages = state.get("messages", [])
                 messages.append({"role": "user", "content": f"[HITL Hint]: {hint}"})
                 state["messages"] = messages
-                # Reset loop counter to give AI another fresh attempt
-                state["loop_counter"] = {"patching": 0, "repair": 0, "compiler": 0, "total_repairs": 1}
+                # Preserve diagnostic trackers — see comment in [r] branch.
+                state["loop_counter"] = _reset_iteration_counters(
+                    state.get("loop_counter"), total_repairs=1,
+                )
                 node_state["hitl_active"] = False
                 node_state["hitl_awaiting_input"] = False
                 node_state["hitl_resolved"] = True
@@ -1225,7 +1406,10 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             print("[HITL] Make your changes in your editor, then press Enter to continue.")
             from harness.hitl import get_channel as _get_channel
             _get_channel().wait_for_manual_edit(workspace_path)
-            # Reset loop counter and clear compiler errors since manual fix was applied
+            # Manual IDE edits invalidate per-file miss history. Reset both
+            # iteration counters and diagnostic trackers — the developer just
+            # changed the file state under us, so the LLM's prior miss history
+            # is no longer the right signal for the next iteration's prompt.
             state["loop_counter"] = {"patching": 0, "repair": 0, "compiler": 0, "total_repairs": 0}
             state["compiler_errors"] = []
             node_state["hitl_active"] = False
@@ -1239,8 +1423,10 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             # Increase budget by $2.00 and reset loop counter for a fresh attempt
             budget_remaining += 2.00
             state["budget_remaining_usd"] = budget_remaining
-            # Reset loop counter to give the repair loop a full fresh cycle
-            state["loop_counter"] = {"patching": 0, "repair": 0, "compiler": 0, "total_repairs": 0}
+            # Preserve diagnostic trackers — see comment in [r] branch.
+            state["loop_counter"] = _reset_iteration_counters(
+                state.get("loop_counter"), total_repairs=0,
+            )
             print(f"[HITL] Budget increased by $2.00. New budget: ${budget_remaining:.2f}. Loop counter reset.")
             continue  # Stay in the menu loop
 
@@ -1727,6 +1913,514 @@ async def interactive_review_loop(spec_path: str, gateway: Any) -> str:
             print(f"[Requirements] Unknown option: '{choice}'. Please choose A, B, or C.")
 
 
+def _validate_product_spec_dir_name(config_value: str) -> Optional[str]:
+    """Validate that ``config_value`` is a bare folder name suitable for
+    use as a workspace-root subdirectory.
+
+    Rules (the value must live inside the workspace root — no other
+    locations are accepted):
+
+    - Must be a non-empty string after stripping whitespace.
+    - Must NOT be an absolute path.
+    - Must NOT contain a path separator (``/`` or ``\\``).
+    - Must NOT contain ``..`` (parent-directory traversal).
+    - Must NOT start with ``~`` (home-directory expansion).
+    - Must NOT be ``.`` or ``..``.
+
+    Returns ``None`` on success, or a human-readable error string when
+    the value violates one of the rules. Callers print + bail on a
+    non-None return.
+    """
+    if not isinstance(config_value, str):
+        return "must be a string"
+    name = config_value.strip()
+    if not name:
+        return "must be a non-empty string"
+    if os.path.isabs(name):
+        return (
+            f"must be a folder NAME at the workspace root (no leading "
+            f"`/`). Got {config_value!r}; use something like \"product_spec\""
+        )
+    if "/" in name or "\\" in name:
+        return (
+            f"must be a folder NAME at the workspace root — no path "
+            f"separators are allowed (`/` or `\\`). Got {config_value!r}; "
+            f"use something like \"product_spec\""
+        )
+    if name.startswith("~"):
+        return (
+            f"must be a folder NAME at the workspace root (no `~` "
+            f"home-directory shorthand). Got {config_value!r}"
+        )
+    if name in (".", ".."):
+        return (
+            f"must be a folder NAME (not `.` or `..`). Got {config_value!r}"
+        )
+    if ".." in name.split(os.sep):
+        # Defensive: separators are already rejected, but catch any
+        # platform-specific separator difference too.
+        return (
+            f"must not contain `..` components. Got {config_value!r}"
+        )
+    return None
+
+
+def _resolve_product_spec_dir(workspace_path: str, config_value: str) -> str:
+    """Resolve the ``product_spec_dir`` config value to an absolute path
+    under the workspace root.
+
+    The value is a bare folder name (validated separately by
+    :func:`_validate_product_spec_dir_name`); this function joins it with
+    ``workspace_path`` and normalises the result. Pure path arithmetic;
+    no I/O.
+    """
+    return os.path.normpath(os.path.join(workspace_path, config_value.strip()))
+
+
+def _load_consolidated_product_spec(
+    workspace_path: str,
+    resolved_spec_dir: str,
+) -> Optional[str]:
+    """Validate and consolidate the configured product-spec folder.
+
+    ``resolved_spec_dir`` is the absolute path produced by
+    :func:`_resolve_product_spec_dir` — it may live anywhere on disk, not
+    necessarily inside ``workspace_path``. The folder must exist and
+    contain one or more ``.txt`` files. Reading order is alphabetical;
+    each file's body is prefixed with a ``## <filename>`` section header
+    so the synthesis LLM can see file boundaries.
+
+    Returns the consolidated content as a single string on success.
+    Returns ``None`` and prints a clear, user-facing error to stderr on
+    any of these failure modes:
+
+    - configured folder missing.
+    - configured folder exists but contains no ``.txt`` files.
+    """
+    product_spec_dir = resolved_spec_dir
+
+    def _fail(headline: str, body: str) -> None:
+        print(file=sys.stderr)
+        print("=" * 72, file=sys.stderr)
+        print(headline, file=sys.stderr)
+        print("=" * 72, file=sys.stderr)
+        print(body, file=sys.stderr)
+        print("=" * 72, file=sys.stderr)
+        logger.error("[product_spec] %s", headline)
+
+    if not os.path.isdir(product_spec_dir):
+        _fail(
+            "Configured product_spec_dir does not exist",
+            (
+                f"The harness expected a directory at:\n\n"
+                f"  {product_spec_dir}\n\n"
+                "but it does not exist. `product_spec_dir` in config.json\n"
+                "points there. Either create the directory and add one or\n"
+                "more `.txt` files describing the product, OR update\n"
+                "`product_spec_dir` to a directory that does exist. The\n"
+                "config value can be an absolute path (anywhere on the\n"
+                "filesystem) or a path relative to the workspace."
+            ),
+        )
+        return None
+
+    txt_files = sorted(
+        f for f in os.listdir(product_spec_dir)
+        if f.endswith(".txt") and os.path.isfile(os.path.join(product_spec_dir, f))
+    )
+    if not txt_files:
+        _fail(
+            "Configured product_spec_dir contains no .txt files",
+            (
+                f"`{product_spec_dir}` exists but holds no `.txt` files. Add\n"
+                "at least one `.txt` file with the product specification and\n"
+                "re-run."
+            ),
+        )
+        return None
+
+    sections: list[str] = [
+        f"# Product Specification (consolidated from {len(txt_files)} file(s))",
+        "",
+        "Source files:",
+        *(f"  - {f}" for f in txt_files),
+        "",
+    ]
+    for fname in txt_files:
+        fpath = os.path.join(product_spec_dir, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError as exc:
+            logger.warning(
+                "[product_spec] Could not read %s: %s — skipping.", fpath, exc,
+            )
+            continue
+        sections.append("---")
+        sections.append(f"## {fname}")
+        sections.append("")
+        sections.append(content.rstrip())
+        sections.append("")
+    consolidated = "\n".join(sections)
+    logger.info(
+        "[product_spec] Consolidated %d file(s) from %s (%d chars).",
+        len(txt_files), product_spec_dir, len(consolidated),
+    )
+    return consolidated
+
+
+def _list_workspace_entries_to_delete(
+    workspace_path: str, spec_dirname: str,
+) -> list[str]:
+    """Enumerate the workspace-root entries that ``--new_build=true``
+    would delete. Mirrors the preserved-set logic in
+    :func:`_perform_new_build_reset` so the preview shown to the
+    operator matches what the destructive pass would actually touch.
+    """
+    if not os.path.isdir(workspace_path):
+        return []
+    preserved = frozenset({".git", spec_dirname})
+    try:
+        entries = sorted(os.listdir(workspace_path))
+    except OSError:
+        return []
+    return [e for e in entries if e not in preserved]
+
+
+def _list_orphan_patch_branches(workspace_path: str) -> list[str]:
+    """Enumerate ``agent/patch-*`` branches in the workspace's git repo.
+    Returns an empty list when the workspace is not a git repo or the
+    git command fails. Matches what :func:`_perform_new_build_reset`
+    would ``git branch -D``.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", workspace_path, "for-each-ref",
+             "--format=%(refname:short)", "refs/heads/agent/patch-*"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+    return sorted(b for b in result.stdout.split("\n") if b.strip())
+
+
+async def _list_workspace_checkpoint_sessions(
+    workspace_path: str, config: dict[str, Any],
+) -> list[Any]:
+    """Enumerate checkpoint sessions whose stored ``workspace_path``
+    matches ``workspace_path`` (under ``os.path.realpath``). Mirrors the
+    filter in :func:`_purge_workspace_checkpoints` so the preview shows
+    exactly the sessions that would be deleted.
+    """
+    persistence_cfg = config.get("persistence", {}) or {}
+    db_path = persistence_cfg.get("db_path", "~/.harness/checkpoints.db")
+    if not os.path.isfile(os.path.expanduser(db_path)):
+        return []
+    try:
+        from harness.storage import list_all_sessions
+        sessions = await list_all_sessions(db_path, limit=10_000)
+    except Exception:  # noqa: BLE001 — preview is best-effort
+        return []
+    ws_real = os.path.realpath(workspace_path)
+    matches: list[Any] = []
+    for s in sessions:
+        s_ws = getattr(s, "workspace_path", "") or ""
+        if not s_ws:
+            continue
+        try:
+            if os.path.realpath(s_ws) == ws_real:
+                matches.append(s)
+        except OSError:
+            continue
+    return matches
+
+
+def _print_new_build_preview(
+    workspace_path: str,
+    spec_dirname: str,
+    files_to_delete: list[str],
+    orphan_branches: list[str],
+    checkpoint_sessions: list[Any],
+) -> None:
+    """Print a human-friendly preview of every destructive action
+    ``--new_build=true`` is about to take, so the operator can review
+    before confirming."""
+    print(file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    print("--new_build=true — REVIEW BEFORE PROCEEDING", file=sys.stderr)
+    print("=" * 72, file=sys.stderr)
+    print(f"Workspace:           {workspace_path}", file=sys.stderr)
+    print(f"Preserved at root:   `{spec_dirname}/`, `.git/`", file=sys.stderr)
+    print(file=sys.stderr)
+
+    if files_to_delete:
+        print(
+            f"Workspace files to DELETE from the base branch "
+            f"({len(files_to_delete)} entries):",
+            file=sys.stderr,
+        )
+        for entry in files_to_delete:
+            print(f"  - {entry}", file=sys.stderr)
+    else:
+        print("Workspace files to delete: none.", file=sys.stderr)
+    print(file=sys.stderr)
+
+    if orphan_branches:
+        print(
+            f"Orphan agent/patch-* branches to DELETE "
+            f"({len(orphan_branches)} branches):",
+            file=sys.stderr,
+        )
+        for branch in orphan_branches:
+            print(f"  - {branch}", file=sys.stderr)
+    else:
+        print("Orphan agent/patch-* branches: none.", file=sys.stderr)
+    print(file=sys.stderr)
+
+    if checkpoint_sessions:
+        print(
+            f"Checkpoint sessions + JSONL transcripts to PURGE "
+            f"({len(checkpoint_sessions)} sessions):",
+            file=sys.stderr,
+        )
+        for s in checkpoint_sessions:
+            sid = getattr(s, "thread_id", "?")
+            updated = getattr(s, "updated_at", "?")
+            print(f"  - {sid}  (last updated {updated})", file=sys.stderr)
+    else:
+        print(
+            "Checkpoint sessions for this workspace: none.",
+            file=sys.stderr,
+        )
+    print("=" * 72, file=sys.stderr)
+
+
+def _perform_new_build_reset(
+    workspace_path: str, spec_dirname: str,
+) -> None:
+    """When ``--new_build=true`` fires, hard-reset the workspace.
+
+    Three steps:
+
+    1. Checkout the base branch (``master`` if it exists, else ``main``).
+    2. Delete every file / directory at the workspace root EXCEPT the
+       preserved set (``.git/`` and the configured ``spec_dirname``) and
+       commit the deletions on the base branch.
+    3. Delete every orphaned ``agent/patch-*`` branch in the repo.
+
+    Runs BEFORE GitGuardian creates the new session's patch branch, so
+    the new branch is forked from a now-clean base. Best-effort: any step
+    that fails is logged but does not abort the harness — GitGuardian
+    will still create the patch branch from whatever the working tree
+    looks like after this function returns.
+    """
+    def _git(*args: str) -> "subprocess.CompletedProcess[str]":
+        return subprocess.run(
+            ["git", "-C", workspace_path, *args],
+            capture_output=True, text=True, timeout=60,
+        )
+
+    if _git("rev-parse", "--git-dir").returncode != 0:
+        logger.warning("[new_build] %s is not a git repo — skipping reset.", workspace_path)
+        return
+
+    base_branch: Optional[str] = None
+    for candidate in ("master", "main"):
+        if _git("rev-parse", "--verify", "--quiet", candidate).returncode == 0:
+            base_branch = candidate
+            break
+    if base_branch is None:
+        logger.error(
+            "[new_build] Neither 'master' nor 'main' branch exists in %s — "
+            "cannot perform reset. Skipping.", workspace_path,
+        )
+        return
+
+    logger.info("[new_build] Resetting workspace on base branch '%s'.", base_branch)
+    checkout = _git("checkout", base_branch)
+    if checkout.returncode != 0:
+        logger.error(
+            "[new_build] Failed to checkout '%s': %s — aborting reset.",
+            base_branch, (checkout.stderr or "").strip(),
+        )
+        return
+
+    # Preserved at workspace root. .git/ can't be deleted without
+    # destroying the repo; the configured product-spec folder is the
+    # source of truth for the next run and must survive.
+    preserved = frozenset({".git", spec_dirname})
+    deleted = 0
+    for entry in os.listdir(workspace_path):
+        if entry in preserved:
+            continue
+        full = os.path.join(workspace_path, entry)
+        try:
+            if os.path.islink(full) or not os.path.isdir(full):
+                os.remove(full)
+            else:
+                shutil.rmtree(full)
+            deleted += 1
+        except OSError as exc:
+            logger.warning("[new_build] Could not delete %s: %s", entry, exc)
+    logger.info("[new_build] Deleted %d entry/entries from workspace root.", deleted)
+
+    add = _git("add", "-A")
+    if add.returncode != 0:
+        logger.warning("[new_build] `git add -A` failed: %s", (add.stderr or "").strip())
+
+    staged = _git("diff", "--cached", "--name-only")
+    if staged.returncode == 0 and staged.stdout.strip():
+        commit = _git("commit", "-m", "harness: --new_build reset")
+        if commit.returncode == 0:
+            logger.info(
+                "[new_build] Committed reset on '%s' (deleted %d entry/entries).",
+                base_branch, deleted,
+            )
+        else:
+            logger.warning(
+                "[new_build] git commit failed: %s",
+                (commit.stderr or "").strip(),
+            )
+    else:
+        logger.info("[new_build] No changes to commit on '%s'.", base_branch)
+
+    branches = _git("for-each-ref", "--format=%(refname:short)", "refs/heads/agent/patch-*")
+    if branches.returncode == 0 and branches.stdout.strip():
+        deleted_branches = 0
+        for branch in branches.stdout.split("\n"):
+            branch = branch.strip()
+            if not branch:
+                continue
+            result = _git("branch", "-D", branch)
+            if result.returncode == 0:
+                deleted_branches += 1
+            else:
+                logger.warning(
+                    "[new_build] Could not delete branch %s: %s",
+                    branch, (result.stderr or "").strip(),
+                )
+        if deleted_branches:
+            logger.info(
+                "[new_build] Deleted %d orphaned agent/patch-* branch(es).",
+                deleted_branches,
+            )
+
+
+async def _purge_workspace_checkpoints(
+    workspace_path: str, config: dict[str, Any],
+) -> None:
+    """Delete every checkpoint session (and per-session JSONL transcript)
+    whose stored ``workspace_path`` matches the workspace being reset.
+
+    Used by ``--new_build=true`` cleanup so that "starting fresh" includes
+    the persistence layer, not just the working tree. Session ↔ workspace
+    association is indirect (the workspace path lives in the serialized
+    LangGraph checkpoint blob under ``channel_values.workspace_path``),
+    so we enumerate sessions via :func:`harness.storage.list_all_sessions`
+    — the same canonical path ``harness status`` already uses — and match
+    by ``os.path.realpath`` to absorb symlink aliases.
+
+    Best-effort: failure to enumerate or delete is logged + swallowed so
+    the harness still proceeds with the rest of session startup.
+    """
+    persistence_cfg = config.get("persistence", {}) or {}
+    db_path = persistence_cfg.get("db_path", "~/.harness/checkpoints.db")
+    ttl_days = persistence_cfg.get("ttl_days", 30)
+    expanded_db = os.path.expanduser(db_path)
+    if not os.path.isfile(expanded_db):
+        logger.info(
+            "[new_build] No checkpoint DB at %s — nothing to purge.", db_path,
+        )
+        return
+
+    try:
+        from harness.storage import HarnessAsyncSqliteSaver, list_all_sessions
+        # Bump the limit well past anything a normal operator would ever
+        # accumulate so a single pass picks up every match.
+        sessions = await list_all_sessions(db_path, limit=10_000)
+    except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+        logger.warning(
+            "[new_build] Could not enumerate checkpoint sessions: %s — "
+            "skipping checkpoint purge.", exc,
+        )
+        return
+
+    ws_real = os.path.realpath(workspace_path)
+    matches = []
+    for s in sessions:
+        s_ws = getattr(s, "workspace_path", "") or ""
+        if not s_ws:
+            continue
+        try:
+            if os.path.realpath(s_ws) == ws_real:
+                matches.append(s)
+        except OSError:
+            continue
+    if not matches:
+        logger.info(
+            "[new_build] No prior checkpoints for workspace %s.", workspace_path,
+        )
+        return
+
+    # Delete from the SQLite store via the same async path cmd_purge uses.
+    deleted_rows = 0
+    try:
+        checkpointer = await HarnessAsyncSqliteSaver.from_db_path(
+            db_path=db_path, ttl_days=ttl_days,
+        )
+        try:
+            for s in matches:
+                try:
+                    await checkpointer.adelete_thread(s.thread_id)
+                    deleted_rows += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[new_build] Could not delete checkpoint thread %s: %s",
+                        s.thread_id, exc,
+                    )
+        finally:
+            try:
+                await checkpointer.conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[new_build] Checkpoint store open failed: %s — JSONL logs still "
+            "cleaned below.", exc,
+        )
+
+    # Per-session JSONL transcripts. Same path + glob shape that
+    # cmd_purge --session-id already handles. Best-effort per file.
+    log_cfg = config.get("logging", {}) or {}
+    log_dir = os.path.expanduser(log_cfg.get("log_dir", "~/.harness/logs"))
+    removed_logs = 0
+    if os.path.isdir(log_dir):
+        import glob as _glob
+        for s in matches:
+            sid = s.thread_id
+            for pat in (
+                os.path.join(log_dir, f"{sid}.jsonl"),
+                os.path.join(log_dir, f"{sid}.jsonl.*"),
+            ):
+                for path in _glob.glob(pat):
+                    try:
+                        os.remove(path)
+                        removed_logs += 1
+                    except OSError as exc:
+                        logger.warning(
+                            "[new_build] Could not remove log file %s: %s",
+                            path, exc,
+                        )
+
+    logger.info(
+        "[new_build] Purged %d checkpoint session(s) and %d JSONL log "
+        "file(s) for workspace %s.",
+        deleted_rows, removed_logs, workspace_path,
+    )
+
+
 def _attempt_git_rollback(workspace_path: str) -> None:
     """Attempt a git checkout to restore modified files to their original state."""
     import subprocess
@@ -1764,11 +2458,13 @@ async def cmd_run(args: argparse.Namespace) -> int:
 
     Examples:
         harness run -r /path/to/repo -p "Add JWT authentication"
-        harness run -r ./myproject -p "Refactor the auth module" --manifest notes.txt
+        harness run -r ./myproject -p "Refactor the auth module" --new_build=false
     """
     workspace_path = os.path.abspath(args.workspace)
     if not os.path.isdir(workspace_path):
         logger.error("Workspace path does not exist: %s", workspace_path)
+        return 1
+    if _refuse_if_workspace_is_harness_root(workspace_path):
         return 1
 
     # FIRST: deterministic config check. Reads + validates the canonical
@@ -1861,33 +2557,143 @@ async def cmd_run(args: argparse.Namespace) -> int:
     )
     set_command_validator(create_command_validator_from_config(config))
 
+    # Read the operator-configured product-spec folder name once and
+    # reuse for both the new_build cleanup (preserves the folder during
+    # the workspace reset) and the requirement-refinement validation
+    # below. The harness refuses to run without product_spec_dir in
+    # config.json — this is the single source of truth for "where does
+    # the product spec live." The value must be a bare folder name (no
+    # separators, no absolute paths); the folder must exist at the
+    # workspace root. validate_config_strict already rejects malformed
+    # values at config-load time; this is the runtime defense-in-depth.
+    spec_dirname_raw = config.get("product_spec_dir")
+    name_error = _validate_product_spec_dir_name(spec_dirname_raw or "")
+    if name_error is not None or spec_dirname_raw is None:
+        print(file=sys.stderr)
+        print("=" * 72, file=sys.stderr)
+        print("Invalid required config: product_spec_dir", file=sys.stderr)
+        print("=" * 72, file=sys.stderr)
+        print(
+            "The harness requires a top-level `product_spec_dir` key in\n"
+            "config.json with the NAME of a folder at the workspace root\n"
+            "that holds the product-specification .txt files.\n\n"
+            f"Problem: {name_error or 'is required.'}\n\n"
+            "Example:\n"
+            "  \"product_spec_dir\": \"product_spec\"\n\n"
+            "Then create the folder at the workspace root:\n"
+            f"  mkdir {workspace_path}/product_spec\n",
+            file=sys.stderr,
+        )
+        print("=" * 72, file=sys.stderr)
+        logger.error("[config] product_spec_dir invalid or missing.")
+        return 1
+    spec_dirname = spec_dirname_raw.strip()
+    resolved_spec_dir = _resolve_product_spec_dir(workspace_path, spec_dirname)
+
+    # Validate the folder exists AND contains at least one .txt file.
+    # product_spec_dir is the SOLE source for the product spec — the
+    # harness no longer accepts a --manifest override. We preload the
+    # consolidated content here so the requirement-refinement step below
+    # doesn't walk the folder a second time.
+    preloaded_consolidated_spec = _load_consolidated_product_spec(
+        workspace_path, resolved_spec_dir,
+    )
+    if preloaded_consolidated_spec is None:
+        # _load_consolidated_product_spec already printed a clear error to
+        # stderr describing whether the folder is missing or empty.
+        return 1
+
+    # --new_build cleanup runs BEFORE GitGuardian creates the session's
+    # patch branch, so the new branch forks from a clean base. The reset is
+    # destructive (deletes most files at workspace root and commits the
+    # deletions on master/main), but the operator opted in by passing the
+    # flag — see _perform_new_build_reset's contract.
+    if getattr(args, "new_build", False):
+        # Build the deletion preview BEFORE touching anything so the
+        # operator can review the exact list and bail if they hit the
+        # flag by mistake or realise one of the files is still useful.
+        files_to_delete = _list_workspace_entries_to_delete(
+            workspace_path, spec_dirname,
+        )
+        orphan_branches = _list_orphan_patch_branches(workspace_path)
+        checkpoint_sessions = await _list_workspace_checkpoint_sessions(
+            workspace_path, config,
+        )
+        total_destructive = (
+            len(files_to_delete) + len(orphan_branches) + len(checkpoint_sessions)
+        )
+        if total_destructive == 0:
+            # No destructive work — skip the prompt entirely. The
+            # cleanup functions will be no-ops; we still call them so
+            # the log line ("No prior checkpoints", etc.) appears.
+            logger.info(
+                "[new_build] --new_build=true but nothing to clean "
+                "(no extra files at workspace root, no orphan patch "
+                "branches, no prior checkpoints for this workspace). "
+                "Skipping the confirmation prompt."
+            )
+        else:
+            _print_new_build_preview(
+                workspace_path, spec_dirname,
+                files_to_delete, orphan_branches, checkpoint_sessions,
+            )
+            if getattr(args, "assume_yes", False):
+                logger.info(
+                    "[new_build] --yes set — skipping the confirmation "
+                    "prompt and proceeding with the reset."
+                )
+            else:
+                from harness.hitl import get_channel as _get_channel
+                confirmed = _get_channel().confirm(
+                    "Proceed with the destructive --new_build reset above?",
+                    default=False,
+                )
+                if not confirmed:
+                    print(
+                        "\n--new_build reset cancelled. Re-run without "
+                        "--new_build=true (or fix the workspace state) "
+                        "before retrying.",
+                        file=sys.stderr,
+                    )
+                    logger.warning(
+                        "[new_build] Operator declined the reset. Exiting."
+                    )
+                    return 1
+        logger.warning(
+            "[new_build] --new_build=true — resetting workspace before "
+            "starting the session. Files outside `%s/` and `.git/` will be "
+            "deleted from the base branch.", spec_dirname,
+        )
+        _perform_new_build_reset(workspace_path, spec_dirname)
+        # And purge every prior checkpoint + JSONL transcript that targeted
+        # this workspace, so "fresh start" includes the persistence layer.
+        # Runs BEFORE GitGuardian creates this session's patch branch and
+        # before any checkpoint write for this session, so list_all_sessions
+        # can't accidentally match (and delete) the run we're about to start.
+        await _purge_workspace_checkpoints(workspace_path, config)
+
     # Initialize GitGuardian for branch lifecycle management
     from harness.security import GitGuardian
     git_guardian = GitGuardian(workspace_path)
     git_guardian.stash_if_dirty()
     git_guardian.create_patch_branch(session_id)
 
-    # --- Requirement Refinement Layer (product_spec.txt auto-discovery or --manifest override) ---
+    # --- Requirement Refinement Layer ---
+    # product_spec_dir is the SOLE source for the product spec. The folder
+    # MUST contain one or more .txt files; the preload at the top of
+    # cmd_run already validated this. Reuse that content here so we don't
+    # walk the directory twice.
     spec_override: Optional[str] = None
-
-    # Resolve the manifest file path:
-    #   1. --manifest flag (explicit override, highest priority)
-    #   2. Auto-discovered product_spec.txt in workspace root (convention)
-    #   3. None — proceed with prompt-only execution
-    manifest_path: Optional[str] = None
-    if args.manifest:
-        manifest_path = os.path.abspath(args.manifest)
-        if not os.path.isfile(manifest_path):
-            logger.error("[requirements] Explicit manifest file not found: %s", manifest_path)
-            return 1
-        logger.info("[requirements] Using explicit manifest: %s", manifest_path)
-    else:
-        # Auto-discovery: look for product_spec.txt in workspace root
-        manifest_file = config.get("manifest_file", "product_spec.txt")
-        auto_manifest = os.path.join(workspace_path, manifest_file)
-        if os.path.isfile(auto_manifest):
-            manifest_path = auto_manifest
-            logger.info("[requirements] Auto-discovered product spec: %s", manifest_path)
+    import tempfile as _tempfile
+    fd, manifest_path = _tempfile.mkstemp(
+        prefix=f"harness_spec_{session_id[:8]}_", suffix=".txt",
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(preloaded_consolidated_spec)
+    logger.info(
+        "[requirements] Product spec sourced from %s "
+        "(consolidated → %s).", resolved_spec_dir, manifest_path,
+    )
 
     if manifest_path:
         logger.info("[requirements] Synthesizing specification from %s", manifest_path)
@@ -1912,28 +2718,69 @@ async def cmd_run(args: argparse.Namespace) -> int:
                 getattr(gw_cfg, "doc_reviewer_primary", "") or ""
                 if gw_cfg is not None else ""
             )
-            if doc_reviewer_primary:
+            # Honour node_throttle.max_doc_review_cycles. The graph-path
+            # spec_review_node already loops via its own counter — the
+            # pre-flight path was firing review_and_revise_spec exactly once
+            # regardless of the config, which silently capped operators who'd
+            # set the cycles to >1. Match the graph node's behaviour here.
+            max_review_cycles = (
+                int(getattr(gw_cfg, "max_doc_review_cycles", 1) or 0)
+                if gw_cfg is not None else 1
+            )
+            if doc_reviewer_primary and max_review_cycles > 0:
                 logger.info(
-                    "[requirements] doc_reviewer_primary=%s configured — running pre-flight spec review.",
-                    doc_reviewer_primary,
+                    "[requirements] doc_reviewer_primary=%s configured — "
+                    "running pre-flight spec review (up to %d cycle(s)).",
+                    doc_reviewer_primary, max_review_cycles,
                 )
                 from harness.graph import review_and_revise_spec
-                review_result = await review_and_revise_spec(
-                    spec_path,
-                    "REQUIREMENTS",
-                    gateway=gateway,
-                    budget_remaining_usd=budget_usd,
-                    user_goal=args.prompt or "",
-                )
-                if review_result["ok"] and review_result.get("review_path"):
+                for cycle in range(1, max_review_cycles + 1):
+                    # Budget gate matches spec_review_node's check at
+                    # graph.py:3754 — stop revisiting the reviewer when the
+                    # remaining session budget is below the reviewer's
+                    # minimum useful cost.
+                    if budget_usd < 0.10:
+                        logger.info(
+                            "[requirements] Budget too low ($%.4f) — "
+                            "skipping remaining review cycles.", budget_usd,
+                        )
+                        break
                     logger.info(
-                        "[requirements] Review written to %s; spec revised in place.",
-                        review_result["review_path"],
+                        "[requirements] Spec review cycle %d/%d.",
+                        cycle, max_review_cycles,
                     )
-                    budget_usd = review_result["new_budget_usd"]
-            else:
+                    review_result = await review_and_revise_spec(
+                        spec_path,
+                        "REQUIREMENTS",
+                        gateway=gateway,
+                        budget_remaining_usd=budget_usd,
+                        user_goal=args.prompt or "",
+                    )
+                    if review_result["ok"] and review_result.get("review_path"):
+                        logger.info(
+                            "[requirements] Cycle %d/%d: review written to %s; "
+                            "spec revised in place.",
+                            cycle, max_review_cycles, review_result["review_path"],
+                        )
+                        budget_usd = review_result["new_budget_usd"]
+                    else:
+                        # Reviewer failed (bad JSON, dispatch error, etc.).
+                        # Helper already logged the reason; abandon the
+                        # remaining cycles rather than spinning on a
+                        # broken reviewer.
+                        logger.info(
+                            "[requirements] Cycle %d/%d: reviewer did not "
+                            "complete cleanly — aborting remaining cycles.",
+                            cycle, max_review_cycles,
+                        )
+                        break
+            elif not doc_reviewer_primary:
                 logger.info(
                     "[requirements] doc_reviewer_primary not configured — skipping pre-flight spec review."
+                )
+            else:
+                logger.info(
+                    "[requirements] max_doc_review_cycles=0 — skipping pre-flight spec review."
                 )
             logger.info("[requirements] Specification synthesized. Entering review loop.")
             spec_override = await interactive_review_loop(spec_path, gateway)
@@ -1960,27 +2807,51 @@ async def cmd_run(args: argparse.Namespace) -> int:
                     # downstream patch, so skipping the critique was the
                     # difference between a layout the patching LLM follows
                     # and one it works around.
-                    if doc_reviewer_primary:
+                    if doc_reviewer_primary and max_review_cycles > 0:
                         logger.info(
-                            "[architecture] doc_reviewer_primary=%s configured — running architecture spec review.",
-                            doc_reviewer_primary,
+                            "[architecture] doc_reviewer_primary=%s configured — "
+                            "running architecture spec review (up to %d cycle(s)).",
+                            doc_reviewer_primary, max_review_cycles,
                         )
-                        arch_review_result = await review_and_revise_spec(
-                            arch_path,
-                            "ARCHITECTURE",
-                            gateway=gateway,
-                            budget_remaining_usd=budget_usd,
-                            user_goal=args.prompt or "",
-                        )
-                        if arch_review_result["ok"] and arch_review_result.get("review_path"):
+                        for cycle in range(1, max_review_cycles + 1):
+                            if budget_usd < 0.10:
+                                logger.info(
+                                    "[architecture] Budget too low ($%.4f) — "
+                                    "skipping remaining review cycles.", budget_usd,
+                                )
+                                break
                             logger.info(
-                                "[architecture] Review written to %s; spec revised in place.",
-                                arch_review_result["review_path"],
+                                "[architecture] Spec review cycle %d/%d.",
+                                cycle, max_review_cycles,
                             )
-                            budget_usd = arch_review_result["new_budget_usd"]
-                    else:
+                            arch_review_result = await review_and_revise_spec(
+                                arch_path,
+                                "ARCHITECTURE",
+                                gateway=gateway,
+                                budget_remaining_usd=budget_usd,
+                                user_goal=args.prompt or "",
+                            )
+                            if arch_review_result["ok"] and arch_review_result.get("review_path"):
+                                logger.info(
+                                    "[architecture] Cycle %d/%d: review written to %s; "
+                                    "spec revised in place.",
+                                    cycle, max_review_cycles, arch_review_result["review_path"],
+                                )
+                                budget_usd = arch_review_result["new_budget_usd"]
+                            else:
+                                logger.info(
+                                    "[architecture] Cycle %d/%d: reviewer did not "
+                                    "complete cleanly — aborting remaining cycles.",
+                                    cycle, max_review_cycles,
+                                )
+                                break
+                    elif not doc_reviewer_primary:
                         logger.info(
                             "[architecture] doc_reviewer_primary not configured — skipping architecture spec review."
+                        )
+                    else:
+                        logger.info(
+                            "[architecture] max_doc_review_cycles=0 — skipping architecture spec review."
                         )
                     arch_content = _read_spec_file(arch_path)
                     if arch_content:
@@ -2008,9 +2879,9 @@ async def cmd_run(args: argparse.Namespace) -> int:
         except Exception as exc:
             logger.error("[requirements] Requirement refinement failed: %s", exc)
             return 1
-    else:
-        logger.info("[requirements] No product spec file found. Place '%s' at the workspace root with your product requirements, or use --manifest to specify an alternate file.",
-                     config.get("manifest_file", "product_spec.txt"))
+    # If we got here, manifest_path is always set — _load_consolidated_product_spec
+    # either succeeded or already returned 1 above. The old "fall through with
+    # no spec" branch is gone with the product_spec/ folder mandate.
 
     thread_id = args.thread_id if args.thread_id else session_id
 
@@ -2047,6 +2918,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             sandbox_config=config.get("sandbox", {}),
             test_generation_config=config.get("test_generation", {}),
             speculative_config=config.get("speculative", {}),
+            compiler_config=config.get("compiler", {}),
         )
     except Exception:
         logger.exception("Graph execution failed with unhandled exception.")
@@ -2131,6 +3003,8 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     from harness.storage import HarnessAsyncSqliteSaver
 
     workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
+    if _refuse_if_workspace_is_harness_root(workspace_path):
+        return 1
     config = discover_config(workspace_path)
     persistence_cfg = config.get("persistence", {})
     db_path = persistence_cfg.get("db_path", "~/.harness/checkpoints.db")
@@ -2307,6 +3181,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
             sandbox_config=config.get("sandbox", {}),
             test_generation_config=config.get("test_generation", {}),
             speculative_config=config.get("speculative", {}),
+            compiler_config=config.get("compiler", {}),
         )
     except Exception:
         logger.exception("Resume execution failed.")
@@ -2821,6 +3696,57 @@ def _doctor_check_config(workspace_path: str) -> tuple[str, str]:
     return "pass", f"config parsed cleanly ({section_count} top-level sections)"
 
 
+def _doctor_check_product_spec(
+    config: dict[str, Any], workspace_path: str,
+) -> tuple[str, str]:
+    """Mandatory: `product_spec_dir` is a valid workspace-root folder
+    name AND the folder exists at the workspace root with at least one
+    ``.txt`` file.
+
+    The value must be a bare folder name (no path separators, no
+    absolute paths, no `..`). The harness mandates the spec folder lives
+    inside the workspace so the operator's product description is
+    versioned alongside the code that implements it. The operator should
+    hear about a misconfiguration in `harness doctor` before they try
+    `harness run`.
+    """
+    spec_dirname = config.get("product_spec_dir")
+    if spec_dirname is None:
+        return (
+            "fail",
+            "product_spec_dir not set in config.json — add a top-level "
+            "string key with the NAME of a workspace-root folder, e.g. "
+            "\"product_spec_dir\": \"product_spec\"",
+        )
+    name_error = _validate_product_spec_dir_name(spec_dirname)
+    if name_error is not None:
+        return ("fail", f"product_spec_dir {name_error}")
+    resolved = _resolve_product_spec_dir(workspace_path, spec_dirname)
+    if not os.path.isdir(resolved):
+        return (
+            "fail",
+            f"`{spec_dirname.strip()}/` folder not found at workspace "
+            f"root — expected at {resolved!r}. Create it and add one or "
+            f"more .txt files",
+        )
+    txt_files = [
+        f for f in os.listdir(resolved)
+        if f.endswith(".txt") and os.path.isfile(os.path.join(resolved, f))
+    ]
+    if not txt_files:
+        return (
+            "fail",
+            f"`{spec_dirname.strip()}/` exists but contains no .txt "
+            "files — add at least one .txt file with the product "
+            "specification",
+        )
+    return (
+        "pass",
+        f"`{spec_dirname.strip()}/` at workspace root contains "
+        f"{len(txt_files)} .txt file(s)",
+    )
+
+
 def _doctor_check_tree_sitter() -> tuple[str, str]:
     """Tree-sitter and the language-pack catalogue are importable and at
     least one grammar loads + parses.
@@ -2953,6 +3879,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         config = discover_config(workspace_path)
         api_keys_result = await _doctor_check_api_keys(config)
         checks.extend([
+            ("product spec", _doctor_check_product_spec(config, workspace_path)),
             ("api keys (live)", api_keys_result),
             ("tree-sitter", _doctor_check_tree_sitter()),
             ("sandbox backend", _doctor_check_sandbox(config)),
@@ -2963,6 +3890,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         # operator sees they exist but understands they can't run yet.
         skipped_detail = "skipped — fix the config check above first"
         checks.extend([
+            ("product spec", ("skip", skipped_detail)),
             ("api keys (live)", ("skip", skipped_detail)),
             ("tree-sitter", ("skip", skipped_detail)),
             ("sandbox backend", ("skip", skipped_detail)),
@@ -3059,6 +3987,105 @@ async def cmd_purge(args: argparse.Namespace) -> int:
         logger.error("Please specify --all to purge everything or --session-id to purge a specific session.")
         return 1
 
+    return 0
+
+
+async def cmd_cache_clear(args: argparse.Namespace) -> int:
+    """Execute ``harness cache clear``.
+
+    Enumerates harness-owned Docker volumes (those prefixed with
+    ``harness-`` by default; configurable via ``sandbox.cache_volumes_prefix``)
+    and removes them. With ``--session-id`` only the volumes scoped to that
+    session are touched; otherwise every harness-owned volume is removed.
+
+    Idempotent: a volume that has already been removed (or never existed)
+    is treated as success, not an error.
+
+    Examples:
+        harness cache clear
+        harness cache clear --session-id sess-abc123
+        harness cache clear --yes  # skip the confirmation prompt
+        harness cache clear --dry-run
+    """
+    workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
+    try:
+        config = discover_config(workspace_path)
+    except Exception:  # noqa: BLE001 — `cache clear` must work without a workspace config
+        config = {}
+
+    sandbox_cfg = config.get("sandbox", {}) or {}
+    prefix = sandbox_cfg.get("cache_volumes_prefix", "harness") + "-"
+    docker_path = sandbox_cfg.get("docker_path", "docker")
+
+    if not shutil.which(docker_path):
+        print(
+            f"[harness] `{docker_path}` not found on PATH. Nothing to clear "
+            f"— cache volumes are a Docker-backend feature.",
+            file=sys.stderr,
+        )
+        return 0
+
+    try:
+        listing = subprocess.run(
+            [docker_path, "volume", "ls", "--format", "{{.Name}}"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        print(f"[harness] `docker volume ls` failed: {exc}", file=sys.stderr)
+        return 1
+    if listing.returncode != 0:
+        print(
+            f"[harness] `docker volume ls` exited {listing.returncode}: "
+            f"{(listing.stderr or '').strip()[:200]}",
+            file=sys.stderr,
+        )
+        return 1
+
+    all_volumes = [v for v in (listing.stdout or "").splitlines() if v.strip()]
+    candidates = [v for v in all_volumes if v.startswith(prefix)]
+    if args.session_id:
+        # session id is the trailing token of the volume name, separated by "-".
+        sid_slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", args.session_id).strip("-")
+        candidates = [v for v in candidates if v.endswith(f"-{sid_slug}")]
+
+    if not candidates:
+        scope = f"session '{args.session_id}'" if args.session_id else "all sessions"
+        print(f"No harness cache volumes found for {scope}.")
+        return 0
+
+    print(f"Found {len(candidates)} harness cache volume(s):")
+    for name in candidates:
+        print(f"  {name}")
+    if args.dry_run:
+        print("(dry run — no volumes removed)")
+        return 0
+    if not args.yes:
+        from harness.hitl import get_channel as _get_channel
+        confirmed = _get_channel().confirm(
+            f"Type 'yes' to remove {len(candidates)} volume(s)", default=False,
+        )
+        if not confirmed:
+            print("Cache clear cancelled.")
+            return 0
+
+    removed, failed = 0, []
+    for name in candidates:
+        rm = subprocess.run(
+            [docker_path, "volume", "rm", name],
+            capture_output=True, text=True, timeout=30,
+        )
+        if rm.returncode == 0:
+            removed += 1
+        else:
+            err = (rm.stderr or "").strip()
+            # "in use" is a non-idempotent failure — surface it but keep going.
+            failed.append((name, err[:160]))
+    print(f"Removed {removed} volume(s).")
+    if failed:
+        print(f"Failed to remove {len(failed)} volume(s):", file=sys.stderr)
+        for name, err in failed:
+            print(f"  {name}: {err}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -3240,11 +4267,6 @@ def build_parser() -> argparse.ArgumentParser:
     # --- `harness run` ---
     run_parser = subparsers.add_parser("run", help="Execute the agent graph on a workspace")
     run_parser.add_argument(
-        "--manifest", "-m",
-        default=None,
-        help="Path to a raw notes/text file to synthesize into SPEC_REQUIREMENTS.md before execution.",
-    )
-    run_parser.add_argument(
         "--output-dir", "-o",
         default="./docs",
         help="Directory to write SPEC_REQUIREMENTS.md (default: ./docs).",
@@ -3347,6 +4369,52 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Override max_code_review_cycles for this run (0-5). 0 suspends "
             "the code reviewer without clearing code_reviewer_primary in config."
+        ),
+    )
+    # --new-build / --new_build accepts true|false. Default false (treat the
+    # workspace as steady-state). When true, the harness deletes every file
+    # / dir at workspace root except product_spec/ and .git/, commits the
+    # cleanup on the base branch (master or main), and deletes every
+    # orphaned agent/patch-* branch — see _perform_new_build_reset. No
+    # confirmation prompt; the operator opted in by passing the flag.
+    def _bool_choice(value: str) -> bool:
+        if isinstance(value, bool):
+            return value
+        v = str(value).strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off"):
+            return False
+        raise argparse.ArgumentTypeError(
+            f"Expected true|false (or yes|no, 1|0), got {value!r}"
+        )
+    run_parser.add_argument(
+        "--new-build", "--new_build",
+        dest="new_build",
+        type=_bool_choice,
+        default=False,
+        metavar="true|false",
+        help=(
+            "When true, treat this as a brand-new app: delete every file "
+            "and directory at the workspace root EXCEPT `product_spec/` and "
+            "`.git/`, commit the deletions on the base branch (master / "
+            "main), and remove every orphaned `agent/patch-*` branch in the "
+            "repo. The harness prints a preview and asks for confirmation "
+            "before deleting anything; pass --yes to skip the prompt for "
+            "automation. Runs before the patch branch for this session is "
+            "created, so the new branch forks from a fully clean baseline. "
+            "Defaults to false (steady-state — workspace contents are preserved)."
+        ),
+    )
+    run_parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        default=False,
+        dest="assume_yes",
+        help=(
+            "Skip the --new_build=true confirmation prompt. Intended for "
+            "automation / non-interactive runs. Has no effect when "
+            "--new_build is false."
         ),
     )
 
@@ -3485,6 +4553,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
+    # --- `harness cache <action>` ---
+    cache_parser = subparsers.add_parser(
+        "cache",
+        help="Manage harness-owned Docker cache volumes (sandbox.cache_volumes).",
+    )
+    cache_subparsers = cache_parser.add_subparsers(
+        dest="cache_action", help="Cache action",
+    )
+    cache_clear_parser = cache_subparsers.add_parser(
+        "clear",
+        help="Remove harness-owned cache volumes (idempotent).",
+    )
+    cache_clear_parser.add_argument(
+        "--session-id",
+        default=None,
+        help="Limit removal to volumes scoped to a specific session.",
+    )
+    cache_clear_parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        default=False,
+        help="Skip the confirmation prompt.",
+    )
+    cache_clear_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="List the volumes that would be removed without removing them.",
+    )
+    cache_clear_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path (for config discovery). Defaults to current directory.",
+    )
+
     return parser
 
 
@@ -3532,6 +4635,11 @@ def main() -> int:
             return asyncio.run(cmd_purge(args))
         elif args.command == "metrics":
             return asyncio.run(cmd_metrics(args))
+        elif args.command == "cache":
+            if getattr(args, "cache_action", None) == "clear":
+                return asyncio.run(cmd_cache_clear(args))
+            parser.parse_args([args.command, "--help"])
+            return 1
         else:
             parser.print_help()
             return 1

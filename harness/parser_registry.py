@@ -427,58 +427,99 @@ class PythonParser(BaseLanguageParser):
         in the same stanza — that's the user frame the assertion came from.
         Also catches the conftest-load header so the conftest path is
         attached even when pytest's frame is below the header.
+
+        For plain ``assert`` failures pytest emits no ``file:line: in <func>``
+        frame line at all (it inlines the source instead), so the E-line ends
+        up unattached. We then fall back to the terminal ``file:line:
+        ErrorType`` line and attach the last-seen E-message + the
+        accompanying ``>`` marker line (the failing source). Without this
+        fallback the diagnostic message collapses to just ``AssertionError``
+        and the repair LLM is asked to fix a failure whose body it has never
+        seen (session 2d0164f0).
         """
         diags: list[DiagnosticObject] = []
         last_frame: Optional[tuple[str, int]] = None
         conftest_path: Optional[str] = None
+        # Buffer the most recent E-line message and the failing ``>`` source
+        # line so a terminal fail-line that lacks its own message body can
+        # attach them.
+        pending_e: Optional[tuple[str, str]] = None  # (error_type, message)
+        pending_failing_src: Optional[str] = None
 
         for line in lines:
             stripped = line.rstrip()
+            bare = stripped.strip()
 
-            header = PythonParser._CONFTEST_HEADER_PATTERN.match(stripped.strip())
+            header = PythonParser._CONFTEST_HEADER_PATTERN.match(bare)
             if header:
                 conftest_path = header.group("file")
                 continue
 
-            frame = PythonParser._PYTEST_FRAME_PATTERN.match(stripped.strip())
+            # Pytest prefixes the failing source line with "> " in the short
+            # traceback. Remember it so we can put it in semantic_context.
+            if stripped.startswith(">"):
+                pending_failing_src = stripped[1:].strip()
+                continue
+
+            frame = PythonParser._PYTEST_FRAME_PATTERN.match(bare)
             if frame:
                 last_frame = (frame.group("file"), int(frame.group("line")))
                 continue
 
             # Terminal "file:line: ErrorType" (no message, no E-line follow-up)
-            term = PythonParser._PYTEST_FAIL_LINE_PATTERN.match(stripped.strip())
+            term = PythonParser._PYTEST_FAIL_LINE_PATTERN.match(bare)
             if term:
+                term_type = term.group("type")
+                # Prefer the pending E-line body when it matches the terminal
+                # error type — that's the actual assertion text the LLM needs.
+                msg = term_type
+                ctx = ""
+                if pending_e is not None and pending_e[0] == term_type:
+                    msg = f"{term_type}: {pending_e[1]}"
+                if pending_failing_src:
+                    ctx = f"failing source: {pending_failing_src}"
                 diags.append(DiagnosticObject(
                     file=term.group("file"),
                     line=int(term.group("line")),
                     column=0,
                     severity="error",
-                    error_code=term.group("type"),
-                    message=term.group("type"),
-                    semantic_context="",
+                    error_code=term_type,
+                    message=msg,
+                    semantic_context=ctx,
                 ))
                 last_frame = None
+                pending_e = None
+                pending_failing_src = None
                 continue
 
             e_line = PythonParser._PYTEST_E_PATTERN.match(stripped)
             if e_line:
+                # Always remember it for the terminal-line fallback above.
+                pending_e = (e_line.group("type"), e_line.group("msg"))
                 if last_frame is not None:
                     file_path, lineno = last_frame
                 elif conftest_path is not None:
                     file_path, lineno = conftest_path, 0
                 else:
+                    # No frame yet — wait for the terminal fail line to pair us.
                     continue
+                ctx = (
+                    f"failing source: {pending_failing_src}"
+                    if pending_failing_src else ""
+                )
                 diags.append(DiagnosticObject(
                     file=file_path,
                     line=lineno,
                     column=0,
                     severity="error",
                     error_code=e_line.group("type"),
-                    message=e_line.group("msg"),
-                    semantic_context="",
+                    message=f"{e_line.group('type')}: {e_line.group('msg')}",
+                    semantic_context=ctx,
                 ))
                 last_frame = None
                 conftest_path = None
+                pending_e = None
+                pending_failing_src = None
         return diags
 
     @staticmethod

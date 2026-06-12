@@ -266,6 +266,93 @@ class UnshareBackend(SandboxBackend):
 # 4. DockerBackend — Docker Container Isolation
 # ---------------------------------------------------------------------------
 
+# Substrings that strongly suggest a writable cache (named volume or host
+# cache) has corrupted entries — pip wheel-hash mismatches, npm cacache
+# integrity failures, cargo registry-index damage. When any of these turn up
+# in the build output we append a one-line "try clearing the cache" hint to
+# the BuildResult so the operator (and any LLM repair loop reading the
+# transcript) doesn't burn a debugging cycle on a recoverable corruption.
+# Match against lowercased output to be case-tolerant. Over-triggering is
+# safe — a stray hint is one line; missing a real signature wastes minutes.
+_CACHE_CORRUPTION_SIGNATURES: tuple[str, ...] = (
+    # pip / pip-tools
+    "these packages do not match the hashes from the requirements file",
+    "could not match the hash",
+    "is not a known hash",
+    # npm / cacache
+    "cacache: integrity check failed",
+    "eintegrity",
+    "sha512-",  # paired with "eintegrity" usually; weak signal alone but kept conservative below
+    # cargo
+    "registry index is corrupt",
+    "the lock file `cargo.lock` is corrupt",
+    "failed to read `registry`",
+)
+# Tighter set used when the only hit is "sha512-": we require the npm-specific
+# error wrapper to also be present, since sha512- appears in benign output too.
+_NPM_INTEGRITY_PAIR = ("sha512-", "eintegrity")
+
+
+def _cache_corruption_hint(raw_output: str) -> Optional[str]:
+    """Return a one-line hint when the build output looks cache-corrupted,
+    or None otherwise. Caller appends to BuildResult.raw_output."""
+    if not raw_output:
+        return None
+    lower = raw_output.lower()
+    hit = False
+    for sig in _CACHE_CORRUPTION_SIGNATURES:
+        if sig == "sha512-":
+            continue  # handled below — requires the EINTEGRITY pair
+        if sig in lower:
+            hit = True
+            break
+    if not hit and all(s in lower for s in _NPM_INTEGRITY_PAIR):
+        hit = True
+    if not hit:
+        return None
+    return (
+        "\n[sandbox-hint] Build output contains a cache-corruption signature "
+        "(hash mismatch / integrity failure / corrupt registry index). If you "
+        "have `sandbox.cache_volumes` enabled, try `harness cache clear` "
+        "(optionally `--session-id <id>`) and rerun. If you don't, your host "
+        "cache (~/.cache/pip, ~/.npm, ~/.cargo) may be damaged — clear the "
+        "affected tool's cache directory."
+    )
+
+
+def _cache_volume_name(
+    cache_path: str,
+    session_id: Optional[str],
+    prefix: str = "harness",
+) -> str:
+    """Derive a deterministic, host-stable, session-namespaced Docker volume
+    name from a read-only cache mount path.
+
+    Operators configure ``sandbox.readonly_cache_mounts`` with tool-specific
+    paths (``~/.cache/pip``, ``~/.npm``, ``~/.cargo``). When
+    ``sandbox.cache_volumes`` is on, we swap each read-only host bind for a
+    writable named volume so the tool can persist downloaded wheels /
+    tarballs / crates back across containers. Volume names are derived from
+    the basename of the cache path so the volume's purpose is greppable from
+    ``docker volume ls``. Session id is appended to scope reuse — variant 1's
+    typo-installed package can't poison a different operator's session.
+
+    ``~/.cache/pip`` collapses its basename to ``pip`` rather than ``cache``
+    (the parent dir name is more informative for the tool-specific mounts the
+    operator actually configures). Empty / missing session id falls back to
+    ``global`` so callers that don't pass one still get a stable name.
+    """
+    expanded = os.path.expanduser(cache_path).rstrip(os.sep)
+    base = os.path.basename(expanded) or "cache"
+    if base == "cache":
+        parent = os.path.basename(os.path.dirname(expanded)) or "cache"
+        base = parent.lstrip(".") or "cache"
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", base.lstrip(".")).strip("-") or "cache"
+    sid = (session_id or "global").strip() or "global"
+    sid_slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", sid).strip("-") or "global"
+    return f"{prefix}-{slug}-{sid_slug}"
+
+
 def _docker_mount_path(p: str) -> str:
     """Normalise a filesystem path for use as a Docker ``-v`` / ``-w`` argument.
 
@@ -325,12 +412,30 @@ class DockerBackend(SandboxBackend):
         docker_path: str = "docker",
         read_only_root: bool = True,
         restore_workspace_ownership: bool = True,
+        cache_volumes_enabled: bool = False,
+        cache_volumes_session_id: Optional[str] = None,
+        cache_volumes_prefix: str = "harness",
     ):
         self.image = image
         self.memory_limit = memory_limit
         self.cpu_limit = cpu_limit
         self.pids_limit = pids_limit
         self.docker_path = docker_path
+        # When True, replace the historical read-only host bind-mounts for
+        # readonly_cache_mounts with writable named Docker volumes scoped to
+        # cache_volumes_session_id. Tools (pip/npm/cargo) can then persist
+        # downloaded wheels/tarballs/crates between containers in the same
+        # session, removing the cold-cache extraction tax on every compile.
+        # See _cache_volume_name for the volume-naming convention and
+        # _ensure_cache_volumes for idempotent creation.
+        self.cache_volumes_enabled = cache_volumes_enabled
+        self.cache_volumes_session_id = cache_volumes_session_id
+        self.cache_volumes_prefix = cache_volumes_prefix
+        # Track which named volumes we've already ensured to exist this
+        # process — `docker volume inspect` is faster than `docker volume
+        # create`, but each call is still a fork/exec. Memoise so the second
+        # variant in a session doesn't pay the cost.
+        self._ensured_volumes: set[str] = set()
         # When True (default) the container's root FS is mounted read-only and
         # only /tmp is writable. Setting this to False is required for builds
         # that install packages into system locations (pip install -e .,
@@ -410,6 +515,14 @@ class DockerBackend(SandboxBackend):
         readonly_cache_mounts: Optional[list[str]] = None,
         extra_env: Optional[dict[str, str]] = None,
     ) -> tuple[int, str, bool, bool]:
+        # Pre-create any named cache volumes for this run. Without this the
+        # `--mount type=volume,source=...` in the docker run argv would
+        # auto-create the volume implicitly, but auto-create silently
+        # initialises an empty volume — we want explicit `docker volume
+        # create` so failures (out of disk, daemon socket perms) surface
+        # with their actual error message before the build starts.
+        if self.cache_volumes_enabled:
+            self._ensure_cache_volumes(readonly_cache_mounts or [])
         docker_cmd = self._build_docker_command(
             command,
             workspace_path,
@@ -429,6 +542,56 @@ class DockerBackend(SandboxBackend):
             # the bind-mount on the host. Best-effort: silently exits if the
             # host user lacks CAP_CHOWN.
             self._host_side_ownership_sweep(workspace_path)
+
+    def _ensure_cache_volumes(self, cache_mounts: list[str]) -> None:
+        """Idempotently `docker volume create` each cache mount's named volume.
+
+        Skips creation when the volume already exists (per the cached set or
+        per `docker volume inspect`). First-call latency per volume is ~50ms
+        on a warm daemon; subsequent calls hit the in-process memo set.
+        """
+        for cache_path in cache_mounts:
+            expanded = os.path.expanduser(cache_path)
+            volume = _cache_volume_name(
+                expanded,
+                self.cache_volumes_session_id,
+                self.cache_volumes_prefix,
+            )
+            if volume in self._ensured_volumes:
+                continue
+            try:
+                inspect = subprocess.run(
+                    [self.docker_path, "volume", "inspect", volume],
+                    capture_output=True,
+                    timeout=10,
+                )
+                if inspect.returncode == 0:
+                    self._ensured_volumes.add(volume)
+                    continue
+                create = subprocess.run(
+                    [self.docker_path, "volume", "create", volume],
+                    capture_output=True,
+                    timeout=15,
+                    text=True,
+                )
+                if create.returncode != 0:
+                    logger.warning(
+                        "[sandbox:docker] Failed to create cache volume %r: %s. "
+                        "Falling back to no cache for this mount this run.",
+                        volume, (create.stderr or "").strip()[:200],
+                    )
+                    continue
+                logger.info(
+                    "[sandbox:docker] Created cache volume %r for %s.",
+                    volume, cache_path,
+                )
+                self._ensured_volumes.add(volume)
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+                logger.warning(
+                    "[sandbox:docker] docker volume probe for %r failed: %s. "
+                    "Falling back to no cache for this mount this run.",
+                    volume, exc,
+                )
 
     # In-container HOME used when --user passes a non-root UID. /tmp is the
     # writable tmpfs already provisioned at line 414, so the host user's HOME
@@ -496,11 +659,32 @@ class DockerBackend(SandboxBackend):
         ws_mount = _docker_mount_path(workspace_path)
         cmd.extend(["-v", f"{ws_mount}:{ws_mount}:rw"])
 
-        # Mount cache directories read-only
+        # Cache mounts. When cache_volumes is on, swap each :ro host bind for
+        # a writable named Docker volume scoped to the session — the tool's
+        # downloads persist across containers and the next compile in the
+        # same session reuses them. Otherwise emit the historical read-only
+        # host bind so behaviour is byte-for-byte unchanged when the flag is
+        # off. We only emit volume mounts that we successfully ensured in
+        # _ensure_cache_volumes; failed-to-create volumes fall back to the
+        # read-only host bind so the build can still cold-fill from the host
+        # cache (better than no cache at all).
         for cache_path in cache_mounts:
             expanded = os.path.expanduser(cache_path)
+            expanded_mount = _docker_mount_path(expanded)
+            if self.cache_volumes_enabled:
+                volume = _cache_volume_name(
+                    expanded,
+                    self.cache_volumes_session_id,
+                    self.cache_volumes_prefix,
+                )
+                if volume in self._ensured_volumes:
+                    cmd.extend([
+                        "--mount",
+                        f"type=volume,source={volume},target={expanded_mount}",
+                    ])
+                    continue
+                # ensure failed → fall through to the read-only host bind.
             if os.path.isdir(expanded):
-                expanded_mount = _docker_mount_path(expanded)
                 cmd.extend(["-v", f"{expanded_mount}:{expanded_mount}:ro"])
 
         # Set working directory (same Windows path conversion as the mount).
@@ -1548,6 +1732,7 @@ class SandboxExecutor:
         command_validator: Optional[Any] = None,
         extra_env: Optional[dict[str, str]] = None,
         sandbox_config: Optional[dict[str, Any]] = None,
+        session_id: Optional[str] = None,
     ):
         self.workspace_path = os.path.abspath(workspace_path)
         self.allow_network = allow_network
@@ -1594,6 +1779,19 @@ class SandboxExecutor:
                 docker_kwargs["restore_workspace_ownership"] = bool(
                     cfg["restore_workspace_ownership"]
                 )
+            # sandbox.cache_volumes opts the docker backend into writable
+            # named volumes for the read-only cache mounts. session_id (from
+            # the SandboxExecutor constructor, typically state["session_id"])
+            # namespaces the volumes so variant 1's typo-installed package
+            # can't poison another session. When the flag is on but no
+            # session id was passed, _cache_volume_name falls back to a
+            # "global" namespace.
+            if cfg.get("cache_volumes"):
+                docker_kwargs["cache_volumes_enabled"] = True
+                docker_kwargs["cache_volumes_session_id"] = session_id
+                cvp = cfg.get("cache_volumes_prefix")
+                if cvp:
+                    docker_kwargs["cache_volumes_prefix"] = str(cvp)
             requested_backend = (cfg.get("backend", "auto") or "auto").lower()
             if requested_backend in ("auto", ""):
                 # auto-detect: forward docker kwargs (auto-detect itself
@@ -1686,9 +1884,20 @@ class SandboxExecutor:
         except Exception:  # noqa: BLE001
             pass
 
+        # Cache-corruption signature scan. Append a one-line hint to the
+        # returned raw_output (the same field the LLM repair loop reads) so
+        # the next iteration sees the recoverable-corruption signal rather
+        # than chasing the real-looking hash mismatch as a code bug. Scan
+        # the original raw_output (filter_critical_errors may have dropped
+        # the signature line under aggressive filtering).
+        result_output = filtered if exit_code != 0 else raw_output
+        hint = _cache_corruption_hint(raw_output)
+        if hint:
+            result_output = (result_output or "") + hint
+
         return BuildResult(
             exit_code=exit_code,
-            raw_output=filtered if exit_code != 0 else raw_output,
+            raw_output=result_output,
             diagnostics=diagnostics,
             elapsed_seconds=elapsed,
             timed_out=timed_out,

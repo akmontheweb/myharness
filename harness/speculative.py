@@ -111,6 +111,21 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
 
     # --- Config ---
     spec_cfg = state.get("speculative_config", {}) or {}
+    # Honour the `enabled` flag. Default is False: across the recent log set
+    # (sessions ae01ec25, c498b865, dd47480a, 8b7f7d52) the winner case
+    # never fired — every speculative round fell through to salvage, the
+    # salvage merge created workspace coherence problems (incoherent
+    # directory layouts, missing entry points), and the downstream repair
+    # loop couldn't recover. The 3× LLM cost bought negative ROI. Operators
+    # who want speculative on a workload where it earns its cost (e.g.
+    # steady-state repos with bounded micro-fixes) flip the flag in
+    # config.json. See speculative.md (when documented) for details.
+    if not spec_cfg.get("enabled", False):
+        logger.info(
+            "[speculative] Disabled (speculative.enabled is false). "
+            "Passing through to standard patching flow."
+        )
+        return _fallback_result()
     num_variants = spec_cfg.get("num_variants", 3)
     temperature = spec_cfg.get("temperature", 0.3)
     strategy = spec_cfg.get("selection_strategy", "first_success")
@@ -302,6 +317,67 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
         if vr.error or not vr.worktree_path:
             return vr
         try:
+            # Per-variant late-bind. The workspace-time resolution above
+            # sniffed an empty/greenfield workspace before any LLM call.
+            # Now that this variant's patches are on disk in its worktree,
+            # re-sniff against THAT tree so the toolchain reflects what
+            # the variant actually produced. Without this, a greenfield
+            # run keeps build_command="make build" against the bare
+            # ubuntu:22.04 default and every variant exits 127 even when
+            # one wrote a perfectly good Python (or Node, or Rust) project.
+            # detect_default_build_command + _apply_toolchain_adaptation
+            # are idempotent — re-calling them produces the same answer
+            # the workspace-time pass picked when the worktree matches.
+            per_variant_build = build_command
+            per_variant_sandbox = sandbox_config
+            per_variant_network = allow_network
+            per_variant_adapted: Optional[str] = None
+            try:
+                from harness.cli import _detect_default_build_command
+                late = _detect_default_build_command(vr.worktree_path)
+                if late and late != per_variant_build:
+                    logger.info(
+                        "[speculative] Variant %d: build command resolved to %r "
+                        "(workspace-time default was %r).",
+                        vr.index, late, per_variant_build,
+                    )
+                    per_variant_adapted = late
+                    per_variant_build = late
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[speculative] Variant %d: per-variant build-command late-bind failed: %s",
+                    vr.index, exc,
+                )
+            try:
+                from harness.graph import _apply_toolchain_adaptation
+                (
+                    per_variant_sandbox,
+                    per_variant_network,
+                    v_image_adapted,
+                    v_net_adapted,
+                    _,
+                ) = _apply_toolchain_adaptation(
+                    per_variant_build,
+                    per_variant_sandbox,
+                    per_variant_network,
+                    command_is_adapter_synthesised=per_variant_adapted is not None,
+                )
+                if v_image_adapted:
+                    logger.info(
+                        "[speculative] Variant %d: adapting docker_image to %r to match toolchain implied by: %s",
+                        vr.index, per_variant_sandbox.get("docker_image"), per_variant_build,
+                    )
+                if v_net_adapted:
+                    logger.info(
+                        "[speculative] Variant %d: auto-enabling network for adapter-synthesised install step: %s",
+                        vr.index, per_variant_build,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[speculative] Variant %d: per-variant toolchain adaptation failed: %s",
+                    vr.index, exc,
+                )
+
             # Give each variant a private writable cache directory tree.
             # Multiple variants running in parallel would otherwise corrupt
             # each other's pip / npm / cargo / go / mypy / pytest caches —
@@ -310,23 +386,95 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
             # Read-only host cache mounts (~/.cache/pip etc. via the unshare
             # backend's --bind -o ro) still serve as warm sources; the env
             # vars below redirect *writes* to per-variant locations.
-            variant_env = _build_variant_cache_env(vr.worktree_path)
+            # When sandbox.cache_volumes is on, route package caches through
+            # the shared named volume (warm-up has already populated it);
+            # keep build-output caches variant-private.
+            use_shared = bool((per_variant_sandbox or {}).get("cache_volumes"))
+            variant_env = _build_variant_cache_env(
+                vr.worktree_path, use_shared_package_cache=use_shared,
+            )
             executor = SandboxExecutor(
                 workspace_path=vr.worktree_path,
                 extra_env=variant_env,
-                sandbox_config=sandbox_config,
-                allow_network=allow_network,
+                sandbox_config=per_variant_sandbox,
+                allow_network=per_variant_network,
+                session_id=state.get("session_id"),
             )
-            result = await executor.run(build_command)
+            result = await executor.run(per_variant_build)
             vr.exit_code = result.exit_code
             vr.raw_output = result.raw_output
             vr.timed_out = result.timed_out
             logger.info("[speculative] Variant %d compiled: exit=%d timed_out=%s",
                          vr.index, vr.exit_code, vr.timed_out)
+            # Exit 127 across variants is almost always a missing-toolchain
+            # signal (the shell could not find the build binary). Append a
+            # one-line hint to the raw_output so the operator — and the
+            # downstream repair loop — see WHY rather than staring at a
+            # bare "exit=127".
+            if vr.exit_code == 127:
+                hint = (
+                    f"\n[speculative-hint] exit 127 typically means the shell could not "
+                    f"find a binary in the build command. Resolved build_command="
+                    f"{per_variant_build!r}, docker_image="
+                    f"{per_variant_sandbox.get('docker_image', 'ubuntu:22.04')!r}. "
+                    f"Either the toolchain isn't installed in that image or the worktree "
+                    f"has no source markers the harness can detect."
+                )
+                vr.raw_output = (vr.raw_output or "") + hint
         except Exception as exc:
             vr.error = f"Compile failed: {exc}"
             logger.warning("[speculative] Variant %d compile error: %s", vr.index, exc)
         return vr
+
+    # --- Cache warm-up pass ---
+    # When sandbox.cache_volumes is on, the variants share a writable named
+    # volume per tool (pip/npm/cargo). Without warm-up, all three variants
+    # race to cold-fill the cache in parallel — 3× the network downloads,
+    # cargo flock contention on the registry index. Warm-up runs the install
+    # step once against the workspace (single-writer) so the variants then
+    # fan out against an already-populated cache.
+    #
+    # Skip warm-up when:
+    #   - cache_volumes is off (no shared cache to fill — variants have
+    #     their own per-variant write dirs and host caches are read-only).
+    #   - The build command does no install work (`make build`, plain
+    #     `cargo build` against a vendored crate, etc.).
+    #   - The workspace has no install markers (greenfield run — the
+    #     workspace-time late-bind returned None, so build_command is still
+    #     the unresolved default and warming up with it would just exit 127).
+    cache_volumes_on = bool((sandbox_config or {}).get("cache_volumes"))
+    if cache_volumes_on:
+        try:
+            from harness.graph import _build_command_needs_network
+            from harness.cli import _detect_default_build_command as _detect_workspace_marker
+            from harness.sandbox import SandboxExecutor
+            session_id = state.get("session_id")
+            needs_install = _build_command_needs_network(build_command)
+            workspace_has_markers = _detect_workspace_marker(workspace_path) is not None
+            if needs_install and workspace_has_markers:
+                logger.info(
+                    "[speculative] Warm-up: priming shared cache volume(s) with "
+                    "a single install pass before %d variants fan out.",
+                    len(variant_results),
+                )
+                warmup_exec = SandboxExecutor(
+                    workspace_path=workspace_path,
+                    sandbox_config=sandbox_config,
+                    allow_network=allow_network,
+                    session_id=session_id,
+                )
+                warmup_result = await warmup_exec.run(build_command)
+                logger.info(
+                    "[speculative] Warm-up complete: exit=%d elapsed=%.2fs.",
+                    warmup_result.exit_code, warmup_result.elapsed_seconds,
+                )
+            else:
+                logger.debug(
+                    "[speculative] Warm-up skipped: needs_install=%s "
+                    "workspace_has_markers=%s.", needs_install, workspace_has_markers,
+                )
+        except Exception as exc:  # noqa: BLE001 — warm-up is best-effort
+            logger.debug("[speculative] Warm-up failed: %s", exc)
 
     variant_results = list(await asyncio.gather(*[
         _compile_variant(vr) for vr in variant_results
@@ -408,10 +556,13 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
         messages_out = list(state.get("messages", []))
         messages_out.append({"role": "system", "content": "\n".join(status_parts)})
 
-        # Update token tracker with the winner's LLM usage
+        # Update token tracker with the winner's LLM usage. Per-stage
+        # attribution: speculative variants are NodeRole.PATCHING dispatches.
         token_tracker = state.get("token_tracker", {})
         if winner.llm_response is not None:
-            token_tracker = gateway.aggregate_tokens(token_tracker, winner.llm_response.usage)
+            token_tracker = gateway.aggregate_tokens(
+                token_tracker, winner.llm_response.usage, role=NodeRole.PATCHING,
+            )
 
         logger.info("[speculative] Complete: %.2fs, winner=Variant %d.", elapsed, winner.index)
 
@@ -489,7 +640,9 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
 
         token_tracker = state.get("token_tracker", {})
         if salvage.llm_response is not None:
-            token_tracker = gateway.aggregate_tokens(token_tracker, salvage.llm_response.usage)
+            token_tracker = gateway.aggregate_tokens(
+                token_tracker, salvage.llm_response.usage, role=NodeRole.PATCHING,
+            )
 
         return {
             "modified_files": merged_modified,
@@ -583,6 +736,20 @@ def _pick_salvage_variant(variant_results: list["VariantResult"]) -> Optional["V
     Ranking: most successful patches first, then fewest lines changed
     (Occam-ish — smaller diffs are less likely to drag in hallucinated code).
     Returns None when no variant qualifies for salvage.
+
+    Quality gate (C1): even the best candidate is refused if it doesn't
+    meet a minimum coherence bar. A variant where only a tiny fraction of
+    its patches landed produces a half-built workspace that the repair
+    loop then tries — and fails — to fix. Better to refuse salvage and let
+    repair work from the pre-speculative workspace, which is internally
+    coherent even if it's missing features.
+
+    Bar (conservative, all must hold):
+      - applied_patches >= 3 (variants with 1-2 successful patches are too
+        thin to be worth merging — they add scaffolding without substance).
+      - applied_patches / total_patches >= 0.50 (at least half of what the
+        variant tried actually landed — fewer than that suggests fundamental
+        confusion about workspace state).
     """
     candidates = [vr for vr in variant_results if _is_recoverable_failure(vr)]
     if not candidates:
@@ -593,7 +760,22 @@ def _pick_salvage_variant(variant_results: list["VariantResult"]) -> Optional["V
             vr.total_lines_changed,
         )
     )
-    return candidates[0]
+    best = candidates[0]
+    applied = sum(1 for r in best.patch_results if r.success)
+    total = len(best.patch_results) or 1
+    pct = applied / total
+    MIN_APPLIED = 3
+    MIN_PCT = 0.50
+    if applied < MIN_APPLIED or pct < MIN_PCT:
+        logger.warning(
+            "[speculative:salvage] Best candidate Variant %d does not meet "
+            "the quality gate (applied=%d/%d=%.0f%%, need >=%d patches and "
+            ">=%.0f%%). Refusing salvage; repair will start from the "
+            "pre-speculative workspace.",
+            best.index, applied, total, pct * 100, MIN_APPLIED, MIN_PCT * 100,
+        )
+        return None
+    return best
 
 
 def _merge_variant_into_workspace(
@@ -683,7 +865,11 @@ def _select_winner(
 # 4. Worktree Management
 # ---------------------------------------------------------------------------
 
-def _build_variant_cache_env(worktree_path: str) -> dict[str, str]:
+def _build_variant_cache_env(
+    worktree_path: str,
+    *,
+    use_shared_package_cache: bool = False,
+) -> dict[str, str]:
     """
     Build environment variables that redirect every common build tool's
     *writable* cache to a variant-local directory tree.
@@ -700,21 +886,30 @@ def _build_variant_cache_env(worktree_path: str) -> dict[str, str]:
     ``sandbox.readonly_cache_mounts``) still seed warm dependencies —
     these env vars only affect where writes land.
 
+    When ``use_shared_package_cache`` is True (``sandbox.cache_volumes`` is
+    on), the **package** caches (pip, npm, yarn, cargo registry, go mods,
+    maven repo) are NOT overridden — they fall through to the tool's
+    default paths inside the container, which the docker backend has
+    bind-mounted to a writable named volume. Build-output / incremental
+    tool caches (__pycache__, mypy, pytest, ruff, gradle, cargo target,
+    go build cache) stay per-variant since different variants produce
+    different code and must not share build artifacts.
+
     Returned env-var keys (each pointing to a per-variant subdirectory):
-      - PIP_CACHE_DIR          (Python pip)
-      - npm_config_cache       (npm — lowercase is canonical)
-      - YARN_CACHE_FOLDER      (Yarn)
-      - CARGO_HOME             (Cargo registry + git + credentials)
-      - CARGO_TARGET_DIR       (Rust build artifacts)
-      - GOCACHE                (Go build cache)
-      - GOMODCACHE             (Go module download cache)
-      - GRADLE_USER_HOME       (Gradle)
-      - MAVEN_OPTS             (-Dmaven.repo.local override)
-      - PYTHONPYCACHEPREFIX    (Python __pycache__)
-      - MYPY_CACHE_DIR         (mypy incremental)
-      - RUFF_CACHE_DIR         (ruff)
-      - PYTEST_ADDOPTS         (forces -p no:cacheprovider OR --cache-dir)
-      - XDG_CACHE_HOME         (generic XDG fallback used by many tools)
+      - PIP_CACHE_DIR          (Python pip; omitted when shared cache is on)
+      - npm_config_cache       (npm — lowercase is canonical; omitted when shared)
+      - YARN_CACHE_FOLDER      (Yarn; omitted when shared)
+      - CARGO_HOME             (Cargo registry + git + credentials; omitted when shared)
+      - CARGO_TARGET_DIR       (Rust build artifacts — always per-variant)
+      - GOCACHE                (Go build cache — always per-variant)
+      - GOMODCACHE             (Go module download cache; omitted when shared)
+      - GRADLE_USER_HOME       (Gradle — always per-variant)
+      - MAVEN_OPTS             (-Dmaven.repo.local override; omitted when shared)
+      - PYTHONPYCACHEPREFIX    (Python __pycache__ — always per-variant)
+      - MYPY_CACHE_DIR         (mypy incremental — always per-variant)
+      - RUFF_CACHE_DIR         (ruff — always per-variant)
+      - PYTEST_ADDOPTS         (forces -o cache_dir=... — always per-variant)
+      - XDG_CACHE_HOME         (generic XDG fallback — always per-variant)
     """
     base = os.path.join(worktree_path, ".harness-cache")
     os.makedirs(base, exist_ok=True)
@@ -724,31 +919,38 @@ def _build_variant_cache_env(worktree_path: str) -> dict[str, str]:
         os.makedirs(p, exist_ok=True)
         return p
 
-    maven_repo = _sub("maven-repo")
-
-    return {
-        # Python / pip / pytest / mypy / ruff
-        "PIP_CACHE_DIR": _sub("pip"),
+    env: dict[str, str] = {
+        # Build outputs + tool incremental state — ALWAYS per-variant,
+        # regardless of cache_volumes. Different variants produce different
+        # code; sharing __pycache__, mypy incremental, ruff, pytest, cargo
+        # target, go build cache, or gradle home would mix branches and
+        # corrupt verdicts.
         "PYTHONPYCACHEPREFIX": _sub("pycache"),
         "MYPY_CACHE_DIR": _sub("mypy"),
         "RUFF_CACHE_DIR": _sub("ruff"),
-        # pytest uses XDG by default but PYTEST_ADDOPTS lets us override.
         "PYTEST_ADDOPTS": f"-o cache_dir={_sub('pytest')}",
-        # JS / TS
-        "npm_config_cache": _sub("npm"),
-        "YARN_CACHE_FOLDER": _sub("yarn"),
-        # Rust
-        "CARGO_HOME": _sub("cargo-home"),
         "CARGO_TARGET_DIR": _sub("cargo-target"),
-        # Go
         "GOCACHE": _sub("go-build"),
-        "GOMODCACHE": _sub("go-mod"),
-        # JVM
         "GRADLE_USER_HOME": _sub("gradle"),
-        "MAVEN_OPTS": f"-Dmaven.repo.local={maven_repo}",
-        # Generic XDG fallback caught by anything else
         "XDG_CACHE_HOME": _sub("xdg"),
     }
+    if not use_shared_package_cache:
+        # Default: per-variant package caches so concurrent writes don't
+        # race (cargo's registry index in particular). With cache_volumes
+        # on, the docker backend bind-mounts a writable named volume at
+        # the container's default tool paths, and the speculative warm-up
+        # pass primes the volume before fan-out — leaving these env vars
+        # unset lets the tools pick up the shared cache.
+        maven_repo = _sub("maven-repo")
+        env.update({
+            "PIP_CACHE_DIR": _sub("pip"),
+            "npm_config_cache": _sub("npm"),
+            "YARN_CACHE_FOLDER": _sub("yarn"),
+            "CARGO_HOME": _sub("cargo-home"),
+            "GOMODCACHE": _sub("go-mod"),
+            "MAVEN_OPTS": f"-Dmaven.repo.local={maven_repo}",
+        })
+    return env
 
 
 def _repo_has_resolvable_head(repo_path: str) -> bool:

@@ -643,6 +643,45 @@ class TestHybridPatcher:
             assert os.path.isfile(os.path.join(tmpdir, "new.py"))
 
     @pytest.mark.asyncio
+    async def test_apply_all_continues_past_middle_failure(self):
+        # A1 regression: apply_all used to break on the first failure, which
+        # in practice discarded 80-90% of the LLM's patches every repair
+        # round (one bad CREATE_FILE in a 12-block batch nuked the other 11).
+        # The repair LLM then saw the same build errors and re-emitted the
+        # same blocks, looping. Verify that a middle-block failure no
+        # longer truncates the result list — blocks 1 and 3 must still
+        # apply successfully.
+        from harness.patcher import HybridPatcher, PatchBlock, OperationType
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Pre-create block-2's target with DIFFERENT content so the
+            # second CREATE_FILE fails the way the repair loop hits it.
+            os.makedirs(os.path.join(tmpdir, "already"))
+            with open(os.path.join(tmpdir, "already", "exists.py"), "w") as f:
+                f.write("pre-existing content\n")
+
+            patcher = HybridPatcher(tmpdir)
+            results = await patcher.apply_all([
+                PatchBlock(operation=OperationType.CREATE_FILE, file="a.py",
+                           content="x = 1"),
+                # This one will fail — file already exists with different content.
+                PatchBlock(operation=OperationType.CREATE_FILE,
+                           file="already/exists.py", content="y = 2"),
+                PatchBlock(operation=OperationType.CREATE_FILE, file="c.py",
+                           content="z = 3"),
+            ])
+            # All three blocks must have a result (length == input length).
+            assert len(results) == 3
+            # Block 1 succeeded.
+            assert results[0].success is True
+            # Block 2 failed but didn't stop the loop.
+            assert results[1].success is False
+            assert "already exists" in (results[1].error or "").lower()
+            # Block 3 still applied even though block 2 failed before it.
+            assert results[2].success is True
+            assert os.path.isfile(os.path.join(tmpdir, "a.py"))
+            assert os.path.isfile(os.path.join(tmpdir, "c.py"))
+
+    @pytest.mark.asyncio
     async def test_process_llm_patch_output(self):
         from harness.patcher import process_llm_patch_output
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2810,7 +2849,9 @@ class TestAgentState:
         with tempfile.TemporaryDirectory() as tmpdir:
             state = _make_state(tmpdir)
             state["exit_code"] = 1
-            state["loop_counter"]["total_repairs"] = 3
+            # Default cap was raised from 3 → 5 (A5). HITL kicks in once
+            # total_repairs hits the cap; pin to the current default.
+            state["loop_counter"]["total_repairs"] = 5
             state["budget_remaining_usd"] = 1.0
             assert route_after_compiler(state) == "human_intervention_node"
 
@@ -3158,6 +3199,33 @@ class TestToolchainAdaptation:
         assert not ro_adapted
         assert "read_only_root" not in cfg
 
+    def test_make_build_swaps_to_image_with_make(self):
+        # Fix 2 (session b6fe5c6e backstop): when the resolved build
+        # command is `make ...`, ubuntu:22.04 doesn't ship `make` →
+        # exit 127. Adaptation must pick an image that has it.
+        from harness.graph import _apply_toolchain_adaptation, _toolchain_image_for
+        # Direct helper check
+        assert _toolchain_image_for("make build") == "buildpack-deps:bookworm"
+        assert _toolchain_image_for("make") == "buildpack-deps:bookworm"
+        assert _toolchain_image_for("make test") == "buildpack-deps:bookworm"
+        # End-to-end through adapter
+        cfg, _allow_net, img_adapted, _net, _ro = _apply_toolchain_adaptation(
+            "make build", {"docker_image": "ubuntu:22.04"}, False,
+        )
+        assert img_adapted
+        assert cfg["docker_image"] == "buildpack-deps:bookworm"
+
+    def test_make_target_does_not_clobber_python_image_when_user_set(self):
+        # Idempotency: when the operator already configured a non-bare
+        # image (e.g. their own custom builder), make-based commands
+        # should NOT silently overwrite it. Only bare defaults get flipped.
+        from harness.graph import _apply_toolchain_adaptation
+        cfg, _allow_net, img_adapted, _net, _ro = _apply_toolchain_adaptation(
+            "make build", {"docker_image": "my-org/custom-builder:1.0"}, False,
+        )
+        assert not img_adapted
+        assert cfg["docker_image"] == "my-org/custom-builder:1.0"
+
     def test_adapts_network_for_pip_install(self):
         # P1.3 closeout: auto-network on pip-install detection now requires
         # explicit opt-in via sandbox.auto_enable_network_for_install. Pass
@@ -3321,10 +3389,387 @@ class TestDetectDefaultBuildCommandPyFallback:
         # pyproject.toml branch fires first → editable install + pytest
         assert "pip install -e ." in cmd
 
+
+class TestMakefileBuildTargetDetection:
+    """Session `b6fe5c6e` regression: an LLM-generated Makefile without a
+    `build:` target caused the harness to invoke `make build` against
+    `ubuntu:22.04` (no make installed) → instant exit-127 with zero
+    diagnostics. The fix only routes to `make build` when the file
+    actually declares the target; otherwise it falls through to
+    manifest-based detection.
+    """
+
+    def test_makefile_without_build_target_falls_through_to_pyproject(self, tmp_path):
+        from harness.cli import _detect_default_build_command
+        (tmp_path / "Makefile").write_text(
+            ".PHONY: help install test\n"
+            "help:\n\t@echo hi\n"
+            "install:\n\tpip install -e .\n"
+            "test:\n\tpytest -v\n"
+        )
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        cmd = _detect_default_build_command(str(tmp_path))
+        # Without a `build:` target the Makefile is ignored; we use the
+        # manifest-based command directly.
+        assert cmd == "python3 -m pip install -e . && python3 -m pytest -q"
+
+    def test_makefile_with_build_target_still_returns_make_build(self, tmp_path):
+        from harness.cli import _detect_default_build_command
+        (tmp_path / "Makefile").write_text(
+            ".PHONY: build\n"
+            "build:\n\tpip install -e . && pytest -v\n"
+        )
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        cmd = _detect_default_build_command(str(tmp_path))
+        assert cmd == "make build"
+
+    def test_makefile_has_target_matches_line_anchor(self, tmp_path):
+        from harness.cli import _makefile_has_target
+        (tmp_path / "Makefile").write_text(
+            ".PHONY: build\n"
+            "build: deps\n"  # target with prerequisites still matches
+            "\tpip install -e .\n"
+        )
+        assert _makefile_has_target(str(tmp_path), "build") is True
+
+    def test_makefile_has_target_rejects_substring_in_recipe(self, tmp_path):
+        # If "build:" appears only inside a recipe (e.g. a comment or an
+        # echo body), NOT at the start of a line, it should not count.
+        from harness.cli import _makefile_has_target
+        (tmp_path / "Makefile").write_text(
+            "help:\n\t@echo 'no build: target here, only help'\n"
+        )
+        assert _makefile_has_target(str(tmp_path), "build") is False
+
+    def test_makefile_has_target_false_for_missing_file(self, tmp_path):
+        from harness.cli import _makefile_has_target
+        assert _makefile_has_target(str(tmp_path), "build") is False
+
+    def test_makefile_has_target_finds_alternate_filenames(self, tmp_path):
+        # Make recognises `Makefile`, `makefile`, and `GNUmakefile`.
+        from harness.cli import _makefile_has_target
+        (tmp_path / "GNUmakefile").write_text("build:\n\techo yes\n")
+        assert _makefile_has_target(str(tmp_path), "build") is True
+
+    def test_makefile_without_build_no_other_markers_falls_to_py_fallback(self, tmp_path):
+        # When the workspace has a Makefile (no `build:`) and a top-level
+        # .py file (no pyproject.toml / requirements.txt), the py
+        # fallback fires instead of returning `make build`.
+        from harness.cli import _detect_default_build_command
+        (tmp_path / "Makefile").write_text("help:\n\t@echo nope\n")
+        (tmp_path / "app.py").write_text("print('hi')\n")
+        cmd = _detect_default_build_command(str(tmp_path))
+        assert cmd is not None
+        assert "pip install pytest" in cmd
+        assert "make build" not in cmd
+
     def test_no_python_returns_none(self, tmp_path):
         from harness.cli import _detect_default_build_command
         (tmp_path / "README.md").write_text("# hi\n")
         assert _detect_default_build_command(str(tmp_path)) is None
+
+
+class TestClaudeCodeStyleEditPipeline:
+    """B1-B6 — adoptions inspired by Claude Code's Edit pipeline. See
+    plans/review-the-last-session-zesty-octopus.md for the design.
+    """
+
+    # ------------------------- B1: pre-flight content ----------------------
+
+    def test_b1_render_file_with_line_numbers_and_hash_emits_prefix_and_sha(self, tmp_path):
+        from harness.graph import _render_file_with_line_numbers_and_hash
+        f = tmp_path / "foo.py"
+        f.write_text("import sys\nprint(sys.argv)\n")
+        rendered, h = _render_file_with_line_numbers_and_hash(str(f))
+        assert rendered is not None
+        # Two lines, each with `  N| ` prefix.
+        assert " 1| import sys" in rendered
+        assert " 2| print(sys.argv)" in rendered
+        # SHA is a hex digest of the file bytes.
+        assert h is not None and len(h) == 64 and all(c in "0123456789abcdef" for c in h)
+
+    def test_b1_render_file_returns_none_for_missing(self, tmp_path):
+        from harness.graph import _render_file_with_line_numbers
+        assert _render_file_with_line_numbers(str(tmp_path / "nope.py")) is None
+
+    def test_b1_preflight_section_emits_files_with_intro(self, tmp_path):
+        from harness.graph import _format_preflight_file_content
+        rendered = _format_preflight_file_content(
+            [("foo.py", " 1| import sys"), ("bar.py", " 1| x = 1")],
+        )
+        assert "## Current Content of Files You Need to Edit" in rendered
+        assert "### `foo.py`" in rendered and "### `bar.py`" in rendered
+        # Default intro warns about the `  N| ` prefix.
+        assert "WITHOUT the `  N| ` line-number prefix" in rendered
+
+    def test_b1_preflight_returns_empty_string_when_no_files(self):
+        from harness.graph import _format_preflight_file_content
+        assert _format_preflight_file_content([]) == ""
+
+    def test_b1_collect_records_hashes_when_dict_provided(self, tmp_path):
+        from harness.graph import _collect_workspace_file_content
+        (tmp_path / "a.py").write_text("a\n")
+        (tmp_path / "b.py").write_text("b\n")
+        hashes: dict[str, str] = {}
+        pairs = _collect_workspace_file_content(
+            str(tmp_path), ["a.py", "b.py", "missing.py"],
+            record_hashes_into=hashes,
+        )
+        assert {p[0] for p in pairs} == {"a.py", "b.py"}
+        assert set(hashes.keys()) == {"a.py", "b.py"}
+        for v in hashes.values():
+            assert len(v) == 64
+
+    # ------------------------- B2: count modifier --------------------------
+
+    def test_b2_replace_block_parser_picks_up_count_field(self):
+        from harness.patcher import parse_patch_blocks, OperationType
+        out = parse_patch_blocks(
+            "<<<REPLACE_BLOCK>>>\n"
+            "file: foo.py\n"
+            "count: all\n"
+            "search:\nfoo\n"
+            "replace:\nbar\n"
+            "<<<END_REPLACE_BLOCK>>>"
+        )
+        assert len(out) == 1
+        assert out[0].operation == OperationType.REPLACE_BLOCK
+        assert out[0].count == "all"
+
+    def test_b2_replace_block_defaults_to_unique_when_count_missing(self):
+        from harness.patcher import parse_patch_blocks
+        out = parse_patch_blocks(
+            "<<<REPLACE_BLOCK>>>\n"
+            "file: foo.py\n"
+            "search:\nfoo\n"
+            "replace:\nbar\n"
+            "<<<END_REPLACE_BLOCK>>>"
+        )
+        assert out[0].count == "unique"
+
+    def test_b2_replace_all_replaces_every_occurrence(self, tmp_path):
+        import asyncio
+        from harness.patcher import TextPatcher
+        f = tmp_path / "a.txt"
+        f.write_text("foo\nfoo\nfoo\n")
+        p = TextPatcher(str(tmp_path))
+        result = asyncio.run(p.replace_block("a.txt", "foo", "BAR", count="all"))
+        assert result.success
+        assert f.read_text() == "BAR\nBAR\nBAR\n"
+
+    def test_b2_replace_first_replaces_only_first_occurrence(self, tmp_path):
+        import asyncio
+        from harness.patcher import TextPatcher
+        f = tmp_path / "a.txt"
+        f.write_text("foo\nfoo\nfoo\n")
+        p = TextPatcher(str(tmp_path))
+        result = asyncio.run(p.replace_block("a.txt", "foo", "BAR", count="first"))
+        assert result.success
+        assert f.read_text() == "BAR\nfoo\nfoo\n"
+
+    def test_b2_replace_unique_errors_on_multiple_matches_with_hint(self, tmp_path):
+        import asyncio
+        from harness.patcher import TextPatcher
+        f = tmp_path / "a.txt"
+        f.write_text("foo\nfoo\n")
+        p = TextPatcher(str(tmp_path))
+        result = asyncio.run(p.replace_block("a.txt", "foo", "BAR"))
+        assert not result.success
+        # Error should suggest count: all / count: first escape hatches.
+        assert "count: all" in (result.error or "")
+        assert "count: first" in (result.error or "")
+
+    def test_b2_delete_all_removes_every_occurrence(self, tmp_path):
+        import asyncio
+        from harness.patcher import TextPatcher
+        f = tmp_path / "a.txt"
+        f.write_text("X\nrm\nX\nrm\n")
+        p = TextPatcher(str(tmp_path))
+        result = asyncio.run(p.delete_block("a.txt", "rm\n", count="all"))
+        assert result.success
+        assert f.read_text() == "X\nX\n"
+
+    # ------------------------- B3: READ_FILE --------------------------------
+
+    def test_b3_parse_read_blocks_extracts_path_and_range(self):
+        from harness.patcher import parse_read_blocks
+        out = parse_read_blocks(
+            "<<<READ_FILE>>>\nfile: foo.py\n<<<END_READ_FILE>>>\n"
+            "<<<READ_FILE>>>\nfile: bar.py\nrange: 10-20\n<<<END_READ_FILE>>>\n"
+        )
+        assert out == [("foo.py", None), ("bar.py", (10, 20))]
+
+    def test_b3_strip_read_blocks_removes_them_from_output(self):
+        from harness.patcher import strip_read_blocks
+        text = (
+            "before\n"
+            "<<<READ_FILE>>>\nfile: foo.py\n<<<END_READ_FILE>>>\n"
+            "after\n"
+        )
+        stripped = strip_read_blocks(text)
+        assert "READ_FILE" not in stripped
+        assert "before" in stripped and "after" in stripped
+
+    def test_b3_resolve_read_blocks_returns_line_numbered_content(self, tmp_path):
+        from harness.graph import _resolve_read_blocks
+        (tmp_path / "foo.py").write_text("import os\nprint('hi')\n")
+        body = _resolve_read_blocks([("foo.py", None)], str(tmp_path))
+        assert "## READ_FILE results" in body
+        assert " 1| import os" in body
+        assert " 2| print('hi')" in body
+
+    def test_b3_resolve_read_blocks_records_hashes(self, tmp_path):
+        from harness.graph import _resolve_read_blocks
+        (tmp_path / "foo.py").write_text("x = 1\n")
+        seen: dict[str, str] = {}
+        _resolve_read_blocks(
+            [("foo.py", None)], str(tmp_path),
+            record_hashes_into=seen,
+        )
+        assert "foo.py" in seen and len(seen["foo.py"]) == 64
+
+    # ------------------------- B5: drift detection -------------------------
+
+    def test_b5_drift_rejection_when_disk_hash_differs(self, tmp_path):
+        # Use a .txt file so we go through TextPatcher directly and skip
+        # any tree-sitter "multiple AST node matches" interference. The
+        # B5 drift check runs in process_llm_patch_output before either
+        # patcher backend, so this still exercises the right path.
+        import asyncio
+        from harness.patcher import process_llm_patch_output
+        (tmp_path / "foo.txt").write_text("original\n")
+        seen = {"foo.txt": "0" * 64}
+        llm_output = (
+            "<<<REPLACE_BLOCK>>>\n"
+            "file: foo.txt\n"
+            "search:\noriginal\n"
+            "replace:\nnew\n"
+            "<<<END_REPLACE_BLOCK>>>"
+        )
+        results, _ = asyncio.run(process_llm_patch_output(
+            llm_output, str(tmp_path),
+            files_seen_by_llm=seen,
+        ))
+        assert len(results) == 1 and not results[0].success
+        assert "drifted" in (results[0].error or "")
+        assert (tmp_path / "foo.txt").read_text() == "original\n"
+
+    def test_b5_drift_passes_when_disk_hash_matches_recorded(self, tmp_path):
+        import asyncio
+        from harness.patcher import (
+            process_llm_patch_output, sha256_file_bytes,
+        )
+        (tmp_path / "foo.txt").write_text("original\n")
+        seen = {"foo.txt": sha256_file_bytes(str(tmp_path / "foo.txt"))}
+        llm_output = (
+            "<<<REPLACE_BLOCK>>>\n"
+            "file: foo.txt\n"
+            "search:\noriginal\n"
+            "replace:\nnew\n"
+            "<<<END_REPLACE_BLOCK>>>"
+        )
+        results, _ = asyncio.run(process_llm_patch_output(
+            llm_output, str(tmp_path),
+            files_seen_by_llm=seen,
+        ))
+        assert len(results) == 1 and results[0].success
+        assert (tmp_path / "foo.txt").read_text() == "new\n"
+
+    def test_b5_enforce_read_before_edit_rejects_unseen_files(self, tmp_path):
+        import asyncio
+        from harness.patcher import process_llm_patch_output
+        (tmp_path / "foo.txt").write_text("original\n")
+        llm_output = (
+            "<<<REPLACE_BLOCK>>>\n"
+            "file: foo.txt\n"
+            "search:\noriginal\n"
+            "replace:\nnew\n"
+            "<<<END_REPLACE_BLOCK>>>"
+        )
+        results, _ = asyncio.run(process_llm_patch_output(
+            llm_output, str(tmp_path),
+            files_seen_by_llm={},
+            enforce_read_before_edit=True,
+        ))
+        assert len(results) == 1 and not results[0].success
+        assert "READ_FILE" in (results[0].error or "")
+        assert (tmp_path / "foo.txt").read_text() == "original\n"
+
+    def test_b5_enforce_off_lets_unseen_files_through_with_recorded_hash(self, tmp_path):
+        # When enforce is OFF and there's no recorded hash, the patcher
+        # falls through to the original byte-match path. Sanity check the
+        # default behaviour is unchanged.
+        import asyncio
+        from harness.patcher import process_llm_patch_output
+        (tmp_path / "foo.txt").write_text("original\n")
+        llm_output = (
+            "<<<REPLACE_BLOCK>>>\n"
+            "file: foo.txt\n"
+            "search:\noriginal\n"
+            "replace:\nnew\n"
+            "<<<END_REPLACE_BLOCK>>>"
+        )
+        results, _ = asyncio.run(process_llm_patch_output(
+            llm_output, str(tmp_path),
+            files_seen_by_llm=None,
+            enforce_read_before_edit=False,
+        ))
+        assert len(results) == 1 and results[0].success
+
+    # ------------------------- B6: tool schemas ----------------------------
+
+    def test_b6_patch_tools_have_canonical_names(self):
+        from harness.tool_schemas import PATCH_TOOLS
+        names = [t["name"] for t in PATCH_TOOLS]
+        assert names == ["read_file", "edit_file", "create_file", "delete_block", "insert_at_block"]
+
+    def test_b6_anthropic_shape_keeps_input_schema(self):
+        from harness.tool_schemas import to_anthropic_tools
+        tools = to_anthropic_tools()
+        for t in tools:
+            assert "input_schema" in t
+            assert "name" in t and "description" in t
+
+    def test_b6_openai_shape_wraps_in_function_envelope(self):
+        from harness.tool_schemas import to_openai_tools
+        tools = to_openai_tools()
+        for t in tools:
+            assert t["type"] == "function"
+            assert "parameters" in t["function"]
+            assert "name" in t["function"]
+
+    def test_b6_translate_edit_file_call_to_replace_block(self):
+        from harness.tool_schemas import tool_call_to_patch_block
+        from harness.patcher import OperationType
+        block = tool_call_to_patch_block({
+            "name": "edit_file",
+            "input": {
+                "file_path": "foo.py",
+                "old_string": "x",
+                "new_string": "y",
+                "count": "all",
+            },
+        })
+        assert block is not None
+        assert block.operation == OperationType.REPLACE_BLOCK
+        assert block.file == "foo.py"
+        assert block.search == "x"
+        assert block.replace == "y"
+        assert block.count == "all"
+
+    def test_b6_read_file_call_is_partitioned_separately(self):
+        from harness.tool_schemas import tool_calls_to_patch_blocks
+        blocks, reads = tool_calls_to_patch_blocks([
+            {"name": "read_file", "input": {"file_path": "x.py"}},
+            {"name": "edit_file", "input": {
+                "file_path": "y.py",
+                "old_string": "a",
+                "new_string": "b",
+            }},
+            {"name": "unknown_op", "input": {}},
+        ])
+        assert len(blocks) == 1 and blocks[0].file == "y.py"
+        assert len(reads) == 1 and reads[0]["input"]["file_path"] == "x.py"
 
 
 class TestPriorPatchFailureSurfacing:
@@ -3339,6 +3784,566 @@ class TestPriorPatchFailureSurfacing:
         from harness.graph import _format_prior_patch_failures
         assert _format_prior_patch_failures([]) == ""
         assert _format_prior_patch_failures(None or []) == ""
+
+    def test_store_patch_failure_preserves_wider_context_uncapped(self):
+        # Regression: the 800-char cap in node_state["patch_failures"]
+        # silently truncated the patcher's "Current file content (around
+        # closest match)" line-numbered window — the single most useful
+        # signal the LLM has for fixing a missed REPLACE_BLOCK search.
+        # Session 2f2d48cc-... burned the repair loop on app/database.py
+        # because the LLM never saw enough of the file content to write
+        # a correct search block. The helper must let wider-context
+        # errors through whole.
+        from harness.graph import (
+            _store_patch_failure_error,
+            _PATCH_ERROR_WIDER_CONTEXT_MARKER,
+        )
+        body = "X" * 2500  # well over the old 800-char cap
+        err = (
+            f"Search block not found in app/database.py. "
+            f"{_PATCH_ERROR_WIDER_CONTEXT_MARKER}\n{body}"
+        )
+        stored = _store_patch_failure_error(err)
+        assert stored == err, (
+            "Wider-context errors must survive storage uncapped — the "
+            f"helper returned {len(stored)} chars from a {len(err)}-char input."
+        )
+
+    def test_store_patch_failure_caps_regular_errors_at_3000(self):
+        # Regular errors (no wider-context marker) still get a cap so a
+        # runaway log line can't bloat state. 3000 chars is generous
+        # enough for any normal patcher error.
+        from harness.graph import _store_patch_failure_error
+        long_err = "boom: " + "X" * 5000
+        stored = _store_patch_failure_error(long_err)
+        assert len(stored) == 3000
+        assert stored.startswith("boom:")
+
+    def test_store_patch_failure_handles_none_and_empty(self):
+        from harness.graph import _store_patch_failure_error
+        assert _store_patch_failure_error(None) == ""
+        assert _store_patch_failure_error("") == ""
+
+    def test_wider_context_extracted_to_top_section(self):
+        # Fix #2: the line-numbered file content lives in its own
+        # `## Current Content of Files You Need to Edit` section,
+        # extracted out of each patch_failure error. The bare error
+        # (no wider context) stays in the per-failure block + a
+        # pointer to the top section.
+        from harness.graph import (
+            _format_current_file_content,
+            _format_prior_patch_failures,
+            _PATCH_ERROR_WIDER_CONTEXT_MARKER,
+        )
+        failures = [{
+            "file": "app/errors.py",
+            "operation": "replace_block",
+            "error": (
+                f"Search block not found in app/errors.py.\n"
+                f"{_PATCH_ERROR_WIDER_CONTEXT_MARKER}\n"
+                f" 1| from typing import Optional\n"
+                f" 2| class AppError(Exception):\n"
+                f" 3|     pass"
+            ),
+        }]
+        top = _format_current_file_content(failures)
+        patch_block = _format_prior_patch_failures(failures)
+
+        # Top section has the file content with line numbers
+        assert "Current Content of Files You Need to Edit" in top
+        assert "class AppError(Exception):" in top
+        assert "from typing import Optional" in top
+
+        # Patch failure block is now wider-context-free; it points at the
+        # top section instead.
+        assert "Current file content (around closest match):" not in patch_block
+        assert "from typing import Optional" not in patch_block
+        assert "Current Content of Files You Need to Edit" in patch_block
+
+    def test_wider_context_dedupes_by_filepath(self):
+        # Two failures on the same file → top section shows the content
+        # once, not twice.
+        from harness.graph import (
+            _format_current_file_content,
+            _PATCH_ERROR_WIDER_CONTEXT_MARKER,
+        )
+        wider = " 1| x = 1\n 2| y = 2"
+        marker = _PATCH_ERROR_WIDER_CONTEXT_MARKER
+        failures = [
+            {"file": "foo.py", "operation": "replace_block",
+             "error": f"miss A\n{marker}\n{wider}"},
+            {"file": "foo.py", "operation": "replace_block",
+             "error": f"miss B\n{marker}\n{wider}"},
+        ]
+        out = _format_current_file_content(failures)
+        assert out.count("x = 1") == 1  # shown once
+
+    def test_extract_wider_context_returns_none_when_no_marker(self):
+        from harness.graph import _extract_wider_context_from_failure
+        prefix, wider = _extract_wider_context_from_failure({
+            "file": "foo.py", "error": "Some random error",
+        })
+        assert prefix == "Some random error"
+        assert wider is None
+
+    def test_replace_block_miss_directive_fires_at_two_misses(self):
+        from harness.graph import _format_replace_block_miss_directive
+        # 2 misses → directive fires.
+        out = _format_replace_block_miss_directive({"foo.py": 2})
+        assert "REPLACE_BLOCK pattern-repetition trap" in out
+        assert "foo.py" in out
+        assert "DELETE_BLOCK" in out
+        assert "INSERT_AT_BLOCK" in out
+        assert "CREATE_FILE" in out
+
+    def test_replace_block_miss_directive_silent_under_threshold(self):
+        from harness.graph import _format_replace_block_miss_directive
+        # 1 miss → no directive (one miss is normal, not stuck).
+        assert _format_replace_block_miss_directive({"foo.py": 1}) == ""
+        # Empty → no directive.
+        assert _format_replace_block_miss_directive({}) == ""
+
+    def test_cascade_hint_fires_for_all_tests_plus_shared_symbol(self):
+        # Fix #4: 5 test files all raise the same F821 for a symbol.
+        # Diagnostic block must include a cascade hint pointing at prod.
+        from harness.graph import _format_diagnostics_for_repair
+        errs = [
+            {"error_code": "F821", "message": "Undefined name 'Job'",
+             "file": f"tests/test_{i}.py", "line": 1, "column": 1,
+             "severity": "error"}
+            for i in range(5)
+        ]
+        out = _format_diagnostics_for_repair(errs)
+        assert "Cascade hint" in out
+        assert "production module" in out
+        assert "`Job`" in out
+
+    def test_cascade_hint_silent_for_single_diagnostic(self):
+        # 1 diagnostic in tests/ → no cascade signal, no hint.
+        from harness.graph import _format_diagnostics_for_repair
+        errs = [{
+            "error_code": "F821", "message": "Undefined name 'X'",
+            "file": "tests/test_one.py", "line": 1, "column": 1,
+            "severity": "error",
+        }]
+        assert "Cascade hint" not in _format_diagnostics_for_repair(errs)
+
+    def test_cascade_hint_fires_on_tests_only_without_symbol(self):
+        # 3 errors in tests with NO single-symbol message → still emit
+        # the "tests-only" variant of the hint.
+        from harness.graph import _format_diagnostics_for_repair
+        errs = [
+            {"error_code": "E501", "message": "line too long",
+             "file": f"tests/test_{i}.py", "line": 1, "column": 1,
+             "severity": "error"}
+            for i in range(3)
+        ]
+        out = _format_diagnostics_for_repair(errs)
+        assert "Cascade hint" in out
+        assert "test files only" in out
+
+    def test_cascade_hint_silent_when_mixed_prod_and_test(self):
+        # 3 errors: 2 in tests, 1 in prod → not a clean cascade signal,
+        # no hint (avoids misleading the LLM).
+        from harness.graph import _format_diagnostics_for_repair
+        errs = [
+            {"error_code": "F821", "message": "Undefined name 'X'",
+             "file": "tests/test_a.py", "line": 1, "column": 1, "severity": "error"},
+            {"error_code": "F821", "message": "Undefined name 'X'",
+             "file": "tests/test_b.py", "line": 1, "column": 1, "severity": "error"},
+            {"error_code": "F821", "message": "Undefined name 'X'",
+             "file": "app/foo.py", "line": 5, "column": 1, "severity": "error"},
+        ]
+        out = _format_diagnostics_for_repair(errs)
+        # Still emits the shared-symbol cascade hint (3 occurrences of `X`)
+        # but doesn't claim it's tests-only.
+        assert "test files only" not in out
+        assert "test files and references" not in out
+
+    def test_corresponding_prod_paths_maps_basenames(self, tmp_path):
+        # Fix #5: tests/test_config.py → app/config.py when app/config.py exists.
+        from harness.graph import _corresponding_prod_paths_for_test
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "config.py").write_text("x")
+        result = _corresponding_prod_paths_for_test(
+            "tests/test_config.py", str(tmp_path),
+        )
+        assert "app/config.py" in result
+
+    def test_corresponding_prod_paths_strips_test_prefix_and_suffix(self, tmp_path):
+        from harness.graph import _corresponding_prod_paths_for_test
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "utils.py").write_text("y")
+        # test_utils.py → utils.py via src/ candidate
+        result = _corresponding_prod_paths_for_test(
+            "tests/test_utils.py", str(tmp_path),
+        )
+        assert "src/utils.py" in result
+
+    def test_corresponding_prod_paths_returns_empty_when_nothing_matches(self, tmp_path):
+        from harness.graph import _corresponding_prod_paths_for_test
+        result = _corresponding_prod_paths_for_test(
+            "tests/test_ghost.py", str(tmp_path),
+        )
+        assert result == []
+
+    def test_cascade_section_attaches_prod_file_content(self, tmp_path):
+        # When a test diagnostic is an ImportError / F821 / etc., the
+        # cascade section appears AND attaches the corresponding prod
+        # file's content so the LLM can verify symbol existence.
+        from harness.graph import _format_test_collection_cascade_section
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "config.py").write_text(
+            "class Settings:\n    api_key: str = ''"
+        )
+        errs = [{
+            "error_code": "ImportError",
+            "message": "cannot import name 'Settings'",
+            "file": "tests/test_config.py",
+            "line": 3, "column": 1, "severity": "error",
+        }]
+        out = _format_test_collection_cascade_section(errs, str(tmp_path))
+        assert "Test-collection cascade hint" in out
+        assert "PRODUCTION" in out
+        assert "app/config.py" in out
+        assert "class Settings" in out  # actual prod content attached
+
+    def test_cascade_section_silent_for_prod_only_diagnostic(self, tmp_path):
+        # Diagnostic in prod code (not test/) → no test-cascade section.
+        from harness.graph import _format_test_collection_cascade_section
+        errs = [{
+            "error_code": "F821",
+            "message": "Undefined name 'X'",
+            "file": "app/main.py",
+            "line": 5, "column": 1, "severity": "error",
+        }]
+        assert _format_test_collection_cascade_section(errs, str(tmp_path)) == ""
+
+    def test_walk_prod_modules_skips_tests_and_caches(self, tmp_path):
+        # Fix #6: prod-import smoke check walks workspace for production
+        # .py files only — tests, __pycache__, build, venv excluded.
+        from harness.graph import _walk_prod_python_modules
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "__init__.py").write_text("")
+        (tmp_path / "app" / "main.py").write_text("x = 1")
+        (tmp_path / "app" / "models.py").write_text("y = 2")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_main.py").write_text("z = 3")
+        (tmp_path / "__pycache__").mkdir()
+        (tmp_path / "__pycache__" / "ghost.py").write_text("ignore me")
+        (tmp_path / "conftest.py").write_text("setup")  # root scripts skipped
+        result = _walk_prod_python_modules(str(tmp_path))
+        assert "app" in result          # the __init__.py becomes the package
+        assert "app.main" in result
+        assert "app.models" in result
+        assert all("test_" not in m for m in result)
+        assert all("__pycache__" not in m for m in result)
+        # Conftest.py at root is excluded (it's a pytest hook, not an
+        # import target).
+        assert "conftest" not in result
+
+    def test_is_test_path_recognises_test_locations(self):
+        from harness.graph import _is_test_path
+        assert _is_test_path("tests/test_foo.py") is True
+        assert _is_test_path("test/foo.py") is True
+        assert _is_test_path("__tests__/bar.py") is True
+        assert _is_test_path("conftest.py") is True
+        assert _is_test_path("pytest.ini") is True
+        # Prod paths
+        assert _is_test_path("app/main.py") is False
+        assert _is_test_path("requirements.txt") is False
+        assert _is_test_path("setup.py") is False
+        assert _is_test_path("") is False
+
+    def test_phase1_filter_drops_test_create_file_blocks(self):
+        # Fix #49: phase-1 patching_node rejects any LLM blocks that
+        # target test paths. The test-generation phase will write tests
+        # in a later turn against verified prod code.
+        from harness.graph import _filter_test_blocks_from_patch_response
+        resp = (
+            "<<<CREATE_FILE>>>\nfile: app/main.py\ncontent:\nprod\n<<<END_CREATE_FILE>>>\n\n"
+            "<<<CREATE_FILE>>>\nfile: tests/test_main.py\ncontent:\nt\n<<<END_CREATE_FILE>>>\n\n"
+            "<<<CREATE_FILE>>>\nfile: conftest.py\ncontent:\nc\n<<<END_CREATE_FILE>>>\n"
+        )
+        filtered, dropped = _filter_test_blocks_from_patch_response(resp)
+        # Test blocks gone from output
+        assert "tests/test_main.py" not in filtered
+        assert "conftest.py" not in filtered
+        # Prod block survives
+        assert "app/main.py" in filtered
+        # Drop list records the operation:path pairs
+        assert "create_file:tests/test_main.py" in dropped
+        assert "create_file:conftest.py" in dropped
+
+    def test_phase1_filter_drops_test_replace_block(self):
+        # All four block types are handled, not just CREATE_FILE.
+        from harness.graph import _filter_test_blocks_from_patch_response
+        resp = (
+            "<<<REPLACE_BLOCK>>>\nfile: tests/test_x.py\nsearch:\na\nreplace:\nb\n<<<END_REPLACE_BLOCK>>>\n\n"
+            "<<<REPLACE_BLOCK>>>\nfile: app/x.py\nsearch:\nc\nreplace:\nd\n<<<END_REPLACE_BLOCK>>>\n"
+        )
+        filtered, dropped = _filter_test_blocks_from_patch_response(resp)
+        assert "tests/test_x.py" not in filtered
+        assert "app/x.py" in filtered
+        assert any("replace_block" in d and "tests/test_x.py" in d for d in dropped)
+
+    def test_phase1_filter_returns_empty_drops_for_prod_only_response(self):
+        # No test blocks in the response → dropped list empty,
+        # filtered text equals input.
+        from harness.graph import _filter_test_blocks_from_patch_response
+        resp = (
+            "<<<CREATE_FILE>>>\nfile: app/main.py\ncontent:\nprod\n<<<END_CREATE_FILE>>>\n"
+        )
+        filtered, dropped = _filter_test_blocks_from_patch_response(resp)
+        assert dropped == []
+        assert filtered == resp
+
+    def test_walk_prod_modules_returns_empty_for_no_python(self, tmp_path):
+        from harness.graph import _walk_prod_python_modules
+        # Just a non-Python file at root.
+        (tmp_path / "readme.txt").write_text("x")
+        assert _walk_prod_python_modules(str(tmp_path)) == []
+
+    def test_cascade_section_silent_for_non_import_test_error(self, tmp_path):
+        # Diagnostic in tests/ but with an unrelated error code (e.g.
+        # E501 line-too-long) → no cascade hint, the failure is genuinely
+        # in the test file.
+        from harness.graph import _format_test_collection_cascade_section
+        (tmp_path / "tests").mkdir()
+        errs = [{
+            "error_code": "E501",
+            "message": "line too long",
+            "file": "tests/test_foo.py",
+            "line": 1, "column": 1, "severity": "error",
+        }]
+        assert _format_test_collection_cascade_section(errs, str(tmp_path)) == ""
+
+    def test_replace_block_miss_directive_lists_only_stuck_files(self):
+        # Mixed: one file at 2, another at 1 → only the stuck one shown.
+        from harness.graph import _format_replace_block_miss_directive
+        out = _format_replace_block_miss_directive({
+            "stuck.py": 3, "safe.py": 1, "also_safe.py": 0,
+        })
+        assert "stuck.py" in out
+        assert "safe.py" not in out
+        assert "also_safe.py" not in out
+
+    def test_repair_node_prompt_ordering_top_section_first(self):
+        # Integration: confirm the new section appears BEFORE the
+        # Patch Failures block when both are present in the same prompt.
+        from harness.graph import (
+            _format_current_file_content,
+            _format_prior_patch_failures,
+            _PATCH_ERROR_WIDER_CONTEXT_MARKER,
+        )
+        failures = [{
+            "file": "foo.py", "operation": "replace_block",
+            "error": (
+                f"miss\n{_PATCH_ERROR_WIDER_CONTEXT_MARKER}\n 1| body line"
+            ),
+        }]
+        prompt = (
+            _format_current_file_content(failures)
+            + _format_prior_patch_failures(failures)
+        )
+        top_idx = prompt.index("Current Content of Files You Need to Edit")
+        patch_idx = prompt.index("Patch Failures (PREVIOUS attempt)")
+        assert top_idx < patch_idx, "top section must come BEFORE patch failures"
+
+    def test_closest_match_returns_whole_file_for_small_files(self):
+        # When the file is small (≤300 lines AND ≤6000 chars) the patcher
+        # returns the ENTIRE current content with line numbers. Session
+        # 62084672 kept failing on pytest.ini (6 lines!) — the 20-line
+        # window was technically the whole file but anchored by closest
+        # match, so the LLM's mental model could still be off. Whole-file
+        # mode removes that anchoring entirely.
+        from harness.patcher import _find_closest_match
+        pytest_ini = (
+            "[pytest]\n"
+            "# Auto-written by harness.test_generation.\n"
+            "addopts = --import-mode=importlib\n"
+        )
+        # An LLM search that doesn't match ANY line — closest-ratio
+        # would normally produce a useless window. Whole-file mode
+        # sidesteps that.
+        out = _find_closest_match(pytest_ini, "this search does not match anything")
+        assert "[pytest]" in out
+        assert "addopts = --import-mode=importlib" in out
+        # Line numbers prefixed.
+        assert "1| [pytest]" in out
+
+    @pytest.mark.asyncio
+    async def test_replace_block_recovers_from_line_number_prefix_copy(self, tmp_path):
+        # Regression: the LLM sometimes copies the `  N| ` line-number
+        # prefix from the patcher's wider-context window into its next
+        # REPLACE_BLOCK search. Whitespace-tolerant matching can't catch
+        # this (the prefix is non-whitespace characters). The patcher
+        # must strip a uniform prefix from the search and retry.
+        from harness.patcher import TextPatcher
+        target = tmp_path / "requirements.txt"
+        target.write_text(
+            "fastapi==0.103.2\n"
+            "uvicorn[standard]==0.23.2\n"
+            "pydantic==2.4.2\n"
+        )
+        patcher = TextPatcher(str(tmp_path))
+        # The LLM's search includes line-number prefixes:
+        result = await patcher.replace_block(
+            "requirements.txt",
+            search=" 1| fastapi==0.103.2\n 2| uvicorn[standard]==0.23.2\n",
+            replace="fastapi==0.104.0\nuvicorn[standard]==0.24.0\n",
+        )
+        assert result.success, result.error
+        content = target.read_text()
+        assert "fastapi==0.104.0" in content
+        assert "uvicorn[standard]==0.24.0" in content
+        assert "pydantic==2.4.2" in content  # untouched
+        # Message tells the operator what the patcher did.
+        assert "line-number-prefix" in (result.message or "").lower()
+
+    def test_strip_line_number_prefixes_returns_none_for_clean_search(self):
+        # When the LLM's search has NO line-number prefix on any line,
+        # the stripper returns None — we don't accidentally mangle a
+        # search that already matches the file.
+        from harness.patcher import _strip_line_number_prefixes
+        assert _strip_line_number_prefixes("fastapi==0.103.2\n") is None
+        # And when ONLY SOME lines have a prefix, also return None
+        # (conservative — don't guess).
+        assert _strip_line_number_prefixes(" 1| foo\nbar\n") is None
+
+    def _make_gateway_with_dump_config(self, *, dump_on: bool, max_files: int = 5000):
+        """Construct a Gateway whose config has the dump flags set as given."""
+        import asyncio
+        from harness.gateway import Gateway, GatewayConfig
+        cfg = GatewayConfig()
+        cfg.dump_llm_calls = dump_on
+        cfg.dump_max_files = max_files
+        gw = Gateway(cfg)
+        return gw, asyncio
+
+    def _make_response(self, model="deepseek-v4-pro", content="<<<patch>>>"):
+        from harness.gateway import LLMResponse, TokenUsage
+        return LLMResponse(
+            content=content,
+            model=model,
+            usage=TokenUsage(
+                input_tokens=12,
+                output_tokens=3,
+                cached_tokens=0,
+                cache_creation_tokens=0,
+                cost_usd=0.0001,
+            ),
+            finish_reason="stop",
+        )
+
+    def test_dump_llm_call_writes_file_when_flag_on(self, monkeypatch, tmp_path):
+        # Universal dump: when debug.dump_llm_calls is on, every dispatch
+        # (regardless of role) writes input messages + response to
+        # ~/.harness/debug/<sid>_<seqno>_<role>_<model>.txt. Ground truth
+        # for post-mortem analysis. Replaces the old repair-only dump.
+        from harness.observability import active_session_scope
+        from harness.gateway import NodeRole
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        gw, asyncio = self._make_gateway_with_dump_config(dump_on=True)
+        response = self._make_response()
+
+        async def _go():
+            with active_session_scope("abc12345-rest-of-uuid"):
+                await gw._dump_llm_call_to_disk(
+                    messages=[
+                        {"role": "system", "content": "system prompt"},
+                        {"role": "user", "content": "fix this"},
+                    ],
+                    response=response,
+                    role=NodeRole.REPAIR,
+                    cost_usd=0.0001,
+                    elapsed_ms=42,
+                )
+
+        asyncio.run(_go())
+
+        debug_dir = tmp_path / ".harness" / "debug"
+        files = sorted(debug_dir.iterdir())
+        assert len(files) == 1, f"expected one dump, got {files}"
+        out = files[0]
+        assert out.name.startswith("abc12345_0001_repair_")
+        body = out.read_text()
+        assert "session: abc12345-rest-of-uuid" in body
+        assert "role: repair" in body
+        assert "tokens_in=12" in body
+        assert "system prompt" in body
+        assert "fix this" in body
+        assert "## response" in body
+        assert "<<<patch>>>" in body
+
+    def test_dump_llm_call_is_noop_when_flag_off(self, monkeypatch, tmp_path):
+        from harness.observability import active_session_scope
+        from harness.gateway import NodeRole
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        gw, asyncio = self._make_gateway_with_dump_config(dump_on=False)
+        response = self._make_response()
+
+        async def _go():
+            with active_session_scope("xyz"):
+                await gw._dump_llm_call_to_disk(
+                    messages=[{"role": "user", "content": "x"}],
+                    response=response,
+                    role=NodeRole.PATCHING,
+                    cost_usd=0.0,
+                    elapsed_ms=1,
+                )
+
+        asyncio.run(_go())
+
+        debug_dir = tmp_path / ".harness" / "debug"
+        if debug_dir.exists():
+            assert list(debug_dir.iterdir()) == []
+
+    def test_dump_llm_call_prunes_oldest_when_over_cap(self, monkeypatch, tmp_path):
+        # With dump_max_files=2, the third dump should evict the oldest.
+        from harness.observability import active_session_scope
+        from harness.gateway import NodeRole
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        gw, asyncio = self._make_gateway_with_dump_config(
+            dump_on=True, max_files=2,
+        )
+        response = self._make_response()
+
+        async def _go():
+            with active_session_scope("sid01234-aaa"):
+                for _ in range(3):
+                    await gw._dump_llm_call_to_disk(
+                        messages=[{"role": "user", "content": "x"}],
+                        response=response,
+                        role=NodeRole.PATCHING,
+                        cost_usd=0.0,
+                        elapsed_ms=1,
+                    )
+
+        asyncio.run(_go())
+
+        debug_dir = tmp_path / ".harness" / "debug"
+        files = sorted(debug_dir.iterdir())
+        assert len(files) == 2, files
+
+    def test_closest_match_returns_window_for_large_files(self):
+        # Files larger than the whole-file caps fall back to a window
+        # around the closest match.
+        from harness.patcher import _find_closest_match
+        # 400 lines, well over the 300-line cap.
+        text = "\n".join(
+            f"line_{i}: lorem ipsum dolor sit amet consectetur" for i in range(400)
+        )
+        out = _find_closest_match(text, "line_200: lorem ipsum dolor sit amet")
+        # The window centres on the match (line 200), NOT line 1.
+        assert "line_200" in out
+        assert "line_0:" not in out  # the top of the file is NOT shown
+        # And the window is capped — not the whole file.
+        assert len(out) <= 6100  # 6000 cap + tiny truncation suffix headroom
 
     def test_failure_block_includes_file_op_and_full_error(self):
         from harness.graph import _format_prior_patch_failures
@@ -4415,6 +5420,69 @@ class TestCLI:
         assert "pip install" in captured_cmd["cmd"]
         assert "pytest" in captured_cmd["cmd"]
         assert result.get("build_command") == captured_cmd["cmd"]
+
+    @pytest.mark.asyncio
+    async def test_compiler_node_preserves_cross_iteration_node_state(self, monkeypatch):
+        # Regression: compiler_node used to rebuild node_state from scratch
+        # (graph.py:2755), wiping patch_failures / allowlist_rejections /
+        # allowed_paths between repair iterations. That left the next
+        # repair_node blind: the patcher's "closest match" file-content
+        # window — the single most useful signal for fixing a missed
+        # REPLACE_BLOCK — never reached the LLM, so it kept hallucinating
+        # SEARCH strings. See session 2d0164f0 in
+        # plans/review-the-last-session-zesty-octopus.md.
+        from harness import graph as graph_mod
+        from harness.sandbox import BuildResult
+
+        class FakeExecutor:
+            def __init__(self, workspace_path, allow_network=False, sandbox_config=None):
+                pass
+            async def run(self, build_cmd: str) -> BuildResult:
+                return BuildResult(exit_code=1, raw_output="some failure")
+
+        monkeypatch.setattr("harness.sandbox.SandboxExecutor", FakeExecutor)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Prior repair_node landed patch_failures + allowlist_rejections
+            # on node_state. They must survive this compiler_node run so the
+            # next repair_node can promote them into its "Current Content of
+            # Files You Need to Edit" prompt section.
+            prior_failures = [
+                {
+                    "file": "task_dispatcher/models.py",
+                    "operation": "replace_block",
+                    "error": (
+                        "Search block not found in task_dispatcher/models.py. "
+                        "Current file content (around closest match):\n"
+                        "  1| from pydantic import BaseModel\n"
+                        "  2| class Job(BaseModel):\n"
+                    ),
+                }
+            ]
+            prior_rejections = [{"file": "x.py", "operation": "create_file", "reason": "..."}]
+            state = {
+                "workspace_path": tmpdir,
+                "build_command": "pytest -q",
+                "allow_network": False,
+                "loop_counter": {},
+                "messages": [],
+                "node_state": {
+                    "current_node": "repair",
+                    "patch_failures": prior_failures,
+                    "allowlist_rejections": prior_rejections,
+                    "allowed_paths": ["task_dispatcher/"],
+                },
+            }
+            result = await graph_mod.compiler_node(state)
+
+        out_state = result["node_state"]
+        # Compiler_node sets its own bookkeeping keys ...
+        assert out_state["current_node"] == "compiler"
+        assert "last_build_output" in out_state
+        # ... but does NOT clobber what the prior repair_node left behind.
+        assert out_state["patch_failures"] == prior_failures
+        assert out_state["allowlist_rejections"] == prior_rejections
+        assert out_state["allowed_paths"] == ["task_dispatcher/"]
 
     @pytest.mark.asyncio
     async def test_compiler_node_keeps_explicit_make_build_when_makefile_exists(self, monkeypatch):

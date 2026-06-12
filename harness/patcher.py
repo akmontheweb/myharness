@@ -56,7 +56,7 @@ class PatchBlock:
     A single parsed patch instruction extracted from LLM output.
 
     Matches the strict formatting defined in the system prompt:
-    
+
     REPLACE_BLOCK, CREATE_FILE, DELETE_BLOCK, INSERT_AT_BLOCK
     with tagged file:, search:, replace:, content:, anchor:, placement: fields.
     """
@@ -67,6 +67,15 @@ class PatchBlock:
     content: str = ""
     anchor: str = ""         # For INSERT_AT_BLOCK: function/class name to anchor to
     placement: Placement = Placement.AFTER  # For INSERT_AT_BLOCK
+    # Match-count policy for REPLACE_BLOCK / DELETE_BLOCK:
+    #   "unique" — fail when the search matches more than once (default,
+    #              matches historical strict behaviour).
+    #   "all"    — apply to every match in the file.
+    #   "first"  — apply only to the first match.
+    # Borrows the spirit of Claude Code's Edit ``replace_all`` flag: gives
+    # the LLM an explicit escape from the "matched N times. Must be unique"
+    # dead-end without forcing it to pad the search with extra context.
+    count: str = "unique"
 
     raw_block: str = ""  # The full matched block text for debugging
 
@@ -80,6 +89,11 @@ class PatchResult:
     message: str = ""
     lines_changed: int = 0
     error: Optional[str] = None
+    # True when the operation succeeded as a resume-safe idempotency no-op
+    # (file already at the target state). Distinguishes real progress from
+    # "nothing to do" so the repair loop's consecutive-zero tripwire is not
+    # masked by the LLM repeatedly emitting already-applied patches.
+    no_op: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -87,35 +101,105 @@ class PatchResult:
 # ---------------------------------------------------------------------------
 
 # Regex patterns to match each block type in LLM output
+# READ_FILE is not a patch operation — it's an LLM-side request for current
+# file bytes that the host resolves inline before re-dispatching. Borrows
+# the spirit of Claude Code's Read tool: instead of guessing what a file
+# contains, the LLM asks and gets the line-numbered current content back
+# in the same turn (no repair-loop slot consumed).
+#
+# Syntax:
+#   <<<READ_FILE>>>
+#   file: path/to/foo.py
+#   range: 1-200       # optional; default is whole file capped at the
+#                      # patcher's line/char limits.
+#   <<<END_READ_FILE>>>
+_READ_FILE_PATTERN = re.compile(
+    r'<<<READ_FILE>>>\s*\n'
+    r'file:\s*(?P<file>.+?)\s*\n'
+    r'(?:range:\s*(?P<range>\d+\s*-\s*\d+|\d+)\s*\n)?'
+    r'<<<END_READ_FILE>>>',
+    re.DOTALL,
+)
+
+
+def parse_read_blocks(llm_output: str) -> list[tuple[str, Optional[tuple[int, int]]]]:
+    """Extract READ_FILE blocks from ``llm_output``.
+
+    Returns a list of ``(rel_path, optional_range)`` where ``optional_range``
+    is ``(start_line, end_line)`` or ``None``. Best-effort: malformed range
+    fields produce ``None`` rather than raising — the resolver will fall back
+    to whole-file output.
+    """
+    out: list[tuple[str, Optional[tuple[int, int]]]] = []
+    for match in _READ_FILE_PATTERN.finditer(llm_output):
+        file_ref = match.group("file").strip()
+        if not file_ref:
+            continue
+        range_str = match.group("range")
+        if range_str is None:
+            out.append((file_ref, None))
+            continue
+        try:
+            if "-" in range_str:
+                a, b = range_str.split("-", 1)
+                lo, hi = int(a.strip()), int(b.strip())
+                if lo > hi or lo < 1:
+                    out.append((file_ref, None))
+                else:
+                    out.append((file_ref, (lo, hi)))
+            else:
+                line = int(range_str.strip())
+                if line < 1:
+                    out.append((file_ref, None))
+                else:
+                    out.append((file_ref, (line, line)))
+        except ValueError:
+            out.append((file_ref, None))
+    return out
+
+
+def strip_read_blocks(llm_output: str) -> str:
+    """Return ``llm_output`` with every READ_FILE block removed.
+
+    Used after the harness has resolved READ_FILE blocks and is about to
+    parse the rest of the response as patch blocks. We do NOT want READ_FILE
+    blocks to feed into ``parse_patch_blocks`` (they're not patches), nor do
+    we want them to leak into commit messages or transcripts.
+    """
+    return _READ_FILE_PATTERN.sub("", llm_output)
+
+
 _BLOCK_PATTERNS = {
     OperationType.REPLACE_BLOCK: re.compile(
         r'<<<REPLACE_BLOCK>>>\s*\n'
-        r'file:\s*(.+?)\s*\n'
-        r'search:\s*\n(.*?)\n'
-        r'replace:\s*\n(.*?)'
+        r'file:\s*(?P<file>.+?)\s*\n'
+        r'(?:count:\s*(?P<count>unique|all|first)\s*\n)?'
+        r'search:\s*\n(?P<search>.*?)\n'
+        r'replace:\s*\n(?P<replace>.*?)'
         r'<<<END_REPLACE_BLOCK>>>',
         re.DOTALL,
     ),
     OperationType.CREATE_FILE: re.compile(
         r'<<<CREATE_FILE>>>\s*\n'
-        r'file:\s*(.+?)\s*\n'
-        r'content:\s*\n(.*?)'
+        r'file:\s*(?P<file>.+?)\s*\n'
+        r'content:\s*\n(?P<content>.*?)'
         r'<<<END_CREATE_FILE>>>',
         re.DOTALL,
     ),
     OperationType.DELETE_BLOCK: re.compile(
         r'<<<DELETE_BLOCK>>>\s*\n'
-        r'file:\s*(.+?)\s*\n'
-        r'search:\s*\n(.*?)'
+        r'file:\s*(?P<file>.+?)\s*\n'
+        r'(?:count:\s*(?P<count>unique|all|first)\s*\n)?'
+        r'search:\s*\n(?P<search>.*?)'
         r'<<<END_DELETE_BLOCK>>>',
         re.DOTALL,
     ),
     OperationType.INSERT_AT_BLOCK: re.compile(
         r'<<<INSERT_AT_BLOCK>>>\s*\n'
-        r'file:\s*(.+?)\s*\n'
-        r'anchor:\s*(.+?)\s*\n'
-        r'placement:\s*(before|after)\s*\n'
-        r'content:\s*\n(.*?)'
+        r'file:\s*(?P<file>.+?)\s*\n'
+        r'anchor:\s*(?P<anchor>.+?)\s*\n'
+        r'placement:\s*(?P<placement>before|after)\s*\n'
+        r'content:\s*\n(?P<content>.*?)'
         r'<<<END_INSERT_AT_BLOCK>>>',
         re.DOTALL,
     ),
@@ -149,37 +233,44 @@ def parse_patch_blocks(llm_output: str) -> list[PatchBlock]:
     for op_type, pattern in _BLOCK_PATTERNS.items():
         for match in pattern.finditer(llm_output):
             raw = match.group(0)
+            gd = match.groupdict()
 
             if op_type == OperationType.REPLACE_BLOCK:
                 blocks.append(PatchBlock(
                     operation=OperationType.REPLACE_BLOCK,
-                    file=match.group(1).strip(),
-                    search=match.group(2).rstrip(),
-                    replace=match.group(3).rstrip(),
+                    file=gd["file"].strip(),
+                    search=gd["search"].rstrip(),
+                    replace=gd["replace"].rstrip(),
+                    count=(gd.get("count") or "unique").strip().lower(),
                     raw_block=raw,
                 ))
             elif op_type == OperationType.CREATE_FILE:
                 blocks.append(PatchBlock(
                     operation=OperationType.CREATE_FILE,
-                    file=match.group(1).strip(),
-                    content=match.group(2).rstrip(),
+                    file=gd["file"].strip(),
+                    content=gd["content"].rstrip(),
                     raw_block=raw,
                 ))
             elif op_type == OperationType.DELETE_BLOCK:
                 blocks.append(PatchBlock(
                     operation=OperationType.DELETE_BLOCK,
-                    file=match.group(1).strip(),
-                    search=match.group(2).rstrip(),
+                    file=gd["file"].strip(),
+                    search=gd["search"].rstrip(),
+                    count=(gd.get("count") or "unique").strip().lower(),
                     raw_block=raw,
                 ))
             elif op_type == OperationType.INSERT_AT_BLOCK:
-                placement = Placement.BEFORE if match.group(3).strip().lower() == "before" else Placement.AFTER
+                placement = (
+                    Placement.BEFORE
+                    if gd["placement"].strip().lower() == "before"
+                    else Placement.AFTER
+                )
                 blocks.append(PatchBlock(
                     operation=OperationType.INSERT_AT_BLOCK,
-                    file=match.group(1).strip(),
-                    anchor=match.group(2).strip(),
+                    file=gd["file"].strip(),
+                    anchor=gd["anchor"].strip(),
                     placement=placement,
-                    content=match.group(4).rstrip(),
+                    content=gd["content"].rstrip(),
                     raw_block=raw,
                 ))
 
@@ -417,13 +508,26 @@ class BasePatcher(ABC):
         ...
 
     @abstractmethod
-    async def replace_block(self, filepath: str, search: str, replace: str) -> PatchResult:
-        """Replace an exact-match block of text within an existing file."""
+    async def replace_block(
+        self, filepath: str, search: str, replace: str,
+        *, count: str = "unique",
+    ) -> PatchResult:
+        """Replace an exact-match block of text within an existing file.
+
+        ``count`` is the match-count policy: ``"unique"`` errors on >1 match
+        (historical default), ``"all"`` replaces every occurrence, ``"first"``
+        replaces only the first.
+        """
         ...
 
     @abstractmethod
-    async def delete_block(self, filepath: str, search: str) -> PatchResult:
-        """Delete an exact-match block of text from an existing file."""
+    async def delete_block(
+        self, filepath: str, search: str, *, count: str = "unique",
+    ) -> PatchResult:
+        """Delete an exact-match block of text from an existing file.
+
+        ``count`` has the same semantics as ``replace_block``.
+        """
         ...
 
     @abstractmethod
@@ -486,6 +590,7 @@ class TextPatcher(BasePatcher):
                     operation=OperationType.CREATE_FILE,
                     message=f"already at target state (no-op on resume): {filepath}",
                     lines_changed=0,
+                    no_op=True,
                 )
             snippet = actual[:200].replace("\n", "\\n")
             return PatchResult(
@@ -518,7 +623,10 @@ class TextPatcher(BasePatcher):
                 error=str(exc),
             )
 
-    async def replace_block(self, filepath: str, search: str, replace: str) -> PatchResult:
+    async def replace_block(
+        self, filepath: str, search: str, replace: str,
+        *, count: str = "unique",
+    ) -> PatchResult:
         full_path, _err = self._resolve_safe(filepath, OperationType.REPLACE_BLOCK)
         if _err is not None:
             return _err
@@ -541,6 +649,17 @@ class TextPatcher(BasePatcher):
         except OSError as exc:
             return PatchResult(success=False, file=filepath, operation=OperationType.REPLACE_BLOCK, error=str(exc))
 
+        policy = (count or "unique").strip().lower()
+        if policy not in {"unique", "all", "first"}:
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.REPLACE_BLOCK,
+                error=(
+                    f"Unknown count policy {count!r} on REPLACE_BLOCK for "
+                    f"{filepath}. Use one of: unique, all, first."
+                ),
+            )
+
         # Exact match search — count occurrences
         count = original.count(search)
         if count == 0:
@@ -562,6 +681,7 @@ class TextPatcher(BasePatcher):
                     operation=OperationType.REPLACE_BLOCK,
                     message=f"region already at target state (no-op on resume): {filepath}",
                     lines_changed=0,
+                    no_op=True,
                 )
             # Whitespace-tolerant fallback: try matching after rstrip-per-line
             # before declaring failure. Catches trailing-whitespace drift,
@@ -604,21 +724,149 @@ class TextPatcher(BasePatcher):
                         f"Add more context lines to make the search unique."
                     ),
                 )
+
+            # Line-number-prefix fallback. The patcher's "Search block not
+            # found" error includes a line-numbered view of the current
+            # file content (see _find_closest_match). LLMs sometimes copy
+            # the prefix verbatim into their next REPLACE_BLOCK search —
+            # e.g. they emit "  1| import asyncio" instead of
+            # "import asyncio". That's invisible to whitespace-tolerant
+            # matching because the prefix is non-whitespace characters.
+            # If every non-blank line of the search starts with a
+            # uniform ``\\s*\\d+\\|\\s?`` prefix, strip it and retry.
+            stripped_search = _strip_line_number_prefixes(search)
+            if stripped_search is not None and stripped_search != search:
+                count = original.count(stripped_search)
+                if count == 1:
+                    modified = original.replace(stripped_search, replace, 1)
+                    lines_changed = _count_diff_lines(original, modified)
+                    try:
+                        await _awrite(full_path, modified)
+                        logger.info(
+                            "[patcher:text] Replaced block in %s via "
+                            "line-number-stripped match (%d lines changed). "
+                            "The LLM's search block had `  N| ` line-number "
+                            "prefixes — likely copied verbatim from a prior "
+                            "patcher error's wider-context window.",
+                            filepath, lines_changed,
+                        )
+                        return PatchResult(
+                            success=True,
+                            file=filepath,
+                            operation=OperationType.REPLACE_BLOCK,
+                            message=(
+                                f"Replaced block in {filepath} "
+                                f"(line-number-prefix stripped)"
+                            ),
+                            lines_changed=lines_changed,
+                        )
+                    except OSError as exc:
+                        return PatchResult(
+                            success=False, file=filepath,
+                            operation=OperationType.REPLACE_BLOCK, error=str(exc),
+                        )
+                if count == 0:
+                    # Try whitespace-tolerant on the stripped search too.
+                    ws_matches_stripped = _whitespace_tolerant_match(
+                        original, stripped_search,
+                    )
+                    if len(ws_matches_stripped) == 1:
+                        modified = _whitespace_tolerant_replace(
+                            original, stripped_search, replace,
+                            ws_matches_stripped[0],
+                        )
+                        lines_changed = _count_diff_lines(original, modified)
+                        try:
+                            await _awrite(full_path, modified)
+                            logger.info(
+                                "[patcher:text] Replaced block in %s via "
+                                "stripped + whitespace-tolerant match "
+                                "(%d lines changed).", filepath, lines_changed,
+                            )
+                            return PatchResult(
+                                success=True,
+                                file=filepath,
+                                operation=OperationType.REPLACE_BLOCK,
+                                message=(
+                                    f"Replaced block in {filepath} "
+                                    f"(line-number-prefix stripped + ws-tolerant)"
+                                ),
+                                lines_changed=lines_changed,
+                            )
+                        except OSError as exc:
+                            return PatchResult(
+                                success=False, file=filepath,
+                                operation=OperationType.REPLACE_BLOCK, error=str(exc),
+                            )
+
+            # Log the first ~600 chars of the failed search at DEBUG so
+            # future debugging has the LLM's actual output to look at
+            # without enabling full transcript logging.
+            logger.debug(
+                "[patcher:text] REPLACE_BLOCK search miss on %s. Search "
+                "block excerpt:\n%s",
+                filepath, search[:600],
+            )
             # No match even after normalization — fall through to closest-match suggestion.
             suggestion = _find_closest_match(original, search)
             return PatchResult(
                 success=False,
                 file=filepath,
                 operation=OperationType.REPLACE_BLOCK,
-                error=f"Search block not found in {filepath}. Closest match:\n{suggestion}",
+                error=(
+                    f"Search block not found in {filepath}. Your search did "
+                    f"not match the current file content — the file may have "
+                    f"drifted since your mental model of it. Below is the "
+                    f"line-numbered current content of the file (either the "
+                    f"entire file, or a window around the closest match for "
+                    f"larger files). Copy the EXACT lines you want to "
+                    f"replace (WITHOUT the line-number prefix `  N| `) into "
+                    f"your next REPLACE_BLOCK's `search:`.\n"
+                    f"Current file content (around closest match):\n{suggestion}"
+                ),
             )
         if count > 1:
-            return PatchResult(
-                success=False,
-                file=filepath,
-                operation=OperationType.REPLACE_BLOCK,
-                error=f"Search block matched {count} times in {filepath}. Must be unique.",
-            )
+            if policy == "all":
+                modified = original.replace(search, replace)
+                replaced_n = count
+            elif policy == "first":
+                modified = original.replace(search, replace, 1)
+                replaced_n = 1
+            else:
+                return PatchResult(
+                    success=False,
+                    file=filepath,
+                    operation=OperationType.REPLACE_BLOCK,
+                    error=(
+                        f"Search block matched {count} times in {filepath}. "
+                        f"Must be unique. To replace every occurrence add "
+                        f"`count: all` to the REPLACE_BLOCK; to replace only "
+                        f"the first add `count: first`."
+                    ),
+                )
+            lines_changed = _count_diff_lines(original, modified)
+            try:
+                await _awrite(full_path, modified)
+                logger.info(
+                    "[patcher:text] Replaced block in %s (%d lines changed, "
+                    "policy=%s, %d occurrence(s))",
+                    filepath, lines_changed, policy, replaced_n,
+                )
+                return PatchResult(
+                    success=True,
+                    file=filepath,
+                    operation=OperationType.REPLACE_BLOCK,
+                    message=(
+                        f"Replaced block in {filepath} "
+                        f"(count={policy}, {replaced_n} occurrence(s))"
+                    ),
+                    lines_changed=lines_changed,
+                )
+            except OSError as exc:
+                return PatchResult(
+                    success=False, file=filepath,
+                    operation=OperationType.REPLACE_BLOCK, error=str(exc),
+                )
 
         modified = original.replace(search, replace, 1)
         lines_changed = _count_diff_lines(original, modified)
@@ -636,7 +884,9 @@ class TextPatcher(BasePatcher):
         except OSError as exc:
             return PatchResult(success=False, file=filepath, operation=OperationType.REPLACE_BLOCK, error=str(exc))
 
-    async def delete_block(self, filepath: str, search: str) -> PatchResult:
+    async def delete_block(
+        self, filepath: str, search: str, *, count: str = "unique",
+    ) -> PatchResult:
         full_path, _err = self._resolve_safe(filepath, OperationType.DELETE_BLOCK)
         if _err is not None:
             return _err
@@ -652,6 +902,17 @@ class TextPatcher(BasePatcher):
             original = await _aread(full_path)
         except OSError as exc:
             return PatchResult(success=False, file=filepath, operation=OperationType.DELETE_BLOCK, error=str(exc))
+
+        policy = (count or "unique").strip().lower()
+        if policy not in {"unique", "all", "first"}:
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.DELETE_BLOCK,
+                error=(
+                    f"Unknown count policy {count!r} on DELETE_BLOCK for "
+                    f"{filepath}. Use one of: unique, all, first."
+                ),
+            )
 
         count = original.count(search)
         if count == 0:
@@ -669,14 +930,50 @@ class TextPatcher(BasePatcher):
                 operation=OperationType.DELETE_BLOCK,
                 message=f"already deleted (no-op on resume): {filepath}",
                 lines_changed=0,
+                no_op=True,
             )
         if count > 1:
-            return PatchResult(
-                success=False,
-                file=filepath,
-                operation=OperationType.DELETE_BLOCK,
-                error=f"Delete block matched {count} times in {filepath}. Must be unique.",
-            )
+            if policy == "all":
+                modified = original.replace(search, "")
+                removed_n = count
+            elif policy == "first":
+                modified = original.replace(search, "", 1)
+                removed_n = 1
+            else:
+                return PatchResult(
+                    success=False,
+                    file=filepath,
+                    operation=OperationType.DELETE_BLOCK,
+                    error=(
+                        f"Delete block matched {count} times in {filepath}. "
+                        f"Must be unique. To delete every occurrence add "
+                        f"`count: all` to the DELETE_BLOCK; to delete only "
+                        f"the first add `count: first`."
+                    ),
+                )
+            lines_changed = _count_diff_lines(original, modified)
+            try:
+                await _awrite(full_path, modified)
+                logger.info(
+                    "[patcher:text] Deleted block from %s "
+                    "(policy=%s, %d occurrence(s))",
+                    filepath, policy, removed_n,
+                )
+                return PatchResult(
+                    success=True,
+                    file=filepath,
+                    operation=OperationType.DELETE_BLOCK,
+                    message=(
+                        f"Deleted block from {filepath} "
+                        f"(count={policy}, {removed_n} occurrence(s))"
+                    ),
+                    lines_changed=lines_changed,
+                )
+            except OSError as exc:
+                return PatchResult(
+                    success=False, file=filepath,
+                    operation=OperationType.DELETE_BLOCK, error=str(exc),
+                )
 
         modified = original.replace(search, "", 1)
         lines_changed = _count_diff_lines(original, modified)
@@ -743,6 +1040,7 @@ class TextPatcher(BasePatcher):
                     operation=OperationType.INSERT_AT_BLOCK,
                     message=f"already inserted (no-op on resume): {filepath}",
                     lines_changed=0,
+                    no_op=True,
                 )
             modified = original[:insert_point] + content_with_newline + original[insert_point:]
         else:  # Placement.AFTER
@@ -767,6 +1065,7 @@ class TextPatcher(BasePatcher):
                     operation=OperationType.INSERT_AT_BLOCK,
                     message=f"already inserted (no-op on resume): {filepath}",
                     lines_changed=0,
+                    no_op=True,
                 )
             modified = original[:insert_point] + content_with_newline + original[insert_point:]
 
@@ -882,12 +1181,25 @@ class TreeSitterPatcher(BasePatcher):
         text_patcher = TextPatcher(self.workspace_root)
         return await text_patcher.create_file(filepath, content)
 
-    async def replace_block(self, filepath: str, search: str, replace: str) -> PatchResult:
+    async def replace_block(
+        self, filepath: str, search: str, replace: str,
+        *, count: str = "unique",
+    ) -> PatchResult:
         """
         AST-aware replacement: locate the target node by structural signature
         and replace only that node's text, preserving all surrounding formatting.
         Falls back to text search if AST parsing fails.
+
+        ``count`` other than ``"unique"`` is delegated to the text patcher,
+        whose byte-level repetition logic already handles multi-match cases.
         """
+        # count != unique exits the AST path immediately — repetition
+        # semantics are naturally a byte-level concern.
+        if (count or "unique").strip().lower() != "unique":
+            text_patcher = TextPatcher(self.workspace_root)
+            return await text_patcher.replace_block(
+                filepath, search, replace, count=count,
+            )
         full_path, _err = self._resolve_safe(filepath, OperationType.REPLACE_BLOCK)
         if _err is not None:
             return _err
@@ -937,7 +1249,13 @@ class TreeSitterPatcher(BasePatcher):
                     success=False,
                     file=filepath,
                     operation=OperationType.REPLACE_BLOCK,
-                    error=f"Search block matched {len(matching_nodes)} AST nodes in {filepath}. Must be unique.",
+                    error=(
+                        f"Search block matched {len(matching_nodes)} AST "
+                        f"nodes in {filepath}. Must be unique. To replace "
+                        f"every occurrence add `count: all` to the "
+                        f"REPLACE_BLOCK; to replace only the first add "
+                        f"`count: first`."
+                    ),
                 )
 
             target = matching_nodes[0]
@@ -971,8 +1289,16 @@ class TreeSitterPatcher(BasePatcher):
             text_patcher = TextPatcher(self.workspace_root)
             return await text_patcher.replace_block(filepath, search, replace)
 
-    async def delete_block(self, filepath: str, search: str) -> PatchResult:
-        """AST-aware delete: locate and remove the target node."""
+    async def delete_block(
+        self, filepath: str, search: str, *, count: str = "unique",
+    ) -> PatchResult:
+        """AST-aware delete: locate and remove the target node.
+
+        ``count`` other than ``"unique"`` delegates to the text patcher.
+        """
+        if (count or "unique").strip().lower() != "unique":
+            text_patcher = TextPatcher(self.workspace_root)
+            return await text_patcher.delete_block(filepath, search, count=count)
         full_path, _err = self._resolve_safe(filepath, OperationType.DELETE_BLOCK)
         if _err is not None:
             return _err
@@ -1006,7 +1332,12 @@ class TreeSitterPatcher(BasePatcher):
                     success=False,
                     file=filepath,
                     operation=OperationType.DELETE_BLOCK,
-                    error=f"Search block matched {len(matching)} nodes. Must be unique.",
+                    error=(
+                        f"Search block matched {len(matching)} nodes. "
+                        f"Must be unique. To delete every occurrence add "
+                        f"`count: all` to the DELETE_BLOCK; to delete only "
+                        f"the first add `count: first`."
+                    ),
                 )
 
             target = matching[0]
@@ -1188,9 +1519,13 @@ class HybridPatcher:
         if block.operation == OperationType.CREATE_FILE:
             return await patcher.create_file(block.file, block.content)
         elif block.operation == OperationType.REPLACE_BLOCK:
-            return await patcher.replace_block(block.file, block.search, block.replace)
+            return await patcher.replace_block(
+                block.file, block.search, block.replace, count=block.count,
+            )
         elif block.operation == OperationType.DELETE_BLOCK:
-            return await patcher.delete_block(block.file, block.search)
+            return await patcher.delete_block(
+                block.file, block.search, count=block.count,
+            )
         elif block.operation == OperationType.INSERT_AT_BLOCK:
             return await patcher.insert_at_block(block.file, block.anchor, block.placement, block.content)
         else:
@@ -1203,14 +1538,27 @@ class HybridPatcher:
 
     async def apply_all(self, blocks: list[PatchBlock]) -> list[PatchResult]:
         """
-        Apply a sequence of patch blocks in order and return results.
+        Apply a sequence of patch blocks in order and return results for ALL
+        blocks (success or failure).
 
-        Stops on the first failure to avoid cascading errors (a failed
-        search on file X followed by a valid patch on file Y that depends
-        on X's changes would be unsafe).
+        Historical behaviour was to stop on the first failure to avoid
+        cascading damage — but in practice this discarded 80-90% of the
+        LLM's output every repair iteration: a single bad block (typically
+        a CREATE_FILE against an already-existing file) would nuke 5-11
+        unrelated patches on other files. The repair LLM then saw the same
+        build errors next round and re-emitted the same blocks, looping.
+
+        We now apply every block independently. Failures are surfaced via
+        the returned PatchResult list (and ultimately ``patch_failures`` in
+        node_state — see ``_format_prior_patch_failures`` in graph.py),
+        which the repair LLM reads on the next turn. True cross-file
+        dependencies are rare in our patch sets; when they appear, the
+        dependent patch will fail with a clear error rather than be
+        silently skipped — same information surface, much higher throughput.
 
         Returns:
-            List of PatchResult objects, one per block up to the failure point.
+            List of PatchResult objects, one per block. Length always
+            equals ``len(blocks)``.
         """
         results: list[PatchResult] = []
         for block in blocks:
@@ -1223,7 +1571,6 @@ class HybridPatcher:
                     block.operation.value,
                     result.error,
                 )
-                break
         return results
 
 
@@ -1241,6 +1588,37 @@ def _count_diff_lines(original: str, modified: str) -> int:
         if line.startswith("+") or line.startswith("-"):
             count += 1
     return count // 2  # Each change appears as both + and -
+
+
+# Line-number prefix regex: matches the patcher's own annotation format
+# (see _find_closest_match): optional leading whitespace, one or more
+# digits, a pipe character, then a single space. Used to strip prefixes
+# the LLM may have accidentally copied from a prior failure's
+# wider-context window into its REPLACE_BLOCK search.
+_LINE_NUMBER_PREFIX_RE = re.compile(r"^\s*\d+\|\s?")
+
+
+def _strip_line_number_prefixes(search: str) -> Optional[str]:
+    """Strip a uniform ``\\s*\\d+\\|\\s?`` prefix from every non-blank line
+    of ``search`` and return the result. Returns ``None`` when the prefix
+    doesn't appear on every non-blank line (i.e. the search doesn't look
+    like a copy-paste from the patcher's annotated wider-context window).
+
+    The conservative "every non-blank line must match" rule prevents the
+    stripper from mangling user content that happens to start with a
+    digit and pipe by coincidence.
+    """
+    lines = search.splitlines(keepends=True)
+    non_blank = [line for line in lines if line.strip()]
+    if not non_blank:
+        return None
+    if not all(_LINE_NUMBER_PREFIX_RE.match(line) for line in non_blank):
+        return None
+    stripped = [
+        _LINE_NUMBER_PREFIX_RE.sub("", line) if line.strip() else line
+        for line in lines
+    ]
+    return "".join(stripped)
 
 
 def _whitespace_tolerant_match(original: str, search: str) -> list[int]:
@@ -1308,44 +1686,108 @@ def _whitespace_tolerant_replace(
     return original[:start_byte] + replace_text + original[start_byte + replaced_bytes:]
 
 
-def _find_closest_match(text: str, search: str, context: int = 3) -> str:
-    """
-    When an exact search block is not found, try to find the closest matching
-    substring to provide a helpful error message.
+def _find_closest_match(text: str, search: str, context: int = 20) -> str:
+    """Return a line-numbered view of the current file content for the
+    LLM's next REPLACE_BLOCK attempt.
+
+    Two modes:
+
+    - **Whole-file mode** (file ≤ 300 lines AND ≤ 6000 chars): return the
+      entire file content with line numbers. Eliminates the "LLM's first
+      line didn't match anything close to the actual edit site" failure —
+      the LLM sees the full file and can pick any region for its next
+      search block. Covers nearly every config file (pytest.ini,
+      requirements.txt, small .py modules) we patch in practice.
+
+    - **Window mode** (anything larger): use the legacy closest-match
+      heuristic to find the best-ratio line and return a ±20-line window
+      around it. Capped at 6000 chars so the prompt doesn't blow up on
+      huge files.
+
+    Earlier sessions (8b7f7d52, 62084672) failed the repair loop because
+    the LLM kept emitting REPLACE_BLOCK searches that didn't match. With
+    a 6-line file like pytest.ini, the LLM was somehow still missing the
+    target — confirming that even a 20-line window isn't enough if the
+    LLM's mental model of the file is wrong. Whole-file mode removes
+    that whole class of failure for small files.
     """
     search_lines = search.strip().splitlines()
     if not search_lines:
         return "(empty search block)"
 
-    first_line = search_lines[0].strip()
     text_lines = text.splitlines()
+    width = max(2, len(str(max(1, len(text_lines)))))
 
-    best_match = ""
+    def _annotate(start: int, end: int) -> str:
+        return "\n".join(
+            f"{(i + 1):>{width}}| {text_lines[i]}" for i in range(start, end)
+        )
+
+    WHOLE_FILE_LINE_CAP = 300
+    WHOLE_FILE_CHAR_CAP = 6000
+
+    # Whole-file mode for small files: no closest-match logic at all,
+    # just the full file with line numbers. The LLM sees everything and
+    # can construct any REPLACE_BLOCK search it needs.
+    if len(text_lines) <= WHOLE_FILE_LINE_CAP and len(text) <= WHOLE_FILE_CHAR_CAP:
+        return _annotate(0, len(text_lines))
+
+    # Window mode for larger files: anchor on the best-ratio match for
+    # the LLM's first search line and pad with ``context`` lines either
+    # side.
+    first_line = search_lines[0].strip()
+    best_start = -1
+    best_end = -1
     best_ratio = 0.0
-
     for i, line in enumerate(text_lines):
         ratio = difflib.SequenceMatcher(None, first_line, line.strip()).ratio()
         if ratio > best_ratio:
             best_ratio = ratio
-            start = max(0, i - context)
-            end = min(len(text_lines), i + len(search_lines) + context)
-            best_match = "\n".join(text_lines[start:end])
+            best_start = max(0, i - context)
+            best_end = min(len(text_lines), i + len(search_lines) + context)
 
-    if best_ratio < 0.3:
-        return "(No similar lines found)"
+    if best_ratio < 0.3 or best_start < 0:
+        return "(No similar lines found in current file content)"
 
-    return best_match[:500]
+    rendered = _annotate(best_start, best_end)
+    if len(rendered) > WHOLE_FILE_CHAR_CAP:
+        rendered = rendered[:WHOLE_FILE_CHAR_CAP] + "\n...(truncated)"
+    return rendered
 
 
 # ---------------------------------------------------------------------------
 # 10. Primary Integration Point
 # ---------------------------------------------------------------------------
 
+def sha256_file_bytes(abs_path: str) -> Optional[str]:
+    """Return the SHA-256 hex digest of ``abs_path``'s bytes, or ``None``
+    when the file is missing or unreadable.
+
+    Cheap drift sensor for B5: the host records the hash of each file at
+    the moment its content is shown to the LLM and compares against the
+    current on-disk hash before applying a patch. Mismatch means a
+    prior patch in the same batch (or an external editor) changed the
+    file out from under the LLM's mental model.
+    """
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(abs_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
 async def process_llm_patch_output(
     llm_output: str,
     workspace_root: str,
     existing_modified_files: Optional[list[str]] = None,
     allowed_paths: Optional["Iterable[str]"] = None,
+    *,
+    files_seen_by_llm: Optional[dict[str, str]] = None,
+    enforce_read_before_edit: bool = False,
 ) -> tuple[list[PatchResult], list[str]]:
     """
     Parse LLM output for patch blocks, apply them using the hybrid patcher,
@@ -1364,6 +1806,17 @@ async def process_llm_patch_output(
             error. When None (default), there is no restriction beyond the
             standard traversal guard — preserves backward compatibility for
             top-level patching_node / repair_node callers.
+        files_seen_by_llm: Optional dict of ``{rel_path: sha256_hex}``
+            tracking the bytes of each file as last shown to the LLM
+            (via pre-flight injection, READ_FILE resolution, or the
+            patcher's closest-match window). Used for B5 drift detection
+            and (when ``enforce_read_before_edit=True``) read-before-edit
+            enforcement.
+        enforce_read_before_edit: When True, any REPLACE_BLOCK /
+            DELETE_BLOCK / INSERT_AT_BLOCK targeting a file NOT in
+            ``files_seen_by_llm`` is rejected with a "you have not been
+            shown this file" error directing the LLM to emit READ_FILE
+            first. Default False — drift detection still runs.
 
     Returns:
         A tuple of (list of PatchResult, updated modified_files list).
@@ -1403,6 +1856,66 @@ async def process_llm_patch_output(
                 )
     else:
         blocks_to_apply = list(blocks)
+
+    # B5 — read-before-edit + drift detection. Both run against the same
+    # files_seen_by_llm dict the host maintains in node_state. Drift detection
+    # is always on when the dict is provided; the harder "must have been read"
+    # rejection is gated by enforce_read_before_edit so existing callers stay
+    # backwards-compatible until the operator opts in.
+    seen_hashes: dict[str, str] = dict(files_seen_by_llm or {})
+    if seen_hashes or enforce_read_before_edit:
+        edit_ops = {
+            OperationType.REPLACE_BLOCK,
+            OperationType.DELETE_BLOCK,
+            OperationType.INSERT_AT_BLOCK,
+        }
+        kept: list[PatchBlock] = []
+        for block in blocks_to_apply:
+            if block.operation not in edit_ops:
+                kept.append(block)
+                continue
+            abs_path = os.path.join(workspace_root, block.file)
+            recorded = seen_hashes.get(block.file)
+            if recorded is None:
+                if enforce_read_before_edit:
+                    results.append(PatchResult(
+                        success=False, file=block.file,
+                        operation=block.operation,
+                        error=(
+                            f"You have not been shown the current bytes of "
+                            f"`{block.file}`. Emit a READ_FILE block for it "
+                            f"first; the harness will resolve it inline and "
+                            f"re-dispatch you in the same iteration."
+                        ),
+                    ))
+                    continue
+                # Drift detection only runs when we have a recorded hash to
+                # compare against. With no record, fall through and let the
+                # patcher do exact-byte matching as before.
+                kept.append(block)
+                continue
+            current = sha256_file_bytes(abs_path)
+            if current is None:
+                # File does not exist on disk — patcher will report a clean
+                # "File not found" error. Don't pre-reject here.
+                kept.append(block)
+                continue
+            if current != recorded:
+                results.append(PatchResult(
+                    success=False, file=block.file,
+                    operation=block.operation,
+                    error=(
+                        f"`{block.file}` has drifted since you last read "
+                        f"it (recorded sha256={recorded[:12]}…, current "
+                        f"sha256={current[:12]}…). A prior patch in this "
+                        f"batch (or an external editor) changed the file. "
+                        f"Emit READ_FILE for the current bytes before "
+                        f"patching."
+                    ),
+                ))
+                continue
+            kept.append(block)
+        blocks_to_apply = kept
 
     # Apply the allowed blocks using the hybrid patcher
     if blocks_to_apply:

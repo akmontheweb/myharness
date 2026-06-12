@@ -525,7 +525,7 @@ class TestRepairNodeAutofixShortCircuit:
                 sentinel["messages"] = list(messages)
                 return StubResp(), budget_remaining_usd
 
-            def aggregate_tokens(self, tracker, usage):
+            def aggregate_tokens(self, tracker, usage, role=None):
                 return tracker or {}
 
         graph.set_gateway(StubGateway())

@@ -51,7 +51,7 @@ class _StubGateway:
         self.dispatched.append({"messages": list(messages), "role": role})
         return _StubResponse(self._content), budget_remaining_usd - 0.001
 
-    def aggregate_tokens(self, tracker, usage):
+    def aggregate_tokens(self, tracker, usage, role=None):
         out = dict(tracker or {})
         out["total_cost_usd"] = out.get("total_cost_usd", 0.0) + float(usage.cost_usd)
         return out
@@ -201,9 +201,13 @@ class TestPatchingNodeAllowlist:
         assert "app/new_module.py" in result.get("modified_files", [])
 
     @pytest.mark.asyncio
-    async def test_conftest_at_root_is_accepted(self, tmp_path, stub_gateway):
-        # conftest.py is in the root-file allowlist — must land at root
-        # even with a non-flat workspace.
+    async def test_conftest_at_root_is_dropped_in_phase1(self, tmp_path, stub_gateway):
+        # Fix #49 (two-phase split): patching_node is phase 1 —
+        # production code only. conftest.py is test infrastructure and
+        # is dropped from the LLM response BEFORE the patcher sees it,
+        # so the file does NOT land on disk during this phase. The
+        # follow-up test_generation_node creates conftest in phase 2,
+        # after prod imports cleanly.
         _seed_app_workspace(tmp_path)
         stub_gateway(
             "<<<CREATE_FILE>>>\n"
@@ -222,8 +226,10 @@ class TestPatchingNodeAllowlist:
             "token_tracker": {},
         })
 
-        assert (tmp_path / "conftest.py").exists()
-        assert "conftest.py" in result.get("modified_files", [])
+        # Phase 1 filter dropped the block — nothing on disk, nothing in
+        # modified_files.
+        assert not (tmp_path / "conftest.py").exists()
+        assert "conftest.py" not in result.get("modified_files", [])
 
     @pytest.mark.asyncio
     async def test_flat_workspace_conservative_fallback_blocks_root_writes(

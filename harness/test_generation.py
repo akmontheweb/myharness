@@ -722,7 +722,11 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             "token_tracker": token_tracker,
             "budget_remaining_usd": new_budget,
             "loop_counter": loop_counter,
+            # Merge into existing node_state so cross-iteration trackers
+            # (patch_failures, allowlist_rejections, allowed_paths from the
+            # prior patching_node) reach the next compiler_node/repair_node.
             "node_state": {
+                **(state.get("node_state") or {}),
                 "current_node": "test_generation",
                 "test_generation": {
                     "status": "passed",
@@ -767,7 +771,12 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         "token_tracker": token_tracker,
         "budget_remaining_usd": new_budget,
         "loop_counter": loop_counter,
+        # Merge into existing node_state so cross-iteration trackers
+        # (patch_failures, allowlist_rejections, allowed_paths from the
+        # prior patching_node) flow into the repair_node we're about to
+        # route to.
         "node_state": {
+            **(state.get("node_state") or {}),
             "current_node": "test_generation",
             "last_build_output": build_result.raw_output,
             "test_generation": {
