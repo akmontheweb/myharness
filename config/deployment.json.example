@@ -1,0 +1,49 @@
+{
+    "_comment": "AI Agent Harness — OPTIONAL org-wide deployment policy. Copy this file to config/deployment.json and edit. When config/deployment.json is absent the deployment-phase questionnaire runs in its current full mode. When present, the planning LLM is told to treat every populated field below as RESOLVED — it skips emitting an interview question for that field. Sections and individual fields are independently optional: leave a section out (or set its keys to null) and the LLM will still emit questions for it. Stack-specific values (Postgres port, Redis volume path, etc.) deliberately are NOT in this file — those are still derived from workspace telemetry and asked per-project. Keys starting with '_' are documentation comments stripped at load time (same convention as config.json).",
+
+    "_schema_version_comment": "Pin the schema this file is written against. Only schema_version 1 is recognised today. The harness exits with code 2 if it sees a higher number, so future loaders know when to migrate.",
+    "schema_version": 1,
+
+    "_network_comment": "Sector 1: NETWORK TOPOLOGY. Org-wide answers for reverse proxy, TLS, public ports, host-side port allocation, Docker networking, and DNS. Leave individual fields out (or set to null) to let the LLM ask anyway.",
+    "network": {
+        "reverse_proxy": "caddy",
+        "tls_strategy": "letsencrypt",
+        "tls_contact_email": "ops@example.com",
+        "public_http_port": 80,
+        "public_https_port": 443,
+        "host_port_range": [8000, 8999],
+        "docker_network_mode": "bridge",
+        "primary_domain": "app.example.com",
+        "dns_provider": "cloudflare"
+    },
+
+    "_storage_comment": "Sector 2: DATA & STORAGE PERSISTENCE. Org-wide answers for volume layout, container UID/GID convention, backup destination, and multi-host storage. Stack-specific volume paths (e.g. /var/lib/postgresql/data) are still derived from telemetry — this section captures the policy decisions that wrap them.",
+    "storage": {
+        "volume_root": "/var/lib/app",
+        "persistence_mode": "bind",
+        "container_uid": 1000,
+        "container_gid": 1000,
+        "backup_destination": "s3",
+        "backup_path": "s3://acme-backups/",
+        "multi_host_storage": "none"
+    },
+
+    "_secrets_comment": "Sector 3: SECRETS & IDENTITY MANAGEMENT. Org-wide answers for secret manager choice, CI injection method, rotation policy, and log masking. Specific secret values are NEVER stored here — only the policy describing where and how the harness fetches them.",
+    "secrets": {
+        "manager": "vault",
+        "manager_endpoint": "https://vault.internal",
+        "env_file_path": ".env",
+        "ci_secret_injection": "github_actions",
+        "rotation_policy_days": 90,
+        "mask_in_logs": true
+    },
+
+    "_infra_sync_comment": "Sector 4: PARTIAL INFRASTRUCTURE SYNC. Org-wide policy for handling pre-existing containers, reserved ports, protected volumes, and legacy compatibility. reserved_ports lists host ports the harness must NEVER bind. protect_containers / protect_volumes name resources the harness must NEVER destroy or recreate. conflict_policy ∈ {skip, overwrite, rename, abort} — default 'abort' is the safest (refuses to touch anything contested).",
+    "infra_sync": {
+        "conflict_policy": "abort",
+        "reserved_ports": [22, 5432, 6379],
+        "protect_containers": ["legacy-db"],
+        "protect_volumes": ["legacy-data"],
+        "legacy_compat_mode": false
+    }
+}

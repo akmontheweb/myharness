@@ -123,6 +123,13 @@ class AgentState(TypedDict, total=False):
     # Discovery-shaped follow-up questions the doc reviewer wants the user to
     # answer in a second pass of the interview loop.
     reviewer_followups: list[dict[str, Any]]
+    # The latest discovery JSON emitted by requirements/architecture/deployment
+    # discovery nodes. Shape: {"modules": [{"name": str, "questions": [...]}],
+    # "complete": bool, "summary": str}. MUST be declared here — without it,
+    # LangGraph's state channel layer silently drops the key on the
+    # discovery_node → discovery_interview_loop hop, leaving the loop with
+    # no modules to render even though the LLM returned a full set.
+    discovery_questions: dict[str, Any]
     # Per-node config sections plumbed through state so the graph nodes can
     # read them without round-tripping through cli.py's config loader. Each
     # is loaded from the corresponding section of config/config.json and
@@ -134,6 +141,12 @@ class AgentState(TypedDict, total=False):
     sandbox_config: dict[str, Any]
     lintgate_config: dict[str, Any]
     deployment_config: dict[str, Any]
+    # Optional org-wide deployment policy loaded from config/deployment.json.
+    # When populated, deployment_discovery_node injects it into the planning
+    # LLM's prompt so already-resolved fields don't produce questions. Empty
+    # dict = no file present = current full-questionnaire behaviour. See
+    # load_deployment_defaults() in cli.py for the schema.
+    deployment_defaults: dict[str, Any]
     run_prod_import_smoke_check: bool
 
 # ---------------------------------------------------------------------------
@@ -4348,12 +4361,21 @@ Your task:
 Output JSON:
 {{
   "modules": [
-    {{"name": "INPUT VALIDATION", "questions": [{{"id": "Q1.1", "text": "...", "critical": true/false}}]}},
+    {{"name": "INPUT VALIDATION", "questions": [
+      {{"id": "Q1.1", "text": "...", "critical": true/false, "suggested_answer": "..."}}
+    ]}},
     ...
   ],
   "complete": false,
   "summary": "Brief status of what's resolved vs remaining"
 }}
+
+Every question MUST include a "suggested_answer" — your best, most-probable
+answer given the conversation context, project files, and prior responses.
+Keep it short (1 line, concrete, actionable). The interview presents it to
+the operator as a default they can press Enter to accept; a vague placeholder
+defeats the purpose. If you genuinely have no signal, use the conservative
+industry default for that sector and say so.
 Return ONLY valid JSON. No markdown or explanation."""
 
     else:
@@ -4394,8 +4416,8 @@ and the operator sees an empty interview screen.
 {
   "modules": [
     {"name": "INPUT VALIDATION", "questions": [
-      {"id": "Q1.1", "text": "...", "critical": true},
-      {"id": "Q1.2", "text": "...", "critical": false}
+      {"id": "Q1.1", "text": "...", "critical": true, "suggested_answer": "..."},
+      {"id": "Q1.2", "text": "...", "critical": false, "suggested_answer": "..."}
     ]},
     {"name": "PAYLOAD FORMATTING", "questions": [...]},
     {"name": "ERROR HANDLING BEHAVIORS", "questions": [...]},
@@ -4409,8 +4431,13 @@ and the operator sees an empty interview screen.
   "summary": "Brief status of what's covered vs still unknown"
 }
 
-Mark critical items with "critical": true. Return ONLY valid JSON. No
-markdown, no explanation, no code blocks."""
+Mark critical items with "critical": true. Every question MUST include
+"suggested_answer" — your best, most-probable answer given the conversation
+context, project files, and sector intent. Keep it short (1 line, concrete,
+actionable). The interview presents it as a default the operator can press
+Enter to accept; a vague placeholder defeats the purpose. If you have no
+signal, use the conservative industry default and say so. Return ONLY valid
+JSON. No markdown, no explanation, no code blocks."""
 
     messages.append({"role": "user", "content": prompt})
 
@@ -4517,14 +4544,20 @@ interview screen.
 {{
   "modules": [
     {{"name": "STORAGE TOPOLOGY", "questions": [
-      {{"id": "A1.1", "text": "...", "critical": true}}
+      {{"id": "A1.1", "text": "...", "critical": true, "suggested_answer": "..."}}
     ]}}
   ],
   "complete": false,
   "summary": "Brief status of what's resolved vs remaining"
 }}
 
-Return ONLY valid JSON. No markdown, no explanation, no code fences."""
+Every question MUST include "suggested_answer" — your best, most-probable
+answer given the conversation context, project files, and prior responses.
+Keep it short (1 line, concrete, actionable). The interview presents it as
+a default the operator can press Enter to accept; a vague placeholder
+defeats the purpose. If you have no signal, use the conservative industry
+default and say so. Return ONLY valid JSON. No markdown, no explanation, no
+code fences."""
 
     else:
         prompt = """You are a Principal Infrastructure Architect. Perform EXHAUSTIVE architecture discovery across ALL 8 sectors.
@@ -4562,7 +4595,7 @@ questions and the operator sees an empty interview screen.
 {
   "modules": [
     {"name": "STORAGE TOPOLOGY", "questions": [
-      {"id": "A1.1", "text": "...", "critical": true}
+      {"id": "A1.1", "text": "...", "critical": true, "suggested_answer": "..."}
     ]},
     ... one entry per architectural sector above ...
   ],
@@ -4570,8 +4603,13 @@ questions and the operator sees an empty interview screen.
   "summary": "Brief status of what's resolved vs remaining"
 }
 
-Mark critical items with "critical": true. Return ONLY valid JSON. No
-markdown, no explanation, no code blocks."""
+Mark critical items with "critical": true. Every question MUST include
+"suggested_answer" — your best, most-probable answer given the conversation
+context, project files, and sector intent. Keep it short (1 line, concrete,
+actionable). The interview presents it as a default the operator can press
+Enter to accept; a vague placeholder defeats the purpose. If you have no
+signal, use the conservative industry default and say so. Return ONLY valid
+JSON. No markdown, no explanation, no code blocks."""
     messages.append({"role": "user", "content": prompt})
 
     from harness.gateway import NodeRole
@@ -4647,6 +4685,30 @@ async def deployment_discovery_node(state: AgentState) -> dict[str, Any]:
     question_count = state.get("node_state", {}).get("discovery_question_count", 0)
     is_followup = question_count > 0
 
+    # Optional org-wide policy from config/deployment.json. When non-empty,
+    # the planning LLM is told to treat every populated field as RESOLVED
+    # and skip emitting a question for it. When empty, the prompt block
+    # below is omitted and the questionnaire runs in its current full mode.
+    deployment_defaults = state.get("deployment_defaults", {}) or {}
+    resolved_block = ""
+    if deployment_defaults:
+        resolved_block = (
+            "\n\n## Pre-resolved deployment policies (operator-supplied)\n\n"
+            "The operator has already declared the following deployment "
+            "policies via config/deployment.json. Treat every populated "
+            "field below as RESOLVED — do NOT emit a question whose answer "
+            "is already given here. Generate questions ONLY for sectors / "
+            "fields not covered and for stack-specific details (e.g. "
+            "per-service ports, volume paths) that this policy does not "
+            "specify. If every sector is fully covered, return "
+            '{"complete": true} on round 1 and skip the interview '
+            "entirely. The values below carry into "
+            "DEPLOYMENT_BLUEPRINT.md verbatim.\n\n"
+            "```json\n"
+            + json.dumps(deployment_defaults, indent=2, sort_keys=True)
+            + "\n```"
+        )
+
     if is_followup:
         prompt = f"""You are a Principal DevSecOps Engineer. FOLLOW-UP round #{question_count + 1}.
 Review the conversation above. Cross-reference deployment answers. Find remaining gaps.
@@ -4659,14 +4721,20 @@ interview screen.
 {{
   "modules": [
     {{"name": "NETWORK TOPOLOGY", "questions": [
-      {{"id": "D1.1", "text": "...", "critical": true}}
+      {{"id": "D1.1", "text": "...", "critical": true, "suggested_answer": "..."}}
     ]}}
   ],
   "complete": false,
   "summary": "Brief status of what's resolved vs remaining"
 }}
 
-Return ONLY valid JSON. No markdown, no explanation, no code fences."""
+Every question MUST include "suggested_answer" — your best, most-probable
+answer given the conversation context, project files, and prior responses.
+Keep it short (1 line, concrete, actionable). The interview presents it as
+a default the operator can press Enter to accept; a vague placeholder
+defeats the purpose. If you have no signal, use the conservative industry
+default and say so. Return ONLY valid JSON. No markdown, no explanation, no
+code fences.{resolved_block}"""
 
     else:
         prompt = """You are a Principal DevSecOps Systems Engineer and Lead SRE. Perform EXHAUSTIVE deployment infrastructure discovery across ALL 4 sectors below.
@@ -4691,7 +4759,7 @@ Output the EXACT JSON shape below — top-level key MUST be literally
 {
   "modules": [
     {"name": "RUNTIME PLATFORM", "questions": [
-      {"id": "D1.1", "text": "...", "critical": true}
+      {"id": "D1.1", "text": "...", "critical": true, "suggested_answer": "..."}
     ]},
     ... one entry per deployment sector above ...
   ],
@@ -4699,8 +4767,13 @@ Output the EXACT JSON shape below — top-level key MUST be literally
   "summary": "Brief status of what's resolved vs remaining"
 }
 
-Mark critical items with "critical": true.
-Return ONLY valid JSON. No markdown, no explanation, no code blocks."""
+Mark critical items with "critical": true. Every question MUST include
+"suggested_answer" — your best, most-probable answer given the conversation
+context, project files, and sector intent. Keep it short (1 line, concrete,
+actionable). The interview presents it as a default the operator can press
+Enter to accept; a vague placeholder defeats the purpose. If you have no
+signal, use the conservative industry default and say so. Return ONLY valid
+JSON. No markdown, no explanation, no code blocks.""" + resolved_block
 
     messages.append({"role": "user", "content": prompt})
 
@@ -6105,13 +6178,73 @@ async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, An
     if not node_state.get("hitl_suspend"):
         return
 
-    # Mirror the [r] Resume branch of hitl_menu_loop: clear suspend flags,
-    # mark HITL resolved, reset loop counter to allow one more repair cycle.
+    # Distinguish suspend source. Discovery-interview suspends must NOT
+    # rewind through human_intervention_node — that route ends up at
+    # compiler_node and re-runs the entire build/security pipeline,
+    # throwing away work the user already completed (code, tests, security
+    # scan) before the discovery phase even started.
+    suspended_from = node_state.get("suspended_from")
+    # Back-compat: pre-tag checkpoints have no suspended_from. Infer from
+    # current_gate + current_node — discovery nodes set current_node to
+    # "<phase>_discovery" before stamping hitl_suspend via the interview loop.
+    if not suspended_from:
+        cur_node = node_state.get("current_node", "")
+        gate = values.get("current_gate", "")
+        if (
+            gate in ("REQUIREMENTS", "ARCHITECTURE", "DEPLOYMENT")
+            and isinstance(cur_node, str)
+            and cur_node.endswith("_discovery")
+        ):
+            suspended_from = "discovery_interview"
+        else:
+            suspended_from = "hitl_menu"
+
+    if suspended_from == "discovery_interview":
+        # Re-enter the gate-appropriate discovery node so its unconditional
+        # outgoing edge fires straight into discovery_interview_loop, which
+        # then re-renders the cached discovery_questions checkpointed by the
+        # prior session. aupdate_state(as_node=...) records "this node just
+        # returned this state" without re-executing the node — so the LLM
+        # is NOT re-called and no budget is burned on rewind.
+        gate = values.get("current_gate", "")
+        gate_to_node = {
+            "REQUIREMENTS": "requirements_discovery_node",
+            "ARCHITECTURE": "architecture_discovery_node",
+            "DEPLOYMENT": "deployment_discovery_node",
+        }
+        rewind_node = gate_to_node.get(gate, "deployment_discovery_node")
+        cleared = dict(node_state)
+        cleared["hitl_suspend"] = False
+        cleared.pop("suspended_from", None)
+        cleared.pop("user_done_with_critical", None)
+        logger.info(
+            "[run_graph] Resume rewind: discovery-interview suspend in %s phase. "
+            "Re-firing %s → discovery_interview_loop with cached questions.",
+            gate or "UNKNOWN", rewind_node,
+        )
+        try:
+            await compiled_graph.aupdate_state(
+                config,
+                {"node_state": cleared},
+                as_node=rewind_node,
+            )
+        except Exception as exc:  # noqa: BLE001 — log but don't crash resume
+            logger.warning(
+                "[run_graph] Failed to rewind discovery-suspend checkpoint: %s. "
+                "Resume may no-op; user can re-run discovery via a fresh session.",
+                exc,
+            )
+        return
+
+    # Default path: HITL menu Save & Quit. Mirror the [r] Resume branch of
+    # hitl_menu_loop — clear suspend flags, mark HITL resolved, reset loop
+    # counter to allow one more repair cycle.
     cleared = dict(node_state)
     cleared["hitl_suspend"] = False
     cleared["hitl_active"] = False
     cleared["hitl_awaiting_input"] = False
     cleared["hitl_resolved"] = True
+    cleared.pop("suspended_from", None)
 
     gw = get_gateway()
     max_repair = (
@@ -6165,6 +6298,7 @@ async def run_graph(
     is_resume: bool = False,
     lintgate_config: Optional[dict[str, Any]] = None,
     deployment_config: Optional[dict[str, Any]] = None,
+    deployment_defaults: Optional[dict[str, Any]] = None,
     sandbox_config: Optional[dict[str, Any]] = None,
     test_generation_config: Optional[dict[str, Any]] = None,
     speculative_config: Optional[dict[str, Any]] = None,
@@ -6215,6 +6349,8 @@ async def run_graph(
         initial_state["lintgate_config"] = lintgate_config
     if deployment_config is not None:
         initial_state["deployment_config"] = deployment_config
+    if deployment_defaults is not None:
+        initial_state["deployment_defaults"] = deployment_defaults
     if test_generation_config is not None:
         initial_state["test_generation_config"] = test_generation_config
     if speculative_config is not None:

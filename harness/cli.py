@@ -315,6 +315,104 @@ def load_raw_config() -> dict[str, Any]:
     return _strip_comments(raw)
 
 
+def _get_deployment_defaults_path() -> str:
+    """Resolve the optional deployment-defaults file path:
+    ``<myharness_root>/config/deployment.json``.
+
+    Lives alongside the canonical ``config.json``. Loaded by
+    :func:`load_deployment_defaults`.
+    """
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(package_dir)
+    return os.path.join(repo_root, "config", "deployment.json")
+
+
+def load_deployment_defaults() -> dict[str, Any]:
+    """Load the optional deployment-policy defaults from
+    ``<repo_root>/config/deployment.json``.
+
+    Unlike :func:`load_raw_config`, this file is OPTIONAL. When absent the
+    function returns ``{}`` and the deployment discovery questionnaire runs
+    in its current full-questionnaire mode. When present, the parsed
+    object is threaded into the deployment_discovery_node so the planning
+    LLM treats every populated field as a resolved policy and skips
+    emitting a question for it.
+
+    The file is intended for tech-stack-agnostic deployment policy
+    (reverse proxy choice, TLS strategy, secret manager, UID/GID,
+    backup destination, conflict policy, ...) — the same answers
+    operators would type into every run inside one organization.
+
+    Validation is intentionally light:
+    - Top-level must be a JSON object.
+    - ``schema_version``, when present, must equal 1.
+    - Known top-level section keys (``network``, ``storage``,
+      ``secrets``, ``infra_sync``) must be objects when present.
+    - Unknown leaf keys inside sections are passed through to the LLM
+      verbatim. This is intentional — operators may set
+      organization-specific policies the harness has never heard of.
+
+    Malformed JSON, unreadable file, or wrong shapes raise
+    :class:`ConfigError` so the harness exits with code 2 at startup
+    (mirrors :func:`load_raw_config`'s contract — bad config never
+    silently degrades).
+    """
+    path = _get_deployment_defaults_path()
+    if not os.path.isfile(path):
+        logger.info(
+            "[cli] No deployment.json at %s — deployment discovery will run "
+            "the full questionnaire. Drop a populated config/deployment.json "
+            "to suppress org-wide policy questions.",
+            path,
+        )
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(
+            f"Invalid JSON in {path}: {exc}. "
+            f"Fix the JSON syntax or delete the file to fall back to the "
+            f"full deployment questionnaire."
+        ) from exc
+    except OSError as exc:
+        raise ConfigError(
+            f"Cannot read {path}: {exc}. "
+            f"Fix the file permissions or delete the file."
+        ) from exc
+
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"{path} must contain a JSON object at the top level, got "
+            f"{type(raw).__name__}."
+        )
+
+    stripped = _strip_comments(raw)
+
+    schema_version = stripped.get("schema_version", 1)
+    if schema_version != 1:
+        raise ConfigError(
+            f"{path}: unsupported schema_version {schema_version!r}. "
+            f"Only schema_version 1 is recognised by this harness."
+        )
+
+    for section in ("network", "storage", "secrets", "infra_sync"):
+        if section in stripped and not isinstance(stripped[section], dict):
+            raise ConfigError(
+                f"{path}: '{section}' must be a JSON object, got "
+                f"{type(stripped[section]).__name__}."
+            )
+
+    populated = [s for s in ("network", "storage", "secrets", "infra_sync")
+                 if stripped.get(s)]
+    logger.info(
+        "[cli] Loaded deployment defaults from %s (sections populated: %s).",
+        path, populated or "none",
+    )
+    return stripped
+
+
 def discover_config(workspace_path: Optional[str] = None) -> dict[str, Any]:
     """Load and strictly validate the canonical config.
 
@@ -1256,14 +1354,24 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
 
 def discovery_interview_loop(state: dict[str, Any]) -> dict[str, Any]:
     """
-    Multi-question streaming interface for exhaustive discovery phases.
-    
-    Reads state["discovery_questions"] (JSON from requirements/architecture discovery node),
-    displays questions grouped by engineering modules, collects answers,
-    and routes back to the discovery node for evaluation.
-    
-    Type 'DONE' to attempt finalization. If critical unknowns remain, the loop
-    refuses to exit and displays [CRITICAL UNKNOWN DETECTED].
+    Sequential discovery interview for requirements/architecture/deployment phases.
+
+    Walks the operator through one question at a time. Each question shows the
+    LLM's recommended answer (from the discovery node's ``suggested_answer``
+    field); pressing Enter accepts it, typing text overrides it. Commands:
+        SUSPEND — save & quit (resumable via ``harness resume``).
+        DONE    — finish the round now. If critical questions remain
+                  unanswered, the loop refuses to finalize and routes back
+                  to the discovery node for a follow-up round.
+        SKIP    — leave a non-critical question blank. Critical questions
+                  cannot be skipped — the loop re-asks once and, if skipped
+                  again, marks the round incomplete so the LLM re-emits it.
+
+    The collected answers are concatenated into one structured
+    ``[Discovery Response - <phase>]`` message appended to the conversation
+    history. ``route_after_discovery`` then either loops back to the
+    discovery node (if critical unknowns remain) or proceeds to
+    ``write_spec_node``.
     """
 
     gate = state.get("current_gate", "REQUIREMENTS")
@@ -1271,99 +1379,255 @@ def discovery_interview_loop(state: dict[str, Any]) -> dict[str, Any]:
     modules = discovery_data.get("modules", [])
     messages = list(state.get("messages", []))
     node_state = state.get("node_state", {})
-    critical_remaining = node_state.get("discovery_critical_remaining", 0)
     complete = node_state.get("discovery_complete", False)
     round_num = node_state.get("discovery_question_count", 0)
 
-    phase_label = "REQUIREMENTS" if gate == "REQUIREMENTS" else "ARCHITECTURE"
+    phase_label = gate if gate in ("REQUIREMENTS", "ARCHITECTURE", "DEPLOYMENT") else "ARCHITECTURE"
 
     if complete:
         logger.info("[discovery] %s discovery complete. Proceeding.", phase_label)
         return {"messages": messages, "node_state": node_state}
 
-    # Display the header
+    # Flatten modules → ordered list of (module_name, question_dict).
+    flat: list[tuple[str, dict[str, Any]]] = []
+    for module in modules:
+        mod_name = module.get("name", "Module")
+        for q in module.get("questions", []) or []:
+            if isinstance(q, dict):
+                flat.append((mod_name, q))
+    total = len(flat)
+    critical_total = sum(1 for _, q in flat if q.get("critical"))
+
+    from harness.hitl import get_channel as _get_channel
+    channel = _get_channel()
+
+    # Header
     print()
     print("=" * 80)
     print(f"[HARNESS ARCHITECT SYSTEM AUDIT: {phase_label} PHASE] — Round {round_num}")
     print("=" * 80)
-    print("The Architect has compiled a list of critical structural questions to eliminate all unknowns:")
+
+    if total == 0:
+        # Edge case: discovery node returned no questions (likely schema
+        # drift). Let the operator either finalize or save & quit so they
+        # aren't stuck staring at an empty interview.
+        print("No questions returned this round.")
+        print("Type 'DONE' to finalize this phase or 'SUSPEND' to save & quit.")
+        print("-" * 80)
+        response = (channel.notes("User Response") or "").strip()
+        if response.upper() == "SUSPEND":
+            return _discovery_suspend(state, node_state, messages, phase_label)
+        if response.upper() == "DONE":
+            node_state["discovery_complete"] = True
+            print("[Discovery] Finalizing specification...")
+            return {"messages": messages, "node_state": node_state}
+        return {"messages": messages, "node_state": node_state}
+
+    summary = discovery_data.get("summary", "")
+    if summary:
+        print(f"Summary: {summary}")
+    print(
+        f"{total} question(s) this round ({critical_total} critical). "
+        "Answer one at a time."
+    )
+    print("Per question: [Enter] accept the recommendation, type to override,")
+    print("              SUSPEND = save & quit · DONE = finish now · SKIP = skip non-critical.")
+    print("-" * 80)
     print()
 
-    for module in modules:
-        mod_name = module.get("name", "Module")
-        questions = module.get("questions", [])
-        if not questions:
+    collected: list[dict[str, Any]] = []
+    current_module: Optional[str] = None
+    suspended = False
+    done_early = False
+
+    for idx, (mod_name, q) in enumerate(flat, start=1):
+        if mod_name != current_module:
+            current_module = mod_name
+            print(f"[MODULE: {mod_name}]")
+            print()
+
+        qid = q.get("id", f"Q{idx}")
+        text = q.get("text", "(no question text)")
+        is_critical = bool(q.get("critical"))
+        critical_marker = " **CRITICAL**" if is_critical else ""
+        suggested = str(q.get("suggested_answer", "") or "").strip()
+
+        print(f"Q {idx}/{total} — {qid}{critical_marker}")
+        print(f"  {text}")
+        if suggested:
+            print(f"  Recommended: {suggested}")
+
+        answer, control = _ask_one_discovery_question(
+            channel, qid, suggested, is_critical,
+        )
+
+        if control == "SUSPEND":
+            suspended = True
+            break
+        if control == "DONE":
+            done_early = True
+            break
+        if control == "SKIP":
+            collected.append({
+                "module": mod_name, "qid": qid, "text": text,
+                "answer": "[SKIPPED]", "accepted_recommendation": False,
+                "critical": is_critical, "skipped": True,
+            })
+            print("  → skipped")
+            print()
             continue
-        print(f"[MODULE: {mod_name}]")
-        for q in questions:
-            qid = q.get("id", "?")
-            text = q.get("text", "")
-            critical_marker = " **CRITICAL**" if q.get("critical") else ""
-            print(f"  - {qid}:{critical_marker} {text}")
-        print()
 
-    if critical_remaining > 0:
-        print(f"[CRITICAL]: {critical_remaining} critical question(s) remain unanswered.")
-    print("-" * 80)
-    print("Type your answers (referencing question numbers if preferred), 'DONE' to finalize, or 'SUSPEND' to save & quit.")
-    print("-" * 80)
-
-    from harness.hitl import get_channel as _get_channel
-    response = _get_channel().notes("User Response")
-
-    if response.upper() == "SUSPEND":
-        session_id = state.get("session_id", "")
-        workspace = state.get("workspace_path", "")
-        print()
-        print("=" * 60)
-        print("Session saved to checkpoint.")
-        print("Resume later with:")
-        print(f"  harness resume --session-id {session_id}")
-        if workspace and workspace != os.getcwd():
-            print(f"  harness resume --session-id {session_id} -r {workspace}")
-        print("=" * 60)
-        print()
-        logger.info("[discovery] %s phase suspended by developer. Session: %s", phase_label, session_id)
-        node_state["hitl_suspend"] = True
-        return {"messages": messages, "node_state": node_state}
-
-    if response.upper() == "DONE":
-        if critical_remaining > 0:
-            # Refuse to exit with critical unknowns
-            print()
-            print("=" * 60)
-            print(f"[CRITICAL UNKNOWN DETECTED]: {critical_remaining} critical question(s) still require answers.")
-            print("You must specify the remaining variables before this phase can be finalized.")
-            print("=" * 60)
-            print()
-            # Set flag so the router knows user tried to skip
-            node_state["user_done_with_critical"] = True
-            return {
-                "messages": messages,
-                "node_state": node_state,
-            }
+        accepted_rec = (answer == suggested and bool(suggested) and control == "ACCEPT")
+        collected.append({
+            "module": mod_name, "qid": qid, "text": text,
+            "answer": answer, "accepted_recommendation": accepted_rec,
+            "critical": is_critical, "skipped": False,
+        })
+        if accepted_rec:
+            print(f"  → accepted: {suggested}")
         else:
-            node_state["discovery_complete"] = True
-            logger.info("[discovery] User finalized %s phase. All questions resolved.", phase_label)
-            print("[Discovery] All questions resolved. Finalizing specification...")
-            return {
-                "messages": messages,
-                "node_state": node_state,
-            }
+            print("  → recorded")
+        print()
 
-    if not response:
-        # Empty input, loop again
+    if suspended:
+        return _discovery_suspend(state, node_state, messages, phase_label)
+
+    # Build the structured response back to the LLM.
+    body_lines = [
+        f"[Discovery Response - {phase_label}] "
+        f"(Round {round_num}, answered {len(collected)} of {total} questions):"
+    ]
+    grouped: dict[str, list[str]] = {}
+    for item in collected:
+        line = f"  - {item['qid']}: {item['answer']}"
+        if item["accepted_recommendation"]:
+            line += "  [accepted recommendation]"
+        if item["skipped"]:
+            line += "  [skipped by operator]"
+        grouped.setdefault(item["module"], []).append(line)
+    for mod_name, lines in grouped.items():
+        body_lines.append(f"[{mod_name}]")
+        body_lines.extend(lines)
+    response_text = "\n".join(body_lines)
+    messages.append({"role": "user", "content": response_text})
+
+    # Compute remaining critical questions: those marked critical that were
+    # either skipped or never reached because of an early DONE.
+    answered_ids = {
+        item["qid"] for item in collected
+        if not item["skipped"] and item["answer"]
+    }
+    critical_unresolved = sum(
+        1 for _, q in flat
+        if q.get("critical") and q.get("id") not in answered_ids
+    )
+
+    if done_early and critical_unresolved > 0:
+        print()
+        print("=" * 60)
+        print(
+            f"[CRITICAL UNKNOWN DETECTED]: {critical_unresolved} critical "
+            "question(s) still require answers."
+        )
+        print("You must specify the remaining variables before this phase can be finalized.")
+        print("=" * 60)
+        print()
+        node_state["user_done_with_critical"] = True
+        node_state["discovery_complete"] = False
         return {"messages": messages, "node_state": node_state}
 
-    # Append user's answers to conversation
-    messages.append({"role": "user", "content": f"[Discovery Response - {phase_label}]: {response}"})
-    node_state["discovery_complete"] = False  # Will be re-evaluated by discovery node
-    logger.info("[discovery] Received user response (%d chars). Routing back for evaluation.", len(response))
+    if done_early:
+        node_state["discovery_complete"] = True
+        logger.info(
+            "[discovery] User finalized %s phase early. %d answers, no critical remaining.",
+            phase_label, len(collected),
+        )
+        print("[Discovery] Finalizing specification...")
+        return {"messages": messages, "node_state": node_state}
 
-    return {
-        "messages": messages,
-        "node_state": node_state,
-    }
+    # Full round walked: hand back to the discovery LLM for follow-up
+    # evaluation. If the LLM determines complete=True, route_after_discovery
+    # routes to write_spec_node on the next pass. If critical_unresolved > 0
+    # (operator SKIPped a critical question twice), force another round.
+    node_state["discovery_complete"] = False
+    if critical_unresolved > 0:
+        node_state["discovery_critical_remaining"] = critical_unresolved
+    logger.info(
+        "[discovery] Received %d answers for %s phase (%d critical unresolved). "
+        "Routing back for evaluation.",
+        len(collected), phase_label, critical_unresolved,
+    )
+    return {"messages": messages, "node_state": node_state}
+
+
+def _ask_one_discovery_question(
+    channel: Any, qid: str, suggested: str, is_critical: bool,
+) -> tuple[str, str]:
+    """Prompt for a single discovery question and resolve special commands.
+
+    Returns ``(answer, control)`` where control ∈ {"ACCEPT", "OVERRIDE",
+    "SUSPEND", "DONE", "SKIP"}. For ACCEPT/OVERRIDE the ``answer`` field
+    holds the final value to record. Empty input → ACCEPT (uses
+    ``suggested`` if present, else empty string).
+
+    Critical questions cannot be SKIPped — on a first SKIP we re-prompt
+    with an explicit "no skip" message; on a second SKIP we return
+    control=SKIP anyway so the caller can record the unresolved state
+    and let route_after_discovery loop the round.
+    """
+    if suggested:
+        prompt_label = f"Q {qid} (Enter = accept, type to override)"
+    else:
+        prompt_label = f"Q {qid} (type your answer)"
+
+    for attempt in range(2):
+        raw = (channel.notes(prompt_label) or "").strip()
+        upper = raw.upper()
+        if upper == "SUSPEND":
+            return ("", "SUSPEND")
+        if upper == "DONE":
+            return ("", "DONE")
+        if upper == "SKIP":
+            if is_critical and attempt == 0:
+                print(
+                    "  [REJECTED] Cannot SKIP a critical question. "
+                    "Type an answer or press Enter to accept the recommendation."
+                )
+                continue
+            return ("", "SKIP")
+        if raw == "":
+            return (suggested, "ACCEPT")
+        return (raw, "OVERRIDE")
+
+    # Loop exhausted — shouldn't happen; treat as SKIP for safety.
+    return ("", "SKIP")
+
+
+def _discovery_suspend(
+    state: dict[str, Any],
+    node_state: dict[str, Any],
+    messages: list[Any],
+    phase_label: str,
+) -> dict[str, Any]:
+    """Stamp the suspend flag set + print the resume instructions banner."""
+    session_id = state.get("session_id", "")
+    workspace = state.get("workspace_path", "")
+    print()
+    print("=" * 60)
+    print("Session saved to checkpoint.")
+    print("Resume later with:")
+    print(f"  harness resume --session-id {session_id}")
+    if workspace and workspace != os.getcwd():
+        print(f"  harness resume --session-id {session_id} -r {workspace}")
+    print("=" * 60)
+    print()
+    logger.info(
+        "[discovery] %s phase suspended by developer. Session: %s",
+        phase_label, session_id,
+    )
+    node_state["hitl_suspend"] = True
+    node_state["suspended_from"] = "discovery_interview"
+    return {"messages": messages, "node_state": node_state}
 
 
 def _reset_iteration_counters(
@@ -1636,6 +1900,7 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             node_state["hitl_suspend"] = True
             node_state["hitl_active"] = False
             node_state["hitl_awaiting_input"] = False
+            node_state["suspended_from"] = "hitl_menu"
             state["node_state"] = node_state
             return state
 
@@ -3177,6 +3442,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             skip_discovery=not getattr(args, "discover", False),
             lintgate_config=config.get("lintgate", {}),
             deployment_config=config.get("deployment", {}),
+            deployment_defaults=load_deployment_defaults(),
             sandbox_config=config.get("sandbox", {}),
             test_generation_config=config.get("test_generation", {}),
             speculative_config=config.get("speculative", {}),
@@ -3453,6 +3719,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
             is_resume=True,
             lintgate_config=config.get("lintgate", {}),
             deployment_config=config.get("deployment", {}),
+            deployment_defaults=load_deployment_defaults(),
             sandbox_config=config.get("sandbox", {}),
             test_generation_config=config.get("test_generation", {}),
             speculative_config=config.get("speculative", {}),
