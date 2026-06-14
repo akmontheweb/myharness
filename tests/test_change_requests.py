@@ -24,6 +24,7 @@ from harness.cli import (
     _resolve_change_requests_dir,
 )
 from harness.deploy import (
+    _build_synthesis_change_request_addendum,
     _generate_caddyfile,
     _generate_compose_file,
     _generate_dockerfile,
@@ -863,3 +864,101 @@ class TestGenerateAssetsCrAttributionFlow:
         compose = (tmp_path / "docker-compose.yml").read_text()
         # The malformed input is ignored, not crashed on.
         assert "CR-" not in compose
+
+
+# ---------------------------------------------------------------------------
+# synthesize_architecture cr_attribution addendum
+# ---------------------------------------------------------------------------
+
+class TestSynthesisChangeRequestAddendum:
+    """The deployment synthesizer's prompt is extended in change-request
+    mode to ask the LLM to populate ``blueprint.cr_attribution``. The
+    generate_assets fallback at ``blueprint.get("cr_attribution")``
+    picks it up unchanged — no separate plumbing channel."""
+
+    def test_empty_addendum_when_no_change_requests(self):
+        rules, schema = _build_synthesis_change_request_addendum(None)
+        assert rules == ""
+        assert schema == ""
+
+    def test_empty_addendum_when_empty_list(self):
+        rules, schema = _build_synthesis_change_request_addendum([])
+        assert rules == ""
+        assert schema == ""
+
+    def test_addendum_names_active_cr_ids(self):
+        records = [
+            {"cr_id": 7, "original_name": "rewrite-auth.txt"},
+            {"cr_id": 8, "original_name": "add-rate-limit.txt"},
+        ]
+        rules, schema = _build_synthesis_change_request_addendum(records)
+        assert "CR-7" in rules and "rewrite-auth.txt" in rules
+        assert "CR-8" in rules and "add-rate-limit.txt" in rules
+        # Schema fragment introduces cr_attribution so the JSON shape the
+        # LLM is asked to follow includes it at the top level.
+        assert '"cr_attribution"' in schema
+
+    def test_addendum_instructs_short_circuit_when_no_significance(self):
+        records = [{"cr_id": 1, "original_name": "tiny.txt"}]
+        rules, _ = _build_synthesis_change_request_addendum(records)
+        # The deployment delta is allowed to be empty when nothing about
+        # the CR moves infra — that's the whole point of "deployment-
+        # significance" gating.
+        assert "deployment-significant" in rules
+        # And the LLM is told explicitly how to signal "nothing changed".
+        assert "empty object" in rules.lower() or "omit" in rules.lower()
+
+
+class TestSynthesizeArchitectureChangeRequestMode:
+    """End-to-end check that synthesize_architecture passes the CR
+    addendum into the LLM prompt when change_request_files is supplied,
+    and produces a byte-identical prompt when it isn't. Uses the
+    _StubGateway to avoid network."""
+
+    def _telemetry(self) -> dict:
+        return {
+            "languages": ["python"],
+            "databases_detected": [],
+            "frameworks_detected": [],
+            "src_directories": ["app"],
+            "web_servers_detected": [],
+            "port_hints": {},
+            "app_name": "myapp",
+        }
+
+    def test_prompt_does_not_mention_cr_when_no_records(self, tmp_path, stub_gateway):
+        from harness.deploy import synthesize_architecture
+        gw = stub_gateway('{"services": {}, "volumes": {}, "networks": {}, "proxy_service": null}')
+        asyncio.run(synthesize_architecture(self._telemetry(), str(tmp_path)))
+        assert len(gw.dispatched) == 1
+        prompt_body = "\n".join(
+            m["content"] for m in gw.dispatched[0]["messages"]
+            if m["role"] == "user"
+        )
+        # Greenfield prompt: no CR references, no cr_attribution schema.
+        assert "CR-" not in prompt_body
+        assert "cr_attribution" not in prompt_body
+
+    def test_prompt_includes_cr_addendum_when_records_supplied(
+        self, tmp_path, stub_gateway,
+    ):
+        from harness.deploy import synthesize_architecture
+        gw = stub_gateway(
+            '{"services": {}, "volumes": {}, "networks": {}, '
+            '"proxy_service": null, "cr_attribution": {}}'
+        )
+        records = [{"cr_id": 11, "original_name": "scale-up.txt"}]
+        asyncio.run(synthesize_architecture(
+            self._telemetry(), str(tmp_path),
+            change_request_files=records,
+        ))
+        assert len(gw.dispatched) == 1
+        prompt_body = "\n".join(
+            m["content"] for m in gw.dispatched[0]["messages"]
+            if m["role"] == "user"
+        )
+        # The active CR is named, and the schema fragment introduces
+        # cr_attribution so the LLM knows where to put its mapping.
+        assert "CR-11" in prompt_body
+        assert "scale-up.txt" in prompt_body
+        assert "cr_attribution" in prompt_body

@@ -399,10 +399,66 @@ _ARCHITECTURE_JSON_SCHEMA = """
 """
 
 
+def _build_synthesis_change_request_addendum(
+    change_request_files: Optional[list[dict[str, Any]]],
+) -> tuple[str, str]:
+    """Render the change-request delta instructions and schema extension
+    for ``synthesize_architecture``.
+
+    Returns ``(rules_addendum, schema_addendum)``. Both empty when not
+    in change-request mode. ``rules_addendum`` extends the prompt's
+    Rules section with delta-shaped guidance; ``schema_addendum`` adds
+    the top-level ``cr_attribution`` field to the JSON shape so the
+    LLM produces it as part of the blueprint and the existing
+    ``generate_assets_from_blueprint`` fallback at
+    ``blueprint.get("cr_attribution")`` picks it up unchanged.
+    """
+    if not change_request_files:
+        return "", ""
+    cr_lines = "\n".join(
+        f"  - CR-{r['cr_id']}: {r.get('original_name', '?')}"
+        for r in change_request_files
+    )
+    rules = (
+        "\n\n### Change-Request Mode — Deployment Delta\n"
+        f"This is an existing-project session driven by the following "
+        f"change request(s):\n{cr_lines}\n\n"
+        "Determine whether each CR is **deployment-significant** "
+        "(adds/removes a service, changes ports/volumes/env vars, "
+        "alters container limits, changes the reverse-proxy routing, "
+        "or adds a dependency). If **NO** CR is deployment-significant, "
+        "produce a blueprint that keeps the existing services unchanged "
+        "and omit `cr_attribution` (or set it to an empty object).\n\n"
+        "When one or more CRs **are** deployment-significant, populate "
+        "the top-level `cr_attribution` field as a mapping of "
+        "**service name → \"CR-N: <one-line reason>\"** for every "
+        "service the CR introduces or modifies. Example:\n"
+        "```json\n"
+        '"cr_attribution": {\n'
+        '  "redis": "CR-7: added redis service for session caching",\n'
+        '  "auth": "CR-11: install postgres client libs"\n'
+        "}\n"
+        "```\n"
+        "Each entry must start with `CR-N:` (or a comma-separated list "
+        "of CR-N IDs when one service serves multiple requests) so a "
+        "downstream `grep CR-N .` finds the infra change next to the "
+        "source change. Do NOT invent CR IDs that aren't in the list "
+        "above."
+    )
+    schema = (
+        ',\n  "cr_attribution": {\n'
+        '    "<service_name>": "CR-N: <one-line reason>"\n'
+        "  }"
+    )
+    return rules, schema
+
+
 async def synthesize_architecture(
     telemetry: dict[str, Any],
     workspace_path: str,
     spec_arch_path: str = "SPEC_ARCHITECTURE.md",
+    *,
+    change_request_files: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """
     Route telemetry + SPEC_ARCHITECTURE.md content to the planning LLM.
@@ -412,6 +468,11 @@ async def synthesize_architecture(
         telemetry: Output from scan_workspace_telemetry().
         workspace_path: Project root path.
         spec_arch_path: Path to the architecture specification file.
+        change_request_files: When supplied (change-request mode), the
+            synthesis prompt is extended with delta-shaped guidance and
+            the LLM is asked to populate ``blueprint.cr_attribution``
+            mapping service names to ``"CR-N: <reason>"`` summaries.
+            ``None`` or empty → greenfield prompt and schema unchanged.
 
     Returns:
         Parsed architecture blueprint dict matching the JSON schema.
@@ -432,6 +493,16 @@ async def synthesize_architecture(
         except OSError:
             spec_content = "(could not read SPEC_ARCHITECTURE.md)"
 
+    cr_rules, cr_schema = _build_synthesis_change_request_addendum(
+        change_request_files,
+    )
+    # Insert the cr_attribution field before the closing brace of the
+    # JSON schema literal. The literal already ends with a trailing
+    # newline and brace, so we splice just before the final closing.
+    schema_for_prompt = _ARCHITECTURE_JSON_SCHEMA
+    if cr_schema:
+        schema_for_prompt = _ARCHITECTURE_JSON_SCHEMA.rstrip().rstrip("}") + cr_schema + "\n}"
+
     # Build the prompt
     prompt = f"""You are a Principal DevOps Architect. Analyze the workspace telemetry below
 and the project's SPEC_ARCHITECTURE.md to design the complete container infrastructure.
@@ -448,7 +519,7 @@ and the project's SPEC_ARCHITECTURE.md to design the complete container infrastr
 Design the optimal container architecture. Return ONLY a valid JSON object matching this EXACT schema:
 
 ```json
-{_ARCHITECTURE_JSON_SCHEMA}
+{schema_for_prompt}
 ```
 
 ### Rules
@@ -459,7 +530,7 @@ Design the optimal container architecture. Return ONLY a valid JSON object match
 5. Link services via depends_on_services where dependencies exist.
 6. If the workspace has a web framework, add a web router/proxy service (Caddy or Nginx).
 7. Use port_hints from telemetry to set correct port mappings.
-8. Do NOT include any text outside the JSON object. Only return valid JSON."""
+8. Do NOT include any text outside the JSON object. Only return valid JSON.{cr_rules}"""
 
     logger.info("[deploy:compose] Synthesizing architecture with planning LLM...")
 
@@ -1204,7 +1275,18 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
                  len(telemetry["languages"]), len(telemetry["databases_detected"]), len(telemetry["frameworks_detected"]))
 
     # --- Phase 2: Synthesize ---
-    blueprint = await synthesize_architecture(telemetry, workspace_path)
+    # In change-request mode, hand the synthesizer the active CR records
+    # so the prompt asks the LLM to populate ``blueprint.cr_attribution``
+    # for any deployment-significant requests. ``None`` (greenfield) =
+    # the original prompt and schema.
+    synth_cr_files = (
+        state.get("change_request_files", []) or []
+        if state.get("change_request_mode", False)
+        else None
+    )
+    blueprint = await synthesize_architecture(
+        telemetry, workspace_path, change_request_files=synth_cr_files,
+    )
     if not blueprint or not blueprint.get("services"):
         return {
             "compiler_errors": [{
