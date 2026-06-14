@@ -1256,8 +1256,15 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
                 "next phase.\n\n"
             )
 
+        # Change-request mode: prepend a CR-N attribution block so the
+        # patching LLM tags each modified function / class / new file with
+        # a single language-appropriate `CR-N` comment. No-op (empty
+        # string) when change_request_mode is False — greenfield runs see
+        # the format reminder unchanged.
+        cr_preamble = _build_change_request_preamble(state, "patching")
+
         # Inject a format reminder to ensure the LLM outputs patch blocks
-        _FORMAT_REMINDER = allowlist_preamble + """[CRITICAL FORMAT INSTRUCTION]
+        _FORMAT_REMINDER = allowlist_preamble + cr_preamble + """[CRITICAL FORMAT INSTRUCTION]
 You MUST respond using ONLY the patch block syntax below. Do NOT include any explanations,
 markdown code fences, or text outside the blocks. Your entire response must be parseable
 as one or more patch blocks.
@@ -3657,8 +3664,12 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             )
         # Append the repair prompt first
         messages.append(MessageDict(role="user", content=repair_prompt))
-        # Then append the strict format reminder (same as patching_node)
-        _REPAIR_FORMAT_REMINDER = """[CRITICAL FORMAT INSTRUCTION]
+        # Then append the strict format reminder (same as patching_node).
+        # In change-request mode prepend the CR-N attribution rules so
+        # repair patches also carry the marker comments.
+        _REPAIR_FORMAT_REMINDER = _build_change_request_preamble(
+            state, "patching"
+        ) + """[CRITICAL FORMAT INSTRUCTION]
 You MUST respond using ONLY the patch block syntax below. Do NOT include any explanations,
 markdown code fences, or text outside the blocks. Your entire response must be parseable
 as one or more patch blocks.
@@ -4604,7 +4615,98 @@ async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
     return {
         "messages": new_messages,
         "change_request_files": records,
+        # Discovery pipeline runs in delta mode for change-request sessions
+        # regardless of the operator's --discover flag — the gatekeeper is
+        # the whole point of the folder convention. Clear skip_discovery
+        # so route_after_spec_review honors interview follow-ups instead
+        # of short-circuiting to the gatekeeper.
+        "skip_discovery": False,
     }
+
+
+def _build_change_request_preamble(state: AgentState, phase: str) -> str:
+    """Return the delta-mode prompt preamble for ``phase`` (one of
+    ``"requirements"``, ``"architecture"``, ``"deployment"``,
+    ``"patching"``, ``"tests"``). Empty string when not in
+    change-request mode.
+
+    The preamble lists active CR-N IDs and tells the LLM which artifacts
+    to tag with `<!-- BEGIN/END CR-N -->` (specs) or `# CR-N:` /
+    `// CR-N:` comments (code, tests, infra) so a downstream
+    `grep -rn "CR-7" .` finds every artifact connected to the request.
+    The full change-request text already sits in messages[1] — we only
+    need to remind the LLM of the active set and the marker contract.
+    """
+    if not state.get("change_request_mode", False):
+        return ""
+    records = state.get("change_request_files", []) or []
+    if not records:
+        return ""
+    cr_lines = [f"  - CR-{r['cr_id']}: {r.get('original_name', '?')}" for r in records]
+    cr_ids_csv = ", ".join(f"CR-{r['cr_id']}" for r in records)
+
+    phase_rules = {
+        "requirements": (
+            "This is an EXISTING project with prior SPEC_REQUIREMENTS.md. "
+            "Ask DELTA-shaped questions only — \"what's changing because "
+            "of these requests?\", \"what must NOT change?\", \"what's "
+            "the acceptance test?\". Do NOT re-elicit baseline "
+            "requirements that are already documented. "
+            "Tag every passage you propose to add or modify in the spec "
+            "with `<!-- BEGIN CR-N -->` / `<!-- END CR-N -->` markers "
+            "naming the originating request, stacking IDs when one "
+            "passage serves multiple CRs (`<!-- BEGIN CR-7,CR-8 -->`)."
+        ),
+        "architecture": (
+            "Evaluate whether these CR-N changes are architecture-"
+            "significant. If NONE are (pure logic / config tweaks), "
+            "return modules=[] and complete=true — the architecture "
+            "review cycle will short-circuit. If ANY are, ask only the "
+            "delta-shaped architecture questions and tag affected "
+            "passages with `<!-- BEGIN/END CR-N -->` markers."
+        ),
+        "deployment": (
+            "Evaluate whether these CR-N changes are deployment- or "
+            "infrastructure-significant (new service, new env var, new "
+            "reverse-proxy route, container limit change, dependency "
+            "added). If NONE are, return modules=[] and complete=true — "
+            "the deployment review cycle short-circuits and existing "
+            "infra files (compose, Dockerfile, Caddyfile, blueprint) "
+            "stay untouched. If ANY are, ask the delta questions and "
+            "tag affected passages with `<!-- BEGIN/END CR-N -->`."
+        ),
+        "patching": (
+            "When you patch source files to satisfy these change "
+            "requests, add ONE terse comment per modified function/"
+            "class/region — language-appropriate (`# CR-N: …` in "
+            "Python, `// CR-N: …` in JS/TS/Go/Rust/Java) — naming the "
+            "originating request. New files get the same one-line "
+            "comment under the module docstring / imports. Do NOT mark "
+            "every line touched; one marker per region is the rule."
+        ),
+        "tests": (
+            "When you generate tests for these change requests, name "
+            "the new test functions with the `test_cr_N_<descriptive>` "
+            "pattern (or the per-language idiom), and reference the CR "
+            "in each test docstring (e.g. `\"\"\"Verifies CR-7: …\"\"\"`). "
+            "When extending an existing test, add a single inline "
+            "`# CR-N:` comment at the new assertion(s)."
+        ),
+    }
+    rules = phase_rules.get(phase, "")
+
+    return (
+        "## Change-Request Mode Active\n\n"
+        f"{len(records)} pending change request(s) drive this session "
+        f"({cr_ids_csv}):\n"
+        + "\n".join(cr_lines)
+        + "\n\n"
+        + "The full text of each request is in the conversation history "
+        "(first user message). Each request's intent must be traceable "
+        "via the `CR-N` ID through every artifact this session produces.\n\n"
+        f"{rules}\n\n"
+        "---\n\n"
+    )
 
 
 def route_after_start(state: AgentState) -> Literal[
@@ -4745,6 +4847,11 @@ Enter to accept; a vague placeholder defeats the purpose. If you have no
 signal, use the conservative industry default and say so. Return ONLY valid
 JSON. No markdown, no explanation, no code blocks."""
 
+    # Delta-mode preamble: when change_request_mode is active, prepend the
+    # CR-N attribution rules and the "ask delta-shaped questions only"
+    # instruction so the LLM doesn't re-elicit baseline requirements on
+    # an existing-project run. No-op (empty string) when not in CR mode.
+    prompt = _build_change_request_preamble(state, "requirements") + prompt
     messages.append({"role": "user", "content": prompt})
 
     from harness.gateway import NodeRole
@@ -4916,6 +5023,11 @@ actionable). The interview presents it as a default the operator can press
 Enter to accept; a vague placeholder defeats the purpose. If you have no
 signal, use the conservative industry default and say so. Return ONLY valid
 JSON. No markdown, no explanation, no code blocks."""
+    # Delta-mode preamble — see ``_build_change_request_preamble``. In
+    # delta mode the LLM is told to short-circuit (modules=[], complete=
+    # true) when no CR is architecture-significant, so light fixes don't
+    # spin up the full architecture review cycle.
+    prompt = _build_change_request_preamble(state, "architecture") + prompt
     messages.append({"role": "user", "content": prompt})
 
     from harness.gateway import NodeRole
@@ -5081,6 +5193,11 @@ Enter to accept; a vague placeholder defeats the purpose. If you have no
 signal, use the conservative industry default and say so. Return ONLY valid
 JSON. No markdown, no explanation, no code blocks.""" + resolved_block
 
+    # Delta-mode preamble — same shape as the requirements/architecture
+    # nodes. In CR mode the LLM returns modules=[] and complete=true when
+    # none of the pending changes touch infrastructure, so light app-only
+    # tweaks bypass the deployment review cycle entirely.
+    prompt = _build_change_request_preamble(state, "deployment") + prompt
     messages.append({"role": "user", "content": prompt})
 
     from harness.gateway import NodeRole
@@ -5212,10 +5329,46 @@ async def write_spec_node(state: AgentState) -> dict[str, Any]:
     else:
         spec_path = os.path.join(output_dir, "DEPLOYMENT_BLUEPRINT.md")
 
+    # Change-request mode: prepend a revision header listing the active
+    # CR IDs and preserve the prior content below. This stops the
+    # destructive overwrite that would otherwise drop a previously
+    # approved spec on every existing-project session.
+    final_content = spec_content
+    if state.get("change_request_mode", False) and os.path.isfile(spec_path):
+        prior_content = ""
+        try:
+            with open(spec_path, "r", encoding="utf-8") as f:
+                prior_content = f.read()
+        except OSError as exc:
+            logger.warning(
+                "[write_spec] Could not read prior %s for revision merge: "
+                "%s. Falling back to overwrite.", spec_path, exc,
+            )
+        if prior_content:
+            cr_records = state.get("change_request_files", []) or []
+            cr_ids = ", ".join(f"CR-{r['cr_id']}" for r in cr_records) or "CR-?"
+            session_id = state.get("session_id", "<unknown-session>")
+            revision_header = (
+                f"## Revision: {cr_ids} — session {session_id}\n"
+                f"\n"
+                f"_(Existing spec preserved verbatim below; this section "
+                f"captures the delta proposed by the listed change "
+                f"requests. The discovery interview's inline "
+                f"`<!-- BEGIN CR-N -->` / `<!-- END CR-N -->` markers in "
+                f"the body of the spec link each modified passage to "
+                f"its originating request.)_\n\n"
+            )
+            final_content = revision_header + spec_content + "\n\n---\n\n" + prior_content
+            logger.info(
+                "[write_spec] Change-request mode: prepending revision "
+                "header for %s onto existing %s (%d chars preserved).",
+                cr_ids, spec_path, len(prior_content),
+            )
+
     try:
         with open(spec_path, "w", encoding="utf-8") as f:
-            f.write(spec_content)
-        logger.info("[write_spec] %s written (%d chars).", spec_path, len(spec_content))
+            f.write(final_content)
+        logger.info("[write_spec] %s written (%d chars).", spec_path, len(final_content))
     except OSError as exc:
         # Don't silently claim success — the gatekeeper that follows will try
         # to read this path. Propagate the failure so routing can react.
@@ -6230,10 +6383,12 @@ def build_graph() -> Any:
         },
     )
 
-    # PR-1 short-circuit: ingest hands off directly to patching_node. PR-2
-    # will replace this edge with a route through requirements_discovery_node
-    # so change requests flow through the gatekeeper.
-    graph.add_edge("ingest_change_requests_node", "patching_node")
+    # ingest_change_requests_node hands off to the discovery pipeline so
+    # change requests flow through requirements → interview → spec →
+    # gatekeeper → patching. The ingest node sets ``skip_discovery=False``
+    # in its returned state so the downstream nodes don't short-circuit
+    # to gatekeeper-only.
+    graph.add_edge("ingest_change_requests_node", "requirements_discovery_node")
 
     # Requirements discovery loop
     graph.add_edge("requirements_discovery_node", "discovery_interview_loop")

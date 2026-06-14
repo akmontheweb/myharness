@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time as time_module
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -670,8 +670,18 @@ def _generate_dockerfile(
     service_spec: dict[str, Any],
     language: str,
     workspace_path: str,
+    *,
+    cr_attribution: Optional[dict[str, str]] = None,
 ) -> str:
-    """Generate a multi-stage Dockerfile for a service."""
+    """Generate a multi-stage Dockerfile for a service.
+
+    ``cr_attribution`` (change-request mode only) maps a service name to a
+    one-line ``"CR-N: <reason>"`` summary; when ``service_name`` is in the
+    dict the resulting Dockerfile is prefixed with ``# CR-N: <reason>`` so
+    a reader can ``grep CR-N`` and find the build artifact for the
+    originating request. ``None`` (the default) yields byte-identical
+    output to pre-change-request behaviour.
+    """
     tmpl = _DOCKERFILE_TEMPLATES.get(language, _DOCKERFILE_TEMPLATES["python"])
 
     build_context = service_spec.get("build_context", ".").strip("/")
@@ -697,6 +707,10 @@ def _generate_dockerfile(
         port=port,
         healthcheck=healthcheck,
     )
+    if cr_attribution:
+        marker = cr_attribution.get(service_name)
+        if marker:
+            dockerfile = f"# {marker}\n" + dockerfile
     return dockerfile
 
 
@@ -725,13 +739,23 @@ def _dockerfile_name_for(svc_name: str, services: dict[str, Any]) -> str:
     return "Dockerfile" if svc_name == build_services[0] else f"Dockerfile.{svc_name}"
 
 
-def _generate_compose_file(blueprint: dict[str, Any]) -> str:
+def _generate_compose_file(
+    blueprint: dict[str, Any],
+    *,
+    cr_attribution: Optional[dict[str, str]] = None,
+) -> str:
     """Generate a docker-compose.yml from the architecture blueprint.
 
     Adds default resource limits to every service (mem_limit, cpus,
     pids_limit) so a runaway container — leak, fork-bomb, or simply a
     misconfigured workload — can't OOM the host. Defaults are conservative
     but can be overridden per-service via blueprint.services.<svc>.limits.
+
+    ``cr_attribution`` (change-request mode only) maps a service name to a
+    one-line ``"CR-N: <reason>"`` summary; each annotated service block is
+    preceded by ``# CR-N: <reason>`` so the request that introduced or
+    changed the service is grep-able in the rendered YAML. ``None``
+    yields byte-identical output to pre-change-request behaviour.
     """
     services = blueprint.get("services", {})
     volumes_cfg = blueprint.get("volumes", {})
@@ -743,6 +767,10 @@ def _generate_compose_file(blueprint: dict[str, Any]) -> str:
     lines = ['version: "3.9"', "", "services:"]
 
     for svc_name, svc_spec in services.items():
+        if cr_attribution:
+            marker = cr_attribution.get(svc_name)
+            if marker:
+                lines.append(f"  # {marker}")
         lines.append(f"  {svc_name}:")
 
         if svc_spec.get("build_context"):
@@ -815,8 +843,18 @@ def _generate_compose_file(blueprint: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _generate_caddyfile(blueprint: dict[str, Any]) -> str:
-    """Generate a Caddyfile from the architecture blueprint."""
+def _generate_caddyfile(
+    blueprint: dict[str, Any],
+    *,
+    cr_attribution: Optional[dict[str, str]] = None,
+) -> str:
+    """Generate a Caddyfile from the architecture blueprint.
+
+    ``cr_attribution`` (change-request mode only) maps a service name to
+    a one-line ``"CR-N: <reason>"`` summary; each annotated reverse-proxy
+    stanza is preceded by ``# CR-N: <reason>``. ``None`` yields
+    byte-identical output to pre-change-request behaviour.
+    """
     services = blueprint.get("services", {})
     lines = ["# Auto-generated Caddyfile", ""]
 
@@ -828,6 +866,10 @@ def _generate_caddyfile(blueprint: dict[str, Any]) -> str:
             container_port = ports[0].split(":")[-1] if ":" in ports[0] else ports[0]
             # Derive a domain-like name
             domain = f"{svc_name}.localhost" if svc_name != services.get("app_name", "app") else "localhost"
+            if cr_attribution:
+                marker = cr_attribution.get(svc_name)
+                if marker:
+                    lines.append(f"# {marker}")
             lines.append(f"{domain} {{")
             lines.append(f"    reverse_proxy {svc_name}:{container_port}")
             lines.append("}")

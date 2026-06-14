@@ -23,11 +23,18 @@ from harness.cli import (
     _list_pending_change_request_files,
     _resolve_change_requests_dir,
 )
+from harness.deploy import (
+    _generate_caddyfile,
+    _generate_compose_file,
+    _generate_dockerfile,
+)
 from harness.graph import (
     _assign_change_request_ids,
+    _build_change_request_preamble,
     _scan_archived_cr_ids,
     ingest_change_requests_node,
     route_after_start,
+    write_spec_node,
 )
 
 
@@ -368,3 +375,247 @@ class TestConfigValidation:
             assert "change_requests_dir" not in str(exc), (
                 f"change_requests_dir-related error fired despite omission: {exc}"
             )
+
+
+# ===========================================================================
+# PR-2: delta-mode discovery + spec-write + prompt injection + deploy markers
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Delta-mode prompt preamble
+# ---------------------------------------------------------------------------
+
+def _state_with_active_crs(crs: list[dict]) -> dict:
+    return {
+        "change_request_mode": True,
+        "change_request_files": crs,
+    }
+
+
+class TestChangeRequestPreamble:
+
+    def test_empty_when_not_in_change_request_mode(self):
+        state = {"change_request_mode": False, "change_request_files": []}
+        assert _build_change_request_preamble(state, "requirements") == ""
+
+    def test_empty_when_no_records(self):
+        state = {"change_request_mode": True, "change_request_files": []}
+        assert _build_change_request_preamble(state, "requirements") == ""
+
+    def test_lists_every_active_cr_id_in_every_phase(self):
+        state = _state_with_active_crs([
+            {"cr_id": 7, "original_name": "rewrite-auth.txt"},
+            {"cr_id": 8, "original_name": "add-rate-limit.txt"},
+        ])
+        for phase in ("requirements", "architecture", "deployment",
+                      "patching", "tests"):
+            preamble = _build_change_request_preamble(state, phase)
+            assert "CR-7" in preamble, f"{phase}: missing CR-7"
+            assert "CR-8" in preamble, f"{phase}: missing CR-8"
+            assert "rewrite-auth.txt" in preamble
+            assert "add-rate-limit.txt" in preamble
+
+    def test_phase_specific_rules_differ_meaningfully(self):
+        state = _state_with_active_crs([{"cr_id": 1, "original_name": "x.txt"}])
+        req = _build_change_request_preamble(state, "requirements")
+        arch = _build_change_request_preamble(state, "architecture")
+        depl = _build_change_request_preamble(state, "deployment")
+        patch = _build_change_request_preamble(state, "patching")
+        tests = _build_change_request_preamble(state, "tests")
+
+        # Spec phases mention BEGIN/END markers for inline tagging.
+        assert "BEGIN CR-N" in req or "BEGIN/END CR-N" in req
+        assert "BEGIN/END CR-N" in arch
+        # Architecture and deployment must tell the LLM how to short-circuit.
+        assert "modules=[]" in arch and "complete=true" in arch
+        assert "modules=[]" in depl and "complete=true" in depl
+        # Code phases mention the inline `# CR-N:` / `// CR-N:` comments.
+        assert "CR-N:" in patch
+        assert "test_cr_N" in tests
+
+
+# ---------------------------------------------------------------------------
+# write_spec_node delta mode
+# ---------------------------------------------------------------------------
+
+def _make_messages(prior_qa: list[tuple[str, str]] | None = None) -> list[dict]:
+    msgs = [{"role": "system", "content": "sys"}]
+    msgs += [{"role": role, "content": content} for role, content in (prior_qa or [])]
+    return msgs
+
+
+class TestWriteSpecNodeDeltaMode:
+
+    def _state(self, workspace: str, gate: str = "REQUIREMENTS",
+               change_request_mode: bool = True) -> dict:
+        return {
+            "workspace_path": workspace,
+            "current_gate": gate,
+            "messages": _make_messages([
+                ("user", "discovery prompt"),
+                ("assistant", '{"modules": []}'),
+            ]),
+            "change_request_mode": change_request_mode,
+            "change_request_files": [
+                {"cr_id": 7, "original_name": "x.txt"},
+                {"cr_id": 8, "original_name": "y.txt"},
+            ],
+            "session_id": "session-xyz",
+        }
+
+    def test_preserves_existing_spec_and_prepends_revision_header(self, tmp_path):
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir()
+        prior_content = "# Baseline Requirements\n\nExisting content that must survive.\n"
+        (docs_dir / "SPEC_REQUIREMENTS.md").write_text(prior_content)
+
+        result = asyncio.run(write_spec_node(self._state(str(tmp_path))))
+
+        written = (docs_dir / "SPEC_REQUIREMENTS.md").read_text()
+        # Revision header is at the TOP and mentions both active CRs.
+        assert written.startswith("## Revision: CR-7, CR-8 — session session-xyz")
+        # Baseline content is preserved verbatim somewhere in the file.
+        assert "Existing content that must survive." in written
+        # The result still points the gatekeeper at the right path.
+        assert result["spec_requirements_path"] == str(docs_dir / "SPEC_REQUIREMENTS.md")
+
+    def test_overwrites_when_not_in_change_request_mode(self, tmp_path):
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir()
+        prior_content = "# Baseline\nThis must be overwritten in greenfield mode.\n"
+        (docs_dir / "SPEC_REQUIREMENTS.md").write_text(prior_content)
+
+        asyncio.run(write_spec_node(self._state(str(tmp_path),
+                                                change_request_mode=False)))
+
+        written = (docs_dir / "SPEC_REQUIREMENTS.md").read_text()
+        # Greenfield path is unchanged: the baseline is gone.
+        assert "must be overwritten" not in written
+        assert "Revision:" not in written
+
+    def test_no_prior_file_falls_back_to_simple_write(self, tmp_path):
+        # First-ever change-request session on a repo without a SPEC file
+        # should still produce a valid spec — no revision header, no
+        # crash, just the synthesized content.
+        docs_dir = tmp_path / "docs"
+        # No SPEC_REQUIREMENTS.md yet.
+        asyncio.run(write_spec_node(self._state(str(tmp_path))))
+        written = (docs_dir / "SPEC_REQUIREMENTS.md").read_text()
+        assert "Revision:" not in written
+        assert "Requirements Specification" in written
+
+
+# ---------------------------------------------------------------------------
+# Routing precedence (PR-2 changes the post-ingest edge target)
+# ---------------------------------------------------------------------------
+
+class TestIngestSetsDiscoveryActive:
+    """PR-2 routes ingest → requirements_discovery_node. The downstream
+    pipeline branches on ``skip_discovery``; ingest must clear it so the
+    interview loop honours follow-ups instead of short-circuiting to the
+    gatekeeper."""
+
+    def test_ingest_returns_skip_discovery_false(self, tmp_path):
+        cr_dir = tmp_path / "change_requests"
+        cr_dir.mkdir()
+        (cr_dir / "alpha.txt").write_text("first request")
+
+        state = {
+            "change_request_mode": True,
+            "change_requests_dir_abs": str(cr_dir),
+            "skip_discovery": True,   # simulates --discover not passed
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "seed"},
+            ],
+        }
+
+        result = asyncio.run(ingest_change_requests_node(state))
+
+        # The router downstream consults skip_discovery; if ingest left it
+        # at True the spec_review would short-circuit straight to the
+        # gatekeeper without the interview loop. PR-2 contract: ingest
+        # forces it to False.
+        assert result["skip_discovery"] is False
+
+
+# ---------------------------------------------------------------------------
+# deploy.py cr_attribution
+# ---------------------------------------------------------------------------
+
+class TestDeployCrAttribution:
+
+    def _blueprint(self) -> dict:
+        return {
+            "services": {
+                "auth": {
+                    "build_context": "auth",
+                    "ports": ["8080:8080"],
+                },
+                "redis": {
+                    "base_image": "redis:7-alpine",
+                    "ports": ["6379:6379"],
+                },
+            },
+            "volumes": {},
+            "networks": {"app-net": {"driver": "bridge"}},
+        }
+
+    def test_compose_byte_identical_when_no_attribution(self):
+        blueprint = self._blueprint()
+        plain = _generate_compose_file(blueprint)
+        explicit_none = _generate_compose_file(blueprint, cr_attribution=None)
+        assert plain == explicit_none
+        # And no CR markers appear in either rendering.
+        assert "CR-" not in plain
+
+    def test_compose_emits_marker_on_annotated_service(self):
+        out = _generate_compose_file(
+            self._blueprint(),
+            cr_attribution={"redis": "CR-7: added redis service for sessions"},
+        )
+        # The marker comment must appear in the YAML, immediately above
+        # the `redis:` service block.
+        idx_marker = out.find("# CR-7: added redis service for sessions")
+        idx_redis = out.find("  redis:")
+        assert idx_marker != -1 and idx_redis != -1, out
+        assert idx_marker < idx_redis, (
+            "marker must precede the redis service block"
+        )
+        # Non-annotated service stays unmarked.
+        assert "# CR-" not in out[:out.find("  auth:")]
+
+    def test_caddyfile_byte_identical_when_no_attribution(self):
+        blueprint = self._blueprint()
+        plain = _generate_caddyfile(blueprint)
+        explicit_none = _generate_caddyfile(blueprint, cr_attribution=None)
+        assert plain == explicit_none
+        assert "CR-" not in plain
+
+    def test_caddyfile_emits_marker_on_annotated_stanza(self):
+        out = _generate_caddyfile(
+            self._blueprint(),
+            cr_attribution={"auth": "CR-9: rate-limited /login endpoint"},
+        )
+        idx_marker = out.find("# CR-9: rate-limited /login endpoint")
+        idx_auth_stanza = out.find("auth.localhost {")
+        assert idx_marker != -1 and idx_auth_stanza != -1
+        assert idx_marker < idx_auth_stanza
+
+    def test_dockerfile_byte_identical_when_no_attribution(self, tmp_path):
+        svc_spec = {"build_context": "auth", "ports": ["8080:8080"]}
+        plain = _generate_dockerfile("auth", svc_spec, "python", str(tmp_path))
+        explicit_none = _generate_dockerfile(
+            "auth", svc_spec, "python", str(tmp_path), cr_attribution=None,
+        )
+        assert plain == explicit_none
+        assert "CR-" not in plain
+
+    def test_dockerfile_emits_marker_on_annotated_service(self, tmp_path):
+        svc_spec = {"build_context": "auth", "ports": ["8080:8080"]}
+        out = _generate_dockerfile(
+            "auth", svc_spec, "python", str(tmp_path),
+            cr_attribution={"auth": "CR-11: install postgres client libs"},
+        )
+        # Marker on the very first line so it survives multi-stage builds.
+        assert out.startswith("# CR-11: install postgres client libs\n")

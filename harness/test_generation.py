@@ -529,6 +529,11 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             "content": "## Test-generation guidance\n\n" + guides_body,
         })
     user_prompt = _build_test_gen_prompt(workspace_path, source_files, primary)
+    # Change-request mode: prepend the CR-N attribution rules so generated
+    # tests follow the `test_cr_N_*` naming convention and reference the
+    # CR in their docstrings. No-op (empty string) outside CR mode.
+    from harness.graph import _build_change_request_preamble
+    user_prompt = _build_change_request_preamble(state, "tests") + user_prompt
     messages.append({"role": "user", "content": user_prompt})
 
     budget = float(state.get("budget_remaining_usd", 2.00))
