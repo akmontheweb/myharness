@@ -1,0 +1,370 @@
+"""Tests for the change_requests/ folder convention (PR-1 scope).
+
+PR-1 introduces:
+  - `change_requests_dir` config field + name validation
+  - CR-N ID assignment from filenames + archive state
+  - `ingest_change_requests_node` graph node
+  - `route_after_start` change-request branch
+  - `_archive_consumed_change_requests` session-end helper
+
+PR-2 will add the delta-mode discovery / write_spec / gatekeeper behavior;
+the assertions here cover only the PR-1 surface.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+
+import pytest
+
+from harness.cli import (
+    _archive_consumed_change_requests,
+    _list_pending_change_request_files,
+    _resolve_change_requests_dir,
+)
+from harness.graph import (
+    _assign_change_request_ids,
+    _scan_archived_cr_ids,
+    ingest_change_requests_node,
+    route_after_start,
+)
+
+
+# ---------------------------------------------------------------------------
+# CR-N ID assignment
+# ---------------------------------------------------------------------------
+
+class TestScanArchivedCrIds:
+
+    def test_empty_when_archive_missing(self, tmp_path):
+        assert _scan_archived_cr_ids(str(tmp_path / "applied")) == set()
+
+    def test_picks_up_top_level_files(self, tmp_path):
+        archive = tmp_path / "applied"
+        archive.mkdir()
+        (archive / "CR-3-foo.txt").write_text("x")
+        (archive / "CR-7-bar.txt").write_text("x")
+        (archive / "not-a-cr.txt").write_text("x")
+        assert _scan_archived_cr_ids(str(archive)) == {3, 7}
+
+    def test_picks_up_one_level_subdirs(self, tmp_path):
+        archive = tmp_path / "applied"
+        (archive / "session-aaa").mkdir(parents=True)
+        (archive / "session-aaa" / "CR-5-foo.txt").write_text("x")
+        (archive / "session-bbb").mkdir()
+        (archive / "session-bbb" / "CR-9-bar.txt").write_text("x")
+        assert _scan_archived_cr_ids(str(archive)) == {5, 9}
+
+
+class TestAssignChangeRequestIds:
+
+    def test_empty_archive_starts_at_one(self, tmp_path):
+        records = _assign_change_request_ids(
+            ["alpha.txt", "beta.txt"], str(tmp_path / "applied"),
+        )
+        assert [r["cr_id"] for r in records] == [1, 2]
+        assert [r["original_name"] for r in records] == ["alpha.txt", "beta.txt"]
+
+    def test_continues_from_max_archived(self, tmp_path):
+        archive = tmp_path / "applied"
+        archive.mkdir()
+        (archive / "CR-5-x.txt").write_text("x")
+        (archive / "CR-9-y.txt").write_text("x")
+        records = _assign_change_request_ids(["new.txt"], str(archive))
+        assert records == [{"cr_id": 10, "original_name": "new.txt"}]
+
+    def test_operator_supplied_id_is_respected(self, tmp_path):
+        records = _assign_change_request_ids(
+            ["alpha.txt", "CR-42-explicit.txt", "beta.txt"],
+            str(tmp_path / "applied"),
+        )
+        by_name = {r["original_name"]: r["cr_id"] for r in records}
+        assert by_name == {
+            "CR-42-explicit.txt": 42,
+            "alpha.txt": 1,
+            "beta.txt": 2,
+        }
+
+    def test_operator_supplied_does_not_displace_sequential(self, tmp_path):
+        # Sequential assignment must skip operator-supplied IDs even when
+        # they fall in the middle of the natural range.
+        records = _assign_change_request_ids(
+            ["a.txt", "b.txt", "CR-2-pinned.txt"],
+            str(tmp_path / "applied"),
+        )
+        # CR-2 is taken; sequential allocation skips 2 and uses 1, 3.
+        by_name = {r["original_name"]: r["cr_id"] for r in records}
+        assert by_name == {
+            "CR-2-pinned.txt": 2,
+            "a.txt": 1,
+            "b.txt": 3,
+        }
+
+    def test_collision_with_archive_raises(self, tmp_path):
+        archive = tmp_path / "applied"
+        archive.mkdir()
+        (archive / "CR-42-old.txt").write_text("x")
+        with pytest.raises(ValueError, match="CR-42"):
+            _assign_change_request_ids(
+                ["CR-42-new.txt"], str(archive),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Folder helpers
+# ---------------------------------------------------------------------------
+
+class TestListPendingChangeRequestFiles:
+
+    def test_empty_when_missing(self, tmp_path):
+        assert _list_pending_change_request_files(str(tmp_path / "absent")) == []
+
+    def test_lists_txt_sorted_skipping_applied_and_other_extensions(self, tmp_path):
+        cr_dir = tmp_path / "change_requests"
+        cr_dir.mkdir()
+        (cr_dir / "zeta.txt").write_text("x")
+        (cr_dir / "alpha.txt").write_text("x")
+        (cr_dir / "notes.md").write_text("x")          # wrong extension
+        (cr_dir / "applied").mkdir()                    # archive subdir
+        (cr_dir / "applied" / "CR-1-old.txt").write_text("x")
+        result = _list_pending_change_request_files(str(cr_dir))
+        assert result == ["alpha.txt", "zeta.txt"]
+
+
+class TestResolveChangeRequestsDir:
+
+    def test_default_when_config_missing(self, tmp_path):
+        result = _resolve_change_requests_dir(str(tmp_path), None)
+        assert result == os.path.normpath(str(tmp_path / "change_requests"))
+
+    def test_custom_when_config_provided(self, tmp_path):
+        result = _resolve_change_requests_dir(str(tmp_path), "deltas")
+        assert result == os.path.normpath(str(tmp_path / "deltas"))
+
+
+# ---------------------------------------------------------------------------
+# Router precedence
+# ---------------------------------------------------------------------------
+
+class TestRouteAfterStart:
+
+    def test_change_request_mode_wins_over_skip_discovery(self):
+        # Plan invariant: change_request_mode=True beats skip_discovery=True
+        # even when both flags are set, so a misconfigured run still goes
+        # through the gatekeeper pipeline (PR-2+) instead of bare patching.
+        state = {"change_request_mode": True, "skip_discovery": True}
+        assert route_after_start(state) == "ingest_change_requests_node"
+
+    def test_skip_discovery_routes_to_patching(self):
+        state = {"change_request_mode": False, "skip_discovery": True}
+        assert route_after_start(state) == "patching_node"
+
+    def test_default_routes_to_requirements_discovery(self):
+        state = {"change_request_mode": False, "skip_discovery": False}
+        assert route_after_start(state) == "requirements_discovery_node"
+
+
+# ---------------------------------------------------------------------------
+# Ingest node
+# ---------------------------------------------------------------------------
+
+def _initial_state_for_ingest(cr_dir: str) -> dict:
+    return {
+        "change_request_mode": True,
+        "change_requests_dir_abs": cr_dir,
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "placeholder seed prompt"},
+        ],
+    }
+
+
+class TestIngestChangeRequestsNode:
+
+    def test_consolidates_with_cr_headers_and_replaces_user_message(self, tmp_path):
+        cr_dir = tmp_path / "change_requests"
+        cr_dir.mkdir()
+        (cr_dir / "alpha.txt").write_text("first request body")
+        (cr_dir / "beta.txt").write_text("second request body")
+
+        result = asyncio.run(
+            ingest_change_requests_node(_initial_state_for_ingest(str(cr_dir)))
+        )
+
+        records = result["change_request_files"]
+        assert [r["cr_id"] for r in records] == [1, 2]
+        assert [r["original_name"] for r in records] == ["alpha.txt", "beta.txt"]
+        for r in records:
+            assert r["abs_path"].endswith(r["original_name"])
+
+        messages = result["messages"]
+        assert messages[0]["role"] == "system"
+        assert messages[1]["role"] == "user"
+        body = messages[1]["content"]
+        assert "CR-1: alpha.txt" in body
+        assert "CR-2: beta.txt" in body
+        assert "first request body" in body
+        assert "second request body" in body
+        # Seed prompt must be replaced (not appended).
+        assert "placeholder seed prompt" not in body
+
+    def test_respects_operator_supplied_cr_ids(self, tmp_path):
+        cr_dir = tmp_path / "change_requests"
+        cr_dir.mkdir()
+        (cr_dir / "CR-100-pinned.txt").write_text("pinned body")
+        (cr_dir / "unprefixed.txt").write_text("auto body")
+
+        result = asyncio.run(
+            ingest_change_requests_node(_initial_state_for_ingest(str(cr_dir)))
+        )
+
+        by_name = {r["original_name"]: r["cr_id"] for r in result["change_request_files"]}
+        assert by_name == {"CR-100-pinned.txt": 100, "unprefixed.txt": 1}
+
+    def test_collision_with_archive_surfaces_system_message(self, tmp_path):
+        cr_dir = tmp_path / "change_requests"
+        cr_dir.mkdir()
+        (cr_dir / "applied").mkdir()
+        (cr_dir / "applied" / "CR-42-old.txt").write_text("x")
+        (cr_dir / "CR-42-new.txt").write_text("conflict")
+
+        result = asyncio.run(
+            ingest_change_requests_node(_initial_state_for_ingest(str(cr_dir)))
+        )
+
+        # Hard-fail path: exit_code surfaces non-zero and a system message
+        # captured the collision so the operator sees it in the transcript.
+        assert result["exit_code"] == 1
+        system_msgs = [m for m in result["messages"] if m["role"] == "system"]
+        joined = "\n".join(m["content"] for m in system_msgs)
+        assert "CR-42" in joined and "ingestion failed" in joined.lower()
+
+
+# ---------------------------------------------------------------------------
+# Archival helper
+# ---------------------------------------------------------------------------
+
+class TestArchiveConsumedChangeRequests:
+
+    def test_moves_files_and_writes_manifest(self, tmp_path):
+        cr_dir = tmp_path / "change_requests"
+        cr_dir.mkdir()
+        src1 = cr_dir / "alpha.txt"
+        src1.write_text("body 1")
+        src2 = cr_dir / "beta.txt"
+        src2.write_text("body 2")
+        archive = cr_dir / "applied" / "session-xyz"
+        records = [
+            {"cr_id": 1, "original_name": "alpha.txt", "abs_path": str(src1)},
+            {"cr_id": 2, "original_name": "beta.txt", "abs_path": str(src2)},
+        ]
+
+        _archive_consumed_change_requests(
+            records, str(archive),
+            session_id="session-xyz",
+            status="success",
+            modified_files=["app/foo.py"],
+        )
+
+        # Sources moved.
+        assert not src1.exists() and not src2.exists()
+        assert (archive / "CR-1-alpha.txt").read_text() == "body 1"
+        assert (archive / "CR-2-beta.txt").read_text() == "body 2"
+        # Manifest written.
+        manifest = json.loads((archive / "manifest.json").read_text())
+        assert manifest["session_id"] == "session-xyz"
+        assert manifest["status"] == "success"
+        assert manifest["modified_files"] == ["app/foo.py"]
+        archived_ids = sorted(c["cr_id"] for c in manifest["change_requests"])
+        assert archived_ids == [1, 2]
+
+    def test_strips_existing_cr_prefix_to_avoid_double_naming(self, tmp_path):
+        cr_dir = tmp_path / "change_requests"
+        cr_dir.mkdir()
+        src = cr_dir / "CR-42-pinned.txt"
+        src.write_text("pinned body")
+        archive = cr_dir / "applied" / "session-xyz"
+
+        _archive_consumed_change_requests(
+            [{"cr_id": 42, "original_name": "CR-42-pinned.txt", "abs_path": str(src)}],
+            str(archive),
+            session_id="session-xyz",
+            status="success",
+            modified_files=[],
+        )
+
+        # CR-42-pinned.txt → CR-42-pinned.txt (not CR-42-CR-42-pinned.txt).
+        assert (archive / "CR-42-pinned.txt").exists()
+        assert not (archive / "CR-42-CR-42-pinned.txt").exists()
+
+    def test_tolerates_missing_source(self, tmp_path):
+        cr_dir = tmp_path / "change_requests"
+        cr_dir.mkdir()
+        archive = cr_dir / "applied" / "session-xyz"
+        records = [
+            {"cr_id": 1, "original_name": "alpha.txt",
+             "abs_path": str(cr_dir / "absent.txt")},
+        ]
+
+        # Must not raise.
+        _archive_consumed_change_requests(
+            records, str(archive),
+            session_id="session-xyz",
+            status="success",
+            modified_files=[],
+        )
+
+        # Manifest still written, source flagged missing.
+        manifest = json.loads((archive / "manifest.json").read_text())
+        assert manifest["change_requests"][0]["source_missing"] is True
+
+    def test_noop_when_records_empty(self, tmp_path):
+        archive = tmp_path / "applied" / "session-xyz"
+        _archive_consumed_change_requests(
+            [], str(archive),
+            session_id="session-xyz",
+            status="success",
+            modified_files=[],
+        )
+        assert not archive.exists()
+
+
+# ---------------------------------------------------------------------------
+# Config validation
+# ---------------------------------------------------------------------------
+
+class TestConfigValidation:
+
+    def _base_config(self) -> dict:
+        return {
+            "build_command": "make build",
+            "models": {"x:y": {}},
+            "model_routing": {
+                "planning_primary": "x:y",
+                "patching_primary": "x:y",
+                "repair_primary": "x:y",
+            },
+            "product_spec_dir": "product_spec",
+        }
+
+    def test_change_requests_dir_with_path_separator_rejected(self):
+        from harness.cli import ConfigError, validate_config_strict
+        cfg = self._base_config()
+        cfg["change_requests_dir"] = "nested/path"
+        with pytest.raises(ConfigError) as exc_info:
+            validate_config_strict(cfg, source="test-config")
+        assert "change_requests_dir" in str(exc_info.value)
+
+    def test_change_requests_dir_absent_is_ok_for_this_rule(self):
+        # change_requests_dir is optional; its omission must NOT produce a
+        # change_requests_dir-specific error. Other unrelated errors are
+        # fine here — the assertion targets ONLY this rule.
+        from harness.cli import ConfigError, validate_config_strict
+        cfg = self._base_config()  # change_requests_dir omitted
+        try:
+            validate_config_strict(cfg, source="test-config")
+        except ConfigError as exc:
+            assert "change_requests_dir" not in str(exc), (
+                f"change_requests_dir-related error fired despite omission: {exc}"
+            )

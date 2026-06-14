@@ -3387,6 +3387,56 @@ class TestMakefileSkills:
         assert "makefile" in _ROOT_ALLOWLIST_FILES
         assert "GNUmakefile" in _ROOT_ALLOWLIST_FILES
 
+    def test_node_manifests_in_root_allowlist(self):
+        # The kitchen-sink builder image supports JS stacks; the patcher
+        # must accept patches to the canonical Node/TS root manifests for
+        # the same reason it accepts Makefile and pyproject.toml.
+        from harness.graph import _ROOT_ALLOWLIST_FILES
+        for name in (
+            "package.json", "package-lock.json",
+            "yarn.lock", "pnpm-lock.yaml",
+            "tsconfig.json",
+        ):
+            assert name in _ROOT_ALLOWLIST_FILES, (
+                f"{name} missing from _ROOT_ALLOWLIST_FILES — Node patches "
+                f"at workspace root will be rejected"
+            )
+
+    @pytest.mark.asyncio
+    async def test_patcher_accepts_vite_config_at_root(self):
+        # End-to-end: when vite.config.ts is on disk, the runtime scan in
+        # _build_patcher_allowlist adds it, and a REPLACE_BLOCK against it
+        # must pass the allowlist check. Regression for the 00:34:37 log
+        # where jest.config.cjs amends were rejected pre-fix.
+        from harness.graph import _build_patcher_allowlist
+        from harness.patcher import process_llm_patch_output
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.makedirs(os.path.join(tmpdir, "src"))
+            with open(os.path.join(tmpdir, "src", "index.ts"), "w") as f:
+                f.write("export const x = 1;\n")
+            with open(os.path.join(tmpdir, "package.json"), "w") as f:
+                f.write('{"name":"x","version":"0.1.0"}\n')
+            with open(os.path.join(tmpdir, "vite.config.ts"), "w") as f:
+                f.write("export default { base: '/' };\n")
+            allowed = _build_patcher_allowlist(tmpdir)
+            assert allowed is not None
+            assert "vite.config.ts" in allowed
+            assert "package.json" in allowed
+
+            llm_output = """<<<REPLACE_BLOCK>>>
+file: vite.config.ts
+search:
+export default { base: '/' };
+replace:
+export default { base: '/app/' };
+<<<END_REPLACE_BLOCK>>>"""
+            results, modified = await process_llm_patch_output(
+                llm_output, tmpdir, allowed_paths=allowed,
+            )
+            assert len(results) == 1
+            assert results[0].success, f"vite.config.ts rejected: {results[0].error}"
+            assert "vite.config.ts" in modified
+
     def test_layout_block_mentions_makefile(self):
         # The system-prompt layout-block enumerates allowed root files for
         # the LLM. Without Makefile in the message, the LLM won't try to

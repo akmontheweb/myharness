@@ -481,6 +481,11 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # holds the product spec .txt files. Mandatory in config.json — the
     # harness refuses to start without it. See _load_consolidated_product_spec.
     "product_spec_dir",
+    # Operator-configurable name of the folder at the workspace root that
+    # holds change-request .txt files for non-greenfield runs. Optional;
+    # defaults to "change_requests". When --new_build=false the folder
+    # MUST contain at least one .txt — see _load_consolidated_change_requests.
+    "change_requests_dir",
     # Observability + debugging knobs. See _dump_repair_prompt_to_disk and
     # the compiler.run_prod_import_smoke_check flag.
     "debug", "compiler",
@@ -601,6 +606,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "build_command": (str,),
     "allow_network": (bool,),
     "product_spec_dir": (str,),
+    "change_requests_dir": (str,),
     "debug.dump_llm_calls": (bool,),
     "debug.dump_max_files": (int,),
     "debug.dump_repair_prompts": (bool,),  # deprecated alias for dump_llm_calls
@@ -831,6 +837,15 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
         name_error = _validate_product_spec_dir_name(spec_dir)
         if name_error is not None:
             errors.append(f"'product_spec_dir' {name_error}.")
+
+    # change_requests_dir is OPTIONAL — defaults to "change_requests" — but
+    # if the operator sets it explicitly, the value must obey the same
+    # bare-folder-name rules as product_spec_dir.
+    cr_dir = config.get("change_requests_dir")
+    if cr_dir is not None:
+        cr_name_error = _validate_product_spec_dir_name(cr_dir)
+        if cr_name_error is not None:
+            errors.append(f"'change_requests_dir' {cr_name_error}.")
 
     models = config.get("models")
     if not isinstance(models, dict) or not models:
@@ -2525,6 +2540,136 @@ def _load_consolidated_product_spec(
     return consolidated
 
 
+_DEFAULT_CHANGE_REQUESTS_DIR = "change_requests"
+_CHANGE_REQUESTS_ARCHIVE_SUBDIR = "applied"
+# Same pattern as harness.graph._CR_FILENAME_PREFIX. Duplicated here to
+# avoid a cli → graph import dependency at module load (graph imports cli
+# helpers in places). A single source of truth would require a small
+# shared helpers module; the duplication is cheap and the regex is stable.
+_CR_FILENAME_PREFIX = re.compile(r"^CR-(\d+)(?:[-_].*)?\.txt$", re.IGNORECASE)
+
+
+def _resolve_change_requests_dir(workspace_path: str, config_value: Optional[str]) -> str:
+    """Resolve the ``change_requests_dir`` config value to an absolute path
+    under the workspace root. Falls back to ``change_requests`` when the
+    config key is absent. Same shape as :func:`_resolve_product_spec_dir`."""
+    name = (config_value or _DEFAULT_CHANGE_REQUESTS_DIR).strip() or _DEFAULT_CHANGE_REQUESTS_DIR
+    return os.path.normpath(os.path.join(workspace_path, name))
+
+
+def _list_pending_change_request_files(change_requests_dir: str) -> list[str]:
+    """Return the sorted list of `.txt` filenames at the top of
+    ``change_requests_dir`` (excluding the ``applied/`` archive). Returns
+    an empty list when the directory is missing.
+
+    Files are returned as basenames; callers join with ``change_requests_dir``
+    to get absolute paths. Sorted alphabetically — the same order the
+    ingest node uses to assign sequential CR-N IDs.
+    """
+    if not os.path.isdir(change_requests_dir):
+        return []
+    try:
+        entries = os.listdir(change_requests_dir)
+    except OSError:
+        return []
+    pending: list[str] = []
+    for entry in sorted(entries):
+        full = os.path.join(change_requests_dir, entry)
+        if entry == _CHANGE_REQUESTS_ARCHIVE_SUBDIR:
+            continue
+        if entry.endswith(".txt") and os.path.isfile(full):
+            pending.append(entry)
+    return pending
+
+
+def _archive_consumed_change_requests(
+    change_request_files: list[dict[str, Any]],
+    archive_target_dir: str,
+    *,
+    session_id: str,
+    status: str,
+    modified_files: list[str],
+) -> None:
+    """Move each consumed change-request file into the per-session archive
+    and drop a ``manifest.json`` with run metadata.
+
+    No-op when ``change_request_files`` is empty or ``archive_target_dir``
+    is unset, so it can be called unconditionally at session end. The
+    helper is intentionally tolerant — a file that has already been moved
+    (re-run of the same session) is skipped silently; an unreadable
+    source file is logged and skipped. The manifest is written even when
+    every source is missing so the operator has a record of the run.
+    """
+    if not change_request_files or not archive_target_dir:
+        return
+    try:
+        os.makedirs(archive_target_dir, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "[change_requests] Could not create archive %s: %s — skipping move.",
+            archive_target_dir, exc,
+        )
+        return
+
+    archived: list[dict[str, Any]] = []
+    for rec in change_request_files:
+        src = rec.get("abs_path", "")
+        cr_id = rec.get("cr_id")
+        original_name = rec.get("original_name", "")
+        # Drop any existing CR-N prefix from the original filename so we
+        # don't end up with CR-7-CR-7-foo.txt on operator-supplied IDs.
+        m = _CR_FILENAME_PREFIX.match(original_name) if original_name else None
+        if m is not None:
+            tail = original_name[m.end(1):].lstrip("-_") or ".txt"
+            if not tail.endswith(".txt"):
+                tail = tail + ".txt"
+            base_name = tail
+        else:
+            base_name = original_name
+        dst = os.path.join(archive_target_dir, f"CR-{cr_id}-{base_name}")
+        if not src or not os.path.isfile(src):
+            logger.info(
+                "[change_requests] CR-%s source missing (%s) — already moved or "
+                "deleted; skipping.", cr_id, src,
+            )
+            archived.append({"cr_id": cr_id, "archived_as": None, "source_missing": True})
+            continue
+        try:
+            os.replace(src, dst)
+            archived.append({
+                "cr_id": cr_id,
+                "archived_as": os.path.basename(dst),
+                "original_name": original_name,
+            })
+            logger.info("[change_requests] Archived CR-%s → %s", cr_id, dst)
+        except OSError as exc:
+            logger.warning(
+                "[change_requests] Could not move %s → %s: %s", src, dst, exc,
+            )
+            archived.append({
+                "cr_id": cr_id,
+                "archived_as": None,
+                "original_name": original_name,
+                "error": str(exc),
+            })
+
+    manifest_path = os.path.join(archive_target_dir, "manifest.json")
+    manifest = {
+        "session_id": session_id,
+        "status": status,
+        "change_requests": archived,
+        "modified_files": list(modified_files),
+    }
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+    except OSError as exc:
+        logger.warning(
+            "[change_requests] Could not write manifest %s: %s",
+            manifest_path, exc,
+        )
+
+
 def _list_workspace_entries_to_delete(
     workspace_path: str, spec_dirname: str,
 ) -> list[str]:
@@ -3082,6 +3227,70 @@ async def cmd_run(args: argparse.Namespace) -> int:
     )
     set_command_validator(create_command_validator_from_config(config))
 
+    # --- Change-request mode detection (existing-project delta path) ---
+    # The harness routes an existing project's bug-fix / feature-add work
+    # through the gatekeeper pipeline (PR-2+) by reading `.txt` files from
+    # `change_requests_dir`. The hard rule is: when --new_build=false the
+    # folder MUST contain at least one .txt file. This replaces the old
+    # implicit "use the existing product_spec" path with a file-driven
+    # workflow that gives every run a checked-in audit trail.
+    #
+    # When --new_build=true (greenfield), the change_requests/ folder is
+    # ignored — greenfield uses product_spec_dir as before.
+    new_build_active = bool(getattr(args, "new_build", False))
+    cr_dir_abs = _resolve_change_requests_dir(
+        workspace_path, config.get("change_requests_dir"),
+    )
+    pending_change_requests = _list_pending_change_request_files(cr_dir_abs)
+    change_request_mode = bool(pending_change_requests) and not new_build_active
+    if not new_build_active and not pending_change_requests:
+        print(file=sys.stderr)
+        print("=" * 72, file=sys.stderr)
+        print(
+            "Existing-project run requires at least one change request",
+            file=sys.stderr,
+        )
+        print("=" * 72, file=sys.stderr)
+        print(
+            "The harness needs at least one `.txt` file under:\n\n"
+            f"  {cr_dir_abs}\n\n"
+            "describing the bug to fix or feature to add. Each file becomes\n"
+            "a numbered Change Request (CR-N) that flows through the\n"
+            "gatekeeper review and is archived after the session terminates.\n\n"
+            "To proceed:\n"
+            "  1. Create the folder if it does not exist.\n"
+            "  2. Add one or more `.txt` files describing the changes.\n"
+            "  3. Re-run `harness run`.\n\n"
+            "If you are starting a fresh build, pass --new_build=true\n"
+            "instead — that flow uses `product_spec_dir` and skips this\n"
+            "check.\n",
+            file=sys.stderr,
+        )
+        print("=" * 72, file=sys.stderr)
+        logger.error(
+            "[change_requests] --new_build=false but no .txt files at %s",
+            cr_dir_abs,
+        )
+        return 1
+    archive_target_dir = (
+        os.path.join(cr_dir_abs, "applied", session_id) if change_request_mode else ""
+    )
+    if change_request_mode:
+        logger.info(
+            "[change_requests] Change-request mode active. Pending: %s. "
+            "Archive target: %s",
+            pending_change_requests, archive_target_dir,
+        )
+        # Folder-driven runs are the source of truth — drop any -p prompt
+        # so the operator can't accidentally double-source the run.
+        prompt_arg = getattr(args, "prompt", "") or ""
+        if prompt_arg.strip():
+            logger.warning(
+                "[change_requests] Both --prompt and %s are populated; "
+                "the folder wins and --prompt is dropped.", cr_dir_abs,
+            )
+            args.prompt = ""
+
     # Read the operator-configured product-spec folder name once and
     # reuse for both the new_build cleanup (preserves the folder during
     # the workspace reset) and the requirement-refinement validation
@@ -3116,17 +3325,25 @@ async def cmd_run(args: argparse.Namespace) -> int:
     resolved_spec_dir = _resolve_product_spec_dir(workspace_path, spec_dirname)
 
     # Validate the folder exists AND contains at least one .txt file.
-    # product_spec_dir is the SOLE source for the product spec — the
-    # harness no longer accepts a --manifest override. We preload the
-    # consolidated content here so the requirement-refinement step below
+    # product_spec_dir is the SOLE source for the product spec on greenfield
+    # runs — the harness no longer accepts a --manifest override. We preload
+    # the consolidated content here so the requirement-refinement step below
     # doesn't walk the folder a second time.
-    preloaded_consolidated_spec = _load_consolidated_product_spec(
-        workspace_path, resolved_spec_dir,
-    )
-    if preloaded_consolidated_spec is None:
-        # _load_consolidated_product_spec already printed a clear error to
-        # stderr describing whether the folder is missing or empty.
-        return 1
+    #
+    # In change-request mode (existing-project deltas) the product_spec
+    # folder is not consulted — the change_requests/ folder drives the run
+    # instead. The config value's NAME is still validated above so other
+    # subsystems that reference spec_dirname (e.g. --new_build cleanup
+    # preserves it) keep working.
+    preloaded_consolidated_spec: Optional[str] = None
+    if not change_request_mode:
+        preloaded_consolidated_spec = _load_consolidated_product_spec(
+            workspace_path, resolved_spec_dir,
+        )
+        if preloaded_consolidated_spec is None:
+            # _load_consolidated_product_spec already printed a clear error to
+            # stderr describing whether the folder is missing or empty.
+            return 1
 
     # --new_build cleanup runs BEFORE GitGuardian creates the session's
     # patch branch, so the new branch forks from a clean base. The reset is
@@ -3206,21 +3423,28 @@ async def cmd_run(args: argparse.Namespace) -> int:
     git_guardian.create_patch_branch(session_id)
 
     # --- Requirement Refinement Layer ---
-    # product_spec_dir is the SOLE source for the product spec. The folder
-    # MUST contain one or more .txt files; the preload at the top of
-    # cmd_run already validated this. Reuse that content here so we don't
-    # walk the directory twice.
+    # product_spec_dir is the SOLE source for the product spec on greenfield
+    # runs. In change-request mode this layer is skipped — the change
+    # requests drive the run instead, and ingest_change_requests_node
+    # injects them as the LLM's task description in-graph.
     spec_override: Optional[str] = None
-    import tempfile as _tempfile
-    fd, manifest_path = _tempfile.mkstemp(
-        prefix=f"harness_spec_{session_id[:8]}_", suffix=".txt",
-    )
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(preloaded_consolidated_spec)
-    logger.info(
-        "[requirements] Product spec sourced from %s "
-        "(consolidated → %s).", resolved_spec_dir, manifest_path,
-    )
+    manifest_path: Optional[str] = None
+    if not change_request_mode:
+        import tempfile as _tempfile
+        fd, manifest_path = _tempfile.mkstemp(
+            prefix=f"harness_spec_{session_id[:8]}_", suffix=".txt",
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(preloaded_consolidated_spec)
+        logger.info(
+            "[requirements] Product spec sourced from %s "
+            "(consolidated → %s).", resolved_spec_dir, manifest_path,
+        )
+    else:
+        logger.info(
+            "[change_requests] Skipping greenfield spec refinement; "
+            "in-graph ingest will compose the LLM task from the folder."
+        )
 
     if manifest_path:
         logger.info("[requirements] Synthesizing specification from %s", manifest_path)
@@ -3447,6 +3671,9 @@ async def cmd_run(args: argparse.Namespace) -> int:
             test_generation_config=config.get("test_generation", {}),
             speculative_config=config.get("speculative", {}),
             compiler_config=config.get("compiler", {}),
+            change_request_mode=change_request_mode,
+            change_requests_dir_abs=cr_dir_abs if change_request_mode else "",
+            archive_target_dir=archive_target_dir,
         )
     except Exception:
         logger.exception("Graph execution failed with unhandled exception.")
@@ -3511,6 +3738,27 @@ async def cmd_run(args: argparse.Namespace) -> int:
     logger.info("  Token Cost:     $%.6f", total_cost)
     logger.info("  Session ID:     %s", session_id)
     logger.info("=" * 60)
+
+    # Archive consumed change-request .txt files into
+    # <change_requests_dir>/applied/<session-id>/ along with a manifest.json.
+    # Suspend (HITL Save & Quit) is exempted — the session will resume and
+    # the files must still be readable from the original folder. Abandon
+    # archives them with a "cancelled" status so the operator can tell
+    # consumed-but-rolled-back runs apart from successful applies.
+    if change_request_mode and not hitl_suspend:
+        if exit_code == 0:
+            cr_status = "success"
+        elif hitl_abandon:
+            cr_status = "cancelled"
+        else:
+            cr_status = "failed-build"
+        _archive_consumed_change_requests(
+            final_state.get("change_request_files", []),
+            archive_target_dir,
+            session_id=session_id,
+            status=cr_status,
+            modified_files=modified_files,
+        )
 
     await checkpointer.conn.close()
 

@@ -79,6 +79,13 @@ def _seed_app_workspace(tmp_path) -> None:
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
 
 
+def _seed_node_workspace(tmp_path) -> None:
+    """Create a Node workspace with a `src/` source root and JS manifests."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "index.ts").write_text("export const x = 1;\n")
+    (tmp_path / "package.json").write_text('{"name":"x","version":"0.1.0"}\n')
+
+
 # ---------------------------------------------------------------------------
 # _build_patcher_allowlist
 # ---------------------------------------------------------------------------
@@ -134,6 +141,55 @@ class TestBuildPatcherAllowlist:
         allowlist = _build_patcher_allowlist(str(tmp_path))
         assert allowlist is not None
         assert "requirements.txt" in allowlist
+
+    def test_node_root_manifests_in_allowlist(self, tmp_path):
+        # Regression: Node workspaces used to fail because the static set
+        # was Python-only — patches to package.json / tsconfig.json got
+        # rejected at workspace root even though the kitchen-sink builder
+        # supports JS. The static set must cover the canonical JS manifests.
+        _seed_node_workspace(tmp_path)
+        allowlist = _build_patcher_allowlist(str(tmp_path))
+        assert allowlist is not None
+        for expected in (
+            "package.json", "package-lock.json",
+            "yarn.lock", "pnpm-lock.yaml",
+            "tsconfig.json", "tsconfig.base.json",
+            ".npmrc", ".nvmrc",
+        ):
+            assert expected in allowlist, (
+                f"{expected} missing — Node patches at workspace root will be rejected"
+            )
+
+    def test_node_config_files_picked_up_by_runtime_scan(self, tmp_path):
+        # The proliferating *.config.* and dotrc variants are not in the
+        # static set — they're caught by the runtime scan. Any file actually
+        # on disk that matches must land in the allowlist so the LLM can
+        # amend it.
+        _seed_node_workspace(tmp_path)
+        (tmp_path / "jest.config.cjs").write_text("module.exports = {};\n")
+        (tmp_path / "vite.config.ts").write_text("export default {};\n")
+        (tmp_path / "tailwind.config.js").write_text("module.exports = {};\n")
+        (tmp_path / ".eslintrc.json").write_text("{}\n")
+        (tmp_path / ".prettierrc").write_text("{}\n")
+        allowlist = _build_patcher_allowlist(str(tmp_path))
+        assert allowlist is not None
+        for expected in (
+            "jest.config.cjs", "vite.config.ts", "tailwind.config.js",
+            ".eslintrc.json", ".prettierrc",
+        ):
+            assert expected in allowlist, (
+                f"{expected} missing — runtime scan should have picked it up"
+            )
+
+    def test_node_config_files_not_added_when_absent(self, tmp_path):
+        # The runtime scan must not invent allowlist entries for configs
+        # that aren't on disk — the static set already covers canonical
+        # names, and broadening to every *.config.* would weaken the guard.
+        _seed_node_workspace(tmp_path)
+        allowlist = _build_patcher_allowlist(str(tmp_path))
+        assert allowlist is not None
+        for absent in ("jest.config.cjs", "vite.config.ts", ".eslintrc.json"):
+            assert absent not in allowlist
 
 
 # ---------------------------------------------------------------------------

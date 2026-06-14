@@ -217,6 +217,9 @@ outside a disposable VM.
 See [`docs/SPEC_ARCHITECTURE.md`](docs/SPEC_ARCHITECTURE.md) for the module
 map and graph topology. See [`docs/SPEC_REQUIREMENTS.md`](docs/SPEC_REQUIREMENTS.md)
 for the functional/non-functional requirements the harness is built against.
+For the flow when running `harness run` against a repository that already has
+code (bug fix / feature add, skipping discovery), see
+[`docs/existing-project-flow.md`](docs/existing-project-flow.md).
 
 ## Development
 

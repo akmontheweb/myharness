@@ -148,6 +148,20 @@ class AgentState(TypedDict, total=False):
     # load_deployment_defaults() in cli.py for the schema.
     deployment_defaults: dict[str, Any]
     run_prod_import_smoke_check: bool
+    # Change-request-mode fields. When change_request_mode is True, the
+    # graph routes through ingest_change_requests_node instead of the bare
+    # patching path; the ingest node populates the remaining fields with
+    # the resolved folder, the per-file CR assignments, and the archive
+    # target. All inert (False / empty) on greenfield + bare existing-project
+    # runs — those paths execute byte-identical to pre-change behaviour.
+    change_request_mode: bool
+    change_requests_dir_abs: str
+    # List of {cr_id: int, original_name: str, abs_path: str} records,
+    # sorted by cr_id. Populated by ingest_change_requests_node; consumed
+    # by the archival helper at session end and by the patching/repair
+    # prompts (PR-2+) for CR-N marker injection.
+    change_request_files: list[dict[str, Any]]
+    archive_target_dir: str
 
 # ---------------------------------------------------------------------------
 # 2. Default State Factory
@@ -163,6 +177,9 @@ def create_initial_state(
     session_id: str = "",
     spec_override: Optional[str] = None,
     skip_discovery: bool = False,
+    change_request_mode: bool = False,
+    change_requests_dir_abs: str = "",
+    archive_target_dir: str = "",
 ) -> AgentState:
     """
     Construct the initial graph state with anchored system prompt at messages[0]
@@ -224,6 +241,10 @@ def create_initial_state(
         exit_code=-1,
         node_state={},
         skip_discovery=skip_discovery,
+        change_request_mode=change_request_mode,
+        change_requests_dir_abs=change_requests_dir_abs,
+        change_request_files=[],
+        archive_target_dir=archive_target_dir,
     )
 
 
@@ -245,7 +266,45 @@ _ROOT_ALLOWLIST_FILES: frozenset[str] = frozenset({
     # target instead of the noisy late-bind adaptation in speculative.py
     # / compiler_node. GNU make recognises all three casings.
     "Makefile", "makefile", "GNUmakefile",
+    # Node / TypeScript root manifests — the kitchen-sink builder image
+    # supports JS stacks (vendor/Dockerfile.builder), and the React/Vue/
+    # Angular/Node skills expect these at the workspace root. Without
+    # them in the static set, every LLM patch to package.json or
+    # tsconfig.json was rejected before the build could repair.
+    "package.json", "package-lock.json",
+    "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json",
+    "tsconfig.json", "tsconfig.base.json",
+    ".npmrc", ".nvmrc", ".node-version",
 })
+
+
+# Runtime-scanned Node/JS root configs — too many proliferating variants
+# (jest.config.cjs vs .js vs .ts; .eslintrc vs .eslintrc.json vs .eslintrc.cjs)
+# to enumerate statically. _build_patcher_allowlist picks up any matching
+# entry actually present at the workspace root, the same way it picks up
+# requirements*.txt.
+_NODE_CONFIG_SUFFIXES: tuple[str, ...] = (
+    ".config.js", ".config.cjs", ".config.mjs", ".config.ts", ".config.json",
+)
+_NODE_CONFIG_PREFIXES: tuple[str, ...] = (
+    ".eslintrc", ".prettierrc", ".babelrc",
+)
+
+
+def _is_node_config_file(name: str) -> bool:
+    """True when ``name`` is a Node/JS tool config worth allowing at root.
+
+    Catches the open-ended families that don't have one canonical filename:
+      - ``*.config.{js,cjs,mjs,ts,json}`` — jest, vite, next, tailwind,
+        postcss, playwright, rollup, webpack, etc.
+      - ``.eslintrc*`` / ``.prettierrc*`` / ``.babelrc*`` — each ships in
+        bare, ``.json``, ``.js``, ``.cjs``, and ``.yaml`` forms.
+    """
+    if any(name.endswith(suffix) for suffix in _NODE_CONFIG_SUFFIXES):
+        return True
+    if any(name.startswith(prefix) for prefix in _NODE_CONFIG_PREFIXES):
+        return True
+    return False
 
 
 def _build_patcher_allowlist(workspace_path: str) -> Optional[list[str]]:
@@ -333,10 +392,16 @@ def _build_patcher_allowlist(workspace_path: str) -> Optional[list[str]]:
         ]
 
     # Pick up any requirements*.txt actually present so the LLM can amend
-    # them without the patcher rejecting the write.
+    # them without the patcher rejecting the write. Same scan also catches
+    # Node/JS tool configs (jest.config.cjs, vite.config.ts, .eslintrc.json,
+    # ...) — too many variants to enumerate statically; we allow only the
+    # ones actually in the tree so the LLM can amend what exists without
+    # opening up arbitrary root writes.
     try:
         for entry in os.listdir(workspace_path):
             if entry.startswith("requirements") and entry.endswith(".txt"):
+                allowlist.append(entry)
+            elif _is_node_config_file(entry):
                 allowlist.append(entry)
     except OSError:
         pass
@@ -4328,6 +4393,247 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
 
 
 # ---------------------------------------------------------------------------
+# 6b'. Change-Request Ingestion (existing-project delta entry point)
+# ---------------------------------------------------------------------------
+
+# Filename pattern recognising operator-supplied CR-N prefixes (e.g.
+# "CR-42-rewrite-auth.txt"). The harness respects pre-assigned IDs so
+# external trackers (Jira ticket IDs, etc.) can map 1:1; collisions with
+# already-archived CR IDs cause the ingest node to abort with a clear
+# error so the operator can rename and retry.
+_CR_FILENAME_PREFIX = re.compile(r"^CR-(\d+)(?:[-_].*)?\.txt$", re.IGNORECASE)
+
+
+def _scan_archived_cr_ids(archive_root: str) -> set[int]:
+    """Return the set of CR-N IDs already present under
+    ``<change_requests_dir>/applied/``. The scan is non-recursive at the
+    top level then walks each per-session subdirectory one level deep —
+    that's the only layout the archive helper writes — so a corrupted
+    deeper tree can't cause an infinite walk. Missing archive → empty set.
+    """
+    used: set[int] = set()
+    if not os.path.isdir(archive_root):
+        return used
+    try:
+        for entry in os.listdir(archive_root):
+            full = os.path.join(archive_root, entry)
+            m = _CR_FILENAME_PREFIX.match(entry)
+            if m and os.path.isfile(full):
+                used.add(int(m.group(1)))
+            elif os.path.isdir(full):
+                try:
+                    for inner in os.listdir(full):
+                        m_inner = _CR_FILENAME_PREFIX.match(inner)
+                        if m_inner:
+                            used.add(int(m_inner.group(1)))
+                except OSError:
+                    continue
+    except OSError:
+        return used
+    return used
+
+
+def _assign_change_request_ids(
+    pending_filenames: list[str],
+    archive_root: str,
+) -> list[dict[str, Any]]:
+    """Assign CR-N IDs to ``pending_filenames`` in sorted order.
+
+    - A filename matching ``CR-<N>-*`` or ``CR-<N>.txt`` keeps its
+      operator-supplied ``N``.
+    - Otherwise, the next sequential ID is allocated from
+      ``max(used) + 1`` (used = archived IDs ∪ already-assigned IDs in
+      this batch). First-ever assignment starts at 1.
+    - Collisions between an operator-supplied ID and an existing
+      archived ID raise ``ValueError`` so the caller can abort early.
+
+    Returns a list of ``{cr_id, original_name}`` records, sorted by
+    ``cr_id``. Pure function — no I/O beyond the archive scan that the
+    caller performed.
+    """
+    archived = _scan_archived_cr_ids(archive_root)
+    used: set[int] = set(archived)
+    records: list[dict[str, Any]] = []
+    # First pass: lock in operator-supplied IDs and detect collisions
+    # against the archive. A pending-vs-pending collision (two files both
+    # declaring CR-N) also raises — the second one to register hits the
+    # same `used`-set check.
+    for name in pending_filenames:
+        m = _CR_FILENAME_PREFIX.match(name)
+        if m is None:
+            continue
+        n = int(m.group(1))
+        if n in used:
+            raise ValueError(
+                f"change-request file {name!r} declares CR-{n}, but that "
+                f"ID is already used in {archive_root} or another pending "
+                "file. Rename one of them and re-run."
+            )
+        records.append({"cr_id": n, "original_name": name})
+        used.add(n)
+    # Second pass: assign sequential IDs to unprefixed filenames.
+    # The starting point is `max(archive) + 1` when the archive holds
+    # prior CRs, else 1 — that preserves monotone history across sessions.
+    # We then skip any ID an operator pinned in this batch so sequential
+    # allocation stays dense (CR-2 pinned + a, b pending → a=1, b=3).
+    next_id = (max(archived) + 1) if archived else 1
+    for name in pending_filenames:
+        if _CR_FILENAME_PREFIX.match(name):
+            continue
+        while next_id in used:
+            next_id += 1
+        records.append({"cr_id": next_id, "original_name": name})
+        used.add(next_id)
+        next_id += 1
+    records.sort(key=lambda r: r["cr_id"])
+    return records
+
+
+async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
+    """Consume the change_requests/ folder and inject the requests as the
+    LLM's task description.
+
+    For PR-1 the node short-circuits to ``patching_node`` (see
+    ``route_after_start``). The consolidated change-request text becomes
+    the user message that drives patching, mirroring how the bare
+    ``-p`` prompt drives existing-project runs today. PR-2+ will route
+    through ``requirements_discovery_node`` and the gatekeeper instead.
+
+    Side effects on returned state:
+      - ``change_request_files``: list of ``{cr_id, original_name, abs_path}``
+        records, sorted by ``cr_id``. Source of truth for the archival
+        helper at session end.
+      - ``messages``: a new user message replacing the seed prompt (the
+        seed prompt was the bare CLI ``-p``; when in change-request
+        mode the CLI either dropped it or it was empty). The
+        replacement uses ``# === CR-7: <relative-path> ===`` headers so
+        the LLM can attribute each request by CR ID.
+    """
+    cr_dir = state.get("change_requests_dir_abs", "")
+    if not cr_dir or not os.path.isdir(cr_dir):
+        logger.error(
+            "[change_requests] ingest_change_requests_node reached without a "
+            "valid change_requests_dir_abs in state — this should be caught "
+            "earlier in cmd_run. Falling through with no changes."
+        )
+        return {}
+
+    archive_root = os.path.join(cr_dir, "applied")
+    try:
+        entries = sorted(os.listdir(cr_dir))
+    except OSError as exc:
+        logger.error("[change_requests] Could not list %s: %s", cr_dir, exc)
+        return {}
+
+    pending = [
+        e for e in entries
+        if e != "applied"
+        and e.endswith(".txt")
+        and os.path.isfile(os.path.join(cr_dir, e))
+    ]
+
+    if not pending:
+        logger.error(
+            "[change_requests] No pending .txt files under %s — cmd_run "
+            "should have rejected this earlier.", cr_dir,
+        )
+        return {}
+
+    try:
+        records = _assign_change_request_ids(pending, archive_root)
+    except ValueError as exc:
+        logger.error("[change_requests] %s", exc)
+        # Surface as a system message so the session terminates cleanly
+        # rather than crashing the graph runtime.
+        return {
+            "messages": list(state.get("messages", [])) + [
+                MessageDict(
+                    role="system",
+                    content=(
+                        f"Change-request ingestion failed: {exc}\n"
+                        "Resolve the collision and re-run."
+                    ),
+                )
+            ],
+            "exit_code": 1,
+        }
+
+    # Attach absolute paths now that IDs are assigned.
+    for rec in records:
+        rec["abs_path"] = os.path.join(cr_dir, rec["original_name"])
+
+    sections: list[str] = [
+        f"# Change requests ({len(records)} pending)",
+        "",
+        "Each request below is a self-contained ask. Each carries a CR-N "
+        "identifier so downstream artifacts (spec revisions, code, tests, "
+        "infra) can be traced back to the originating request via `grep CR-N`.",
+        "",
+    ]
+    for rec in records:
+        try:
+            with open(rec["abs_path"], "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError as exc:
+            logger.warning(
+                "[change_requests] Could not read %s: %s — skipping.",
+                rec["abs_path"], exc,
+            )
+            continue
+        sections.append(f"# === CR-{rec['cr_id']}: {rec['original_name']} ===")
+        sections.append("")
+        sections.append(content.rstrip())
+        sections.append("")
+
+    consolidated = "\n".join(sections)
+    cr_ids = ", ".join(f"CR-{r['cr_id']}" for r in records)
+    logger.info(
+        "[change_requests] Ingested %d request(s): %s. Source dir: %s",
+        len(records), cr_ids, cr_dir,
+    )
+
+    # Replace the seed user message (messages[1]) with the consolidated
+    # change requests. messages[0] stays as the anchored system prompt for
+    # prefix-cache reuse.
+    new_messages = list(state.get("messages", []))
+    if len(new_messages) >= 2 and new_messages[1].get("role") == "user":
+        new_messages[1] = MessageDict(role="user", content=consolidated)
+    else:
+        new_messages.append(MessageDict(role="user", content=consolidated))
+
+    return {
+        "messages": new_messages,
+        "change_request_files": records,
+    }
+
+
+def route_after_start(state: AgentState) -> Literal[
+    "requirements_discovery_node", "patching_node", "ingest_change_requests_node",
+]:
+    """START edge router. Module-level so tests can call it directly.
+
+    Precedence:
+      1. ``change_request_mode`` → ingest_change_requests_node (a populated
+         change_requests/ folder always overrides skip_discovery so a
+         misconfigured run still goes through the gatekeeper pipeline once
+         PR-2 lands the delta routing).
+      2. ``skip_discovery`` → patching_node (the bare existing-project path
+         from before change-request mode existed).
+      3. Default → requirements_discovery_node (greenfield discovery).
+    """
+    if state.get("change_request_mode", False):
+        logger.info(
+            "[router] change_request_mode active. "
+            "Routing START → ingest_change_requests_node."
+        )
+        return "ingest_change_requests_node"
+    if state.get("skip_discovery", False):
+        logger.info("[router] --skip-discovery active. Routing START → patching_node.")
+        return "patching_node"
+    return "requirements_discovery_node"
+
+
+# ---------------------------------------------------------------------------
 # 6c. Generator Nodes for Three-Phase HITL Gates
 # ---------------------------------------------------------------------------
 
@@ -5871,6 +6177,9 @@ def build_graph() -> Any:
     )
     graph.add_node("test_generation_node", _test_generation_node)
 
+    # Register change-request ingest entry point
+    graph.add_node("ingest_change_requests_node", ingest_change_requests_node)
+
     # Register exhaustive discovery nodes
     graph.add_node("requirements_discovery_node", requirements_discovery_node)
     graph.add_node("architecture_discovery_node", architecture_discovery_node)
@@ -5905,22 +6214,26 @@ def build_graph() -> Any:
     # =====================================================================
 
     # =====================================================================
-    # START routing: if skip_discovery, jump directly to patching_node
+    # START routing: change_request_mode wins (ingest → patching for PR-1;
+    # ingest → discovery delta-mode → gatekeeper → patching in PR-2+).
+    # Otherwise: skip_discovery → patching_node, else → discovery pipeline.
+    # `route_after_start` is module-level (see below) so tests can call it
+    # without building the full graph.
     # =====================================================================
-    def route_after_start(state: AgentState) -> Literal["requirements_discovery_node", "patching_node"]:
-        if state.get("skip_discovery", False):
-            logger.info("[router] --skip-discovery active. Routing START → patching_node.")
-            return "patching_node"
-        return "requirements_discovery_node"
-
     graph.add_conditional_edges(
         START,
         route_after_start,
         {
             "requirements_discovery_node": "requirements_discovery_node",
             "patching_node": "patching_node",
+            "ingest_change_requests_node": "ingest_change_requests_node",
         },
     )
+
+    # PR-1 short-circuit: ingest hands off directly to patching_node. PR-2
+    # will replace this edge with a route through requirements_discovery_node
+    # so change requests flow through the gatekeeper.
+    graph.add_edge("ingest_change_requests_node", "patching_node")
 
     # Requirements discovery loop
     graph.add_edge("requirements_discovery_node", "discovery_interview_loop")
@@ -6303,6 +6616,9 @@ async def run_graph(
     test_generation_config: Optional[dict[str, Any]] = None,
     speculative_config: Optional[dict[str, Any]] = None,
     compiler_config: Optional[dict[str, Any]] = None,
+    change_request_mode: bool = False,
+    change_requests_dir_abs: str = "",
+    archive_target_dir: str = "",
 ) -> AgentState:
     """
     Execute the full agent graph from start to finish.
@@ -6340,6 +6656,9 @@ async def run_graph(
         session_id=session_id,
         spec_override=spec_override,
         skip_discovery=skip_discovery,
+        change_request_mode=change_request_mode,
+        change_requests_dir_abs=change_requests_dir_abs,
+        archive_target_dir=archive_target_dir,
     )
 
     # Per-node config sections — read by lintgate_node and deployment_node
