@@ -497,12 +497,25 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # Web research tool skills (web_fetch / web_search). Default off — the
     # gateway path is unchanged when disabled. See harness/web_tools.py.
     "web_tools",
+    # Per-repo session memory. Default enabled. Planner reads prior
+    # session notes; cmd_run appends a session entry on exit. See
+    # harness/repo_memory.py.
+    "memory",
     # Model Context Protocol client pool. Default off. When enabled,
     # each declared server spawns as a subprocess (stdio transport),
     # advertises its tools, and the harness registers them as
     # `mcp__<server>__<tool>` skills the planner can invoke via
     # `<<<MCP_CALL>>>` blocks. See harness/mcp_client.py.
     "mcp",
+    # GitHub integration. Pure config-side knobs (gh_path); subcommands
+    # (`harness gh issue / pr-create / pr-comment`) work without a
+    # config block when `gh` is on PATH.
+    "github",
+    # Semantic retrieval index. Built via `harness index build` and
+    # injected into the planner context when `repo_index.enabled=true`.
+    # Default off — the planner is unchanged when disabled. See
+    # harness/repo_index.py.
+    "repo_index",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -638,6 +651,32 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "enabled", "tool_call_timeout_seconds", "command_allowlist",
         "allow_local_filesystem_servers", "result_max_bytes", "servers",
     }),
+    # Skill loader. user_skills_dir is the path the SkillRegistry walks at
+    # startup to import user-supplied *.py files (each can call
+    # harness.skills.register to add tools / pipelines / sub-agents).
+    # Defaults to ~/.harness/skills.
+    "skills": frozenset({"user_skills_dir"}),
+    # Per-repo memory. enabled toggles the whole feature. dir is the
+    # directory holding ``<repo_id>.md`` files. max_bytes is the FIFO
+    # trim cap on the file itself. inject_max_bytes caps what the
+    # planner sees (tail of file) so the system message stays small.
+    "memory": frozenset({
+        "enabled", "dir", "max_bytes", "inject_max_bytes",
+    }),
+    # GitHub integration. gh_path lets ops point at a non-PATH `gh`.
+    "github": frozenset({"gh_path"}),
+    # Semantic retrieval index. enabled gates planner injection +
+    # auto-build behaviour. backend = "tfidf" (default) | "openai_embeddings".
+    # chunk_lines / chunk_overlap shape the per-file slicing. top_k bounds
+    # the retrieval set. inject_max_bytes caps what the planner sees.
+    # index_dir is where the SQLite DB lives. exclude_globs / text_extensions
+    # tune the file walker. openai_model / openai_api_base configure the
+    # embeddings backend when selected.
+    "repo_index": frozenset({
+        "enabled", "backend", "top_k", "chunk_lines", "chunk_overlap",
+        "inject_max_bytes", "index_dir", "exclude_globs", "text_extensions",
+        "max_file_bytes", "openai_model", "openai_api_base",
+    }),
     # Change-request mode knobs. reverse_engineer_budget_usd caps the
     # one-shot LLM walk in reverse_engineer_architecture_node so a large
     # codebase doesn't blow the session budget on first contact.
@@ -733,6 +772,24 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "mcp.allow_local_filesystem_servers": (bool,),
     "mcp.result_max_bytes": (int,),
     "mcp.servers": (list,),
+    "skills.user_skills_dir": (str,),
+    "memory.enabled": (bool,),
+    "memory.dir": (str,),
+    "memory.max_bytes": (int,),
+    "memory.inject_max_bytes": (int,),
+    "github.gh_path": (str,),
+    "repo_index.enabled": (bool,),
+    "repo_index.backend": (str,),
+    "repo_index.top_k": (int,),
+    "repo_index.chunk_lines": (int,),
+    "repo_index.chunk_overlap": (int,),
+    "repo_index.inject_max_bytes": (int,),
+    "repo_index.index_dir": (str,),
+    "repo_index.exclude_globs": (list,),
+    "repo_index.text_extensions": (list,),
+    "repo_index.max_file_bytes": (int,),
+    "repo_index.openai_model": (str,),
+    "repo_index.openai_api_base": (str,),
     "metrics.burn_rate_window_minutes": (int,),
     "metrics.metrics_dir": (str,),
     "deployment.enabled": (bool,),
@@ -3185,6 +3242,38 @@ async def _drain_mcp_pools() -> None:
             logger.debug("[cli:mcp] pool shutdown error: %s", exc)
 
 
+def _append_repo_memory_safely(
+    *,
+    workspace_path: str,
+    session_id: str,
+    prompt_summary: str,
+    modified_files: list[str],
+    exit_code: int,
+    config: dict[str, Any],
+) -> None:
+    """Append a one-line session entry to the per-repo memory file.
+
+    Wrapped: any failure (config disabled, write error, import error)
+    logs and returns silently. The caller never sees an exception —
+    memory is best-effort observability, not load-bearing for the run.
+    """
+    try:
+        from harness.repo_memory import RepoMemoryConfig, append_session_note
+        mem_cfg = RepoMemoryConfig.from_config(config)
+        if not mem_cfg.enabled:
+            return
+        append_session_note(
+            workspace_path,
+            session_id=session_id,
+            prompt_summary=prompt_summary,
+            modified_files=modified_files,
+            exit_code=exit_code,
+            cfg=mem_cfg,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[cli] repo memory append skipped: %s", exc)
+
+
 async def _maybe_start_mcp_pool(config: dict[str, Any]) -> Optional[Any]:
     """Build + start an :class:`McpClientPool` from ``config.mcp`` when
     ``mcp.enabled=true``. Registers every advertised tool into the
@@ -3861,6 +3950,8 @@ async def cmd_run(args: argparse.Namespace) -> int:
             change_requests_dir_abs=cr_dir_abs if change_request_mode else "",
             archive_target_dir=archive_target_dir,
             change_requests_config=config.get("change_requests", {}),
+            repo_memory_config=config.get("memory", {}),
+            repo_index_config=config.get("repo_index", {}),
         )
     except Exception:
         logger.exception("Graph execution failed with unhandled exception.")
@@ -3962,6 +4053,19 @@ async def cmd_run(args: argparse.Namespace) -> int:
 
     await checkpointer.conn.close()
     await _drain_mcp_pools()
+
+    # Persist a one-line entry to the per-repo memory file so the next
+    # `harness run` against this workspace sees the prior outcome in
+    # the planner context. Wrapped: failures must not change the
+    # exit code.
+    _append_repo_memory_safely(
+        workspace_path=workspace_path,
+        session_id=session_id,
+        prompt_summary=getattr(args, "prompt", "") or "",
+        modified_files=modified_files,
+        exit_code=exit_code,
+        config=config,
+    )
 
     return 0 if exit_code == 0 else 1
 
@@ -4232,6 +4336,14 @@ async def cmd_resume(args: argparse.Namespace) -> int:
 
     await checkpointer.conn.close()
     await _drain_mcp_pools()
+    _append_repo_memory_safely(
+        workspace_path=workspace_path,
+        session_id=args.session_id,
+        prompt_summary=getattr(args, "prompt", "") or "",
+        modified_files=modified_files,
+        exit_code=exit_code,
+        config=config,
+    )
     return 0 if exit_code == 0 else 1
 
 
@@ -5019,6 +5131,166 @@ def _doctor_check_tree_sitter() -> tuple[str, str]:
             f"tree-sitter-language-pack."
         )
     return "pass", f"AST available for {len(healthy)} grammar(s): {healthy}"
+
+
+def _resolve_repo_index_config(workspace_path: str) -> "Any":
+    """Build a RepoIndexConfig from the workspace's config, with safe
+    defaults when the config file is missing or invalid."""
+    try:
+        config = discover_config(workspace_path)
+    except ConfigError:
+        config = {}
+    from harness.repo_index import RepoIndexConfig
+    return RepoIndexConfig.from_config(config)
+
+
+def cmd_index_build(args: argparse.Namespace) -> int:
+    """``harness index build`` — (re)build the workspace's repo index."""
+    workspace_path = (
+        os.path.abspath(args.workspace) if getattr(args, "workspace", None)
+        else os.getcwd()
+    )
+    if not os.path.isdir(workspace_path):
+        print(f"error: workspace path does not exist: {workspace_path}", file=sys.stderr)
+        return 1
+    cfg = _resolve_repo_index_config(workspace_path)
+    from harness.repo_index import build_index
+    print(f"Building repo index for {workspace_path} ...")
+    print(f"  backend: {cfg.backend}")
+    print(f"  chunk_lines={cfg.chunk_lines}, overlap={cfg.chunk_overlap}")
+    try:
+        stats = build_index(workspace_path, cfg)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"Indexed {stats.chunk_count} chunk(s) across {stats.file_count} file(s) "
+        f"(backend={stats.backend}, built_at={stats.built_at})."
+    )
+    return 0
+
+
+def cmd_index_status(args: argparse.Namespace) -> int:
+    workspace_path = (
+        os.path.abspath(args.workspace) if getattr(args, "workspace", None)
+        else os.getcwd()
+    )
+    cfg = _resolve_repo_index_config(workspace_path)
+    from harness.repo_index import get_stats
+    stats = get_stats(workspace_path, cfg)
+    if stats is None:
+        print(f"No index built yet for {workspace_path}.")
+        print("Run `harness index build` to create one.")
+        return 0
+    print(f"Workspace: {workspace_path}")
+    print(f"Workspace ID: {stats.workspace_id}")
+    print(f"Backend: {stats.backend}")
+    print(f"Chunks: {stats.chunk_count}")
+    print(f"Files: {stats.file_count}")
+    print(f"Built: {stats.built_at}")
+    return 0
+
+
+def cmd_index_clear(args: argparse.Namespace) -> int:
+    workspace_path = (
+        os.path.abspath(args.workspace) if getattr(args, "workspace", None)
+        else os.getcwd()
+    )
+    cfg = _resolve_repo_index_config(workspace_path)
+    from harness.repo_index import clear_index
+    deleted = clear_index(workspace_path, cfg)
+    print(f"Removed {deleted} indexed chunk(s) for {workspace_path}.")
+    return 0
+
+
+def cmd_gh_issue(args: argparse.Namespace) -> int:
+    """Pull a GitHub issue into ``change_requests/CR-N-<slug>.txt``.
+
+    Example::
+
+        harness gh issue --repo akmontheweb/myharness --number 42
+
+    Subsequent ``harness run`` against the workspace picks up the new
+    CR file via the existing change-request flow.
+    """
+    workspace_path = (
+        os.path.abspath(args.workspace) if getattr(args, "workspace", None)
+        else os.getcwd()
+    )
+    if not os.path.isdir(workspace_path):
+        print(f"error: workspace path does not exist: {workspace_path}", file=sys.stderr)
+        return 1
+    try:
+        config = discover_config(workspace_path)
+    except ConfigError:
+        # The ingest subcommand only needs the github section + the
+        # change-requests dir name; degrade gracefully when the full
+        # config is broken so the operator can still ingest the issue
+        # and fix the config separately.
+        config = {}
+    cr_dir_name = (config.get("change_requests_dir") or "change_requests")
+    try:
+        from harness.github_integration import ingest_issue_to_change_request
+        path = ingest_issue_to_change_request(
+            workspace_path, args.repo, args.number,
+            change_requests_dir=str(cr_dir_name),
+            config=config,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Wrote {path}")
+    print(
+        "Next: run `harness run -r {} -p \"fix CR\" --new_build=false` "
+        "to process the new change request.".format(workspace_path)
+    )
+    return 0
+
+
+def cmd_gh_pr_create(args: argparse.Namespace) -> int:
+    """Open a PR from the workspace's current branch."""
+    workspace_path = (
+        os.path.abspath(args.workspace) if getattr(args, "workspace", None)
+        else os.getcwd()
+    )
+    if not os.path.isdir(workspace_path):
+        print(f"error: workspace path does not exist: {workspace_path}", file=sys.stderr)
+        return 1
+    try:
+        config = discover_config(workspace_path)
+    except ConfigError:
+        config = {}
+    try:
+        from harness.github_integration import create_pr
+        pr = create_pr(
+            workspace_path,
+            title=args.title,
+            body=args.body or "",
+            base=args.base,
+            draft=getattr(args, "draft", False),
+            config=config,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(pr.url)
+    return 0
+
+
+def cmd_gh_pr_comment(args: argparse.Namespace) -> int:
+    """Post a comment on an existing PR."""
+    try:
+        config = discover_config(os.getcwd())
+    except ConfigError:
+        config = {}
+    try:
+        from harness.github_integration import post_pr_comment
+        post_pr_comment(args.repo, args.number, args.body, config=config)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"Comment posted on {args.repo}#{args.number}")
+    return 0
 
 
 async def _doctor_check_mcp(
@@ -5872,6 +6144,81 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
+    # --- `harness index <action>` ---
+    index_parser = subparsers.add_parser(
+        "index",
+        help="Build / inspect / clear the per-workspace semantic retrieval index (repo_index.*).",
+    )
+    index_subparsers = index_parser.add_subparsers(dest="index_action", help="Index action")
+    index_build_parser = index_subparsers.add_parser(
+        "build",
+        help="(Re)build the repo index for the given workspace.",
+    )
+    index_build_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path. Defaults to current directory.",
+    )
+    index_status_parser = index_subparsers.add_parser(
+        "status",
+        help="Show the prior index summary for the given workspace.",
+    )
+    index_status_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path. Defaults to current directory.",
+    )
+    index_clear_parser = index_subparsers.add_parser(
+        "clear",
+        help="Delete the prior index for the given workspace.",
+    )
+    index_clear_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path. Defaults to current directory.",
+    )
+
+    # --- `harness gh <action>` ---
+    gh_parser = subparsers.add_parser(
+        "gh",
+        help="GitHub integration (issue ingest, PR create, PR comment). Requires `gh` CLI on PATH.",
+    )
+    gh_subparsers = gh_parser.add_subparsers(dest="gh_action", help="GitHub action")
+
+    gh_issue_parser = gh_subparsers.add_parser(
+        "issue",
+        help="Pull a GitHub issue into change_requests/CR-N-<slug>.txt for processing.",
+    )
+    gh_issue_parser.add_argument("--repo", required=True, help="owner/repo")
+    gh_issue_parser.add_argument("--number", type=int, required=True, help="Issue number")
+    gh_issue_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path. Defaults to current directory.",
+    )
+
+    gh_pr_create_parser = gh_subparsers.add_parser(
+        "pr-create",
+        help="Open a PR from the current branch via `gh pr create`.",
+    )
+    gh_pr_create_parser.add_argument("--title", required=True, help="PR title")
+    gh_pr_create_parser.add_argument("--body", default="", help="PR body (markdown)")
+    gh_pr_create_parser.add_argument("--base", default="main", help="Base branch (default: main)")
+    gh_pr_create_parser.add_argument("--draft", action="store_true", help="Open as draft PR")
+    gh_pr_create_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path. Defaults to current directory.",
+    )
+
+    gh_pr_comment_parser = gh_subparsers.add_parser(
+        "pr-comment",
+        help="Post a comment on a PR via `gh pr comment`.",
+    )
+    gh_pr_comment_parser.add_argument("--repo", required=True, help="owner/repo")
+    gh_pr_comment_parser.add_argument("--number", type=int, required=True, help="PR number")
+    gh_pr_comment_parser.add_argument("--body", required=True, help="Comment body (markdown)")
+
     # --- `harness cache <action>` ---
     cache_parser = subparsers.add_parser(
         "cache",
@@ -5957,6 +6304,26 @@ def main() -> int:
         elif args.command == "cache":
             if getattr(args, "cache_action", None) == "clear":
                 return asyncio.run(cmd_cache_clear(args))
+            parser.parse_args([args.command, "--help"])
+            return 1
+        elif args.command == "index":
+            action = getattr(args, "index_action", None)
+            if action == "build":
+                return cmd_index_build(args)
+            if action == "status":
+                return cmd_index_status(args)
+            if action == "clear":
+                return cmd_index_clear(args)
+            parser.parse_args([args.command, "--help"])
+            return 1
+        elif args.command == "gh":
+            action = getattr(args, "gh_action", None)
+            if action == "issue":
+                return cmd_gh_issue(args)
+            if action == "pr-create":
+                return cmd_gh_pr_create(args)
+            if action == "pr-comment":
+                return cmd_gh_pr_comment(args)
             parser.parse_args([args.command, "--help"])
             return 1
         else:

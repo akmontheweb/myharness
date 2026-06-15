@@ -235,5 +235,34 @@
         "allow_local_filesystem_servers": false,
         "result_max_bytes": 200000,
         "servers": []
+    },
+
+    "_skills_comment": "Runtime-extensible skill loader. user_skills_dir is the path the SkillRegistry walks at startup; each *.py file under it is imported and may call harness.skills.register(MySkill(...)) to add a ToolSkill / PipelineSkill / SubAgentSkill that the planner can invoke. Failures (syntax error, missing import) are logged and skipped — one bad file doesn't take down startup. Default ~/.harness/skills.",
+    "skills": {
+        "user_skills_dir": "~/.harness/skills"
+    },
+
+    "_memory_comment": "Per-repository session memory. When enabled=true (default), the planner reads the prior-session log (~/.harness/memory/<repo_id>.md) at the start of every harness run and injects the most recent entries as system context, and cmd_run appends a fresh entry on exit. Repo identity = SHA-256 of `git remote get-url origin` if available, else the workspace path. max_bytes caps the file itself (FIFO trim drops oldest sections). inject_max_bytes caps what the planner sees on each run.",
+    "memory": {
+        "enabled": true,
+        "dir": "~/.harness/memory",
+        "max_bytes": 100000,
+        "inject_max_bytes": 8000
+    },
+
+    "_github_comment": "GitHub integration. Subcommands (harness gh issue / pr-create / pr-comment) shell out to the `gh` CLI; auth is whatever `gh auth status` shows. Set gh_path to point at a non-PATH `gh` binary if needed.",
+    "github": {
+        "gh_path": ""
+    },
+
+    "_repo_index_comment": "Repository semantic-retrieval index. Build with `harness index build`; when enabled, the planner queries the index for top-K chunks relevant to the user prompt and injects them as a system context block. backend = 'tfidf' (zero-dep, pure Python, default) or 'openai_embeddings' (requires OPENAI_API_KEY; falls back to tfidf on missing key). chunk_lines / chunk_overlap shape the per-file slicing; top_k bounds the retrieval set; inject_max_bytes caps the planner injection. index_dir is the SQLite store. exclude_globs and text_extensions tune the file walker.",
+    "repo_index": {
+        "enabled": false,
+        "backend": "tfidf",
+        "top_k": 5,
+        "chunk_lines": 200,
+        "chunk_overlap": 20,
+        "inject_max_bytes": 4000,
+        "index_dir": "~/.harness/repo_index"
     }
 }

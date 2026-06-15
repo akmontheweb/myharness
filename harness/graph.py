@@ -141,6 +141,16 @@ class AgentState(TypedDict, total=False):
     sandbox_config: dict[str, Any]
     lintgate_config: dict[str, Any]
     deployment_config: dict[str, Any]
+    # Per-repo memory config (#7). dict shape mirrors the ``memory``
+    # section of config.json: {enabled, dir, max_bytes, inject_max_bytes}.
+    # planning_node reads it to decide whether to inject prior-session
+    # notes. Empty dict = use defaults (enabled, ~/.harness/memory).
+    repo_memory_config: dict[str, Any]
+    # Semantic-retrieval index config (#6). dict shape mirrors the
+    # ``repo_index`` section of config.json. planning_node queries
+    # top-K chunks when ``enabled`` and injects them as a system
+    # message. Empty dict = disabled (no retrieval, no injection).
+    repo_index_config: dict[str, Any]
     # Operator-controlled toggle for the entire deployment phase (discovery
     # → DEPLOYMENT_BLUEPRINT → gatekeeper → docker-compose up). Set by the
     # `--dev-deployment` CLI flag on `harness run`; default False. When False,
@@ -1297,6 +1307,111 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
 
     try:
         from harness.gateway import NodeRole
+
+        # Inject per-repo memory (prior-session notes) into the planner
+        # context when memory is enabled and the file exists. The note
+        # goes in as a SECOND system message right after the canonical
+        # planner system prompt, so the cache_control marker on
+        # messages[0] still bites. Best-effort: any failure logs and
+        # falls back to the unmodified messages list.
+        try:
+            workspace_path = state.get("workspace_path", "")
+            if workspace_path:
+                from harness.repo_memory import RepoMemoryConfig, read_repo_memory
+                cfg = state.get("repo_memory_config") or {}
+                mem_cfg = RepoMemoryConfig(
+                    enabled=bool(cfg.get("enabled", True)),
+                    dir=str(cfg.get("dir", "~/.harness/memory")),
+                    max_bytes=int(cfg.get("max_bytes", 100_000)),
+                    inject_max_bytes=int(cfg.get("inject_max_bytes", 8_000)),
+                )
+                memory_text = read_repo_memory(workspace_path, mem_cfg)
+                if memory_text:
+                    # Find the index just after the last system message
+                    # so the prior-session notes ride alongside the
+                    # main system prompt rather than landing as a user
+                    # message.
+                    insert_at = 0
+                    for i, m in enumerate(messages):
+                        if m.get("role") == "system":
+                            insert_at = i + 1
+                        else:
+                            break
+                    messages.insert(
+                        insert_at,
+                        MessageDict(
+                            role="system",
+                            content=(
+                                "### Prior session memory for this repository\n\n"
+                                "Use this only as background context — do not "
+                                "echo it back. Each entry summarises a past "
+                                "run on the same workspace.\n\n"
+                                + memory_text
+                            ),
+                        ),
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[planning_node] memory injection skipped: %s", exc)
+
+        # Inject semantic retrieval results — top-K relevant chunks for
+        # the user's prompt. Independent of the memory injection above
+        # and gated on its own ``repo_index.enabled`` flag.
+        try:
+            workspace_path = state.get("workspace_path", "")
+            idx_cfg_dict = state.get("repo_index_config") or {}
+            idx_enabled = bool(idx_cfg_dict.get("enabled", False))
+            if workspace_path and idx_enabled:
+                from harness.repo_index import (
+                    RepoIndexConfig,
+                    async_query_top_chunks,
+                    render_results_for_injection,
+                )
+                idx_cfg = RepoIndexConfig(
+                    enabled=True,
+                    backend=str(idx_cfg_dict.get("backend", "tfidf")),
+                    top_k=int(idx_cfg_dict.get("top_k", 5)),
+                    chunk_lines=int(idx_cfg_dict.get("chunk_lines", 200)),
+                    chunk_overlap=int(idx_cfg_dict.get("chunk_overlap", 20)),
+                    inject_max_bytes=int(idx_cfg_dict.get("inject_max_bytes", 4000)),
+                    index_dir=str(idx_cfg_dict.get("index_dir", "~/.harness/repo_index")),
+                )
+                # Use the last user message as the retrieval query —
+                # that's what represents "what the operator asked for".
+                query = ""
+                for m in reversed(messages):
+                    if m.get("role") == "user":
+                        query = m.get("content", "") or ""
+                        break
+                if query:
+                    results = await async_query_top_chunks(
+                        workspace_path, query, cfg=idx_cfg,
+                    )
+                    block = render_results_for_injection(
+                        results, max_bytes=idx_cfg.inject_max_bytes,
+                    )
+                    if block:
+                        insert_at = 0
+                        for i, m in enumerate(messages):
+                            if m.get("role") == "system":
+                                insert_at = i + 1
+                            else:
+                                break
+                        messages.insert(
+                            insert_at,
+                            MessageDict(
+                                role="system",
+                                content=(
+                                    "### Repository context (semantic retrieval)\n\n"
+                                    "These are the top-scoring code chunks for the "
+                                    "current request. Use them to ground your plan "
+                                    "in the existing codebase. Lower scores = less "
+                                    "relevant; ignore if not useful.\n\n"
+                                    + block
+                                ),
+                            ),
+                        )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[planning_node] repo_index injection skipped: %s", exc)
 
         budget = state.get("budget_remaining_usd", 2.00)
         response, new_budget = await gateway.dispatch(
@@ -7280,6 +7395,8 @@ async def run_graph(
     archive_target_dir: str = "",
     change_requests_config: Optional[dict[str, Any]] = None,
     dev_deployment: bool = False,
+    repo_memory_config: Optional[dict[str, Any]] = None,
+    repo_index_config: Optional[dict[str, Any]] = None,
 ) -> AgentState:
     """
     Execute the full agent graph from start to finish.
@@ -7339,6 +7456,10 @@ async def run_graph(
         initial_state["speculative_config"] = speculative_config
     if change_requests_config is not None:
         initial_state["change_requests_config"] = change_requests_config
+    if repo_memory_config is not None:
+        initial_state["repo_memory_config"] = repo_memory_config
+    if repo_index_config is not None:
+        initial_state["repo_index_config"] = repo_index_config
     # Plumb the smoke-check flag into state so compiler_node can read it
     # without reaching out to config (which the graph module doesn't
     # touch directly today).

@@ -759,5 +759,100 @@ def register_builtin_skills(config: Optional[dict[str, Any]] = None) -> int:
     except Exception as exc:  # noqa: BLE001 — additive skill registration must never block startup
         logger.warning("[skills] web tools registration skipped: %s", exc)
 
+    # Opt-in: user skills directory. Operators drop `*.py` files under
+    # ``~/.harness/skills`` (or the directory named by ``skills.user_skills_dir``);
+    # each module is imported at startup and can call ``harness.skills.register``
+    # to add its own ToolSkill / PipelineSkill / SubAgentSkill. The contract
+    # is "import side-effect registration" — same pattern Claude Code uses,
+    # same pattern the built-ins above use. Bad files (syntax errors,
+    # missing deps) log and are skipped so one bad file doesn't take down
+    # the harness.
+    try:
+        user_count = load_user_skills_directory(config)
+        count += user_count
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[skills] user skills directory load skipped: %s", exc)
+
     logger.info("[skills] Registered %d total built-in skill(s).", count)
+    return count
+
+
+# ---------------------------------------------------------------------------
+# 11. User Skills Directory Loader  (#5 — runtime-extensible skills)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_USER_SKILLS_DIR = "~/.harness/skills"
+
+
+def _resolve_user_skills_dir(config: Optional[dict[str, Any]]) -> str:
+    """Resolve the user-skills directory from config or default."""
+    section = ((config or {}).get("skills") or {})
+    raw = section.get("user_skills_dir") or _DEFAULT_USER_SKILLS_DIR
+    return _os.path.expanduser(str(raw))
+
+
+def load_user_skills_directory(config: Optional[dict[str, Any]] = None) -> int:
+    """Import every ``*.py`` file under the user skills directory.
+
+    Each file's module-level body runs at import time and may call
+    :func:`register` to add new skills to the global registry. The loader:
+      - silently no-ops if the directory does not exist (default install
+        has no user skills);
+      - imports files in deterministic sorted order;
+      - skips files whose name starts with ``_`` (private helpers);
+      - wraps each import in try/except so one bad file does not abort
+        the rest of the load — failures log a clear warning naming the
+        offending path and exception.
+
+    Returns the number of files successfully imported (not the number of
+    skills they registered — a single file can register many).
+    """
+    target_dir = _resolve_user_skills_dir(config)
+    if not _os.path.isdir(target_dir):
+        logger.debug("[skills] user skills dir %s does not exist; skipping.", target_dir)
+        return 0
+
+    import importlib.util
+    import sys
+
+    count = 0
+    try:
+        entries = sorted(_os.listdir(target_dir))
+    except OSError as exc:
+        logger.warning("[skills] cannot list %s: %s", target_dir, exc)
+        return 0
+
+    for filename in entries:
+        if not filename.endswith(".py"):
+            continue
+        if filename.startswith("_"):
+            continue
+        path = _os.path.join(target_dir, filename)
+        if not _os.path.isfile(path):
+            continue
+        module_name = f"harness_user_skill_{filename[:-3]}"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            if spec is None or spec.loader is None:
+                logger.warning("[skills] could not build import spec for %s", path)
+                continue
+            module = importlib.util.module_from_spec(spec)
+            # Insert into sys.modules BEFORE exec so the module can refer
+            # to itself by name (rare but allowed) and so any sub-imports
+            # see a partially-initialised parent — matches importlib's
+            # documented contract.
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            count += 1
+            logger.info("[skills] loaded user skill module %s from %s",
+                         module_name, path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[skills] user skill file %s failed to load: %s",
+                path, exc,
+            )
+            sys.modules.pop(module_name, None)
+    if count:
+        logger.info("[skills] loaded %d user skill module(s) from %s.",
+                     count, target_dir)
     return count

@@ -13,6 +13,43 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ## [Unreleased]
 
 ### Added
+- **Tier 1 capability** — Runtime-extensible skills directory.
+  ``register_builtin_skills()`` now walks ``~/.harness/skills`` (or the
+  path named by ``skills.user_skills_dir``) and imports every ``*.py``
+  file at startup. Each loaded module can call
+  ``harness.skills.register(MySkill(...))`` to add a ``ToolSkill``,
+  ``PipelineSkill``, or ``SubAgentSkill`` without forking the repo —
+  same import-side-effect contract Claude Code uses. Bad files log +
+  skip without taking down startup.
+- **Tier 1 capability** — Persistent per-repo session memory
+  (``harness/repo_memory.py``). Planner reads
+  ``~/.harness/memory/<repo_id>.md`` at the start of every ``harness run``
+  and injects the recent entries as an extra system message;
+  ``cmd_run`` / ``cmd_resume`` append a fresh session entry (prompt
+  summary, modified files, exit status) at the end. Repo identity =
+  SHA-256 of ``git remote get-url origin`` (or the workspace path when
+  there's no remote), so cross-machine continuity works for cloned
+  repos. FIFO trim caps the file at ``memory.max_bytes``. Default
+  enabled.
+- **Tier 1 capability** — GitHub integration
+  (``harness/github_integration.py``). New ``harness gh issue --repo X
+  --number Y`` pulls an issue body and writes it into the workspace's
+  ``change_requests/CR-N-<slug>.txt`` so the existing change-request
+  flow (PR-1 → PR-3) handles the rest. ``harness gh pr-create`` opens
+  a PR from the current branch; ``harness gh pr-comment`` posts a
+  comment. Shells out to the ``gh`` CLI (no new Python dep). Optional
+  ``github.gh_path`` for non-PATH installs.
+- **Tier 1 capability** — Repository semantic retrieval index
+  (``harness/repo_index.py``). New ``harness index build`` /
+  ``status`` / ``clear`` CLI subcommands. Two backends: a zero-dep
+  ``TfidfBackend`` (default, deterministic, pure-Python TF-IDF with
+  identifier-aware tokenisation) and an opt-in
+  ``OpenAIEmbeddingsBackend`` (``text-embedding-3-small`` via existing
+  httpx + ``OPENAI_API_KEY``). SQLite store under
+  ``~/.harness/repo_index/``. When ``repo_index.enabled=true``, the
+  planner queries top-K chunks for the user prompt and injects them as
+  a system context block — complements the AST-based ``impact.py`` with
+  semantic retrieval. Default off.
 - **Tier 1 parity** — Anthropic prompt caching: `AnthropicProvider` now
   emits `cache_control: {"type": "ephemeral"}` on the system block and
   on the first user message when it exceeds 4 KB. Gated by
