@@ -13,6 +13,30 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ## [Unreleased]
 
 ### Added
+- **Tier 1 capability** — Interactive refinement REPL (`harness chat`).
+  New `harness/chat.py` ships a stdin-driven REPL that reuses the
+  Gateway, redactor, web/MCP tool-loop, repo-memory injection, and
+  repo-index injection (when enabled). Slash commands: `/help`,
+  `/exit`, `/clear`, `/files`, `/apply` (per-session HITL confirmation
+  before applying SEARCH/REPLACE blocks from the last assistant
+  reply), `/build` (runs the workspace's build command in the
+  sandbox), `/save`, `/budget`, `/memory`. In-memory only — `--resume`
+  is a clean follow-up. Tests inject scripted reader/writer functions
+  so the REPL is unit-testable without real stdin.
+- **Tier 1 capability** — Graph-level multi-agent fan-out
+  infrastructure (`harness/fanout.py`). `AgentSpec` / `AgentResult`
+  dataclasses, `run_parallel_agents()` with bounded asyncio semaphore
+  concurrency (default 8) and shared-budget reservation/refund
+  accounting, `run_with_verification()` adversarial pattern (one
+  finder + N skeptics; majority vote decides). New
+  `SubAgentFanoutSkill` registered in `register_builtin_skills()`
+  exposes the runner to the planner as a text-DSL tool —
+  `<<<FANOUT_QUERY prompts='[...]'>>>` lets the planner dispatch N
+  parallel sub-queries with one block. Lifts fan-out from
+  speculative.py / SubAgentSkill (single-purpose) into a reusable
+  primitive that future graph integrations (parallel discovery per
+  sector, parallel test gen per module, parallel security-fix
+  attempts per finding) can build on.
 - **Tier 1 capability** — Runtime-extensible skills directory.
   ``register_builtin_skills()`` now walks ``~/.harness/skills`` (or the
   path named by ``skills.user_skills_dir``) and imports every ``*.py``

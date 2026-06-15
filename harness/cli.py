@@ -5133,6 +5133,65 @@ def _doctor_check_tree_sitter() -> tuple[str, str]:
     return "pass", f"AST available for {len(healthy)} grammar(s): {healthy}"
 
 
+async def cmd_chat(args: argparse.Namespace) -> int:
+    """``harness chat`` — interactive refinement REPL (#8).
+
+    Builds the same gateway / redactor / skill registry that ``cmd_run``
+    uses, then hands control to :func:`harness.chat.run_chat`. The
+    workspace lock is acquired so a concurrent ``harness run`` against
+    the same workspace can't corrupt patches.
+    """
+    workspace_path = (
+        os.path.abspath(args.workspace) if getattr(args, "workspace", None)
+        else os.getcwd()
+    )
+    if not os.path.isdir(workspace_path):
+        print(f"error: workspace path does not exist: {workspace_path}", file=sys.stderr)
+        return 1
+    try:
+        config = discover_config(workspace_path)
+    except ConfigError as exc:
+        print(f"[harness] {exc}", file=sys.stderr)
+        return 2
+
+    lock_handle = _acquire_workspace_lock(workspace_path, force=False)
+    if lock_handle is False:
+        return 1
+
+    # Gateway + skill registry + (optional) MCP pool — same wiring as cmd_run.
+    from harness.gateway import create_gateway_from_config
+    from harness.graph import set_gateway
+    gateway = create_gateway_from_config(config)
+    set_gateway(gateway)
+    try:
+        from harness.skills import register_builtin_skills
+        register_builtin_skills(config=config)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[cli:chat] skill registration skipped: %s", exc)
+    try:
+        from harness.redactor import create_redactor_from_config
+        create_redactor_from_config(config)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[cli:chat] redactor init skipped: %s", exc)
+    pool = await _maybe_start_mcp_pool(config)  # noqa: F841
+
+    budget = (
+        float(args.budget) if getattr(args, "budget", None) is not None
+        else float((config.get("token_budget") or {}).get("hard_cap_usd", 2.00))
+    )
+    try:
+        from harness.chat import run_chat
+        return await run_chat(
+            workspace_path=workspace_path,
+            gateway=gateway,
+            config=config,
+            initial_budget_usd=budget,
+        )
+    finally:
+        await gateway.close()
+        await _drain_mcp_pools()
+
+
 def _resolve_repo_index_config(workspace_path: str) -> "Any":
     """Build a RepoIndexConfig from the workspace's config, with safe
     defaults when the config file is missing or invalid."""
@@ -6144,6 +6203,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
+    # --- `harness chat` (#8) ---
+    chat_parser = subparsers.add_parser(
+        "chat",
+        help="Interactive refinement REPL — reuses the gateway, tools, and memory; no auto-apply.",
+    )
+    chat_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path. Defaults to current directory.",
+    )
+    chat_parser.add_argument(
+        "--budget",
+        type=float,
+        default=None,
+        help="Optional per-session budget cap in USD. Falls back to token_budget.hard_cap_usd.",
+    )
+
     # --- `harness index <action>` ---
     index_parser = subparsers.add_parser(
         "index",
@@ -6306,6 +6382,8 @@ def main() -> int:
                 return asyncio.run(cmd_cache_clear(args))
             parser.parse_args([args.command, "--help"])
             return 1
+        elif args.command == "chat":
+            return asyncio.run(cmd_chat(args))
         elif args.command == "index":
             action = getattr(args, "index_action", None)
             if action == "build":

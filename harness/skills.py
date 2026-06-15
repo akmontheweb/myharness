@@ -759,6 +759,16 @@ def register_builtin_skills(config: Optional[dict[str, Any]] = None) -> int:
     except Exception as exc:  # noqa: BLE001 — additive skill registration must never block startup
         logger.warning("[skills] web tools registration skipped: %s", exc)
 
+    # Always-on: the multi-agent fan-out tool (#11). Exposed via the
+    # text-DSL pattern as ``<<<FANOUT_QUERY prompts='[...]'>>>`` —
+    # consistent with web/MCP tool wiring. Failures registering this
+    # are non-fatal; the planner just won't have the tool available.
+    try:
+        from harness.fanout import register_fanout_skill
+        count += register_fanout_skill()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[skills] fanout skill registration skipped: %s", exc)
+
     # Opt-in: user skills directory. Operators drop `*.py` files under
     # ``~/.harness/skills`` (or the directory named by ``skills.user_skills_dir``);
     # each module is imported at startup and can call ``harness.skills.register``
