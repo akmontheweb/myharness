@@ -516,6 +516,9 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # Default off — the planner is unchanged when disabled. See
     # harness/repo_index.py.
     "repo_index",
+    # Cron-driven scheduled job daemon. Started with `harness schedule
+    # run`. Default off. See harness/schedule.py.
+    "schedule",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -669,6 +672,15 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "memory": frozenset({
         "enabled", "dir", "max_bytes", "inject_max_bytes",
     }),
+    # Scheduled-job daemon. enabled toggles the entire feature; jobs is
+    # the list of {name, schedule, workspace, prompt, on_success,
+    # on_failure, enabled, harness_args}. history_db / log_dir /
+    # tick_seconds / harness_binary configure where state lands and
+    # how often the daemon polls. See harness/schedule.py.
+    "schedule": frozenset({
+        "enabled", "jobs", "history_db", "log_dir",
+        "tick_seconds", "harness_binary",
+    }),
     # GitHub integration. gh_path lets ops point at a non-PATH `gh`.
     "github": frozenset({"gh_path"}),
     # Semantic retrieval index. enabled gates planner injection +
@@ -794,6 +806,12 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "memory.dir": (str,),
     "memory.max_bytes": (int,),
     "memory.inject_max_bytes": (int,),
+    "schedule.enabled": (bool,),
+    "schedule.jobs": (list,),
+    "schedule.history_db": (str,),
+    "schedule.log_dir": (str,),
+    "schedule.tick_seconds": (int,),
+    "schedule.harness_binary": (str,),
     "github.gh_path": (str,),
     "repo_index.enabled": (bool,),
     "repo_index.backend": (str,),
@@ -5150,6 +5168,160 @@ def _doctor_check_tree_sitter() -> tuple[str, str]:
     return "pass", f"AST available for {len(healthy)} grammar(s): {healthy}"
 
 
+def _resolve_schedule_config(args: argparse.Namespace) -> "Any":
+    """Load the schedule section from the canonical config. Returns a
+    ScheduleConfig; raises ConfigError to the outer handler when the
+    config itself doesn't load (subcommand exits with code 2)."""
+    workspace_path = (
+        os.path.abspath(args.workspace) if getattr(args, "workspace", None)
+        else os.getcwd()
+    )
+    try:
+        config = discover_config(workspace_path)
+    except ConfigError:
+        config = {}
+    from harness.schedule import ScheduleConfig
+    return ScheduleConfig.from_config(config)
+
+
+async def cmd_schedule_run(args: argparse.Namespace) -> int:
+    cfg = _resolve_schedule_config(args)
+    if not cfg.enabled:
+        print(
+            "error: schedule.enabled is false. Flip it on in config.json "
+            "before starting the daemon.",
+            file=sys.stderr,
+        )
+        return 1
+    if not cfg.jobs:
+        print("error: schedule.jobs is empty — nothing to run.", file=sys.stderr)
+        return 1
+    from harness.schedule import ScheduleDaemon
+    daemon = ScheduleDaemon(cfg)
+    print(f"harness schedule — {len(cfg.jobs)} job(s), tick={cfg.tick_seconds}s. Ctrl-C to stop.")
+    return await daemon.run_forever()
+
+
+def cmd_schedule_list(args: argparse.Namespace) -> int:
+    cfg = _resolve_schedule_config(args)
+    from harness.schedule import (
+        build_run_command, last_run_for_job, next_run,
+    )
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc)
+    if not cfg.jobs:
+        print("No jobs configured. Add entries under schedule.jobs in config.json.")
+        return 0
+    print(f"{'NAME':<24} {'ENABLED':<8} {'SCHEDULE':<24} {'NEXT (UTC)':<20} {'LAST EXIT':<10}")
+    for job in cfg.jobs:
+        last = last_run_for_job(cfg, job.name)
+        last_started = None
+        last_exit = "-"
+        if last:
+            if last.get("exit_code") is not None:
+                last_exit = str(last["exit_code"])
+            try:
+                last_started = _dt.fromisoformat(last["started_at"])
+                if last_started.tzinfo is None:
+                    last_started = last_started.replace(tzinfo=_tz.utc)
+            except (TypeError, ValueError):
+                pass
+        nxt = next_run(job.schedule, after=now, last_started=last_started)
+        print(
+            f"{job.name[:24]:<24} {('yes' if job.enabled else 'no'):<8} "
+            f"{job.schedule.raw[:24]:<24} "
+            f"{nxt.strftime('%Y-%m-%d %H:%M'):<20} {last_exit:<10}"
+        )
+        print(f"  cmd: {' '.join(build_run_command(cfg, job))}")
+    return 0
+
+
+def cmd_schedule_validate(args: argparse.Namespace) -> int:
+    """Parse the section, print problems, exit non-zero on any."""
+    workspace_path = (
+        os.path.abspath(args.workspace) if getattr(args, "workspace", None)
+        else os.getcwd()
+    )
+    try:
+        config = discover_config(workspace_path)
+    except ConfigError as exc:
+        print(f"[harness] {exc}", file=sys.stderr)
+        return 2
+    raw_jobs = ((config.get("schedule") or {}).get("jobs") or [])
+    problems = 0
+    from harness.schedule import parse_schedule
+    for i, raw in enumerate(raw_jobs):
+        if not isinstance(raw, dict):
+            print(f"  jobs[{i}]: not an object — skipped.")
+            problems += 1
+            continue
+        name = raw.get("name") or f"(unnamed @ index {i})"
+        if not raw.get("workspace"):
+            print(f"  {name}: missing 'workspace'.")
+            problems += 1
+        if not raw.get("schedule"):
+            print(f"  {name}: missing 'schedule'.")
+            problems += 1
+            continue
+        try:
+            parse_schedule(str(raw.get("schedule")))
+            print(f"  {name}: OK — schedule {raw.get('schedule')!r}")
+        except ValueError as exc:
+            print(f"  {name}: {exc}")
+            problems += 1
+    if problems:
+        print(f"\n{problems} problem(s) found.")
+        return 1
+    print(f"\nAll {len(raw_jobs)} job(s) validate cleanly.")
+    return 0
+
+
+async def cmd_schedule_once(args: argparse.Namespace) -> int:
+    cfg = _resolve_schedule_config(args)
+    job = next((j for j in cfg.jobs if j.name == args.name), None)
+    if job is None:
+        print(
+            f"error: no job named {args.name!r}. Known jobs: "
+            f"{[j.name for j in cfg.jobs]}",
+            file=sys.stderr,
+        )
+        return 1
+    from harness.schedule import execute_job_once
+    result = await execute_job_once(cfg, job)
+    print(
+        f"{result['job_name']}: exit={result['exit_code']} "
+        f"duration={result['duration_sec']:.1f}s log={result['log_path']}"
+    )
+    return 0 if result["exit_code"] == 0 else 1
+
+
+def cmd_schedule_history(args: argparse.Namespace) -> int:
+    cfg = _resolve_schedule_config(args)
+    from harness.schedule import history_for_job
+    job_names = [args.job] if args.job else [j.name for j in cfg.jobs]
+    if not job_names:
+        print("No jobs configured.")
+        return 0
+    for name in job_names:
+        rows = history_for_job(cfg, name, limit=args.limit)
+        if not rows:
+            print(f"{name}: no recorded runs.")
+            continue
+        print(f"\n{name}:")
+        print(f"  {'STARTED (UTC)':<20} {'EXIT':<5} {'DUR (s)':<8} LOG")
+        for r in rows:
+            started = r['started_at'] or '-'
+            ec = r['exit_code']
+            dur = r['duration_sec']
+            print(
+                f"  {started[:19]:<20} "
+                f"{(str(ec) if ec is not None else '?'):<5} "
+                f"{(f'{dur:.1f}' if dur is not None else '?'):<8} "
+                f"{r['log_path'] or '-'}"
+            )
+    return 0
+
+
 async def cmd_chat(args: argparse.Namespace) -> int:
     """``harness chat`` — interactive refinement REPL (#8).
 
@@ -6220,6 +6392,64 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
+    # --- `harness schedule` (#13) ---
+    schedule_parser = subparsers.add_parser(
+        "schedule",
+        help="Cron-driven background daemon — runs configured jobs on a recurring schedule.",
+    )
+    schedule_subparsers = schedule_parser.add_subparsers(
+        dest="schedule_action", help="Schedule action",
+    )
+    schedule_run_parser = schedule_subparsers.add_parser(
+        "run", help="Start the daemon (foreground).",
+    )
+    schedule_run_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path (for config discovery). Defaults to current directory.",
+    )
+    schedule_list_parser = schedule_subparsers.add_parser(
+        "list", help="Print configured jobs with their schedules + next/last run times.",
+    )
+    schedule_list_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path (for config discovery). Defaults to current directory.",
+    )
+    schedule_validate_parser = schedule_subparsers.add_parser(
+        "validate", help="Parse the schedule section and report any issues.",
+    )
+    schedule_validate_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path (for config discovery). Defaults to current directory.",
+    )
+    schedule_once_parser = schedule_subparsers.add_parser(
+        "once", help="Run a single named job immediately, regardless of its schedule.",
+    )
+    schedule_once_parser.add_argument("name", help="Job name (from schedule.jobs[].name)")
+    schedule_once_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path (for config discovery). Defaults to current directory.",
+    )
+    schedule_history_parser = schedule_subparsers.add_parser(
+        "history", help="Show recent job execution history (read from the SQLite store).",
+    )
+    schedule_history_parser.add_argument(
+        "--job", default=None,
+        help="Restrict to a single job name.",
+    )
+    schedule_history_parser.add_argument(
+        "--limit", type=int, default=20,
+        help="Max rows to show per job (default 20).",
+    )
+    schedule_history_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path (for config discovery). Defaults to current directory.",
+    )
+
     # --- `harness chat` (#8) ---
     chat_parser = subparsers.add_parser(
         "chat",
@@ -6401,6 +6631,20 @@ def main() -> int:
             return 1
         elif args.command == "chat":
             return asyncio.run(cmd_chat(args))
+        elif args.command == "schedule":
+            action = getattr(args, "schedule_action", None)
+            if action == "run":
+                return asyncio.run(cmd_schedule_run(args))
+            if action == "list":
+                return cmd_schedule_list(args)
+            if action == "validate":
+                return cmd_schedule_validate(args)
+            if action == "once":
+                return asyncio.run(cmd_schedule_once(args))
+            if action == "history":
+                return cmd_schedule_history(args)
+            parser.parse_args([args.command, "--help"])
+            return 1
         elif args.command == "index":
             action = getattr(args, "index_action", None)
             if action == "build":

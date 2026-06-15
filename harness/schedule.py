@@ -1,0 +1,636 @@
+"""``harness schedule`` — cron-driven background daemon (#13).
+
+Why this exists
+===============
+``harness run`` is a workstation tool — operator runs it, watches it,
+walks away when it's done. Many of the highest-value harness workloads
+are recurring: "every night, ingest open Renovate PRs and regenerate
+failing tests", "every Monday, run the security review on main".
+Standing those up today means wrapping ``harness run`` in cron or
+systemd timers and reinventing per-job state, retry, and notification
+for each. The schedule daemon turns that into a config-driven
+primitive.
+
+Scope of v1
+===========
+- **Hand-rolled cron syntax subset.** ``every 15m`` / ``every 6h`` /
+  ``every 3d`` / ``hourly :MM`` / ``daily HH:MM`` / ``weekly mon HH:MM``.
+  Covers >90% of real scheduled-job use cases without depending on
+  ``croniter``. Full POSIX cron is a follow-up if the demand
+  materialises (clean upgrade path: drop in an opt-in backend the
+  same way ``repo_index.backend`` flips ``tfidf`` → ``openai_embeddings``).
+- **Generic shell hooks** for ``on_success`` and ``on_failure``. The
+  operator wires Slack / Discord / PagerDuty / email via curl in one
+  config line. No built-in notifiers in v1 — keeps the daemon small
+  and the security review trivial.
+- **Subprocess job execution.** Each job runs as ``harness run`` in
+  its own subprocess so a crash never takes the daemon down. Stdout
+  / stderr are streamed to per-job log files under
+  ``~/.harness/schedule_logs/<job>/<iso8601>.log``.
+- **SQLite-backed history** so ``harness schedule list`` /
+  ``harness schedule history`` survive restarts.
+
+Not in scope
+============
+- Filesystem-watch mode (``harness watch``) — separate slice if anyone
+  asks for it.
+- Built-in Slack/Discord notifiers — follow-up.
+- Distributed scheduling across hosts — out of scope; operators run
+  the daemon under their orchestrator of choice.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import shlex
+import sqlite3
+import subprocess
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_DEFAULT_HISTORY_DB = "~/.harness/schedule.db"
+_DEFAULT_LOG_DIR = "~/.harness/schedule_logs"
+_DEFAULT_TICK_SECONDS = 60
+
+
+# ---------------------------------------------------------------------------
+# 1. Schedule expression — hand-rolled cron subset
+# ---------------------------------------------------------------------------
+
+SCHEDULE_KIND_INTERVAL = "interval"
+SCHEDULE_KIND_HOURLY = "hourly"
+SCHEDULE_KIND_DAILY = "daily"
+SCHEDULE_KIND_WEEKLY = "weekly"
+
+_INTERVAL_RE = re.compile(r"^every\s+(\d+)\s*([mhd])\s*$", re.IGNORECASE)
+_HOURLY_RE = re.compile(r"^hourly\s*:\s*(\d{1,2})\s*$", re.IGNORECASE)
+_DAILY_RE = re.compile(r"^daily\s+(\d{1,2})\s*:\s*(\d{2})\s*$", re.IGNORECASE)
+_WEEKLY_RE = re.compile(
+    r"^weekly\s+(mon|tue|wed|thu|fri|sat|sun)\s+(\d{1,2})\s*:\s*(\d{2})\s*$",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """Parsed schedule expression. Use :func:`parse_schedule` to build
+    one and :func:`next_run` to compute when it next fires."""
+
+    raw: str
+    kind: str
+    minutes: int = 0    # for interval schedules: total minutes between runs
+    hour: int = 0       # for hourly/daily/weekly: target HH (0-23)
+    minute: int = 0     # for hourly/daily/weekly: target MM (0-59)
+    weekday: int = -1   # for weekly: 0=Mon ... 6=Sun
+
+
+def parse_schedule(raw: str) -> Schedule:
+    """Parse a schedule string.
+
+    Accepted forms (case-insensitive)::
+
+        every 15m            # every 15 minutes
+        every 6h             # every 6 hours
+        every 3d             # every 3 days
+        hourly :30           # at 30 minutes past every hour
+        daily 02:30          # every day at 02:30 UTC
+        weekly mon 03:00     # every Monday at 03:00 UTC
+
+    Raises ``ValueError`` with a guidance-shaped error message when the
+    input doesn't match any form. The error always names the supported
+    forms so the operator never has to guess.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("schedule must be a non-empty string")
+    expr = raw.strip()
+
+    m = _INTERVAL_RE.match(expr)
+    if m:
+        amount, unit = int(m.group(1)), m.group(2).lower()
+        if amount < 1:
+            raise ValueError(f"schedule {raw!r}: interval must be >= 1")
+        minutes = {"m": amount, "h": amount * 60, "d": amount * 60 * 24}[unit]
+        return Schedule(raw=expr, kind=SCHEDULE_KIND_INTERVAL, minutes=minutes)
+
+    m = _HOURLY_RE.match(expr)
+    if m:
+        minute = int(m.group(1))
+        if not 0 <= minute <= 59:
+            raise ValueError(f"schedule {raw!r}: minute must be 0-59")
+        return Schedule(raw=expr, kind=SCHEDULE_KIND_HOURLY, minute=minute)
+
+    m = _DAILY_RE.match(expr)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(f"schedule {raw!r}: HH:MM must be 00:00-23:59")
+        return Schedule(raw=expr, kind=SCHEDULE_KIND_DAILY, hour=hour, minute=minute)
+
+    m = _WEEKLY_RE.match(expr)
+    if m:
+        wd_name = m.group(1).lower()
+        hour, minute = int(m.group(2)), int(m.group(3))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError(f"schedule {raw!r}: HH:MM must be 00:00-23:59")
+        weekday = _WEEKDAYS.index(wd_name)
+        return Schedule(
+            raw=expr, kind=SCHEDULE_KIND_WEEKLY,
+            hour=hour, minute=minute, weekday=weekday,
+        )
+
+    raise ValueError(
+        f"schedule {raw!r} is not recognised. Accepted forms: "
+        "'every Nm' / 'every Nh' / 'every Nd' / 'hourly :MM' / "
+        "'daily HH:MM' / 'weekly DAY HH:MM' (DAY ∈ mon,tue,wed,"
+        "thu,fri,sat,sun). All times are UTC."
+    )
+
+
+def next_run(
+    schedule: Schedule,
+    *,
+    after: datetime,
+    last_started: Optional[datetime] = None,
+) -> datetime:
+    """Compute the next firing time strictly after ``after``.
+
+    For interval schedules, ``last_started`` is the timestamp the job
+    last fired at — the next run is ``last_started + interval`` (clamped
+    to be after ``after`` so a long-stopped daemon catches up instead
+    of firing thousands of missed runs in a row). For absolute
+    schedules (hourly/daily/weekly), ``last_started`` is ignored — we
+    just find the next clock instant that matches.
+
+    All datetimes are expected to be tz-aware UTC; the function asserts
+    this rather than silently converting from naive local time, because
+    "the daemon fired at the wrong time because we forgot the timezone"
+    is a confusing failure mode.
+    """
+    if after.tzinfo is None:
+        raise ValueError("next_run requires tz-aware datetimes (use UTC)")
+
+    if schedule.kind == SCHEDULE_KIND_INTERVAL:
+        delta = timedelta(minutes=schedule.minutes)
+        if last_started is None:
+            return after + delta
+        candidate = last_started + delta
+        while candidate <= after:
+            candidate = candidate + delta
+        return candidate
+
+    if schedule.kind == SCHEDULE_KIND_HOURLY:
+        candidate = after.replace(
+            minute=schedule.minute, second=0, microsecond=0,
+        )
+        if candidate <= after:
+            candidate = candidate + timedelta(hours=1)
+        return candidate
+
+    if schedule.kind == SCHEDULE_KIND_DAILY:
+        candidate = after.replace(
+            hour=schedule.hour, minute=schedule.minute,
+            second=0, microsecond=0,
+        )
+        if candidate <= after:
+            candidate = candidate + timedelta(days=1)
+        return candidate
+
+    if schedule.kind == SCHEDULE_KIND_WEEKLY:
+        candidate = after.replace(
+            hour=schedule.hour, minute=schedule.minute,
+            second=0, microsecond=0,
+        )
+        days_ahead = (schedule.weekday - candidate.weekday()) % 7
+        candidate = candidate + timedelta(days=days_ahead)
+        if candidate <= after:
+            candidate = candidate + timedelta(days=7)
+        return candidate
+
+    raise ValueError(f"unknown schedule kind: {schedule.kind!r}")
+
+
+# ---------------------------------------------------------------------------
+# 2. Job + config dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Job:
+    """One scheduled job. The daemon spawns ``harness run`` in a
+    subprocess per fire and shells the hooks afterwards.
+
+    ``on_success`` / ``on_failure`` are arbitrary shell commands. Two
+    environment variables are exported to the hook:
+
+        HARNESS_JOB_NAME          — the job's ``name``.
+        HARNESS_JOB_EXIT_CODE     — the exit code of ``harness run``.
+        HARNESS_JOB_DURATION_SEC  — wall-clock seconds.
+        HARNESS_JOB_LOG_PATH      — path to the run's captured log file.
+    """
+
+    name: str
+    schedule: Schedule
+    workspace: str
+    prompt: str = ""
+    on_success: str = ""
+    on_failure: str = ""
+    enabled: bool = True
+    harness_args: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ScheduleConfig:
+    enabled: bool = False
+    jobs: list[Job] = field(default_factory=list)
+    history_db: str = _DEFAULT_HISTORY_DB
+    log_dir: str = _DEFAULT_LOG_DIR
+    tick_seconds: int = _DEFAULT_TICK_SECONDS
+    harness_binary: str = "harness"  # operators using a venv set "/path/to/venv/bin/harness"
+
+    @classmethod
+    def from_config(cls, config: Optional[dict[str, Any]]) -> "ScheduleConfig":
+        section = ((config or {}).get("schedule") or {})
+        jobs: list[Job] = []
+        for raw in (section.get("jobs") or []):
+            if not isinstance(raw, dict):
+                logger.warning("[schedule] dropping malformed job entry: %r", raw)
+                continue
+            try:
+                job = cls._build_job(raw)
+            except ValueError as exc:
+                logger.warning(
+                    "[schedule] dropping job %r: %s",
+                    raw.get("name") or "(unnamed)", exc,
+                )
+                continue
+            jobs.append(job)
+        tick_seconds = max(1, min(3600, int(section.get("tick_seconds", _DEFAULT_TICK_SECONDS))))
+        return cls(
+            enabled=bool(section.get("enabled", False)),
+            jobs=jobs,
+            history_db=str(section.get("history_db", _DEFAULT_HISTORY_DB)),
+            log_dir=str(section.get("log_dir", _DEFAULT_LOG_DIR)),
+            tick_seconds=tick_seconds,
+            harness_binary=str(section.get("harness_binary", "harness")),
+        )
+
+    @staticmethod
+    def _build_job(raw: dict[str, Any]) -> Job:
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            raise ValueError("job is missing 'name'")
+        sched_raw = str(raw.get("schedule") or "")
+        if not sched_raw:
+            raise ValueError("job is missing 'schedule'")
+        workspace = str(raw.get("workspace") or "").strip()
+        if not workspace:
+            raise ValueError("job is missing 'workspace'")
+        sched = parse_schedule(sched_raw)
+        return Job(
+            name=name,
+            schedule=sched,
+            workspace=workspace,
+            prompt=str(raw.get("prompt") or ""),
+            on_success=str(raw.get("on_success") or ""),
+            on_failure=str(raw.get("on_failure") or ""),
+            enabled=bool(raw.get("enabled", True)),
+            harness_args=[str(a) for a in (raw.get("harness_args") or []) if isinstance(a, str)],
+        )
+
+
+# ---------------------------------------------------------------------------
+# 3. History store (SQLite next to checkpoints)
+# ---------------------------------------------------------------------------
+
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS schedule_runs (
+    job_name        TEXT NOT NULL,
+    started_at      TEXT NOT NULL,
+    ended_at        TEXT,
+    exit_code       INTEGER,
+    duration_sec    REAL,
+    log_path        TEXT,
+    PRIMARY KEY (job_name, started_at)
+);
+CREATE INDEX IF NOT EXISTS idx_schedule_job_time
+    ON schedule_runs (job_name, started_at DESC);
+"""
+
+
+def _open_history(cfg: ScheduleConfig) -> sqlite3.Connection:
+    path = os.path.expanduser(cfg.history_db)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.executescript(_SCHEMA_SQL)
+    return conn
+
+
+def record_run_started(
+    cfg: ScheduleConfig, *, job_name: str, started_at: datetime, log_path: str,
+) -> None:
+    conn = _open_history(cfg)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO schedule_runs "
+                "(job_name, started_at, log_path) VALUES (?, ?, ?)",
+                (job_name, started_at.isoformat(), log_path),
+            )
+    finally:
+        conn.close()
+
+
+def record_run_finished(
+    cfg: ScheduleConfig, *,
+    job_name: str, started_at: datetime,
+    exit_code: int, duration_sec: float,
+) -> None:
+    conn = _open_history(cfg)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE schedule_runs SET ended_at = ?, exit_code = ?, "
+                "duration_sec = ? WHERE job_name = ? AND started_at = ?",
+                (
+                    _utcnow().isoformat(), exit_code, duration_sec,
+                    job_name, started_at.isoformat(),
+                ),
+            )
+    finally:
+        conn.close()
+
+
+def last_run_for_job(
+    cfg: ScheduleConfig, job_name: str,
+) -> Optional[dict[str, Any]]:
+    conn = _open_history(cfg)
+    try:
+        row = conn.execute(
+            "SELECT started_at, ended_at, exit_code, duration_sec, log_path "
+            "FROM schedule_runs WHERE job_name = ? "
+            "ORDER BY started_at DESC LIMIT 1",
+            (job_name,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {
+        "started_at": row[0],
+        "ended_at": row[1],
+        "exit_code": row[2],
+        "duration_sec": row[3],
+        "log_path": row[4],
+    }
+
+
+def history_for_job(
+    cfg: ScheduleConfig, job_name: str, *, limit: int = 20,
+) -> list[dict[str, Any]]:
+    conn = _open_history(cfg)
+    try:
+        rows = conn.execute(
+            "SELECT started_at, ended_at, exit_code, duration_sec, log_path "
+            "FROM schedule_runs WHERE job_name = ? "
+            "ORDER BY started_at DESC LIMIT ?",
+            (job_name, max(1, min(1000, int(limit)))),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "started_at": r[0], "ended_at": r[1], "exit_code": r[2],
+            "duration_sec": r[3], "log_path": r[4],
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 4. Job execution — subprocess + hooks
+# ---------------------------------------------------------------------------
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _log_path_for(cfg: ScheduleConfig, job_name: str, started_at: datetime) -> str:
+    base = os.path.expanduser(cfg.log_dir)
+    job_dir = os.path.join(base, _safe_filename(job_name))
+    os.makedirs(job_dir, exist_ok=True)
+    stamp = started_at.strftime("%Y%m%dT%H%M%SZ")
+    return os.path.join(job_dir, f"{stamp}.log")
+
+
+def _safe_filename(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-") or "job"
+
+
+def build_run_command(cfg: ScheduleConfig, job: Job) -> list[str]:
+    """Build the argv for ``harness run`` for this job. Pure function;
+    no I/O. Used by ``harness schedule list`` for transparency too.
+    """
+    cmd = [cfg.harness_binary, "run", "-r", job.workspace]
+    if job.prompt:
+        cmd += ["-p", job.prompt]
+    cmd += list(job.harness_args)
+    return cmd
+
+
+async def execute_job_once(
+    cfg: ScheduleConfig, job: Job,
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Spawn ``harness run`` for this job, await completion, fire the
+    success/failure hook. Returns a dict summary so the caller can
+    print or log it (``harness schedule once`` does both).
+    """
+    started_at = now or _utcnow()
+    log_path = _log_path_for(cfg, job.name, started_at)
+    record_run_started(cfg, job_name=job.name, started_at=started_at, log_path=log_path)
+
+    argv = build_run_command(cfg, job)
+    logger.info("[schedule:%s] launching: %s", job.name, " ".join(shlex.quote(a) for a in argv))
+    monotonic_start = time.monotonic()
+    exit_code = -1
+    try:
+        with open(log_path, "wb") as log_fh:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, stdout=log_fh, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            exit_code = await proc.wait()
+    except Exception as exc:  # noqa: BLE001 — subprocess crashes shouldn't kill the daemon
+        logger.exception("[schedule:%s] subprocess error: %s", job.name, exc)
+        with open(log_path, "ab") as log_fh:
+            log_fh.write(f"\n[schedule] subprocess error: {exc}\n".encode("utf-8"))
+        exit_code = -1
+    duration = time.monotonic() - monotonic_start
+
+    record_run_finished(
+        cfg, job_name=job.name, started_at=started_at,
+        exit_code=exit_code, duration_sec=duration,
+    )
+
+    hook = job.on_success if exit_code == 0 else job.on_failure
+    if hook.strip():
+        await _run_hook(
+            hook,
+            job_name=job.name, exit_code=exit_code,
+            duration_sec=duration, log_path=log_path,
+        )
+
+    return {
+        "job_name": job.name,
+        "started_at": started_at.isoformat(),
+        "exit_code": exit_code,
+        "duration_sec": duration,
+        "log_path": log_path,
+    }
+
+
+async def _run_hook(
+    hook: str, *,
+    job_name: str, exit_code: int,
+    duration_sec: float, log_path: str,
+) -> None:
+    """Invoke the operator-supplied shell hook. Hooks run via ``/bin/sh
+    -c <hook>`` so curl + redirection + pipes Just Work without
+    operators having to argv-tokenise. The harness's
+    :func:`harness.trust.safe_subprocess_env` is intentionally NOT
+    applied — the hook may want to read tokens the harness scrubs
+    (SLACK_WEBHOOK, GH_TOKEN, etc.) directly from the operator's env.
+    Operators who want stricter scrubbing pass env through ``env -i``
+    themselves.
+    """
+    env = dict(os.environ)
+    env["HARNESS_JOB_NAME"] = job_name
+    env["HARNESS_JOB_EXIT_CODE"] = str(exit_code)
+    env["HARNESS_JOB_DURATION_SEC"] = f"{duration_sec:.2f}"
+    env["HARNESS_JOB_LOG_PATH"] = log_path
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            hook, env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0:
+            logger.warning(
+                "[schedule:%s] hook exit=%d: %s",
+                job_name, proc.returncode,
+                (stdout or b"").decode("utf-8", errors="replace")[:500],
+            )
+    except asyncio.TimeoutError:
+        logger.warning("[schedule:%s] hook timed out after 30s", job_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[schedule:%s] hook error: %s", job_name, exc)
+
+
+# ---------------------------------------------------------------------------
+# 5. Daemon
+# ---------------------------------------------------------------------------
+
+class ScheduleDaemon:
+    """The cron loop. Wakes every ``cfg.tick_seconds``, checks each
+    enabled job, fires it if its ``next_run`` has elapsed. A job that
+    is still running from a prior tick will NOT be fired again — the
+    daemon tracks in-flight jobs in memory.
+    """
+
+    def __init__(self, cfg: ScheduleConfig):
+        self.cfg = cfg
+        self._in_flight: set[str] = set()
+        self._next_due: dict[str, datetime] = {}
+
+    def initialise_due_times(self) -> None:
+        """Seed ``_next_due`` from history (or the current time if the
+        job has never run). Called once at daemon start."""
+        now = _utcnow()
+        for job in self.cfg.jobs:
+            if not job.enabled:
+                continue
+            last = last_run_for_job(self.cfg, job.name)
+            last_started = None
+            if last and last.get("started_at"):
+                try:
+                    last_started = datetime.fromisoformat(last["started_at"])
+                    if last_started.tzinfo is None:
+                        last_started = last_started.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    last_started = None
+            self._next_due[job.name] = next_run(
+                job.schedule, after=now, last_started=last_started,
+            )
+
+    def jobs_due(self, *, now: Optional[datetime] = None) -> list[Job]:
+        """Return the subset of enabled jobs whose ``next_due`` time
+        is at or before ``now`` and which are not currently in flight."""
+        now = now or _utcnow()
+        out: list[Job] = []
+        for job in self.cfg.jobs:
+            if not job.enabled:
+                continue
+            if job.name in self._in_flight:
+                continue
+            due = self._next_due.get(job.name)
+            if due is None or due <= now:
+                out.append(job)
+        return out
+
+    async def fire_job(self, job: Job) -> dict[str, Any]:
+        """Run a single job and update its next_due. Never raises;
+        records the outcome through ``execute_job_once``."""
+        if job.name in self._in_flight:
+            return {"skipped": True, "reason": "job already in flight"}
+        self._in_flight.add(job.name)
+        try:
+            now = _utcnow()
+            result = await execute_job_once(self.cfg, job, now=now)
+            self._next_due[job.name] = next_run(
+                job.schedule, after=_utcnow(), last_started=now,
+            )
+            return result
+        finally:
+            self._in_flight.discard(job.name)
+
+    async def tick_once(self) -> list[dict[str, Any]]:
+        """Run one tick of the daemon loop: fire all due jobs
+        concurrently, return their summaries. Public so unit tests can
+        drive the daemon without sleeping."""
+        due = self.jobs_due()
+        if not due:
+            return []
+        results = await asyncio.gather(
+            *(self.fire_job(j) for j in due), return_exceptions=False,
+        )
+        return list(results)
+
+    async def run_forever(self) -> int:
+        """Main loop. Returns when the asyncio task is cancelled
+        (Ctrl-C / SIGTERM)."""
+        self.initialise_due_times()
+        logger.info(
+            "[schedule] starting with %d enabled job(s); tick=%ds",
+            sum(1 for j in self.cfg.jobs if j.enabled),
+            self.cfg.tick_seconds,
+        )
+        try:
+            while True:
+                try:
+                    await self.tick_once()
+                except Exception as exc:  # noqa: BLE001 — never crash the loop
+                    logger.exception("[schedule] tick error: %s", exc)
+                await asyncio.sleep(self.cfg.tick_seconds)
+        except asyncio.CancelledError:
+            logger.info("[schedule] cancellation received; shutting down.")
+            return 0

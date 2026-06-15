@@ -266,6 +266,16 @@
         "gh_path": ""
     },
 
+    "_schedule_comment": "Cron-driven background daemon (#13) that fires recurring `harness run` jobs. Started with `harness schedule run`. Each job has a name, a schedule string, a workspace, an optional prompt, and optional on_success / on_failure shell hooks. Schedule syntax (hand-rolled subset; case-insensitive; all times UTC): 'every 15m' / 'every 6h' / 'every 3d' / 'hourly :MM' / 'daily HH:MM' / 'weekly DAY HH:MM' (DAY ∈ mon,tue,wed,thu,fri,sat,sun). Hooks run via /bin/sh -c with these env vars exported: HARNESS_JOB_NAME, HARNESS_JOB_EXIT_CODE, HARNESS_JOB_DURATION_SEC, HARNESS_JOB_LOG_PATH — wire any service (Slack/Discord/PagerDuty/email) in one curl line. tick_seconds is the daemon's polling interval (default 60s). history_db is where job execution history persists (SQLite next to checkpoints). harness_binary is the path the daemon shells out to (set to the venv's bin when not on PATH). Default off. Drop sample jobs into 'jobs' to enable.",
+    "schedule": {
+        "enabled": false,
+        "tick_seconds": 60,
+        "history_db": "~/.harness/schedule.db",
+        "log_dir": "~/.harness/schedule_logs",
+        "harness_binary": "harness",
+        "jobs": []
+    },
+
     "_repo_index_comment": "Repository semantic-retrieval index. Build with `harness index build`; when enabled, the planner queries the index for top-K chunks relevant to the user prompt and injects them as a system context block. backend = 'tfidf' (zero-dep, pure Python, default) or 'openai_embeddings' (requires OPENAI_API_KEY; falls back to tfidf on missing key). chunk_lines / chunk_overlap shape the per-file slicing; top_k bounds the retrieval set; inject_max_bytes caps the planner injection. index_dir is the SQLite store. exclude_globs and text_extensions tune the file walker.",
     "repo_index": {
         "enabled": false,
