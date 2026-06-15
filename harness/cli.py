@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import json
 import logging
 import os
@@ -493,6 +494,15 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "patcher",
     # Change-request behaviour knobs (reverse_engineer_budget_usd etc.).
     "change_requests",
+    # Web research tool skills (web_fetch / web_search). Default off — the
+    # gateway path is unchanged when disabled. See harness/web_tools.py.
+    "web_tools",
+    # Model Context Protocol client pool. Default off. When enabled,
+    # each declared server spawns as a subprocess (stdio transport),
+    # advertises its tools, and the harness registers them as
+    # `mcp__<server>__<tool>` skills the planner can invoke via
+    # `<<<MCP_CALL>>>` blocks. See harness/mcp_client.py.
+    "mcp",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -578,6 +588,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     # names, so future NodeRole additions don't break this list.
     "llm_dispatch": frozenset({
         "max_tokens_default", "max_tokens_per_role",
+        # Prompt caching master switch. Default True. Falls back to the
+        # legacy string-form Anthropic system payload when False, and
+        # silences the prefix-stability drift events. Single-flag
+        # rollback if a provider rejects the cache_control directives.
+        "prompt_cache_enabled",
     }),
     # Observability knobs. dump_llm_calls captures every LLM dispatch
     # (across all roles) to ~/.harness/debug for post-mortem analysis;
@@ -597,6 +612,32 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     # Pre-build smoke checks (see compiler_node prod-import step).
     "compiler": frozenset({"run_prod_import_smoke_check"}),
+    # Web research tools. enabled toggles registration of web_fetch +
+    # web_search in the SkillRegistry. max_bytes / max_results cap result
+    # size. search_backend selects the search provider (only
+    # ``duckduckgo_lite`` ships today). allow_private_ips opens the
+    # SSRF guard for trusted internal targets. timeout_seconds bounds
+    # each HTTP call. tool_call_cap_per_dispatch caps how many tool
+    # rounds a single graph-node call may take before the interceptor
+    # forces the LLM to proceed.
+    "web_tools": frozenset({
+        "enabled", "max_bytes", "max_results", "search_backend",
+        "api_key_env", "allow_private_ips", "timeout_seconds",
+        "tool_call_cap_per_dispatch",
+    }),
+    # MCP client pool. enabled toggles registration of MCP servers as
+    # subprocess clients + their tools as McpToolSkill entries.
+    # tool_call_timeout_seconds bounds every tools/call. command_allowlist
+    # extends the built-in safe allowlist (npx, node, python*, uvx,
+    # docker) with operator-trusted binaries. allow_local_filesystem_servers
+    # opens the gate for the official filesystem MCP server (which bypasses
+    # the build sandbox — must be explicit). result_max_bytes caps every
+    # tools/call response. servers is the per-server config list (each
+    # entry validated separately — see McpServerConfig).
+    "mcp": frozenset({
+        "enabled", "tool_call_timeout_seconds", "command_allowlist",
+        "allow_local_filesystem_servers", "result_max_bytes", "servers",
+    }),
     # Change-request mode knobs. reverse_engineer_budget_usd caps the
     # one-shot LLM walk in reverse_engineer_architecture_node so a large
     # codebase doesn't blow the session budget on first contact.
@@ -677,6 +718,21 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "speculative.worktree_base_dir": (str,),
     "llm_dispatch.max_tokens_default": (int,),
     "llm_dispatch.max_tokens_per_role": (dict,),
+    "llm_dispatch.prompt_cache_enabled": (bool,),
+    "web_tools.enabled": (bool,),
+    "web_tools.max_bytes": (int,),
+    "web_tools.max_results": (int,),
+    "web_tools.search_backend": (str,),
+    "web_tools.api_key_env": (str,),
+    "web_tools.allow_private_ips": (bool,),
+    "web_tools.timeout_seconds": (int, float),
+    "web_tools.tool_call_cap_per_dispatch": (int,),
+    "mcp.enabled": (bool,),
+    "mcp.tool_call_timeout_seconds": (int, float),
+    "mcp.command_allowlist": (list,),
+    "mcp.allow_local_filesystem_servers": (bool,),
+    "mcp.result_max_bytes": (int,),
+    "mcp.servers": (list,),
     "metrics.burn_rate_window_minutes": (int,),
     "metrics.metrics_dir": (str,),
     "deployment.enabled": (bool,),
@@ -3078,6 +3134,101 @@ def _attempt_git_rollback(workspace_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# MCP pool helper (shared by cmd_run / cmd_resume / cmd_doctor)
+# ---------------------------------------------------------------------------
+
+_mcp_pool_registry: list[Any] = []  # active pools — drained on shutdown
+
+
+def _register_pool_for_shutdown(pool: Any) -> None:
+    """Track ``pool`` so the atexit + signal handlers can drain it on
+    process exit. Keeping the list global rather than threading through
+    state mirrors how ``set_command_validator`` already does it."""
+    _mcp_pool_registry.append(pool)
+
+
+def _sync_kill_mcp_subprocesses() -> None:
+    """Synchronous backstop for the asyncio drain path. Runs at
+    ``atexit`` so subprocess leak survival of a hard crash / unhandled
+    exception is bounded — every spawned MCP subprocess gets a SIGTERM
+    on its process group.
+
+    The clean shutdown path (``McpClientPool.shutdown``) handles SIGTERM
+    + grace + SIGKILL on its own; this hook only kicks in when that path
+    didn't get a chance to run. Best-effort; failures are silent.
+    """
+    import os as _os
+    import signal as _signal
+    for pool in list(_mcp_pool_registry):
+        clients = getattr(pool, "clients", None) or {}
+        for client in clients.values():
+            proc = getattr(client, "_proc", None)
+            if proc is None or proc.returncode is not None:
+                continue
+            try:
+                _os.killpg(_os.getpgid(proc.pid), _signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                continue
+
+
+atexit.register(_sync_kill_mcp_subprocesses)
+
+
+async def _drain_mcp_pools() -> None:
+    """Shut down every registered pool. Idempotent."""
+    pools = list(_mcp_pool_registry)
+    _mcp_pool_registry.clear()
+    for pool in pools:
+        try:
+            await pool.shutdown()
+        except Exception as exc:  # noqa: BLE001 — shutdown is best-effort
+            logger.debug("[cli:mcp] pool shutdown error: %s", exc)
+
+
+async def _maybe_start_mcp_pool(config: dict[str, Any]) -> Optional[Any]:
+    """Build + start an :class:`McpClientPool` from ``config.mcp`` when
+    ``mcp.enabled=true``. Registers every advertised tool into the
+    SkillRegistry via ``register_mcp_skills``. Returns the pool (or
+    ``None`` when disabled / failed) so the caller can hand it to
+    later cleanup. Failures log and return ``None`` — MCP is additive,
+    a bad config must not block the harness from running.
+    """
+    try:
+        from harness.mcp_client import (
+            McpClientPool, McpPoolConfig, register_mcp_skills,
+        )
+    except Exception as exc:  # noqa: BLE001 — MCP optional
+        logger.debug("[cli:mcp] mcp_client import skipped: %s", exc)
+        return None
+    pool_cfg = McpPoolConfig.from_config(config)
+    if not pool_cfg.enabled:
+        return None
+    if not pool_cfg.servers:
+        logger.info("[cli:mcp] enabled but no servers configured; skipping pool start.")
+        return None
+    pool = McpClientPool(pool_cfg)
+    try:
+        await pool.start()
+    except ValueError as exc:
+        # Filesystem-server safety gate, command-allowlist rejection, etc.
+        logger.warning("[cli:mcp] pool refused to start: %s", exc)
+        await pool.shutdown()
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[cli:mcp] pool failed to start: %s", exc)
+        await pool.shutdown()
+        return None
+    try:
+        registered = register_mcp_skills(pool)
+        logger.info("[cli:mcp] registered %d tool(s) from %d server(s).",
+                    registered, len(pool.clients))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[cli:mcp] skill registration failed: %s", exc)
+    _register_pool_for_shutdown(pool)
+    return pool
+
+
+# ---------------------------------------------------------------------------
 # 3. Subcommand Handlers
 # ---------------------------------------------------------------------------
 
@@ -3220,6 +3371,24 @@ async def cmd_run(args: argparse.Namespace) -> int:
 
     gateway = create_gateway_from_config(config)
     set_gateway(gateway)
+
+    # Register built-in skills (pipeline + docgen + opt-in tool skills like
+    # web_fetch / web_search). Wrapped: any failure inside the skill
+    # registry must NOT block the harness from starting — the registry is
+    # additive, not load-bearing for the core graph.
+    try:
+        from harness.skills import register_builtin_skills
+        register_builtin_skills(config=config)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[cli] skill registration skipped: %s", exc)
+
+    # Start the MCP client pool when ``mcp.enabled=true``. Each declared
+    # MCP server spawns as a subprocess; their tools register into the
+    # SkillRegistry under ``mcp__<server>__<tool>`` names so the graph's
+    # tool-block interceptor can dispatch them. An atexit handler tears
+    # the subprocesses down on a clean exit; Ctrl-C is handled by the
+    # outer asyncio cancel path which also triggers the same shutdown.
+    _mcp_pool = await _maybe_start_mcp_pool(config)
 
     # Initialize the secret redactor
     from harness.redactor import create_redactor_from_config
@@ -3792,6 +3961,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         )
 
     await checkpointer.conn.close()
+    await _drain_mcp_pools()
 
     return 0 if exit_code == 0 else 1
 
@@ -3854,6 +4024,24 @@ async def cmd_resume(args: argparse.Namespace) -> int:
 
     gateway = create_gateway_from_config(config)
     set_gateway(gateway)
+
+    # Register built-in skills (pipeline + docgen + opt-in tool skills like
+    # web_fetch / web_search). Wrapped: any failure inside the skill
+    # registry must NOT block the harness from starting — the registry is
+    # additive, not load-bearing for the core graph.
+    try:
+        from harness.skills import register_builtin_skills
+        register_builtin_skills(config=config)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[cli] skill registration skipped: %s", exc)
+
+    # Start the MCP client pool when ``mcp.enabled=true``. Each declared
+    # MCP server spawns as a subprocess; their tools register into the
+    # SkillRegistry under ``mcp__<server>__<tool>`` names so the graph's
+    # tool-block interceptor can dispatch them. An atexit handler tears
+    # the subprocesses down on a clean exit; Ctrl-C is handled by the
+    # outer asyncio cancel path which also triggers the same shutdown.
+    _mcp_pool = await _maybe_start_mcp_pool(config)
 
     # Initialize the secret redactor
     from harness.redactor import create_redactor_from_config
@@ -4043,6 +4231,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     logger.info("[resume] Session '%s' completed with exit code %d.", args.session_id, exit_code)
 
     await checkpointer.conn.close()
+    await _drain_mcp_pools()
     return 0 if exit_code == 0 else 1
 
 
@@ -4832,6 +5021,82 @@ def _doctor_check_tree_sitter() -> tuple[str, str]:
     return "pass", f"AST available for {len(healthy)} grammar(s): {healthy}"
 
 
+async def _doctor_check_mcp(
+    config: dict[str, Any],
+) -> list[tuple[str, tuple[str, str]]]:
+    """Run a connectivity check against every configured MCP server.
+
+    Returns one row per server. When ``mcp.enabled=false`` returns an
+    empty list — the operator hasn't opted in, so there's nothing to
+    report and the doctor table stays terse.
+
+    Each server is started in isolation (so one bad server doesn't
+    cascade) and the count of advertised tools is reported on success.
+    Both the start AND a graceful shutdown happen here so the doctor
+    leaves no zombie subprocesses.
+    """
+    try:
+        from harness.mcp_client import (
+            McpClientPool, McpPoolConfig, StdioMcpClient,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return [("mcp", ("warn", f"mcp_client import failed: {exc}"))]
+    pool_cfg = McpPoolConfig.from_config(config)
+    if not pool_cfg.enabled:
+        return []
+    if not pool_cfg.servers:
+        return [(
+            "mcp", ("warn", "enabled but no servers configured in mcp.servers"),
+        )]
+    rows: list[tuple[str, tuple[str, str]]] = []
+    for server in pool_cfg.servers:
+        if not server.name or not server.command:
+            rows.append((
+                f"mcp:{server.name or '?'}",
+                ("fail", "malformed server entry (missing name or command)"),
+            ))
+            continue
+        # Safety: refuse to start a filesystem server during doctor unless
+        # the operator's already opted in. Doctor mirrors cmd_run.
+        if (not pool_cfg.allow_local_filesystem_servers and
+                McpClientPool._looks_like_filesystem_server(server)):
+            rows.append((
+                f"mcp:{server.name}",
+                ("warn", (
+                    "looks like a filesystem server — set "
+                    "mcp.allow_local_filesystem_servers=true to enable."
+                )),
+            ))
+            continue
+        client = StdioMcpClient(
+            server,
+            timeout_seconds=pool_cfg.tool_call_timeout_seconds,
+            extra_allowlist=pool_cfg.command_allowlist,
+        )
+        try:
+            await client.start()
+            tool_count = len(client.tools)
+            tool_names = ", ".join(t.get("name", "?") for t in client.tools[:5])
+            tail = " ..." if tool_count > 5 else ""
+            rows.append((
+                f"mcp:{server.name}",
+                ("pass", f"{tool_count} tool(s): {tool_names}{tail}"),
+            ))
+        except ValueError as exc:
+            # Command rejected by trust.validate_mcp_server_command.
+            rows.append((
+                f"mcp:{server.name}",
+                ("fail", f"command rejected: {exc}"),
+            ))
+        except Exception as exc:  # noqa: BLE001
+            rows.append((
+                f"mcp:{server.name}", ("fail", f"start failed: {exc}"),
+            ))
+        finally:
+            await client.shutdown()
+    return rows
+
+
 async def cmd_doctor(args: argparse.Namespace) -> int:
     """
     Execute the `harness doctor` subcommand.
@@ -4883,6 +5148,11 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         # External tools the harness shells out to. Emits one row per
         # tool so each is visible individually in the report.
         checks.extend(_doctor_check_external_tools(config, workspace_path))
+        # MCP healthcheck. Only adds rows when mcp.enabled=true (otherwise
+        # nothing to report — the check is silent on the off path so
+        # doctor stays terse for the default no-MCP install).
+        mcp_rows = await _doctor_check_mcp(config)
+        checks.extend(mcp_rows)
     else:
         # Config invalid → mark downstream checks as skipped so the
         # operator sees they exist but understands they can't run yet.

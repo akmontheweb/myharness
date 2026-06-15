@@ -1108,6 +1108,167 @@ def apply_memory_cleanse(state: AgentState, resolution_kind: str = "compiler_suc
 # 4. Node Implementations (Gateway-Integrated)
 # ---------------------------------------------------------------------------
 
+def _web_tool_cap_from_state(_state: "AgentState") -> int:
+    """Resolve the per-dispatch tool-call cap from the registered web
+    tools skill, falling back to 3 when the skills aren't registered.
+
+    Reads it from the SkillRegistry rather than threading config through
+    AgentState so existing checkpoints (no ``web_tools_config`` field)
+    keep working unchanged. Cheap (one dict lookup); no I/O.
+    """
+    try:
+        from harness.skills import SkillRegistry
+        from harness.web_tools import WebFetchSkill
+        skill = SkillRegistry().get("web_fetch")
+        if isinstance(skill, WebFetchSkill):
+            return int(getattr(skill, "_cfg").tool_call_cap_per_dispatch)
+    except Exception:  # noqa: BLE001
+        pass
+    return 3
+
+
+async def _run_tool_loop(
+    *,
+    initial_response_content: str,
+    messages: list["MessageDict"],
+    gateway: Any,
+    role: Any,
+    budget: float,
+    cap: int = 3,
+    token_tracker: Optional[dict[str, Any]] = None,
+) -> tuple[str, list["MessageDict"], float, int]:
+    """Iteratively resolve ``<<<WEB_FETCH ...>>>`` / ``<<<WEB_SEARCH ...>>>``
+    blocks in the LLM response.
+
+    Each round:
+      1. Parse tool blocks from the latest response content.
+      2. If none → return the content unchanged.
+      3. Otherwise, dispatch each block via :class:`SkillRegistry`,
+         append a ``user`` message containing the tool results,
+         re-dispatch the same role, append the new assistant reply,
+         and repeat.
+
+    Stops at ``cap`` rounds. The final content is the response from the
+    last dispatch with all tool blocks **stripped** (so downstream
+    consumers — patcher, planning blueprint storage — never see them).
+
+    Returns ``(final_content, messages, budget_remaining_usd, rounds_run)``.
+
+    Best-effort: if the skill registry isn't initialised, or the
+    ``web_tools`` skills aren't registered (operator hasn't opted in),
+    the function quietly returns the original content unchanged and the
+    tool blocks remain in the text — the LLM will see them on a future
+    dispatch and learn that tools aren't available.
+    """
+    try:
+        from harness.web_tools import parse_tool_blocks, strip_tool_blocks
+        from harness.skills import SkillRegistry
+    except Exception as exc:  # noqa: BLE001 — web tools are optional
+        logger.debug("[tool_loop] web tools unavailable: %s", exc)
+        return initial_response_content, messages, budget, 0
+
+    # MCP blocks are parsed by a separate module (the parser ships with
+    # mcp_client.py to keep the MCP surface self-contained). The import
+    # is best-effort: if MCP isn't enabled / installed, the variable
+    # stays None and only web tool blocks are intercepted.
+    try:
+        from harness.mcp_client import parse_mcp_blocks, strip_mcp_blocks
+    except Exception:  # noqa: BLE001 — MCP is optional
+        parse_mcp_blocks = None  # type: ignore[assignment]
+        strip_mcp_blocks = None  # type: ignore[assignment]
+
+    def _all_blocks(text: str) -> list[Any]:
+        out = list(parse_tool_blocks(text))
+        if parse_mcp_blocks is not None:
+            out.extend(parse_mcp_blocks(text))
+        return out
+
+    def _strip_all_blocks(text: str) -> str:
+        text = strip_tool_blocks(text)
+        if strip_mcp_blocks is not None:
+            text = strip_mcp_blocks(text)
+        return text
+
+    current_content = initial_response_content
+    rounds = 0
+    while rounds < cap:
+        blocks = _all_blocks(current_content)
+        if not blocks:
+            break
+        rounds += 1
+        registry = SkillRegistry()
+        tool_results: list[str] = []
+        for block in blocks:
+            skill = registry.get(block.skill_name)
+            if skill is None:
+                tool_results.append(
+                    f"[tool {block.skill_name}] not registered "
+                    f"(set web_tools.enabled=true in config to enable)."
+                )
+                continue
+            try:
+                result = await skill.execute(**block.kwargs)
+            except Exception as exc:  # noqa: BLE001 — never let a skill blow up the graph
+                logger.exception("[tool_loop] skill %s failed", block.skill_name)
+                result = {"error": f"unexpected error: {exc}"}
+            tool_results.append(
+                f"[tool {block.skill_name}({block.kwargs})] -> {result!r}"
+            )
+
+        # Strip the tool blocks (web + MCP) from the assistant text we
+        # just got so the patcher / blueprint store never sees them, and
+        # so the LLM doesn't see them re-quoted in the next round.
+        clean_assistant = _strip_all_blocks(current_content).strip()
+        if clean_assistant:
+            messages.append(MessageDict(role="assistant", content=clean_assistant))
+
+        # Append tool results as a user message — same shape as the rest of
+        # the harness's tool DSL (READ_FILE results come back this way too).
+        messages.append(
+            MessageDict(
+                role="user",
+                content=(
+                    "Tool execution results (round %d/%d):\n%s\n\n"
+                    "Continue your previous task. Emit more tool blocks if "
+                    "needed, or proceed to the final answer."
+                ) % (rounds, cap, "\n".join(tool_results)),
+            )
+        )
+
+        # Re-dispatch
+        try:
+            response, budget = await gateway.dispatch(
+                messages=list(messages),
+                role=role,
+                budget_remaining_usd=budget,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface and stop the loop
+            logger.warning("[tool_loop] re-dispatch failed: %s", exc)
+            break
+        current_content = response.content or ""
+        # Account for the re-dispatch tokens in the caller's tracker. If
+        # the caller passed token_tracker=None they've opted out and the
+        # tokens won't show up in their per-stage breakdown — but the
+        # gateway has already deducted the cost from budget either way.
+        if token_tracker is not None:
+            try:
+                gateway.aggregate_tokens(token_tracker, response.usage, role=role)
+            except Exception as exc:  # noqa: BLE001 — telemetry must not block
+                logger.debug("[tool_loop] token aggregate skipped: %s", exc)
+
+    # Strip any residual tool blocks (web + MCP) from the final content
+    # before returning so downstream code paths (blueprint storage,
+    # repair grep, …) never see a half-parsed <<<WEB_FETCH...>>> /
+    # <<<MCP_CALL...>>> token.
+    try:
+        final_content = _strip_all_blocks(current_content)
+    except Exception:  # noqa: BLE001
+        final_content = current_content
+    if rounds >= cap:
+        logger.info("[tool_loop] hit cap of %d rounds; forcing LLM to proceed.", cap)
+    return final_content, messages, budget, rounds
+
+
 async def planning_node(state: AgentState) -> dict[str, Any]:
     """
     Node 1: The Architect.
@@ -1150,15 +1311,30 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
             token_tracker, response.usage, role=NodeRole.PLANNING,
         )
 
-        # Append the planning response to messages
-        messages.append(MessageDict(role="assistant", content=response.content))
+        # Resolve any <<<WEB_FETCH ...>>> / <<<WEB_SEARCH ...>>> blocks
+        # the planner emitted. When web_tools.enabled is false the
+        # blocks fall through with a "tool not registered" notice and
+        # the LLM proceeds without them — no graph rewiring needed.
+        final_content, messages, new_budget, tool_rounds = await _run_tool_loop(
+            initial_response_content=response.content,
+            messages=messages,
+            gateway=gateway,
+            role=NodeRole.PLANNING,
+            budget=new_budget,
+            cap=_web_tool_cap_from_state(state),
+            token_tracker=token_tracker,
+        )
+
+        # Append the planning response (with tool blocks stripped) to messages
+        messages.append(MessageDict(role="assistant", content=final_content))
 
         logger.info(
-            "[planning_node] Blueprint generated. tokens_in=%d tokens_out=%d cost=$%.6f budget_left=$%.4f",
+            "[planning_node] Blueprint generated. tokens_in=%d tokens_out=%d cost=$%.6f budget_left=$%.4f tool_rounds=%d",
             response.usage.input_tokens,
             response.usage.output_tokens,
             response.usage.cost_usd,
             new_budget,
+            tool_rounds,
         )
 
         return {

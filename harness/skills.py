@@ -693,8 +693,20 @@ def register_docgen_skills() -> int:
 # 10. Register All Built-in Skills
 # ---------------------------------------------------------------------------
 
-def register_builtin_skills() -> int:
-    """Register all built-in pipeline, tool, and documentation skills."""
+def register_builtin_skills(config: Optional[dict[str, Any]] = None) -> int:
+    """Register all built-in pipeline, tool, and documentation skills.
+
+    Args:
+        config: Optional parsed config.json dict. When provided, opt-in
+            skill groups (currently: web tools) are registered if their
+            section turns them on. When ``None`` (the historical call
+            signature kept for the test suite), no opt-in skills are
+            registered — same behaviour as before this slice.
+
+    Returns the number of skills registered. Each individual registration
+    is wrapped in try/except so a failure in one optional skill does NOT
+    take down startup — we log + continue.
+    """
     count = 0
 
     # Pipeline: lintgate
@@ -732,6 +744,20 @@ def register_builtin_skills() -> int:
 
     # Documentation skills
     count += register_docgen_skills()
+
+    # Opt-in: web tools (web_fetch, web_search). Only register when the
+    # operator turned them on in config.json; default is off. Wrapped so
+    # any import or registration failure (e.g. httpx unavailable in an
+    # exotic test env) logs and skips rather than killing startup.
+    try:
+        from harness.web_tools import WebToolsConfig, register_web_tool_skills
+        web_cfg = WebToolsConfig.from_config(config)
+        if web_cfg.enabled:
+            count += register_web_tool_skills(web_cfg)
+        else:
+            logger.debug("[skills] web_tools disabled in config; skipping registration.")
+    except Exception as exc:  # noqa: BLE001 — additive skill registration must never block startup
+        logger.warning("[skills] web tools registration skipped: %s", exc)
 
     logger.info("[skills] Registered %d total built-in skill(s).", count)
     return count

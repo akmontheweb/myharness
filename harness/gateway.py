@@ -549,9 +549,46 @@ class AnthropicProvider(BaseLLM):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        # Prompt caching. When the model declares ``supports_cache`` and the
+        # gateway has not disabled it via ``prompt_cache_enabled=False``,
+        # rewrite the system block into list-of-blocks form with a
+        # ``cache_control: ephemeral`` marker. Optionally attach a second
+        # breakpoint on the first user message when it carries the
+        # immutable preamble (impact analysis / READ_FILE results /
+        # planning blueprint). Anthropic allows up to 4 breakpoints;
+        # 2 is enough for the harness's stable prefix shape.
+        cache_enabled = (
+            bool(getattr(self, "prompt_cache_enabled", True))
+            and bool(self.spec.supports_cache)
+        )
         if system_content:
-            # Anthropic expects a single string or list of text blocks for system
-            payload["system"] = "\n\n".join(system_content)
+            joined = "\n\n".join(system_content)
+            if cache_enabled:
+                payload["system"] = [
+                    {
+                        "type": "text",
+                        "text": joined,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            else:
+                payload["system"] = joined
+        if cache_enabled and anthropic_messages:
+            # Mark the first user message as a second cache breakpoint when
+            # it's substantial (≥ ~4096 chars ≈ ~1024 tokens — Anthropic's
+            # minimum block size for the ephemeral cache). Anything smaller
+            # would be ignored by the server, so we keep the legacy string
+            # form to avoid noise.
+            first = anthropic_messages[0]
+            first_content = first.get("content", "")
+            if isinstance(first_content, str) and len(first_content) >= 4096:
+                first["content"] = [
+                    {
+                        "type": "text",
+                        "text": first_content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
 
         # Extended thinking: must be opted in per request, and Anthropic requires
         # temperature=1.0 with thinking enabled. budget_tokens must be < max_tokens.
@@ -865,6 +902,37 @@ def ensure_prefix_cache_anchor(messages: list[dict[str, Any]]) -> list[dict[str,
         logger.debug("[gateway] System prompt anchor hash: %s", content_hash)
 
     return messages
+
+
+def hash_stable_prefix(messages: list[dict[str, Any]], n_stable: int = 2) -> str:
+    """Hash the first ``n_stable`` messages of a request payload.
+
+    Used by :class:`Gateway` to detect prefix drift across calls in the
+    same (session, role) pair. OpenAI and DeepSeek auto-caches only fire
+    when the request prefix is byte-identical; even one whitespace drift
+    kills the hit. When this hash changes between consecutive calls for
+    the same role, the gateway logs a warning + emits the
+    ``cache_prefix_drift`` observability event so we can trace the leak
+    back to the graph node that mutated a "should be stable" segment.
+
+    The hash is deterministic across processes (no Python ``hash()`` salt),
+    so it's safe to compare across resumed sessions. SHA-256 is overkill
+    for collision resistance here but matches what
+    ``ensure_prefix_cache_anchor`` already uses and stays under 5 µs per
+    call.
+    """
+    h = hashlib.sha256()
+    for msg in messages[: max(0, n_stable)]:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        h.update(role.encode("utf-8") if isinstance(role, str) else str(role).encode("utf-8"))
+        h.update(b"|")
+        if isinstance(content, str):
+            h.update(content.encode("utf-8"))
+        else:
+            h.update(json.dumps(content, sort_keys=True, default=str).encode("utf-8"))
+        h.update(b"\n---\n")
+    return h.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -1182,6 +1250,20 @@ class GatewayConfig:
     # patch blocks both fit.
     max_tokens_default: int = 4096
     max_tokens_per_role: dict[str, int] = field(default_factory=dict)
+    # Prompt caching master switch. When True (default) and the selected
+    # model carries ``supports_cache=True``, the gateway emits provider-
+    # specific cache directives:
+    #   - Anthropic: rewrites the system block to list-of-blocks form with
+    #     ``cache_control: {"type": "ephemeral"}``; marks the first user
+    #     message as a second breakpoint when it exceeds ~1024 tokens.
+    #   - OpenAI / DeepSeek: nothing on the wire (server-side auto-cache);
+    #     the prefix-stability hasher reports drift so we notice when an
+    #     immutable prefix accidentally mutates and silently kills the
+    #     cache hit.
+    # Flip to False in ~/.harness/config.json (llm_dispatch.prompt_cache_enabled)
+    # to fall back to the legacy string-form system payload — single-flag
+    # rollback if any provider rejects the cache directives.
+    prompt_cache_enabled: bool = True
 
 
 # Filename pattern for universal LLM dumps written by Gateway._dump_llm_call_to_disk.
@@ -1256,13 +1338,30 @@ class Gateway:
         self._dump_seqno_lock = _asyncio.Lock()
         # Defer the count() factory so the iter is created on first use
         self._count_factory = _count
+        # Prefix-stability tracker. Maps (session_id, role) → last hash of
+        # the first N "should be stable" messages. When the hash changes
+        # between consecutive calls for the same key, we log a warning +
+        # emit a ``cache_prefix_drift`` event so we can trace which graph
+        # node accidentally mutated an immutable preamble (timestamps in
+        # the planning blueprint, file mtimes in READ_FILE results, etc.).
+        # Bounded in size: cleared when the gateway closes; in-memory only
+        # so it doesn't survive process restarts (no value in resuming it).
+        self._prefix_hashes: dict[tuple[str, str], str] = {}
 
     async def _get_provider(self, model_key: str) -> BaseLLM:
         """Get or create a cached provider instance."""
         if model_key not in self._providers:
-            self._providers[model_key] = create_provider(
+            provider = create_provider(
                 model_key, ssl_verify=self.config.ssl_verify
             )
+            # Stamp the cache flag on the provider so it knows whether to
+            # emit ``cache_control`` markers (Anthropic) or stay on the
+            # legacy string-form system payload. Set as an attribute
+            # (rather than threading through chat_completion kwargs) to
+            # keep the provider signatures stable for the existing test
+            # doubles (`_StubProvider` etc).
+            provider.prompt_cache_enabled = bool(self.config.prompt_cache_enabled)  # type: ignore[attr-defined]
+            self._providers[model_key] = provider
         return self._providers[model_key]
 
     def _circuit_is_open(self) -> bool:
@@ -1630,6 +1729,43 @@ class Gateway:
 
         # Anchor system prompt at messages[0] for prefix caching
         messages = ensure_prefix_cache_anchor(list(messages))
+
+        # Prefix-stability drift detection. The first 2 messages of every
+        # request should be byte-stable across calls in the same role
+        # (system prompt + immutable preamble). When the hash changes,
+        # OpenAI/DeepSeek auto-caches miss silently — surface it as an
+        # observability event so we can chase the leak.
+        try:
+            from harness.observability import get_active_session_id, emit_event
+            _sid = get_active_session_id() or "unknown"
+        except Exception:  # noqa: BLE001 — telemetry is best-effort
+            _sid = "unknown"
+            emit_event = None  # type: ignore[assignment]
+        try:
+            _prefix_hash = hash_stable_prefix(messages, n_stable=2)
+            _drift_key = (_sid, role.value)
+            _last_hash = self._prefix_hashes.get(_drift_key)
+            if _last_hash is not None and _last_hash != _prefix_hash:
+                logger.warning(
+                    "[gateway] cache prefix drift role=%s session=%s prev=%s now=%s "
+                    "— auto-cache will miss this call.",
+                    role.value, _sid[:8] if _sid else "?",
+                    _last_hash[:8], _prefix_hash[:8],
+                )
+                if emit_event is not None:
+                    try:
+                        emit_event(
+                            "cache_prefix_drift",
+                            role=role.value,
+                            session_id=_sid,
+                            prev_hash=_last_hash[:8],
+                            now_hash=_prefix_hash[:8],
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            self._prefix_hashes[_drift_key] = _prefix_hash
+        except Exception as exc:  # noqa: BLE001 — drift telemetry must never block dispatch
+            logger.debug("[gateway] prefix drift check skipped: %s", exc)
 
         # Pre-flight context window guardrail
         messages = await check_context_window(
@@ -2235,5 +2371,8 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         ssl_verify=config_dict.get("ssl_verify", True),
         max_tokens_default=max_tokens_default,
         max_tokens_per_role=max_tokens_per_role,
+        prompt_cache_enabled=bool(
+            llm_dispatch.get("prompt_cache_enabled", True)
+        ),
     )
     return Gateway(gateway_config)

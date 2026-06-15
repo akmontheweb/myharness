@@ -13,6 +13,57 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 ## [Unreleased]
 
 ### Added
+- **Tier 1 parity** — Anthropic prompt caching: `AnthropicProvider` now
+  emits `cache_control: {"type": "ephemeral"}` on the system block and
+  on the first user message when it exceeds 4 KB. Gated by
+  `llm_dispatch.prompt_cache_enabled` (default `true`); flip to `false`
+  to fall back to the legacy string-form system payload. Cost
+  accounting + `cache_read_input_tokens` / `cache_creation_input_tokens`
+  extraction were already wired; this fills the missing request-side
+  marker emission so the discount actually fires.
+- **Tier 1 parity** — Prefix-stability drift detector in
+  `Gateway.dispatch`. Hashes the first 2 messages of every request,
+  scoped by `(session_id, role)`; logs a warning + emits a
+  `cache_prefix_drift` observability event when the prefix changes
+  between calls. Surfaces silent cache-misses on OpenAI and DeepSeek
+  auto-caching where the cost is already correct but the discount
+  vanishes when a graph node mutates the immutable preamble.
+- **Tier 1 parity** — `WebFetchSkill` + `WebSearchSkill` (new
+  `harness/web_tools.py`) exposed via text-DSL blocks (`<<<WEB_FETCH
+  url="...">>>` / `<<<WEB_SEARCH query="...">>>`). Default backend:
+  `duckduckgo_lite` (no API key). New SSRF guard
+  `harness.trust.validate_outbound_url` rejects `file://`/`javascript:`,
+  loopback / link-local (incl. AWS metadata 169.254.169.254) /
+  RFC-1918 hosts unless `web_tools.allow_private_ips=true`. HTML→text
+  stripper, content-type allowlist, byte cap, per-dispatch tool-loop
+  cap. Off by default (`web_tools.enabled=false`).
+- **Tier 1 parity** — MCP (Model Context Protocol) client (new
+  `harness/mcp_client.py`). Hand-rolled JSON-RPC 2.0 over stdio
+  (HTTP/SSE deferred); supports the `initialize` / `tools/list` /
+  `tools/call` flow per the 2024-11-05 protocol version. Each
+  configured MCP server's advertised tools register as
+  `mcp__<server>__<tool>` skills in `SkillRegistry`. New
+  `harness.trust.validate_mcp_server_command` enforces a command
+  allowlist (`npx` / `npm` / `node` / `python*` / `uvx` / `pipx` /
+  `docker`), hard-deny on shells/`sudo`/`rm`, shell-metacharacter
+  scan, and `/etc` `/root` `/proc` `/sys` path rejection. Filesystem
+  servers (which bypass the build sandbox) gated behind
+  `mcp.allow_local_filesystem_servers=true`. Off by default
+  (`mcp.enabled=false`). `harness doctor` adds one row per server when
+  enabled, showing the tool count or the start error.
+- **Tier 1 parity** — Tool-block interceptor in `harness/graph.py`:
+  new `_run_tool_loop` parses both `<<<WEB_FETCH/SEARCH>>>` and
+  `<<<MCP_CALL server="..." tool="..." args='{...}'>>>` blocks emitted
+  by the planner, dispatches each via `SkillRegistry`, appends the
+  result as a tool-result message, re-dispatches up to a configurable
+  cap, and strips the blocks before downstream consumers (patcher,
+  blueprint store, repair grep) see them. Wired into `planning_node`
+  only in this slice; extension to `patching_node` / `repair_node` is
+  a follow-up.
+- **Tier 1 parity** — `register_builtin_skills(config=…)` now called
+  from `cmd_run` / `cmd_resume` (previously only invoked from tests),
+  bringing the existing pipeline + docgen skill registrations live at
+  runtime as well as the new opt-in web/MCP tools.
 - **Tier 4** — Platform support matrix in `README.md`. Documents which
   platforms (Linux / macOS / WSL2 / Windows) are CI-tested vs
   best-effort vs unsupported, per sandbox backend (`docker` / `unshare` /

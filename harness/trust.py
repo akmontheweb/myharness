@@ -438,6 +438,176 @@ def safe_subprocess_env(extra: Optional[dict[str, str]] = None) -> dict[str, str
 
 
 # ---------------------------------------------------------------------------
+# Outbound URL guard (web tools, MCP HTTP transports)
+# ---------------------------------------------------------------------------
+
+def _ip_in_private_range(host: str) -> bool:
+    """Return True when ``host`` is an IP literal inside a non-routable or
+    cloud-metadata range — RFC 1918, link-local (169.254/16), loopback
+    (127/8), or 0.0.0.0/8. Returns False for hostnames (they're resolved
+    later by httpx) and for malformed IPs (so the caller decides).
+    """
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_unspecified:
+        return True
+    # AWS / GCP / Azure instance metadata services all live on
+    # 169.254.169.254 — already caught by is_link_local, but spelled out
+    # here for the reader who's reviewing this for SSRF safety.
+    return False
+
+
+def validate_outbound_url(
+    url: str,
+    *,
+    allow_private_ips: bool = False,
+    allowed_schemes: tuple[str, ...] = ("http", "https"),
+) -> str:
+    """Validate an LLM-supplied outbound URL before the harness fetches it.
+
+    Designed for use by ``WebFetchSkill`` / ``WebSearchSkill`` (and any
+    future HTTP-transport MCP client) so the LLM cannot trick the harness
+    into hitting cloud-metadata endpoints (SSRF), localhost services, or
+    internal RFC-1918 hosts when ``allow_private_ips`` is False.
+
+    Guards against:
+        - Empty / non-string URLs
+        - Schemes outside the whitelist (default ``http`` / ``https``)
+          — explicitly rejects ``file://``, ``gopher://``, ``ftp://``,
+          ``data:``, ``javascript:``
+        - IP literals inside loopback / link-local / RFC-1918 / unspecified
+          ranges unless ``allow_private_ips=True``
+        - Hostnames ``localhost`` / ``localhost.localdomain``
+        - Missing netloc
+
+    Returns the URL unchanged on success.
+    Raises ``ValueError`` on any rejection.
+    """
+    from urllib.parse import urlparse
+
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("url must be a non-empty string")
+    parsed = urlparse(url.strip())
+    if parsed.scheme.lower() not in allowed_schemes:
+        raise ValueError(
+            f"scheme {parsed.scheme!r} not in allowlist {allowed_schemes}"
+        )
+    if not parsed.netloc:
+        raise ValueError(f"url missing host: {url!r}")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError(f"url has no parseable host: {url!r}")
+    host_lower = host.lower()
+    if not allow_private_ips:
+        if host_lower in ("localhost", "localhost.localdomain", "ip6-localhost"):
+            raise ValueError(f"localhost rejected: {url!r}")
+        if _ip_in_private_range(host_lower):
+            raise ValueError(
+                f"private/loopback/link-local IP rejected (SSRF guard): {url!r}"
+            )
+    return url
+
+
+# ---------------------------------------------------------------------------
+# MCP server command allowlist
+# ---------------------------------------------------------------------------
+
+# Commands the harness will agree to spawn as MCP servers. Deliberately
+# narrow: anything that lets the LLM ship arbitrary shell payloads
+# (``bash -c``, ``sh -c``, ``sudo``) is rejected. The allowlist covers
+# the four ways MCP servers ship in practice today:
+#   - ``npx`` / ``npm`` exec for Node packages (the dominant pattern)
+#   - ``node`` for hand-written Node scripts
+#   - ``python`` / ``python3`` / ``uvx`` / ``pipx`` for Python servers
+#   - ``docker`` for containerized servers (``docker run --rm -i …``)
+# Operators wanting a custom binary outside this list must add it to
+# ``mcp.command_allowlist`` in config — explicit opt-in only.
+_MCP_DEFAULT_COMMAND_ALLOWLIST = frozenset({
+    "npx", "npm", "node",
+    "python", "python3", "uvx", "pipx",
+    "docker",
+})
+
+# Hard-deny: even when the operator extends the allowlist, these names
+# remain forbidden. The LLM can synthesize a server config with any name
+# in the prompt that produced it, so we keep a backstop list.
+_MCP_HARD_DENY = frozenset({
+    "sudo", "su", "doas",
+    "sh", "bash", "zsh", "fish", "ksh", "dash",
+    "eval", "exec",
+    "rm", "mv", "dd",
+    "/bin/sh", "/bin/bash", "/bin/zsh",
+})
+
+
+def validate_mcp_server_command(
+    cmd: list[str],
+    *,
+    extra_allowlist: Optional["Iterable[str]"] = None,
+) -> list[str]:
+    """Validate a list-form MCP server launch command (e.g. ``["npx", "-y",
+    "@modelcontextprotocol/server-filesystem", "/workspace"]``).
+
+    Rejected:
+      - non-list / empty inputs
+      - any binary not in the allowlist (default + operator-provided)
+      - any binary in the hard-deny list, regardless of allowlist
+      - absolute paths under ``/etc``, ``/root``, ``/proc``, ``/sys``
+        (operators can still launch a server by absolute path under
+        ``/usr/local/bin`` etc., if they extend the allowlist with the
+        basename of their binary)
+      - shell metacharacters in any argv element — ``;``, ``|``, ``&``,
+        ``$`` followed by ``(``, ``` ` ``` — anything that would let the
+        argv smuggle a second command past a naive shell
+
+    Returns the validated command unchanged on success.
+    Raises ``ValueError`` on any rejection. Never executes anything.
+    """
+    if not isinstance(cmd, list) or not cmd:
+        raise ValueError("mcp command must be a non-empty list of strings")
+    if not all(isinstance(arg, str) and arg for arg in cmd):
+        raise ValueError("mcp command args must all be non-empty strings")
+
+    head = cmd[0]
+    basename = os.path.basename(head)
+    if basename in _MCP_HARD_DENY or head in _MCP_HARD_DENY:
+        raise ValueError(f"mcp command rejected (hard deny): {head!r}")
+
+    allow = set(_MCP_DEFAULT_COMMAND_ALLOWLIST)
+    if extra_allowlist:
+        for extra in extra_allowlist:
+            if isinstance(extra, str) and extra:
+                allow.add(extra)
+    if basename not in allow and head not in allow:
+        raise ValueError(
+            f"mcp command {head!r} not in allowlist {sorted(allow)}. "
+            f"Add to mcp.command_allowlist in config to opt in explicitly."
+        )
+
+    if os.path.isabs(head):
+        for forbidden in ("/etc/", "/root/", "/proc/", "/sys/"):
+            if head.startswith(forbidden):
+                raise ValueError(
+                    f"mcp command path under {forbidden!r} rejected: {head!r}"
+                )
+
+    # Shell-metacharacter scan over every argv element. We're not going
+    # through a shell, but a sloppy server config could still smuggle
+    # a payload if anything downstream `shell=True`'s. Defence in depth.
+    bad_chars_re = re.compile(r"[;|&`\n\r]|\$\(")
+    for i, arg in enumerate(cmd):
+        if bad_chars_re.search(arg):
+            raise ValueError(
+                f"mcp command argv[{i}] contains shell metacharacters: {arg!r}"
+            )
+
+    return cmd
+
+
+# ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
