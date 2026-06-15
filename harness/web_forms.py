@@ -384,3 +384,294 @@ def renderable_dotted_keys() -> set[str]:
         for f in s.fields:
             keys.add(f.dotted_key)
     return keys
+
+
+# ---------------------------------------------------------------------------
+# 6. Run-harness CLI flag schema (per-flag inputs on the Run page)
+# ---------------------------------------------------------------------------
+
+# Yes/No select kind — operator-friendly form rendering for boolean CLI
+# flags. The form layer maps "yes" → emit the flag, "no" → omit; this
+# is more discoverable than a single text box where operators have to
+# remember --allow-network vs --allow_network.
+FORM_KIND_YES_NO = "yes_no"
+
+
+@dataclass
+class RunFlag:
+    """One CLI flag the operator can toggle from the Run Harness page.
+
+    ``kind`` is one of the ``FORM_KIND_*`` constants. ``flag`` is the
+    canonical long-form (e.g. ``--allow-network``); ``flag_off`` is the
+    explicit-off form for tri-valued flags (e.g. ``--git=disable``).
+    ``yes_emits_flag`` controls how ``FORM_KIND_YES_NO`` collapses to an
+    argv list: True means "yes" emits the flag and "no" omits it
+    (store_true semantics); False is the opposite.
+    """
+
+    name: str                 # form field id ("allow_network")
+    label: str                # human-facing label ("Allow network")
+    description: str          # operator-facing helper text
+    kind: str                 # FORM_KIND_*
+    flag: str = ""            # e.g. "--allow-network"; for SELECT/TEXT/NUMBER, emitted as `<flag> <value>`
+    default: Any = None       # default form value
+    yes_emits_flag: bool = True   # YES_NO: "yes" → emit flag, "no" → omit
+    choices: tuple[str, ...] = ()  # FORM_KIND_SELECT
+    min_value: Optional[int] = None  # FORM_KIND_NUMBER_INT bounds
+    max_value: Optional[int] = None
+
+    @property
+    def field_id(self) -> str:
+        return f"flag.{self.name}"
+
+
+# Operator-facing schema of every flag the Run page surfaces. Mirrors
+# the interactive `harness run` wizard (see :func:`harness.wizard.run_setup_wizard`)
+# which asks for exactly five things: workspace, prompt, git mode, new
+# build, discover. Workspace + prompt have dedicated inputs at the top
+# of the form; the remaining three live in this list. Operators reach
+# the other CLI flags (build-cmd, allow-network, verbose, etc.) from the
+# terminal — keeping the web page in sync with the wizard avoids
+# burying the common path under a wall of advanced toggles.
+_RUN_FLAGS: tuple[RunFlag, ...] = (
+    RunFlag(
+        name="git",
+        label="Git mode",
+        description="'enable' (default) uses git for stash/patch-branch/rollback. 'disable' skips every git-aware step — pick this when the target repo isn't under git.",
+        kind=FORM_KIND_SELECT,
+        flag="--git",
+        default="enable",
+        choices=("enable", "disable"),
+    ),
+    RunFlag(
+        name="new_build",
+        label="New build",
+        description="When true, delete every file at the workspace root except product_spec/ and .git/, then start fresh on a clean baseline. Defaults to false (steady-state).",
+        kind=FORM_KIND_SELECT,
+        flag="--new-build",
+        default="false",
+        choices=("false", "true"),
+    ),
+    RunFlag(
+        name="discover",
+        label="Run discovery",
+        description="Run the full requirements/architecture/deployment discovery interview before code generation. Recommended for greenfield projects; skipped by default for incremental patching.",
+        kind=FORM_KIND_YES_NO,
+        flag="--discover",
+        default="no",
+    ),
+)
+
+
+def run_flags() -> tuple[RunFlag, ...]:
+    """Operator-facing CLI flag schema for the Run Harness page."""
+    return _RUN_FLAGS
+
+
+def build_run_argv_from_form(
+    post_data: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Translate a POSTed Run Harness form into a list of CLI argv tokens.
+
+    Returns ``(argv, errors)`` — errors is a list of operator-facing
+    messages keyed by flag name (e.g. "spec_review_cycles: must be 0-5"),
+    suitable for surfacing back to the form.
+
+    Unset / blank fields collapse to "use the CLI default" (i.e. they
+    don't add anything to argv). The yes/no kinds emit the flag only
+    when the operator says yes.
+    """
+    argv: list[str] = []
+    errors: list[str] = []
+    for f in _RUN_FLAGS:
+        raw = post_data.get(f.field_id, None)
+        if isinstance(raw, list):
+            raw = raw[-1] if raw else None
+        if raw is None:
+            value: str = ""
+        else:
+            value = str(raw).strip()
+
+        if f.kind == FORM_KIND_TEXT:
+            if not value:
+                continue
+            argv.extend([f.flag, value])
+            continue
+        if f.kind == FORM_KIND_YES_NO:
+            picked = value.lower() if value else str(f.default).lower()
+            if picked not in ("yes", "no"):
+                errors.append(f"{f.name}: must be yes or no, got {value!r}")
+                continue
+            if (picked == "yes") == f.yes_emits_flag:
+                argv.append(f.flag)
+            continue
+        if f.kind == FORM_KIND_SELECT:
+            picked = value or str(f.default)
+            if picked not in f.choices:
+                errors.append(
+                    f"{f.name}: value {picked!r} not in {list(f.choices)}"
+                )
+                continue
+            # Skip when the operator hasn't moved off the default — the CLI
+            # already applies the same default, so an explicit
+            # `--flag=default` token is noise.
+            if picked == str(f.default):
+                continue
+            # --new-build / --git both take the form `--flag=value` in the
+            # CLI, so emit a single equals-joined token for consistency.
+            argv.append(f"{f.flag}={picked}")
+            # --new-build=true triggers a confirmation prompt in cmd_run;
+            # the dashboard spawns the subprocess without a TTY, so the
+            # prompt would hang forever. Mirror what the interactive
+            # wizard does (wizard.py sets args.assume_yes=True on the
+            # same branch) and emit --yes.
+            if f.name == "new_build" and picked == "true":
+                argv.append("--yes")
+            continue
+        if f.kind == FORM_KIND_NUMBER_INT:
+            if not value:
+                continue
+            try:
+                num = int(value)
+            except ValueError:
+                errors.append(f"{f.name}: not a valid integer ({value!r})")
+                continue
+            if f.min_value is not None and num < f.min_value:
+                errors.append(f"{f.name}: must be >= {f.min_value}")
+                continue
+            if f.max_value is not None and num > f.max_value:
+                errors.append(f"{f.name}: must be <= {f.max_value}")
+                continue
+            argv.extend([f.flag, str(num)])
+            continue
+        # Unknown kind — skip silently.
+    return argv, errors
+
+
+# ---------------------------------------------------------------------------
+# 7. Configure Harness page — semantic grouping of config sections
+# ---------------------------------------------------------------------------
+
+# Map every top-level config section to a human-facing group. The
+# Configure Harness page renders one collapsible group per entry; the
+# accordion of section editors sits inside the group body. When a new
+# top-level section lands in :data:`harness.cli._KNOWN_TOP_LEVEL_KEYS`,
+# add it to one of these groups so it's discoverable in the UI.
+#
+# Order in this tuple is the render order. Sections within each group
+# stay in alphabetical order (consistent with ``all_sections``).
+_CONFIG_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "general",
+        "General",
+        (
+            "build_command", "allow_network",
+            "product_spec_dir", "change_requests_dir", "change_requests",
+            "patcher", "compiler", "languages",
+        ),
+    ),
+    (
+        "llm_registry",
+        "LLM Registry",
+        ("models",),
+    ),
+    (
+        "llm_routing",
+        "LLM Routing",
+        ("model_routing", "llm_dispatch"),
+    ),
+    (
+        "sandbox_security",
+        "Sandbox & Security",
+        ("sandbox", "security", "redaction"),
+    ),
+    (
+        "budget_throttling",
+        "Budget & Throttling",
+        ("token_budget", "node_throttle", "metrics"),
+    ),
+    (
+        "logging_debug",
+        "Logging & Debug",
+        ("logging", "debug"),
+    ),
+    (
+        "skills_tools",
+        "Skills & Tools",
+        ("skills", "web_tools", "mcp"),
+    ),
+    (
+        "patching_speculation",
+        "Patching & Speculation",
+        ("speculative", "impact", "lintgate", "test_generation"),
+    ),
+    (
+        "storage_memory",
+        "Storage & Memory",
+        ("persistence", "memory", "repo_index"),
+    ),
+    (
+        "deployment",
+        "Deployment",
+        ("deployment",),
+    ),
+    (
+        "scheduling",
+        "Scheduling",
+        ("schedule",),
+    ),
+    (
+        "dashboard",
+        "Dashboard",
+        ("dashboard",),
+    ),
+    (
+        "github",
+        "GitHub",
+        ("github",),
+    ),
+)
+
+
+@dataclass
+class ConfigGroup:
+    """One collapsible group of related config sections on the Configure
+    Harness page.
+
+    ``sections`` is in the order ``_CONFIG_GROUPS`` declares; the renderer
+    iterates that order directly.
+    """
+
+    slug: str
+    title: str
+    sections: list[FormSection] = field(default_factory=list)
+
+
+def grouped_sections(
+    *, current_config: Optional[dict[str, Any]] = None,
+) -> list[ConfigGroup]:
+    """Build the grouped form schema the Configure Harness page renders.
+
+    Every section in :func:`all_sections` lands in exactly one group;
+    sections not yet listed in :data:`_CONFIG_GROUPS` fall into a
+    catch-all "Other" group so they remain reachable. The catch-all is a
+    safety net — new sections should be moved into a semantic group as
+    soon as they land, not left in Other.
+    """
+    sections = all_sections(current_config=current_config)
+    by_name = {s.section: s for s in sections}
+    groups: list[ConfigGroup] = []
+    placed: set[str] = set()
+    for slug, title, section_names in _CONFIG_GROUPS:
+        group = ConfigGroup(slug=slug, title=title)
+        for name in section_names:
+            sec = by_name.get(name)
+            if sec is None:
+                continue
+            group.sections.append(sec)
+            placed.add(name)
+        groups.append(group)
+    unplaced = [s for s in sections if s.section not in placed]
+    if unplaced:
+        groups.append(ConfigGroup(slug="other", title="Other", sections=unplaced))
+    return groups

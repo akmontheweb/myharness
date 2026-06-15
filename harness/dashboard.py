@@ -1096,6 +1096,78 @@ def _render_status(cfg: DashboardConfig) -> str:
     return section_a + section_b + section_c
 
 
+def _collect_run_argv(form: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Translate the Run Harness form's per-flag inputs into a CLI argv
+    list. Thin wrapper over :func:`harness.web_forms.build_run_argv_from_form`
+    so the request handler doesn't import the form module directly."""
+    from harness.web_forms import build_run_argv_from_form
+    return build_run_argv_from_form(form)
+
+
+def _render_run_flag_input(flag) -> str:
+    """Render one CLI flag's input element. Mirrors the Carbon styling of
+    the config form so the two screens feel consistent."""
+    from harness.web_forms import (
+        FORM_KIND_NUMBER_INT, FORM_KIND_SELECT, FORM_KIND_YES_NO,
+    )
+    name = html.escape(flag.field_id)
+    default = "" if flag.default is None else html.escape(str(flag.default))
+    if flag.kind == FORM_KIND_YES_NO:
+        opts = []
+        for choice in ("no", "yes"):
+            sel = "selected" if str(flag.default).lower() == choice else ""
+            opts.append(f"<option value='{choice}' {sel}>{choice.capitalize()}</option>")
+        return (
+            f"<select class='bx--select-input' name='{name}' style='width:100%'>"
+            + "".join(opts) + "</select>"
+        )
+    if flag.kind == FORM_KIND_SELECT:
+        opts = []
+        for choice in flag.choices:
+            sel = "selected" if str(flag.default) == choice else ""
+            opts.append(
+                f"<option value='{html.escape(choice)}' {sel}>{html.escape(choice)}</option>"
+            )
+        return (
+            f"<select class='bx--select-input' name='{name}' style='width:100%'>"
+            + "".join(opts) + "</select>"
+        )
+    if flag.kind == FORM_KIND_NUMBER_INT:
+        bounds = []
+        if flag.min_value is not None:
+            bounds.append(f"min='{flag.min_value}'")
+        if flag.max_value is not None:
+            bounds.append(f"max='{flag.max_value}'")
+        bound_attrs = (" " + " ".join(bounds)) if bounds else ""
+        return (
+            f"<input class='bx--text-input' type='number' step='1' name='{name}' "
+            f"value='{default}' style='width:100%'{bound_attrs}>"
+        )
+    # FORM_KIND_TEXT fallback.
+    return (
+        f"<input class='bx--text-input' type='text' name='{name}' "
+        f"value='{default}' style='width:100%'>"
+    )
+
+
+def _render_run_flag_rows() -> str:
+    """All CLI-flag rows for the Run Harness form table."""
+    from harness.web_forms import run_flags
+    rows = []
+    for flag in run_flags():
+        rows.append(
+            f"<tr>"
+            f"<td><label class='bx--label' for='{html.escape(flag.field_id)}'>"
+            f"{html.escape(flag.label)} "
+            f"<code class='muted' style='font-size:0.85em'>{html.escape(flag.flag)}</code>"
+            f"</label></td>"
+            f"<td class='muted'>{html.escape(flag.description)}</td>"
+            f"<td>{_render_run_flag_input(flag)}</td>"
+            f"</tr>"
+        )
+    return "".join(rows)
+
+
 def _render_run_harness(cfg: DashboardConfig) -> str:
     if not cfg.writes_enabled:
         return (
@@ -1138,6 +1210,7 @@ def _render_run_harness(cfg: DashboardConfig) -> str:
     else:
         pending_html = "<p class='muted'>No one-shot jobs scheduled.</p>"
 
+    flag_rows = _render_run_flag_rows()
     form = f"""
 <div class='card'>
   <h2>Start a harness run</h2>
@@ -1152,11 +1225,14 @@ def _render_run_harness(cfg: DashboardConfig) -> str:
       <label class='bx--label' for='prompt'>Prompt</label>
       <textarea class='bx--text-area' id='prompt' name='prompt' rows='4' required></textarea>
     </div>
-    <div style='margin-bottom:1rem'>
-      <label class='bx--label' for='extra_args'>Extra harness args (space-separated)</label>
-      <input class='bx--text-input' id='extra_args' name='extra_args' type='text'
-             placeholder='--new_build=false --allow-network'>
-    </div>
+    <fieldset style='border:1px solid var(--cds-ui-04, #8d8d8d); padding:1rem; margin:1rem 0;'>
+      <legend class='bx--label'>Run options</legend>
+      <p class='muted' style='margin-bottom:0.75rem'>One field per CLI flag. Leave a text/number field blank to use the harness default. Yes/No flags emit the flag only on Yes.</p>
+      <table style='width:100%'>
+        <tr><th style='text-align:left; width:30%'>Flag</th><th style='text-align:left; width:45%'>Meaning</th><th style='text-align:left; width:25%'>Value</th></tr>
+        {flag_rows}
+      </table>
+    </fieldset>
     <fieldset id='schedule-fields' style='display:none; border:none; padding:0; margin:1rem 0;'>
       <legend class='bx--label'>Scheduled run</legend>
       <div style='margin-bottom:1rem'>
@@ -1280,7 +1356,7 @@ def _render_configure_harness(cfg: DashboardConfig) -> str:
             "viewable read-only at <a href='/config'>Configuration (raw)</a>.</p></div>"
         )
 
-    from harness.web_forms import all_sections
+    from harness.web_forms import grouped_sections
     # Load the live config so the form pre-populates with current values.
     current_config: dict[str, Any] = {}
     try:
@@ -1292,66 +1368,98 @@ def _render_configure_harness(cfg: DashboardConfig) -> str:
         current_config = {}
 
     csrf_token = resolve_csrf_token(cfg) or ""
-    sections = all_sections(current_config=current_config)
-    panels = []
-    for sec in sections:
-        if not sec.fields:
-            # Section without renderable fields — show a one-line note so
-            # the operator knows it exists but isn't web-editable.
-            panels.append(
+    groups = grouped_sections(current_config=current_config)
+    group_blocks: list[str] = []
+    for group in groups:
+        section_items: list[str] = []
+        editable_count = 0
+        for sec in group.sections:
+            if not sec.fields:
+                section_items.append(
+                    f"<li class='bx--accordion__item'>"
+                    f"<button class='bx--accordion__heading' aria-expanded='false' type='button'>"
+                    f"<span class='bx--accordion__title'>{html.escape(sec.section)}</span>"
+                    f"</button>"
+                    f"<div class='bx--accordion__content'>"
+                    f"<p class='muted'>No web-editable fields registered for this section. "
+                    f"Edit <code>config.json</code> directly.</p></div></li>"
+                )
+                continue
+            editable_count += 1
+            rows = []
+            for f in sec.fields:
+                description = html.escape(f.description) if f.description else "<span class='muted'>—</span>"
+                input_html = _render_field_input_new(f)
+                rows.append(
+                    f"<tr>"
+                    f"<td style='width:25%'><label class='bx--label'>{html.escape(f.name)}</label></td>"
+                    f"<td style='width:45%' class='muted'>{description}</td>"
+                    f"<td style='width:30%'>{input_html}</td>"
+                    f"</tr>"
+                )
+            section_items.append(
                 f"<li class='bx--accordion__item'>"
-                f"<button class='bx--accordion__heading' aria-expanded='false'>"
-                f"<span class='bx--accordion__title'>{html.escape(sec.section)}</span>"
-                f"</button>"
+                f"<button class='bx--accordion__heading' aria-expanded='false' type='button'>"
+                f"<span class='bx--accordion__title'>{html.escape(sec.section)} "
+                f"<span class='muted'>({len(sec.fields)} field{'s' if len(sec.fields) != 1 else ''})</span>"
+                f"</span></button>"
                 f"<div class='bx--accordion__content'>"
-                f"<p class='muted'>No web-editable fields registered for this section. "
-                f"Edit <code>config.json</code> directly.</p></div></li>"
+                f"<form method='post' action='/config/{html.escape(sec.section)}'>"
+                f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+                f"<table>"
+                f"<tr><th>Key</th><th>Meaning</th><th>Value</th></tr>"
+                + "".join(rows) +
+                f"</table>"
+                f"<p><button class='bx--btn bx--btn--primary' type='submit'>Save {html.escape(sec.section)}</button></p>"
+                f"</form></div></li>"
             )
-            continue
-        rows = []
-        for f in sec.fields:
-            description = html.escape(f.description) if f.description else "<span class='muted'>—</span>"
-            input_html = _render_field_input_new(f)
-            rows.append(
-                f"<tr>"
-                f"<td style='width:25%'><label class='bx--label'>{html.escape(f.name)}</label></td>"
-                f"<td style='width:45%' class='muted'>{description}</td>"
-                f"<td style='width:30%'>{input_html}</td>"
-                f"</tr>"
-            )
-        panel = (
-            f"<li class='bx--accordion__item'>"
-            f"<button class='bx--accordion__heading' aria-expanded='false'>"
-            f"<span class='bx--accordion__title'>{html.escape(sec.section)} "
-            f"<span class='muted'>({len(sec.fields)} field{'s' if len(sec.fields) != 1 else ''})</span>"
-            f"</span></button>"
-            f"<div class='bx--accordion__content'>"
-            f"<form method='post' action='/config/{html.escape(sec.section)}'>"
-            f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
-            f"<table>"
-            f"<tr><th>Key</th><th>Meaning</th><th>Value</th></tr>"
-            + "".join(rows) +
-            f"</table>"
-            f"<p><button class='bx--btn bx--btn--primary' type='submit'>Save {html.escape(sec.section)}</button></p>"
-            f"</form></div></li>"
+        section_count = len(group.sections)
+        section_word = "section" if section_count == 1 else "sections"
+        group_blocks.append(
+            f"<div class='config-group' data-group='{html.escape(group.slug)}' "
+            f"style='margin-bottom:1rem; border:1px solid var(--cds-ui-04, #c6c6c6);'>"
+            f"<button type='button' class='config-group__heading' aria-expanded='false' "
+            f"style='width:100%; text-align:left; padding:0.75rem 1rem; background:var(--cds-ui-02, #f4f4f4); "
+            f"border:none; cursor:pointer; font-weight:600; font-size:1rem; display:flex; align-items:center;'>"
+            f"<span class='config-group__toggle' aria-hidden='true' "
+            f"style='display:inline-block; width:1.25rem; text-align:center; margin-right:0.5rem;'>+</span>"
+            f"<span class='config-group__title'>{html.escape(group.title)}</span>"
+            f"<span class='muted' style='margin-left:0.75rem; font-weight:normal; font-size:0.85em;'>"
+            f"({section_count} {section_word})</span>"
+            f"</button>"
+            f"<div class='config-group__body' style='display:none; padding:0.5rem 1rem 1rem 1rem;'>"
+            f"<ul class='bx--accordion'>{''.join(section_items)}</ul>"
+            f"</div></div>"
         )
-        panels.append(panel)
 
     return (
         "<div class='card'>"
         "<h2>Configuration sections</h2>"
-        "<p class='muted'>Each section is one top-level key in <code>config.json</code>. "
-        "Save commits atomically and re-validates through the strict validator before landing.</p>"
-        f"<ul class='bx--accordion'>{''.join(panels)}</ul>"
+        "<p class='muted'>Settings are grouped by purpose. Click a group header to expand it, "
+        "then click a section inside to edit its fields. Save commits atomically and re-validates "
+        "through the strict validator before landing.</p>"
+        f"<div class='config-groups'>{''.join(group_blocks)}</div>"
         "</div>"
         "<div class='card'>"
         "<p class='muted'>Deployment defaults live in <code>config/deployment.json</code> — "
         "edit directly until web editing lands for that file.</p>"
         "</div>"
-        # Minimal accordion JS — toggles aria-expanded + a CSS class. Carbon's
-        # bundled JS would also work but this is one inline handler.
+        # Minimal JS for both the group +/- toggle and the inner section
+        # accordion. Each click flips aria-expanded, hides/shows the body,
+        # and swaps the +/- glyph.
         "<script>"
         "(function(){"
+        "var groups = document.querySelectorAll('.config-group__heading');"
+        "groups.forEach(function(g){"
+        "  g.addEventListener('click', function(){"
+        "    var open = g.getAttribute('aria-expanded') === 'true';"
+        "    g.setAttribute('aria-expanded', open ? 'false' : 'true');"
+        "    var body = g.nextElementSibling;"
+        "    if (body) body.style.display = open ? 'none' : 'block';"
+        "    var toggle = g.querySelector('.config-group__toggle');"
+        "    if (toggle) toggle.textContent = open ? '+' : '−';"
+        "  });"
+        "});"
         "var btns = document.querySelectorAll('.bx--accordion__heading');"
         "btns.forEach(function(b){"
         "  b.addEventListener('click', function(){"
@@ -1937,11 +2045,14 @@ def make_request_handler(
         def _handle_run_now(self, form: dict[str, Any]) -> None:
             workspace = str(form.get("workspace") or "").strip()
             prompt = str(form.get("prompt") or "").strip()
-            extra = str(form.get("extra_args") or "").strip()
             if not workspace or not prompt:
                 self._send(400, "text/plain", "workspace and prompt required\n")
                 return
-            extra_args = extra.split() if extra else []
+            extra_args, flag_errors = _collect_run_argv(form)
+            if flag_errors:
+                self._send(400, "text/plain",
+                           "invalid run options:\n  - " + "\n  - ".join(flag_errors) + "\n")
+                return
             try:
                 wp = spawn_harness_run(
                     cfg, workspace=workspace, prompt=prompt,
@@ -1960,7 +2071,6 @@ def make_request_handler(
             prompt = str(form.get("prompt") or "").strip()
             fire_raw = str(form.get("fire_at_utc") or "").strip()
             name = str(form.get("name") or "web-oneshot").strip() or "web-oneshot"
-            extra = str(form.get("extra_args") or "").strip()
             if not workspace or not prompt or not fire_raw:
                 self._send(400, "text/plain", "workspace, prompt, fire_at_utc required\n")
                 return
@@ -1972,7 +2082,11 @@ def make_request_handler(
             except ValueError as exc:
                 self._send(400, "text/plain", f"fire_at_utc invalid: {exc}\n")
                 return
-            extra_args = extra.split() if extra else []
+            extra_args, flag_errors = _collect_run_argv(form)
+            if flag_errors:
+                self._send(400, "text/plain",
+                           "invalid run options:\n  - " + "\n  - ".join(flag_errors) + "\n")
+                return
             try:
                 row_id = add_oneshot_job(
                     db_path=cfg.web_db_path, name=name,

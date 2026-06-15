@@ -271,3 +271,124 @@ def test_all_sections_returns_known_sections():
     section_names = {s.section for s in sections}
     # Every top-level section we know about appears (even if empty).
     assert _KNOWN_TOP_LEVEL_KEYS <= section_names
+
+
+# ---------------------------------------------------------------------------
+# 6. Run-harness CLI flag form
+# ---------------------------------------------------------------------------
+
+def test_run_flags_mirrors_cli_wizard():
+    """The Run page surfaces exactly the three flags the interactive CLI
+    wizard asks for (besides workspace + prompt, which have dedicated
+    inputs). Other `harness run` flags stay on the terminal."""
+    from harness.web_forms import run_flags
+    names = {f.name for f in run_flags()}
+    assert names == {"git", "new_build", "discover"}
+
+
+def test_build_run_argv_empty_form_produces_no_args():
+    """A wholly-default form should not emit any CLI flag, so the
+    harness's own defaults take over."""
+    from harness.web_forms import build_run_argv_from_form
+    argv, errors = build_run_argv_from_form({})
+    assert errors == []
+    assert argv == []
+
+
+def test_build_run_argv_discover_yes_emits_flag():
+    from harness.web_forms import build_run_argv_from_form
+    argv, errors = build_run_argv_from_form({"flag.discover": "yes"})
+    assert errors == []
+    assert "--discover" in argv
+
+
+def test_build_run_argv_discover_no_omits_flag():
+    from harness.web_forms import build_run_argv_from_form
+    argv, errors = build_run_argv_from_form({"flag.discover": "no"})
+    assert errors == []
+    assert "--discover" not in argv
+
+
+def test_build_run_argv_select_emits_flag_equals_value():
+    from harness.web_forms import build_run_argv_from_form
+    argv, errors = build_run_argv_from_form({
+        "flag.new_build": "true",
+        "flag.git": "disable",
+    })
+    assert errors == []
+    assert "--new-build=true" in argv
+    assert "--git=disable" in argv
+
+
+def test_build_run_argv_new_build_true_also_emits_yes():
+    """The CLI wizard auto-sets --yes when the operator picks
+    --new-build=true (otherwise cmd_run would block on a confirmation
+    prompt). The web form mirrors that because the spawned subprocess
+    has no TTY."""
+    from harness.web_forms import build_run_argv_from_form
+    argv, errors = build_run_argv_from_form({"flag.new_build": "true"})
+    assert errors == []
+    assert "--new-build=true" in argv
+    assert "--yes" in argv
+
+
+def test_build_run_argv_new_build_false_does_not_emit_yes():
+    from harness.web_forms import build_run_argv_from_form
+    argv, errors = build_run_argv_from_form({"flag.new_build": "false"})
+    assert errors == []
+    # new_build=false is the default → emit nothing at all (skip the
+    # noisy `--new-build=false` token and the irrelevant `--yes`).
+    assert argv == []
+
+
+def test_build_run_argv_select_rejects_unknown_choice():
+    from harness.web_forms import build_run_argv_from_form
+    argv, errors = build_run_argv_from_form({"flag.git": "bogus"})
+    assert any("git" in e for e in errors)
+    # Even on error the argv list is well-formed (no partial flags).
+    assert "--git" not in " ".join(argv)
+
+
+# ---------------------------------------------------------------------------
+# 7. Config-page grouping
+# ---------------------------------------------------------------------------
+
+def test_grouped_sections_covers_every_known_section():
+    """Every section all_sections() returns must land in a group. The
+    catch-all "Other" group is the safety net — but the named groups
+    should be exhaustive."""
+    from harness.web_forms import grouped_sections, all_sections
+    groups = grouped_sections()
+    grouped_names = set()
+    for g in groups:
+        for s in g.sections:
+            grouped_names.add(s.section)
+    all_names = {s.section for s in all_sections()}
+    assert all_names == grouped_names, (
+        f"sections not placed in any group: {all_names - grouped_names}"
+    )
+
+
+def test_grouped_sections_render_order_is_stable():
+    from harness.web_forms import grouped_sections
+    groups = grouped_sections()
+    titles = [g.title for g in groups]
+    # First and last group titles are operator-visible nav landmarks —
+    # pin them so a reorder shows up as a test failure rather than silent
+    # UI churn.
+    assert titles[0] == "General"
+    assert "LLM Registry" in titles
+    assert "LLM Routing" in titles
+
+
+def test_grouped_sections_each_section_appears_exactly_once():
+    """A section listed in two groups would render twice and confuse the
+    save-button targeting. Catch the regression here."""
+    from harness.web_forms import grouped_sections
+    seen: list[str] = []
+    for g in grouped_sections():
+        for s in g.sections:
+            seen.append(s.section)
+    assert len(seen) == len(set(seen)), (
+        f"duplicate sections across groups: {seen}"
+    )

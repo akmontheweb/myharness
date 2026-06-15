@@ -621,6 +621,47 @@ def test_run_page_renders_form_when_writes_enabled(tmp_path, monkeypatch):
     assert "Scheduled runs" in body
 
 
+def test_run_page_renders_per_flag_inputs(tmp_path, monkeypatch):
+    """The Run Harness page mirrors the interactive CLI wizard: workspace
+    + prompt have dedicated inputs at the top, and the Run options table
+    surfaces exactly the three wizard fields (git mode, new build,
+    discover). Other CLI flags stay on the terminal."""
+    monkeypatch.setenv("FAKE_CSRF", "tok")
+    cfg = _make_cfg(
+        tmp_path,
+        writes_enabled=True,
+        csrf_token_env="FAKE_CSRF",
+        web_db_path=str(tmp_path / "web.db"),
+    )
+    _, _, body = dispatch(cfg, "/run")
+    # The legacy "Extra harness args" combined textbox is gone.
+    assert "Extra harness args" not in body
+    assert "name='extra_args'" not in body
+    # --git enable/disable select.
+    assert "name='flag.git'" in body
+    assert "<option value='enable'" in body and "<option value='disable'" in body
+    # --new-build true/false select.
+    assert "name='flag.new_build'" in body
+    assert "<option value='true'" in body and "<option value='false'" in body
+    # --discover yes/no select.
+    assert "name='flag.discover'" in body
+    assert "<option value='yes'" in body and "<option value='no'" in body
+    # Flags NOT in the wizard stay off the web page — the operator gets
+    # them on the terminal. Catching their absence here is the drift
+    # detector for "did someone add another input?".
+    for absent in (
+        "flag.build_cmd", "flag.output_dir", "flag.session_id",
+        "flag.thread_id", "flag.allow_network", "flag.verbose",
+        "flag.dev_deployment", "flag.force_lock", "flag.assume_yes",
+        "flag.spec_review_cycles", "flag.code_review_cycles",
+    ):
+        assert absent not in body, f"unexpected flag input {absent!r} on Run page"
+    # CLI flag names are echoed so operators learn the vocabulary.
+    assert "--git" in body
+    assert "--new-build" in body
+    assert "--discover" in body
+
+
 # --- Configure Harness ------------------------------------------------------
 
 def test_config_ui_off_when_writes_explicitly_disabled(tmp_path):
@@ -656,3 +697,48 @@ def test_config_ui_renders_accordion_with_dropdown_for_sandbox_backend(tmp_path,
     assert "Save sandbox" in body
     # Deployment.json out-of-scope notice
     assert "deployment.json" in body
+
+
+def test_config_ui_groups_related_sections_with_collapsible_headers(tmp_path, monkeypatch):
+    """Related config sections are bundled under a group header (LLM
+    Registry, LLM Routing, etc.) that the operator can expand/collapse."""
+    monkeypatch.setenv("FAKE_CSRF", "tok")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({
+        "sandbox": {"backend": "docker"},
+        "model_routing": {"planning_primary": "gpt-4"},
+    }))
+    cfg = _make_cfg(
+        tmp_path,
+        writes_enabled=True,
+        csrf_token_env="FAKE_CSRF",
+        web_db_path=str(tmp_path / "web.db"),
+        config_path=str(config_path),
+    )
+    _, _, body = dispatch(cfg, "/config-ui")
+    # Group container + clickable headings.
+    assert "config-group" in body
+    assert "config-group__heading" in body
+    # +/- toggle glyph in the heading.
+    assert "config-group__toggle" in body and ">+<" in body
+    # Group titles operators expect to see.
+    for title in (
+        "General",
+        "LLM Registry",
+        "LLM Routing",
+        "Sandbox &amp; Security",
+        "Budget &amp; Throttling",
+        "Logging &amp; Debug",
+        "Skills &amp; Tools",
+        "Patching &amp; Speculation",
+        "Storage &amp; Memory",
+        "Scheduling",
+        "Dashboard",
+    ):
+        assert title in body, f"missing group header {title!r}"
+    # Groups start collapsed (aria-expanded='false', body display:none).
+    assert "aria-expanded='false'" in body
+    assert "display:none" in body
+    # Inside, the existing section editors still render.
+    assert "name='sandbox.backend'" in body
+    assert "name='model_routing.planning_primary'" in body
