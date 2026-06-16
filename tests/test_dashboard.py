@@ -474,9 +474,10 @@ def test_layout_links_static_stylesheet_and_favicon_and_js(tmp_path):
     removal during future refactors."""
     cfg = _make_cfg(tmp_path)
     _, _, body = dispatch(cfg, "/status")
-    assert 'href="/static/css/app.css"' in body
+    # Asset URLs carry a ``?v=<mtime-hex>`` cache-buster, so match by prefix.
+    assert 'href="/static/css/app.css?v=' in body or 'href="/static/css/app.css"' in body
     assert 'href="/static/favicon.ico"' in body
-    assert 'src="/static/js/dashboard.js"' in body
+    assert 'src="/static/js/dashboard.js?v=' in body or 'src="/static/js/dashboard.js"' in body
     assert 'name="viewport"' in body  # mobile-ready
 
 
@@ -619,7 +620,11 @@ def test_layout_includes_toast_surface_via_dashboard_js(tmp_path):
     cfg = _make_cfg(tmp_path)
     _, _, body = dispatch(cfg, "/status")
     # The script tag references dashboard.js (toast helper lives in it).
-    assert 'src="/static/js/dashboard.js"' in body
+    # The URL carries a ``?v=<mtime-hex>`` cache-buster appended in _layout.
+    assert (
+        'src="/static/js/dashboard.js?v=' in body
+        or 'src="/static/js/dashboard.js"' in body
+    )
 
 
 def test_run_page_has_new_and_resume_tabs(tmp_path, monkeypatch):

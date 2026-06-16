@@ -1074,7 +1074,31 @@ def _render_side_nav(active: str) -> str:
     )
 
 
+def _static_asset_version(cfg: DashboardConfig, relpath: str) -> str:
+    """Return a short cache-busting token for a static asset, derived
+    from the file's mtime. Static responses set
+    ``Cache-Control: max-age=3600`` so a stale dashboard.js can survive
+    across hot iterations; appending ``?v=<token>`` to the asset URL
+    changes the resource key whenever the file changes, forcing the
+    browser to refetch. Falls back to a constant when stat fails so the
+    URL still works."""
+    candidates: list[str] = []
+    override_dir = (getattr(cfg, "static_dir", "") or "").strip()
+    if override_dir:
+        candidates.append(os.path.expanduser(override_dir))
+    candidates.append(_PACKAGED_STATIC_DIR)
+    for root in candidates:
+        try:
+            mtime = os.path.getmtime(os.path.join(root, relpath))
+        except OSError:
+            continue
+        return f"{int(mtime):x}"
+    return "0"
+
+
 def _layout(title: str, body: str, cfg: DashboardConfig, active: str = "") -> str:
+    app_css_v = _static_asset_version(cfg, "css/app.css")
+    dashboard_js_v = _static_asset_version(cfg, "js/dashboard.js")
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1084,10 +1108,10 @@ def _layout(title: str, body: str, cfg: DashboardConfig, active: str = "") -> st
 <title>{html.escape(title)} — myharness</title>
 <link rel="icon" href="/static/favicon.ico">
 <link rel="stylesheet" href="{html.escape(cfg.carbon_css_url)}">
-<link rel="stylesheet" href="/static/css/app.css">
+<link rel="stylesheet" href="/static/css/app.css?v={app_css_v}">
 <style>{_BASE_CSS}</style>
 <script src="{html.escape(cfg.chart_js_url)}"></script>
-<script defer src="/static/js/dashboard.js"></script>
+<script defer src="/static/js/dashboard.js?v={dashboard_js_v}"></script>
 </head>
 <body class="bx--body">
 <header class="bx--header" role="banner">
