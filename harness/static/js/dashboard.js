@@ -640,6 +640,28 @@
     if (nearBottom) container.scrollTop = container.scrollHeight;
   }
 
+  // Dedicated lightweight SSE channel for live HITL surfacing on the
+  // operator console. The console body omits the visible events list,
+  // but Phase 2's "banner appears in ~100ms when the harness pauses"
+  // contract relies on the JSONL stream — so we open a hidden EventSource
+  // here and only react to hitl_pending / hitl_resolved.
+  function wireHitlSseChannel() {
+    var slot = document.getElementById("hitl-pending-slot");
+    if (!slot || typeof EventSource === "undefined") return;
+    var url = slot.getAttribute("data-hitl-sse-url");
+    if (!url) return;
+    var es = new EventSource(url);
+    es.onmessage = function (evt) {
+      var data;
+      try { data = JSON.parse(evt.data); } catch (_e) { return; }
+      var kind = data && data.event;
+      if (kind === "hitl_pending" || kind === "hitl_resolved") {
+        refreshHitlSlot();
+      }
+    };
+    es.addEventListener("close", function () { es.close(); });
+  }
+
   function wireEventStream() {
     var ul = document.getElementById("event-stream");
     if (!ul || typeof EventSource === "undefined") return;
@@ -1267,6 +1289,7 @@
     wireNavToggle();
     wireEventStream();
     wireStdoutStream();
+    wireHitlSseChannel();
     wireConfigTree();
     wireSessionPicker();
     wireSessionPurge();

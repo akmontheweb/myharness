@@ -952,8 +952,12 @@ def test_run_page_shows_no_runs_in_progress_when_empty(tmp_path):
 
 def test_run_console_returns_200_for_known_session(tmp_path):
     """/run/console/{sid} is the operator's live cockpit for an active
-    run. It must render with the Close-console button (back to /run)
-    and the same content panels the historical session view uses."""
+    run. The body is deliberately minimal: HITL slot, chat-notes slot,
+    raw stdout/stderr stream — no events table, no JSONL events list.
+    Operators asked for "just the chat window and the logs" so the
+    console keeps the surface focused. The HITL slot still carries a
+    hidden SSE channel URL so Phase 2's live banner works without the
+    visible events list."""
     cfg = _make_cfg(tmp_path)
     handle, base_url = _start(cfg)
     csrf = handle.csrf_token
@@ -967,13 +971,21 @@ def test_run_console_returns_200_for_known_session(tmp_path):
             headers={"Cookie": f"csrf_token={csrf}"},
         )
         body = urllib.request.urlopen(req, timeout=4.0).read().decode("utf-8")
+        # Chrome + Close button back to /run
         assert "run-console-chrome" in body
         assert "Close console" in body
         assert "href='/run'" in body or 'href="/run"' in body
-        # The slot wrappers and SSE streams must render via the shared
-        # _render_session_with_hitl content.
+        # Kept panels: HITL slot, chat-notes slot, raw stdout stream.
         assert "id='hitl-pending-slot'" in body or 'id="hitl-pending-slot"' in body
+        assert "id='chat-notes-slot'" in body or 'id="chat-notes-slot"' in body
         assert "id='stdout-stream'" in body or 'id="stdout-stream"' in body
+        # Hidden SSE channel for live HITL surfacing — Phase 2 contract.
+        assert "data-hitl-sse-url" in body
+        assert "/api/sessions/sess-cn/events" in body
+        # Removed panels: JSONL events list + the session-detail events
+        # table. Asserting absence prevents an inadvertent re-add.
+        assert "id='event-stream'" not in body and 'id="event-stream"' not in body
+        assert "Live events" not in body
     finally:
         handle.shutdown()
 

@@ -1424,7 +1424,7 @@ def _route_run_console(cfg: DashboardConfig, params: dict[str, str]) -> tuple[in
     body = (
         f"<div class='{wrapper_class}'>"
         + _render_run_console_chrome(cfg, sid)
-        + _render_session_with_hitl(cfg, sid)
+        + _render_console_body(cfg, sid)
         + "</div>"
     )
     return 200, "text/html; charset=utf-8", _layout(
@@ -4660,6 +4660,44 @@ def _render_chat_notes_card(cfg: DashboardConfig, session_id: str) -> str:
         "<p class='chat-note-error muted' role='alert'></p>"
         "</form></div>"
     )
+
+
+def _render_console_body(cfg: DashboardConfig, session_id: str) -> str:
+    """Operator-console content: HITL banner + chat-notes + raw
+    stdout/stderr stream. Deliberately omits the JSONL events table and
+    the "Live events" SSE list — operators consistently asked for just
+    the chat window and the tail-style stdout view during a run, so the
+    console keeps the surface minimal.
+
+    Phase 2's live HITL banner still works without the visible events
+    list: we render a hidden ``data-hitl-sse-url`` marker on the HITL
+    slot div so ``wireHitlSseChannel()`` opens a dedicated EventSource
+    that listens only for ``hitl_pending`` / ``hitl_resolved`` events
+    and triggers the slot refresh."""
+    sid_esc = _esc(session_id)
+    parts: list[str] = []
+    parts.append(
+        f"<div id='hitl-pending-slot' data-session-id='{sid_esc}' "
+        f"data-hitl-sse-url='/api/sessions/{sid_esc}/events'>"
+        + _render_pending_hitl_rows(cfg, session_id)
+        + "</div>"
+    )
+    parts.append(
+        f"<div id='chat-notes-slot' data-session-id='{sid_esc}'>"
+        + _render_chat_notes_card(cfg, session_id)
+        + "</div>"
+    )
+    stdout_url = f"/api/sessions/{sid_esc}/stdout"
+    parts.append(
+        "<div class='card'><h3>Logs</h3>"
+        "<p class='muted'>Live stdout/stderr from the harness subprocess. "
+        "Newest output appears at the bottom; auto-scroll pauses when "
+        "you scroll up.</p>"
+        "<pre id='stdout-stream' class='stdout-stream' "
+        f"data-sse-url='{stdout_url}'></pre>"
+        "</div>"
+    )
+    return "".join(parts)
 
 
 def _render_session_with_hitl(cfg: DashboardConfig, session_id: str) -> str:
