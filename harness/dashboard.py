@@ -63,6 +63,13 @@ _DEFAULT_CARBON_CSS_URL = "https://unpkg.com/carbon-components@10.58.12/css/carb
 _DEFAULT_CARBON_JS_URL = "https://unpkg.com/carbon-components@10.58.12/scripts/carbon-components.min.js"
 _DEFAULT_DOCS_DIR = ""  # empty → resolve to <repo_root>/docs at request time
 
+# Cap on the size of prompts accepted by the /run/now and /run/resume web
+# handlers. ~50 KB is roughly two long pages — enough for any realistic
+# product-requirement paste, small enough that no single submission can
+# DoS the spawn loop. Operators with legitimately larger inputs should
+# upload a spec file instead of pasting.
+_RUN_PROMPT_MAX_CHARS = 50_000
+
 
 # ---------------------------------------------------------------------------
 # 1. Config
@@ -92,6 +99,8 @@ class DashboardConfig:
     writes_enabled: bool = True
     csrf_token_env: str = ""       # CSRF token env var; auto-generated when empty + writes_enabled
     hitl_webhook_secret: str = ""  # shared secret the harness POSTs with
+    hitl_webhook_timeout_seconds: float = 600.0  # max seconds the webhook handler blocks waiting for an operator answer
+    audit_log_retention_days: int = 90  # web.db audit_log rows older than this are pruned at server start; 0 disables
     web_db_path: str = "~/.harness/web.db"
     config_path: str = ""          # canonical config.json path; empty → use discover_config
     carbon_css_url: str = _DEFAULT_CARBON_CSS_URL
@@ -129,6 +138,14 @@ class DashboardConfig:
             writes_enabled=bool(section.get("writes_enabled", True)),
             csrf_token_env=str(section.get("csrf_token_env", "")),
             hitl_webhook_secret=str(section.get("hitl_webhook_secret", "")),
+            hitl_webhook_timeout_seconds=max(
+                1.0,
+                float(section.get("hitl_webhook_timeout_seconds", 600.0)),
+            ),
+            audit_log_retention_days=max(
+                0,
+                int(section.get("audit_log_retention_days", 90)),
+            ),
             web_db_path=str(section.get("web_db_path", "~/.harness/web.db")),
             config_path=str(section.get("config_path", "")),
             carbon_css_url=str(section.get("carbon_css_url", _DEFAULT_CARBON_CSS_URL)),
@@ -1003,6 +1020,10 @@ def _empty_state(
     Use anywhere a renderer previously emitted a lone ``<p class='muted'>
     No foo yet…</p>``. The CTA replaces the previous "go run the CLI"
     hint with a one-click affordance.
+
+    ``body`` is treated as plain text and HTML-escaped — callers that
+    want a richer empty-state body should compose the markup themselves
+    and use a different helper.
     """
     cta_html = ""
     if cta_text and cta_href:
@@ -1014,7 +1035,7 @@ def _empty_state(
         f"<div class='empty-state'>"
         f"<div class='empty-state__icon'>{_icon(icon, size=32, klass='icon--lg')}</div>"
         f"<h3 class='empty-state__title'>{html.escape(title)}</h3>"
-        f"<p class='empty-state__body'>{body}</p>"
+        f"<p class='empty-state__body'>{html.escape(body)}</p>"
         f"{cta_html}"
         f"</div>"
     )
@@ -1108,8 +1129,8 @@ def _render_sessions(cfg: DashboardConfig) -> str:
             icon="list",
             title="No sessions yet",
             body=(
-                "Run the harness via <a href='/run'>Run Harness</a> or the "
-                "<code>harness run</code> CLI to populate this view."
+                "Run the harness from the Run Harness page or the "
+                "`harness run` CLI to populate this view."
             ),
             cta_text="Run harness",
             cta_href="/run",
@@ -1423,6 +1444,18 @@ def _route_docs_file(cfg: DashboardConfig, params: dict[str, str]) -> tuple[int,
     status, body = _render_docs_file(cfg, relpath)
     title = f"Document · {relpath}" if status == 200 else "Document · not found"
     return status, "text/html; charset=utf-8", _layout(title, body, cfg, active="docs")
+
+
+def _route_api_config_mtime(
+    cfg: DashboardConfig, _params: dict[str, str],
+) -> tuple[int, str, str]:
+    """Return the current ``config.json`` mtime as JSON. The Configure
+    page polls this every few seconds and shows a "config changed
+    externally — Reload" banner when the value differs from the
+    snapshot stamped at page-render time."""
+    mtime_ns = config_file_mtime_ns(cfg)
+    payload = {"mtime_ns": mtime_ns}
+    return 200, "application/json", json.dumps(payload)
 
 
 def _stub_panel(label: str) -> str:
@@ -2121,6 +2154,12 @@ def _render_configure_harness(cfg: DashboardConfig) -> str:
     current_config = {k: v for k, v in current_config.items() if not k.startswith("_")}
 
     csrf_token = resolve_csrf_token(cfg) or ""
+    # Snapshot the file mtime so the save handler can detect concurrent
+    # external edits and the JS poller can detect them while the page
+    # is open. Empty string when the file is missing — the page is
+    # creating a config from scratch, so there's nothing to be stale of.
+    base_mtime_ns = config_file_mtime_ns(cfg)
+    base_mtime_attr = "" if base_mtime_ns is None else str(base_mtime_ns)
 
     # Sections inside each group that have a closed-shape schema — for
     # these we render with allow_add_keys=False so the operator doesn't
@@ -2195,6 +2234,7 @@ def _render_configure_harness(cfg: DashboardConfig) -> str:
             f"<form method='post' action='/config-tree/{html.escape(section_key)}' "
             f"class='ct-form'>"
             f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+            f"<input type='hidden' name='__base_mtime_ns' value='{html.escape(base_mtime_attr)}'>"
             f"<div class='ct-tree'>{tree_html}</div>"
             f"<div class='actions'>"
             f"<button class='bx--btn bx--btn--primary' type='submit'>"
@@ -2256,7 +2296,23 @@ def _render_configure_harness(cfg: DashboardConfig) -> str:
             "</div></details>"
         )
 
+    # Banner placeholder driven by dashboard.js — when the poller sees
+    # config.json's mtime change on disk it un-hides this card so the
+    # operator knows their form values are stale.
+    stale_banner = (
+        "<div class='card fail config-stale-banner' "
+        "id='config-stale-banner' hidden role='alert'>"
+        "<p><strong>config.json was modified outside this tab.</strong> "
+        "Your form values may be stale. "
+        "<a href='/config-ui'>Reload the page</a> to see the latest values "
+        "before saving.</p>"
+        "</div>"
+    )
     return (
+        f"<div class='configure-page' "
+        f"data-config-mtime-ns='{html.escape(base_mtime_attr)}' "
+        f"data-config-mtime-poll-url='/api/config-mtime'>"
+        f"{stale_banner}"
         "<div class='card'>"
         "<h2>Configuration sections</h2>"
         "<p class='muted'>Edit any value in <code>config.json</code> right here. "
@@ -2269,6 +2325,7 @@ def _render_configure_harness(cfg: DashboardConfig) -> str:
         "<div class='card'>"
         "<p class='muted'>Deployment defaults live in <code>config/deployment.json</code> — "
         "edit directly until web editing lands for that file.</p>"
+        "</div>"
         "</div>"
     )
 
@@ -2563,6 +2620,7 @@ _ROUTES: list[Route] = [
     (re.compile(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/?$"), _route_session_detail),
     (re.compile(r"^/cost/?$"), _route_cost),
     (re.compile(r"^/api/cost-burn/?$"), _route_api_cost_burn),
+    (re.compile(r"^/api/config-mtime/?$"), _route_api_config_mtime),
     (re.compile(r"^/schedule/?$"), _route_schedule),
     (re.compile(r"^/index/?$"), _route_index),
     (re.compile(r"^/memory/?$"), _route_memory),
@@ -2902,8 +2960,21 @@ def make_request_handler(
                 self._send(400, "text/html; charset=utf-8",
                            _layout(f"Config · {section_name}", body, cfg))
                 return
-            ok, msg = write_config_section_atomic(cfg, section_name, parsed)
+            base_mtime_ns = _extract_base_mtime_ns(form)
+            ok, msg = write_config_section_atomic(
+                cfg, section_name, parsed,
+                expected_base_mtime_ns=base_mtime_ns,
+            )
             if not ok:
+                if msg.startswith(CONFIG_STALE_MARKER):
+                    flash = msg[len(CONFIG_STALE_MARKER):].strip()
+                    body = _render_config_section(
+                        cfg, section_name, csrf_token=csrf_token,
+                        flash=flash,
+                    )
+                    self._send(409, "text/html; charset=utf-8",
+                               _layout(f"Config · {section_name}", body, cfg))
+                    return
                 err_map = {section.fields[0].dotted_key: msg} if section.fields else {}
                 body = _render_config_section(
                     cfg, section_name, csrf_token=csrf_token,
@@ -2958,17 +3029,33 @@ def make_request_handler(
                 # was never present. Save an empty container so the validator
                 # sees an explicit shape rather than vanishing.
                 section_value = {}
-            ok, msg = write_config_section_atomic(cfg, section_name, section_value)
+            base_mtime_ns = _extract_base_mtime_ns(form)
+            ok, msg = write_config_section_atomic(
+                cfg, section_name, section_value,
+                expected_base_mtime_ns=base_mtime_ns,
+            )
             if not ok:
                 # Re-render the page with the failure surfaced as a flash.
+                # Stale-write conflicts get a 409 + plain message so the
+                # operator immediately understands "reload, don't retry".
                 body = _render_configure_harness(cfg)
-                fail_card = (
-                    f"<div class='card'><p class='fail'>"
-                    f"Save of <code>{html.escape(section_name)}</code> failed: "
-                    f"{html.escape(msg)}</p></div>"
-                )
+                if msg.startswith(CONFIG_STALE_MARKER):
+                    plain = msg[len(CONFIG_STALE_MARKER):].strip()
+                    fail_card = (
+                        f"<div class='card fail'><p>"
+                        f"Save of <code>{html.escape(section_name)}</code> rejected: "
+                        f"{html.escape(plain)}</p></div>"
+                    )
+                    status_code = 409
+                else:
+                    fail_card = (
+                        f"<div class='card'><p class='fail'>"
+                        f"Save of <code>{html.escape(section_name)}</code> failed: "
+                        f"{html.escape(msg)}</p></div>"
+                    )
+                    status_code = 400
                 self._send(
-                    400, "text/html; charset=utf-8",
+                    status_code, "text/html; charset=utf-8",
                     _layout("Configure Harness", fail_card + body, cfg, active="config"),
                 )
                 return
@@ -3010,6 +3097,13 @@ def make_request_handler(
             if not workspace:
                 self._send(400, "text/plain", "workspace required\n")
                 return
+            workspace_resolved = os.path.expanduser(workspace)
+            if not os.path.isdir(workspace_resolved):
+                self._send(
+                    400, "text/plain",
+                    f"workspace not found: {workspace}\n",
+                )
+                return
             # The Product Requirement input accepts either pasted text or
             # an uploaded .txt/.md document (whose path lands in the
             # hidden ``spec_file_path`` field via /api/upload-spec). At
@@ -3020,6 +3114,13 @@ def make_request_handler(
                     400, "text/plain",
                     "Provide a product requirement: either enter text or "
                     "upload a .txt/.md document.\n",
+                )
+                return
+            if len(prompt) > _RUN_PROMPT_MAX_CHARS:
+                self._send(
+                    400, "text/plain",
+                    f"prompt too long ({len(prompt)} chars; "
+                    f"max {_RUN_PROMPT_MAX_CHARS})\n",
                 )
                 return
             # Block parallel runs against the same workspace — the
@@ -3075,6 +3176,21 @@ def make_request_handler(
             # workspace from the checkpoint if omitted.
             workspace = str(form.get("workspace") or "").strip() or None
             prompt = str(form.get("prompt") or "").strip() or None
+            if workspace:
+                workspace_resolved = os.path.expanduser(workspace)
+                if not os.path.isdir(workspace_resolved):
+                    self._send(
+                        400, "text/plain",
+                        f"workspace not found: {workspace}\n",
+                    )
+                    return
+            if prompt and len(prompt) > _RUN_PROMPT_MAX_CHARS:
+                self._send(
+                    400, "text/plain",
+                    f"prompt too long ({len(prompt)} chars; "
+                    f"max {_RUN_PROMPT_MAX_CHARS})\n",
+                )
+                return
             try:
                 wp = spawn_harness_resume(
                     cfg, session_id=session_id,
@@ -3458,8 +3574,8 @@ def make_request_handler(
             )
             # Block on the operator's answer. Default 10 minute cap so
             # an abandoned UI session doesn't keep the harness pinned
-            # forever.
-            timeout = float((cfg.csrf_token_env and 1) or 1) * 600.0
+            # forever. Tunable via dashboard.hitl_webhook_timeout_seconds.
+            timeout = float(cfg.hitl_webhook_timeout_seconds or 600.0)
             if not entry.event.wait(timeout=timeout):
                 self._send(504, "text/plain", "504 operator did not respond in time\n")
                 return
@@ -3518,6 +3634,20 @@ def start_server(
     handle is returned for tests to shut down."""
     expected_token = resolve_expected_token(cfg)
     csrf = resolve_csrf_token(cfg)
+    # One-shot audit-log retention sweep at server start. Otherwise the
+    # table grows forever; even on a low-traffic dashboard that's
+    # eventually a long-tail problem.
+    try:
+        from harness.web_state import prune_audit_log
+        removed = prune_audit_log(
+            db_path=cfg.web_db_path,
+            days=int(cfg.audit_log_retention_days),
+        )
+        if removed:
+            logger.info("[dashboard] pruned %d audit_log row(s) > %d days old",
+                        removed, cfg.audit_log_retention_days)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[dashboard] audit_log prune skipped: %s", exc)
     handler_class = make_request_handler(cfg, expected_token, csrf_token=csrf)
     server = _ThreadingServer((cfg.host, cfg.port), handler_class)
     if blocking:
@@ -3668,16 +3798,53 @@ def read_config_file(cfg: DashboardConfig) -> dict[str, Any]:
     return {k: v for k, v in data.items() if not k.startswith("_")}
 
 
+def config_file_mtime_ns(cfg: DashboardConfig) -> Optional[int]:
+    """Return the canonical ``config.json`` mtime in nanoseconds, or
+    ``None`` when the file is missing / unreadable. Used to detect
+    out-of-band edits between page render and save (Tier-B optimistic
+    concurrency) and to drive the live-poll banner on the Configure
+    page. Integer ns is exact across the JSON / form-data round trip —
+    floats would lose precision."""
+    path = _config_file_path(cfg)
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
+
+CONFIG_STALE_MARKER = "__config_stale__"
+
+
 def write_config_section_atomic(
     cfg: DashboardConfig, section: str, new_section_value: Any,
+    *,
+    expected_base_mtime_ns: Optional[int] = None,
 ) -> tuple[bool, str]:
     """Read the current config, replace ``section``, validate the
     merged result through the strict validator, write atomically.
     Returns ``(success, message)``. On validation failure the disk
-    file is untouched."""
+    file is untouched.
+
+    When ``expected_base_mtime_ns`` is supplied, the disk file's
+    current mtime must match it — otherwise an external process has
+    rewritten the file since the operator opened the page, and we
+    refuse the save with a message prefixed by :data:`CONFIG_STALE_MARKER`
+    so the caller can surface a "reload to see latest values" banner
+    instead of a generic validation error."""
     path = _config_file_path(cfg)
     if not os.path.isfile(path):
         return False, f"config file not found at {path}"
+    if expected_base_mtime_ns is not None:
+        try:
+            current_mtime_ns = os.stat(path).st_mtime_ns
+        except OSError as exc:
+            return False, f"could not stat config: {exc}"
+        if current_mtime_ns != expected_base_mtime_ns:
+            return False, (
+                f"{CONFIG_STALE_MARKER} config.json was modified outside "
+                f"this browser tab since the page was loaded. Reload to "
+                f"see the current values, then re-apply your edits."
+            )
     try:
         with open(path, "r", encoding="utf-8") as f:
             full = json.load(f)
@@ -3816,13 +3983,20 @@ def spawn_harness_run(
     if cfg.hitl_webhook_secret:
         env["HARNESS_HITL_WEBHOOK_SECRET"] = cfg.hitl_webhook_secret
 
-    proc = _sub.Popen(
-        argv,
-        stdout=open(log_path + ".stdout", "ab"),
-        stderr=_sub.STDOUT,
-        env=env,
-        start_new_session=True,
-    )
+    # Open the stdout sink, hand the FD to Popen (which dup's it into the
+    # child), then close the parent's copy so the dashboard process doesn't
+    # leak one FD per spawned run.
+    stdout_fh = open(log_path + ".stdout", "ab")
+    try:
+        proc = _sub.Popen(
+            argv,
+            stdout=stdout_fh,
+            stderr=_sub.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+    finally:
+        stdout_fh.close()
     wp = WebProcess(
         session_id=session_id, pid=proc.pid, argv=argv,
         log_path=log_path, workspace_path=workspace, prompt=prompt,
@@ -3902,13 +4076,18 @@ def spawn_harness_resume(
     if cfg.hitl_webhook_secret:
         env["HARNESS_HITL_WEBHOOK_SECRET"] = cfg.hitl_webhook_secret
 
-    proc = _sub.Popen(
-        argv,
-        stdout=open(log_path + ".stdout", "ab"),
-        stderr=_sub.STDOUT,
-        env=env,
-        start_new_session=True,
-    )
+    # See spawn_harness_run for why we close the parent FD after Popen.
+    stdout_fh = open(log_path + ".stdout", "ab")
+    try:
+        proc = _sub.Popen(
+            argv,
+            stdout=stdout_fh,
+            stderr=_sub.STDOUT,
+            env=env,
+            start_new_session=True,
+        )
+    finally:
+        stdout_fh.close()
     wp = WebProcess(
         session_id=session_id, pid=proc.pid, argv=argv,
         log_path=log_path,
@@ -4116,8 +4295,11 @@ def _render_config_section(
         err = errors.get(f.dotted_key, "")
         inputs.append(f"<div class='field'>{_render_field_input(f, err)}</div>")
     if cfg.writes_enabled and csrf_token is not None:
+        base_mtime_ns = config_file_mtime_ns(cfg)
+        base_mtime_attr = "" if base_mtime_ns is None else str(base_mtime_ns)
         save = (
             f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+            f"<input type='hidden' name='__base_mtime_ns' value='{html.escape(base_mtime_attr)}'>"
             "<p><button type='submit'>Save changes</button></p>"
         )
         form_open = f"<form method='post' action='/config/{_esc(section_name)}'>"
@@ -4288,6 +4470,25 @@ def _render_session_with_hitl(cfg: DashboardConfig, session_id: str) -> str:
 # ---------------------------------------------------------------------------
 # Form parsing — read the POST body
 # ---------------------------------------------------------------------------
+
+def _extract_base_mtime_ns(form: dict[str, Any]) -> Optional[int]:
+    """Pull the hidden ``__base_mtime_ns`` field out of a POSTed form
+    and return it as an int. Returns ``None`` when the field is missing
+    or empty (no baseline → skip the stale check; legitimate when the
+    config file didn't exist at render time)."""
+    raw = form.get("__base_mtime_ns")
+    if isinstance(raw, list):
+        raw = raw[-1] if raw else None
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
 
 def _parse_form_body(body: bytes) -> dict[str, Any]:
     text = body.decode("utf-8", errors="replace")

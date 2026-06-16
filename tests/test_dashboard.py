@@ -84,6 +84,38 @@ def test_dashboard_config_port_clamped_to_valid_range():
     assert cfg2.port == 65535
 
 
+def test_dashboard_config_hitl_webhook_timeout_default_and_override():
+    cfg = DashboardConfig.from_config({})
+    assert cfg.hitl_webhook_timeout_seconds == 600.0
+    cfg2 = DashboardConfig.from_config({
+        "dashboard": {"hitl_webhook_timeout_seconds": 1200.0},
+    })
+    assert cfg2.hitl_webhook_timeout_seconds == 1200.0
+
+
+def test_dashboard_config_audit_log_retention_default_and_override():
+    cfg = DashboardConfig.from_config({})
+    assert cfg.audit_log_retention_days == 90
+    cfg2 = DashboardConfig.from_config({
+        "dashboard": {"audit_log_retention_days": 30},
+    })
+    assert cfg2.audit_log_retention_days == 30
+
+
+def test_empty_state_escapes_body():
+    """_empty_state's ``body`` parameter is rendered as plain text. A
+    caller that passes user-derived data with HTML in it must not
+    produce live markup."""
+    from harness.dashboard import _empty_state
+    html_out = _empty_state(
+        icon="list",
+        title="No sessions yet",
+        body="<script>alert(1)</script>",
+    )
+    assert "<script>alert(1)</script>" not in html_out
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html_out
+
+
 # ---------------------------------------------------------------------------
 # 2. Auth
 # ---------------------------------------------------------------------------
@@ -1120,3 +1152,187 @@ def test_config_ui_groups_related_sections_with_collapsible_headers(tmp_path, mo
     assert "data-section='model_routing'" in body
     assert "name='__path[]' value='sandbox/backend'" in body
     assert "name='__path[]' value='model_routing/planning_primary'" in body
+
+
+# ---------------------------------------------------------------------------
+# Configure page — external-edit detection (mtime stamp + /api/config-mtime)
+# ---------------------------------------------------------------------------
+
+def _minimal_valid_config_dict() -> dict:
+    """Smallest config shape ``validate_config_strict`` accepts. Used
+    by the stale-write tests so the writer's atomic-write path actually
+    reaches the mtime comparison instead of bouncing off validation."""
+    return {
+        "build_command": "make",
+        "allow_network": False,
+        "product_spec_dir": "p",
+        "sandbox": {"backend": "auto", "docker_image": "x:1",
+                    "docker_memory_limit": "512m", "docker_cpu_limit": "1.0",
+                    "docker_pids_limit": 100, "readonly_cache_mounts": [],
+                    "timeout_seconds": 300, "pgid_kill_on_timeout": True,
+                    "restore_workspace_ownership": True},
+        "token_budget": {"hard_cap_usd": 1.0,
+                         "context_window_threshold_pct": 0.85},
+        "models": {"m": {
+            "provider": "ollama", "model_id": "m",
+            "context_window": 4096, "input_cost_per_1m": 0.0,
+            "output_cost_per_1m": 0.0,
+            "api_base_url": "http://x", "api_key": "",
+            "supports_thinking": False, "supports_cache": False,
+        }},
+        "model_routing": {"planning_primary": "m",
+                          "patching_primary": "m",
+                          "repair_primary": "m"},
+        "persistence": {"db_path": "~/.harness/x.db", "ttl_days": 30},
+    }
+
+def test_config_ui_stamps_base_mtime_ns_on_every_section_form(tmp_path, monkeypatch):
+    """Every per-section form on /config-ui carries a hidden
+    ``__base_mtime_ns`` field that snapshots the on-disk mtime so the
+    save handler can detect concurrent external rewrites. The outer
+    ``.configure-page`` wrapper exposes the same value as a data-attr
+    for the live-poll banner JS."""
+    from harness.dashboard import config_file_mtime_ns
+    monkeypatch.setenv("FAKE_CSRF", "tok")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"sandbox": {"backend": "docker"}}))
+    cfg = _make_cfg(
+        tmp_path,
+        writes_enabled=True,
+        csrf_token_env="FAKE_CSRF",
+        web_db_path=str(tmp_path / "web.db"),
+        config_path=str(config_path),
+    )
+    expected_mtime = config_file_mtime_ns(cfg)
+    assert expected_mtime is not None
+    _, _, body = dispatch(cfg, "/config-ui")
+    # Outer wrapper carries the snapshot + poll URL for the JS.
+    assert f"data-config-mtime-ns='{expected_mtime}'" in body
+    assert "data-config-mtime-poll-url='/api/config-mtime'" in body
+    # Stale banner placeholder is rendered (hidden until JS unhides it).
+    assert "id='config-stale-banner'" in body and "hidden" in body
+    # Each section form also carries the hidden field — both for the
+    # tree editor and (defensively) the legacy curated form, so a save
+    # POST always has the baseline available.
+    assert f"name='__base_mtime_ns' value='{expected_mtime}'" in body
+
+
+def test_config_ui_empty_base_mtime_when_config_file_missing(tmp_path, monkeypatch):
+    """When config.json doesn't exist yet (fresh install / new
+    deployment), the hidden field renders an empty value — the save
+    handler interprets that as "no baseline, skip stale check"."""
+    monkeypatch.setenv("FAKE_CSRF", "tok")
+    cfg = _make_cfg(
+        tmp_path,
+        writes_enabled=True,
+        csrf_token_env="FAKE_CSRF",
+        web_db_path=str(tmp_path / "web.db"),
+        config_path=str(tmp_path / "missing.json"),
+    )
+    _, _, body = dispatch(cfg, "/config-ui")
+    assert "data-config-mtime-ns=''" in body
+    # No baseline → no banner trigger, but the wrapper still renders so
+    # the poller no-ops cleanly.
+    assert "configure-page" in body
+
+
+def test_api_config_mtime_returns_current_ns(tmp_path):
+    """``GET /api/config-mtime`` reports the file's current mtime in
+    nanoseconds. The Configure page polls this and compares against
+    its render-time baseline to detect external edits."""
+    import os as _os
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"sandbox": {"backend": "docker"}}))
+    cfg = _make_cfg(tmp_path, config_path=str(config_path))
+    status, ctype, body = dispatch(cfg, "/api/config-mtime")
+    assert status == 200
+    assert "application/json" in ctype
+    payload = json.loads(body)
+    assert payload["mtime_ns"] == _os.stat(str(config_path)).st_mtime_ns
+
+
+def test_api_config_mtime_returns_null_when_missing(tmp_path):
+    """If the file is missing, the endpoint returns ``mtime_ns: null``.
+    The poller treats that as "no change" — there's no baseline to
+    diverge from anyway."""
+    cfg = _make_cfg(tmp_path, config_path=str(tmp_path / "missing.json"))
+    status, _, body = dispatch(cfg, "/api/config-mtime")
+    assert status == 200
+    assert json.loads(body) == {"mtime_ns": None}
+
+
+def test_write_config_section_atomic_rejects_stale_base_mtime(tmp_path):
+    """When the supplied base mtime doesn't match the file's current
+    mtime, the writer refuses to save and returns the
+    :data:`CONFIG_STALE_MARKER` sentinel so the handler can render a
+    "reload to see latest values" banner instead of a validation error.
+    The stale check runs BEFORE strict validation, so an external
+    rewrite by an arbitrary process trips this even for a minimal
+    config shape."""
+    from harness.dashboard import (
+        CONFIG_STALE_MARKER, config_file_mtime_ns,
+        write_config_section_atomic,
+    )
+
+    config_path = tmp_path / "config.json"
+    initial = _minimal_valid_config_dict()
+    config_path.write_text(json.dumps(initial))
+    cfg = _make_cfg(tmp_path, config_path=str(config_path), writes_enabled=True)
+    baseline = config_file_mtime_ns(cfg)
+    # Simulate an external rewrite by re-touching the file with a new mtime.
+    # os.utime with ns=(now+1s) guarantees a strictly different mtime even
+    # on coarse-resolution filesystems.
+    new_ns = (baseline or 0) + 1_000_000_000  # +1s
+    os.utime(str(config_path), ns=(new_ns, new_ns))
+    # Save with the stale baseline → rejected, file untouched.
+    new_sandbox = dict(initial["sandbox"], timeout_seconds=999)
+    ok, msg = write_config_section_atomic(
+        cfg, "sandbox", new_sandbox, expected_base_mtime_ns=baseline,
+    )
+    assert ok is False
+    assert msg.startswith(CONFIG_STALE_MARKER)
+    # File contents unchanged.
+    with open(config_path, "r", encoding="utf-8") as f:
+        on_disk = json.load(f)
+    assert on_disk["sandbox"]["timeout_seconds"] == 300
+
+
+def test_write_config_section_atomic_succeeds_with_matching_mtime(tmp_path):
+    """When the submitted baseline still matches disk, the save lands."""
+    from harness.dashboard import (
+        config_file_mtime_ns, write_config_section_atomic,
+    )
+
+    config_path = tmp_path / "config.json"
+    initial = _minimal_valid_config_dict()
+    config_path.write_text(json.dumps(initial))
+    cfg = _make_cfg(tmp_path, config_path=str(config_path), writes_enabled=True)
+    baseline = config_file_mtime_ns(cfg)
+    new_sandbox = dict(initial["sandbox"], timeout_seconds=999)
+    ok, msg = write_config_section_atomic(
+        cfg, "sandbox", new_sandbox, expected_base_mtime_ns=baseline,
+    )
+    assert ok is True, msg
+    with open(config_path, "r", encoding="utf-8") as f:
+        on_disk = json.load(f)
+    assert on_disk["sandbox"]["timeout_seconds"] == 999
+
+
+def test_write_config_section_atomic_no_baseline_skips_stale_check(tmp_path):
+    """When the caller doesn't supply a baseline (legacy clients,
+    file-missing-at-render case), the writer doesn't enforce the
+    stale check at all — preserving the pre-change behavior."""
+    from harness.dashboard import write_config_section_atomic
+
+    config_path = tmp_path / "config.json"
+    initial = _minimal_valid_config_dict()
+    config_path.write_text(json.dumps(initial))
+    cfg = _make_cfg(tmp_path, config_path=str(config_path), writes_enabled=True)
+    # Touch the file to a totally different mtime — irrelevant when no
+    # baseline is passed.
+    os.utime(str(config_path), ns=(123_000_000_000, 123_000_000_000))
+    new_sandbox = dict(initial["sandbox"], timeout_seconds=42)
+    ok, msg = write_config_section_atomic(
+        cfg, "sandbox", new_sandbox, expected_base_mtime_ns=None,
+    )
+    assert ok is True, msg

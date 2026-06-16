@@ -1032,6 +1032,53 @@
   }
 
   // -------------------------------------------------------------------
+  // Configure-page external-edit poller
+  // -------------------------------------------------------------------
+  //
+  // The page-render server stamps the current config.json mtime (ns)
+  // onto .configure-page[data-config-mtime-ns]. We poll the endpoint
+  // listed under data-config-mtime-poll-url every ~5s; when the value
+  // diverges from the baseline a backend process has rewritten the
+  // file out of band, so we unhide the stale banner and stop polling
+  // (the operator must reload to re-baseline).
+
+  function wireConfigMtimePoll() {
+    var root = document.querySelector(".configure-page");
+    if (!root) return;
+    var baseline = root.getAttribute("data-config-mtime-ns") || "";
+    var url = root.getAttribute("data-config-mtime-poll-url") || "/api/config-mtime";
+    var banner = document.getElementById("config-stale-banner");
+    if (!banner) return;
+    var INTERVAL_MS = 5000;
+    var timer = null;
+
+    function stop() {
+      if (timer) { window.clearInterval(timer); timer = null; }
+    }
+    function showBanner() {
+      banner.hidden = false;
+      // Keep banner visible above the form when scrolled.
+      banner.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+    function check() {
+      fetch(url, { credentials: "same-origin", cache: "no-store" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (payload) {
+          if (!payload) return;
+          // Compare as strings — JSON ints round-trip through json()
+          // as numbers but baseline is always a string from the DOM.
+          var current = payload.mtime_ns == null ? "" : String(payload.mtime_ns);
+          if (current && current !== baseline) {
+            stop();
+            showBanner();
+          }
+        })
+        .catch(function () { /* network blips — keep polling */ });
+    }
+    timer = window.setInterval(check, INTERVAL_MS);
+  }
+
+  // -------------------------------------------------------------------
   // Configure-page Cancel button (revert in-flight edits)
   // -------------------------------------------------------------------
 
@@ -1060,6 +1107,7 @@
     wireWorkspacePicker();
     wireSpecUpload();
     wireSectionCancel();
+    wireConfigMtimePoll();
   }
 
   if (document.readyState === "loading") {
