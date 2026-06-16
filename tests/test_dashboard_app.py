@@ -726,6 +726,233 @@ def test_sse_stream_emits_log_lines(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 9b. Session detail page surfaces pending HITL prompts
+# ---------------------------------------------------------------------------
+
+def test_session_detail_renders_pending_hitl_form(tmp_path):
+    """A pending HITL prompt for a session must show up on
+    ``/sessions/<sid>`` as a card with a CSRF-wired answer form.
+    Without this wiring, operators have no in-browser way to answer
+    and the harness times out waiting for the webhook response."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    assert csrf  # writes_enabled fixture should always yield a token
+    try:
+        # Make sure the log file exists so _render_session_detail doesn't
+        # short-circuit before the HITL panel is appended.
+        log_dir = os.path.expanduser(cfg.log_dir)
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "sess-hitl.jsonl")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"event": "session_start"}) + "\n")
+
+        get_hitl_queue().register_pending(
+            request_id="req-abc",
+            session_id="sess-hitl",
+            prompt={"gate": "REQUIREMENTS", "question": "approve?"},
+        )
+
+        req = urllib.request.Request(
+            base_url + "/sessions/sess-hitl",
+            headers={"Cookie": f"csrf_token={csrf}"},
+        )
+        resp = urllib.request.urlopen(req, timeout=4.0)
+        body = resp.read().decode("utf-8")
+        assert resp.status == 200
+        assert "HITL pending" in body
+        assert "req-abc" in body
+        assert "/sessions/sess-hitl/hitl/answer" in body
+        # The hidden csrf_token field must carry a non-empty value. The
+        # functional CSRF check (cookie + X-CSRF-Token) is covered by
+        # test_hitl_webhook_round_trip; what matters here is that the
+        # earlier ``value=''`` placeholder is gone.
+        assert "name='csrf_token' value=''" not in body
+        import re as _re
+        m = _re.search(r"name='csrf_token' value='([^']+)'", body)
+        assert m is not None and len(m.group(1)) > 0
+    finally:
+        handle.shutdown()
+
+
+def test_session_detail_renders_hitl_above_events(tmp_path):
+    """When a HITL prompt is pending, its card must render BEFORE the
+    session-detail / Events card so operators see the gate as soon as
+    they land on the page. Reordered in the cockpit overhaul — without
+    this assertion the order could silently regress."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    assert csrf
+    try:
+        log_dir = os.path.expanduser(cfg.log_dir)
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "sess-order.jsonl")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"event": "session_start"}) + "\n")
+        get_hitl_queue().register_pending(
+            request_id="req-order",
+            session_id="sess-order",
+            prompt={"gate": "REQUIREMENTS", "question": "approve?"},
+        )
+        req = urllib.request.Request(
+            base_url + "/sessions/sess-order",
+            headers={"Cookie": f"csrf_token={csrf}"},
+        )
+        body = urllib.request.urlopen(req, timeout=4.0).read().decode("utf-8")
+        hitl_idx = body.find("hitl-alert")
+        events_idx = body.find("Events (")
+        assert hitl_idx != -1, "expected hitl-alert wrapper class on pending card"
+        assert events_idx != -1, "expected an Events header"
+        assert hitl_idx < events_idx, (
+            "HITL pending card must render before the Events section"
+        )
+        # autofocus on the choice input so operators answer without clicking.
+        assert "name='choice'" in body and "autofocus" in body
+    finally:
+        handle.shutdown()
+
+
+def test_session_detail_renders_stdout_stream_panel(tmp_path):
+    """The session page must surface a stdout-stream container wired
+    to /api/sessions/<sid>/stdout so the operator sees raw subprocess
+    output alongside the JSONL events."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    csrf = handle.csrf_token
+    try:
+        log_dir = os.path.expanduser(cfg.log_dir)
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, "sess-stdout.jsonl"), "w") as f:
+            f.write(json.dumps({"event": "session_start"}) + "\n")
+        req = urllib.request.Request(
+            base_url + "/sessions/sess-stdout",
+            headers={"Cookie": f"csrf_token={csrf}"},
+        )
+        body = urllib.request.urlopen(req, timeout=4.0).read().decode("utf-8")
+        assert "id='stdout-stream'" in body
+        assert "/api/sessions/sess-stdout/stdout" in body
+        assert "stdout-stream" in body  # class hook for sticky-bottom JS
+    finally:
+        handle.shutdown()
+
+
+def test_stdout_sse_endpoint_streams_lines(tmp_path):
+    """GET /api/sessions/<sid>/stdout opens an SSE stream of lines from
+    the harness subprocess's combined-output file. The endpoint must
+    return text/event-stream and frame each line as a JSON ``{"text"}``
+    payload so the dashboard's wireStdoutStream() can render it."""
+    cfg = _make_cfg(tmp_path)
+    handle, base_url = _start(cfg)
+    try:
+        log_dir = os.path.expanduser(cfg.log_dir)
+        os.makedirs(log_dir, exist_ok=True)
+        stdout_path = os.path.join(log_dir, "sess-raw.jsonl.stdout")
+        with open(stdout_path, "w", encoding="utf-8") as f:
+            f.write("hello\nworld\n")
+        # Register the process as "terminated" so the generator drains
+        # and returns instead of polling forever.
+        from harness.web_state import WebProcess
+        reg = get_process_registry()
+        reg.register(WebProcess(
+            session_id="sess-raw",
+            pid=-1,
+            argv=[],
+            log_path=os.path.join(log_dir, "sess-raw.jsonl"),
+        ))
+        reg.mark_terminated("sess-raw", 0)
+        resp = urllib.request.urlopen(
+            base_url + "/api/sessions/sess-raw/stdout", timeout=4.0,
+        )
+        assert resp.status == 200
+        assert resp.headers.get("Content-Type", "").startswith("text/event-stream")
+        body = resp.read().decode("utf-8")
+        assert '"text": "hello"' in body
+        assert '"text": "world"' in body
+    finally:
+        handle.shutdown()
+
+
+def test_tail_session_stdout_yields_lines_then_exits(tmp_path):
+    """Unit test for the generator powering the stdout SSE endpoint.
+    With ``follow=False`` it should drain whatever's in the file and
+    then return."""
+    from harness.dashboard import tail_session_stdout
+
+    p = tmp_path / "x.stdout"
+    p.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    events = list(tail_session_stdout(str(p), follow=False))
+    assert events == [{"text": "alpha"}, {"text": "beta"}, {"text": "gamma"}]
+
+
+# ---------------------------------------------------------------------------
+# 9c. spawn_harness_run propagates the operator-wait timeout to the harness
+# ---------------------------------------------------------------------------
+
+def test_spawn_harness_run_propagates_hitl_webhook_timeout(tmp_path, monkeypatch):
+    """The dashboard's hitl_webhook_timeout_seconds (default 600s) is
+    how long the webhook handler will block waiting for an operator
+    answer. The harness's HttpChannel default request timeout is 30s,
+    so without this propagation the harness aborts ~20x faster than
+    the dashboard. Spawn must export ``HARNESS_HITL_WEBHOOK_TIMEOUT``
+    set to (dashboard wait + 30s buffer)."""
+    import subprocess
+
+    captured: dict = {}
+
+    class _StubPopen:
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            captured["env"] = kwargs.get("env")
+            self.pid = -1
+            self._argv = argv
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", _StubPopen)
+    cfg = _make_cfg(tmp_path, hitl_webhook_timeout_seconds=420.0)
+    cfg.host = "127.0.0.1"
+    cfg.port = _free_port()
+    spawn_harness_run(
+        cfg, workspace=str(tmp_path), prompt="x",
+        harness_binary=sys.executable,
+    )
+    env = captured["env"]
+    assert env is not None
+    assert "HARNESS_HITL_WEBHOOK_TIMEOUT" in env
+    assert float(env["HARNESS_HITL_WEBHOOK_TIMEOUT"]) == pytest.approx(450.0)
+
+
+def test_spawn_harness_run_honors_preexisting_timeout_env(tmp_path, monkeypatch):
+    """Operators who pin HARNESS_HITL_WEBHOOK_TIMEOUT in the dashboard's
+    own environment win — the spawn uses ``env.setdefault`` so that
+    explicit override survives."""
+    import subprocess
+
+    captured: dict = {}
+
+    class _StubPopen:
+        def __init__(self, argv, **kwargs):
+            captured["env"] = kwargs.get("env")
+            self.pid = -1
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", _StubPopen)
+    monkeypatch.setenv("HARNESS_HITL_WEBHOOK_TIMEOUT", "77")
+    cfg = _make_cfg(tmp_path, hitl_webhook_timeout_seconds=600.0)
+    cfg.host = "127.0.0.1"
+    cfg.port = _free_port()
+    spawn_harness_run(
+        cfg, workspace=str(tmp_path), prompt="x",
+        harness_binary=sys.executable,
+    )
+    assert captured["env"]["HARNESS_HITL_WEBHOOK_TIMEOUT"] == "77"
+
+
+# ---------------------------------------------------------------------------
 # 10. New CLI surface — dashboard subcommand still accepts new flag
 # ---------------------------------------------------------------------------
 

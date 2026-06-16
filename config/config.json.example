@@ -173,9 +173,10 @@
         "langsmith": false
     },
 
-    "_lintgate_comment": "Lintgate behaviour after patches land. format_modified_files=false (default) skips the auto-formatter on pre-existing files so the harness doesn't clobber user style. Linters still run on every modified file.",
+    "_lintgate_comment": "Lintgate behaviour after patches land. format_modified_files=false (default) skips the auto-formatter on pre-existing files so the harness doesn't clobber user style. Linters still run on every modified file. strict_missing_formatter=false (default) silently warns when a configured formatter (ruff, prettier, gofmt, etc.) isn't on PATH; set true to surface as a build-blocking diagnostic so the format lock the spec promises is actually enforced.",
     "lintgate": {
-        "format_modified_files": false
+        "format_modified_files": false,
+        "strict_missing_formatter": false
     },
 
     "_speculative_comment": "Configuration-driven speculative compilation (#12 rebuild). Six independent strategy axes; the shipped defaults aim for positive ROI on typical workloads. (1) trigger decides WHEN speculative engages: 'always' fires every patching pass (high cost); 'first_attempt_only' is the legacy default; 'after_n_repair_failures' (DEFAULT) holds back until sequential repair has stalled — the high-value moment; 'manual' fires only when state.force_speculative is set. n_repair_failures_threshold (default 2) is the gate for the after_n_repair_failures trigger. (2) diversity_mode decides HOW variants differ: 'temperature' spreads temps over one model (legacy); 'prompt' fixes the model but varies a per-variant system-prompt style; 'model' (DEFAULT) routes each variant through a different model from variant_models — real architectural independence beats temperature noise; 'mixed' combines models and styles. (3) cost_strategy decides the COST shape: 'equal_cost' (legacy 3x cost); 'cheap_first_sequential' (DEFAULT) dispatches the cheap_model first, then expensive_model only if needed — expected cost ~1.1x; 'cheap_parallel_then_expensive' fires all-but-one cheap and one expensive in parallel; 'all_cheap' uses cheap_model for every variant; 'gradient_low_to_high' assigns ``variant_models`` in monotonic cost order (variant 0 → variant_models[0], …, variant N → variant_models[N]) so operators can distribute speculative runs across a low→high cost ladder of LLMs without modulo cycling. (4) selection_strategy: 'first_pass' (DEFAULT, alias 'first_success'); 'fewest_changes'; 'voted' dispatches voting.n_judges adversarial reviewers per passing variant (reuses fanout #11) and picks the highest-vote-rate; 'all_pass' requires every variant to pass. (5) salvage_strategy: 'none' (DEFAULT — fall back to sequential repair against the untouched workspace, strictly safer than the legacy merge); 'fewest_errors'; 'voted_partial'; 'merge' (legacy behaviour; documented failure mode of incoherent workspaces). (6) num_variants ∈ [1, 10]; max_concurrency ∈ [1, 10] caps parallelism; temperature ∈ [0.0, 1.5]. variant_models is a list of model keys used by diversity_mode ∈ {model, mixed}. variant_prompt_styles is a list of styles (e.g. 'minimal-diff', 'balanced', 'thorough') or names from the built-in style library used by diversity_mode ∈ {prompt, mixed}. expensive_model + cheap_model are referenced by the cost_strategy axes. Legacy configs without the new keys auto-upgrade to {trigger: first_attempt_only, diversity_mode: temperature, cost_strategy: equal_cost, salvage_strategy: merge} with a one-time warning so existing operators see exactly today's behaviour.",
@@ -221,9 +222,9 @@
         "run_prod_import_smoke_check": true
     },
 
-    "_patcher_comment": "Patcher behaviour. enforce_read_before_edit=true makes the patcher reject REPLACE_BLOCK / DELETE_BLOCK / INSERT_AT_BLOCK on any file the LLM has not been shown this turn (via pre-flight content, READ_FILE results, or a prior closest-match window). Mirrors Claude Code's Read-before-Edit invariant — flip on after verifying the LLM emits READ_FILE for unfamiliar files. Drift detection (sha256 comparison) runs unconditionally whenever the host has recorded a hash.",
+    "_patcher_comment": "Patcher behaviour. enforce_read_before_edit=true (default) makes the patcher reject REPLACE_BLOCK / DELETE_BLOCK / INSERT_AT_BLOCK on any file the LLM has not been shown this turn (via pre-flight content, READ_FILE results, or a prior closest-match window). Mirrors Claude Code's Read-before-Edit invariant. Flip to false only if you need the lax behaviour (e.g. for prompts that rely on memory of earlier patches). Drift detection (sha256 comparison) runs unconditionally whenever the host has recorded a hash.",
     "patcher": {
-        "enforce_read_before_edit": false
+        "enforce_read_before_edit": true
     },
 
     "_web_tools_comment": "Web research tools (web_fetch + web_search) exposed to the planner LLM via text-DSL blocks like <<<WEB_FETCH url=\"...\">>> and <<<WEB_SEARCH query=\"...\">>>. enabled=false (default) keeps the skills unregistered so the harness behaves byte-identically to pre-tool runs. Flip to true to let the planner pull documentation, RFCs, and search results before deciding on an implementation. max_bytes caps response size per fetch (default 200 KB ≈ 50 K tokens). max_results caps search results. search_backend chooses the search provider — only 'duckduckgo_lite' ships today (no API key required); Tavily / Brave / SerpAPI land in a follow-up. allow_private_ips opens the SSRF guard for trusted internal targets (e.g. an internal docs portal on 10.0.0.0/8) — leave false on multi-tenant or untrusted-prompt hosts. timeout_seconds bounds each HTTP call. tool_call_cap_per_dispatch caps how many tool rounds the LLM may run inside a single graph-node call before the interceptor forces it to proceed.",
@@ -281,6 +282,8 @@
         "writes_enabled": false,
         "csrf_token_env": "",
         "hitl_webhook_secret": "",
+        "hitl_webhook_timeout_seconds": 600.0,
+        "audit_log_retention_days": 90,
         "web_db_path": "~/.harness/web.db"
     },
 

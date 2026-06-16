@@ -582,6 +582,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     "lintgate": frozenset({
         "format_modified_files",
+        "strict_missing_formatter",
     }),
     "logging": frozenset({
         "level", "log_dir", "json_stderr", "langsmith",
@@ -702,6 +703,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "schedule_db", "static_dir", "chart_js_url", "sessions_max",
         # Tier B/C extensions (web app).
         "writes_enabled", "csrf_token_env", "hitl_webhook_secret",
+        "hitl_webhook_timeout_seconds", "audit_log_retention_days",
         "web_db_path", "config_path",
         # Carbon Design System shell + docs viewer.
         "carbon_css_url", "carbon_js_url", "docs_dir",
@@ -794,6 +796,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "model_routing.ollama_local_backup": (str,),
     "model_routing.force_local_only": (bool,),
     "lintgate.format_modified_files": (bool,),
+    "lintgate.strict_missing_formatter": (bool,),
     "logging.level": (str,),
     "logging.log_dir": (str,),
     "logging.json_stderr": (bool,),
@@ -862,6 +865,8 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "dashboard.writes_enabled": (bool,),
     "dashboard.csrf_token_env": (str,),
     "dashboard.hitl_webhook_secret": (str,),
+    "dashboard.hitl_webhook_timeout_seconds": (int, float),
+    "dashboard.audit_log_retention_days": (int,),
     "dashboard.web_db_path": (str,),
     "dashboard.config_path": (str,),
     "dashboard.carbon_css_url": (str,),
@@ -5047,6 +5052,31 @@ def _doctor_check_checkpoint_db(config: dict[str, Any]) -> tuple[str, str]:
     return "pass", f"writable: {expanded}"
 
 
+def _doctor_check_patcher_mode(config: dict[str, Any]) -> tuple[str, str]:
+    """Surface the patcher's two behaviour flags so operators know which
+    mode the harness is running in.
+
+    B5 (``patcher.enforce_read_before_edit``) — when on, REPLACE/DELETE/
+    INSERT blocks against files the LLM has not been shown this turn are
+    rejected. Default on.
+
+    B6 (``patcher.use_structured_tools``) — when on, providers that
+    support native tool-use receive PATCH_TOOLS as ``tools=...`` instead
+    of relying on the text DSL. Default off pending integration work;
+    this row exists so operators stop expecting native tool-use to "just
+    work" when they haven't enabled the dispatch wiring.
+    """
+    patcher = (config.get("patcher") or {})
+    b5 = bool(patcher.get("enforce_read_before_edit", True))
+    b6 = bool(patcher.get("use_structured_tools", False))
+    b5_label = "read-before-edit ON" if b5 else "read-before-edit OFF"
+    b6_label = (
+        "native tool-use ON (experimental)" if b6
+        else "native tool-use OFF — text DSL active"
+    )
+    return "pass", f"{b5_label}; {b6_label}"
+
+
 def _doctor_check_global_config() -> tuple[str, str]:
     """The in-repo global config file at <myharness_root>/config/config.json exists.
 
@@ -6190,6 +6220,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
             ("tree-sitter", _doctor_check_tree_sitter()),
             ("sandbox backend", _doctor_check_sandbox(config)),
             ("checkpoint db", _doctor_check_checkpoint_db(config)),
+            ("patcher mode", _doctor_check_patcher_mode(config)),
         ])
         # External tools the harness shells out to. Emits one row per
         # tool so each is visible individually in the report.

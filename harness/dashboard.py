@@ -1370,7 +1370,7 @@ def _route_sessions(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int,
 def _route_session_detail(cfg: DashboardConfig, params: dict[str, str]) -> tuple[int, str, str]:
     return 200, "text/html; charset=utf-8", _layout(
         f"Session {params['sid']}",
-        _render_session_detail(cfg, params["sid"]),
+        _render_session_with_hitl(cfg, params["sid"]),
         cfg, active="dashboards",
     )
 
@@ -2780,6 +2780,10 @@ def make_request_handler(
                 status, ctype, body = (500, "text/plain; charset=utf-8",
                                        "500 internal error\n")
             # SSE sentinel — stream instead of buffering.
+            if ctype == "text/event-stream" and body.startswith("__SSE_STDOUT__"):
+                session_id = body[len("__SSE_STDOUT__"):]
+                self._stream_sse(session_id, mode="stdout")
+                return
             if ctype == "text/event-stream" and body.startswith("__SSE__"):
                 session_id = body[len("__SSE__"):]
                 self._stream_sse(session_id)
@@ -2804,15 +2808,21 @@ def make_request_handler(
 
         # ---- SSE ----------------------------------------------------------
 
-        def _stream_sse(self, session_id: str) -> None:
-            log_path = os.path.join(os.path.expanduser(cfg.log_dir), f"{session_id}.jsonl")
+        def _stream_sse(self, session_id: str, *, mode: str = "events") -> None:
+            log_dir = os.path.expanduser(cfg.log_dir)
+            if mode == "stdout":
+                source = os.path.join(log_dir, f"{session_id}.jsonl.stdout")
+                generator = tail_session_stdout(source, follow=True, max_lines=2000)
+            else:
+                source = os.path.join(log_dir, f"{session_id}.jsonl")
+                generator = tail_session_events(source, follow=True, max_lines=2000)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             try:
-                for evt in tail_session_events(log_path, follow=True, max_lines=2000):
+                for evt in generator:
                     line = "data: " + json.dumps(evt, default=str) + "\n\n"
                     self.wfile.write(line.encode("utf-8"))
                     self.wfile.flush()
@@ -3992,6 +4002,13 @@ def spawn_harness_run(
     )
     if cfg.hitl_webhook_secret:
         env["HARNESS_HITL_WEBHOOK_SECRET"] = cfg.hitl_webhook_secret
+    # Keep the harness's HttpChannel timeout >= the dashboard's operator-wait
+    # ceiling; the +30s buffer lets the dashboard return 504 first instead of
+    # the harness aborting mid-prompt. Operators can still override via env.
+    env.setdefault(
+        "HARNESS_HITL_WEBHOOK_TIMEOUT",
+        str(float(cfg.hitl_webhook_timeout_seconds or 600.0) + 30.0),
+    )
 
     # Open the stdout sink, hand the FD to Popen (which dup's it into the
     # child), then close the parent's copy so the dashboard process doesn't
@@ -4085,6 +4102,10 @@ def spawn_harness_resume(
     )
     if cfg.hitl_webhook_secret:
         env["HARNESS_HITL_WEBHOOK_SECRET"] = cfg.hitl_webhook_secret
+    env.setdefault(
+        "HARNESS_HITL_WEBHOOK_TIMEOUT",
+        str(float(cfg.hitl_webhook_timeout_seconds or 600.0) + 30.0),
+    )
 
     # See spawn_harness_run for why we close the parent FD after Popen.
     stdout_fh = open(log_path + ".stdout", "ab")
@@ -4196,6 +4217,54 @@ def tail_session_events(
                                 evt = _safe_json(tail_line)
                                 if evt is not None:
                                     yield evt
+                    except OSError:
+                        pass
+                    return
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def tail_session_stdout(
+    stdout_path: str, *,
+    max_lines: int = 5000,
+    poll_interval: float = 0.5,
+    follow: bool = True,
+):
+    """Generator that yields raw stdout/stderr lines as they appear in
+    the harness subprocess's combined stdout file. Each yield is a dict
+    ``{"text": <line>}`` so the SSE framing stays uniform with
+    ``tail_session_events``. Stops when ``follow`` is False and we hit
+    EOF, or when the registered subprocess for this log has exited."""
+    pos = 0
+    yielded = 0
+    while True:
+        try:
+            with open(stdout_path, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(pos)
+                line = f.readline()
+                while line:
+                    pos = f.tell()
+                    text = line.rstrip("\n")
+                    yield {"text": text}
+                    yielded += 1
+                    if yielded >= max_lines:
+                        return
+                    line = f.readline()
+        except OSError:
+            pass
+        if not follow:
+            return
+        time.sleep(poll_interval)
+        try:
+            reg = get_process_registry()
+            for proc in reg.list_all():
+                if (proc.log_path and proc.log_path + ".stdout" == stdout_path
+                        and not proc.is_running):
+                    try:
+                        with open(stdout_path, "r", encoding="utf-8", errors="replace") as f:
+                            f.seek(pos)
+                            for tail_line in f:
+                                yield {"text": tail_line.rstrip("\n")}
                     except OSError:
                         pass
                     return
@@ -4422,30 +4491,51 @@ def _render_run_new(cfg: DashboardConfig, csrf_token: Optional[str], flash: str 
 
 def _render_session_with_hitl(cfg: DashboardConfig, session_id: str) -> str:
     """Detailed per-session view that includes pending HITL prompts +
-    a queued-notes panel when writes are enabled."""
+    a queued-notes panel when writes are enabled.
+
+    Layout order is operator-cockpit-first: any pending HITL prompts
+    render at the top with sticky-banner styling so they remain visible
+    while the operator scrolls through events. Live streams (JSONL +
+    raw stdout) sit at the bottom for the tail-style view operators
+    expect during a run."""
     log_path = os.path.join(os.path.expanduser(cfg.log_dir), f"{session_id}.jsonl")
-    base = _render_session_detail(cfg, session_id)
-    parts = [base]
+    parts: list[str] = []
+    csrf_token = resolve_csrf_token(cfg) or ""
+    csrf_field = (
+        f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
+    )
     q = get_hitl_queue()
     pending = q.list_pending_for_session(session_id)
     if pending:
         rows = []
-        for p in pending:
+        for idx, p in enumerate(pending):
             prompt_text = html.escape(json.dumps(p.prompt, indent=2, default=str))
+            if cfg.writes_enabled and csrf_token:
+                autofocus = " autofocus" if idx == 0 else ""
+                form_html = (
+                    f"<form method='post' action='/sessions/{_esc(session_id)}/hitl/answer'>"
+                    f"{csrf_field}"
+                    f"<input type='hidden' name='request_id' value='{html.escape(p.request_id)}'>"
+                    "<label>Choice (a/e/m/s)<br>"
+                    f"<input type='text' name='choice' placeholder='a' required{autofocus}></label><br><br>"
+                    "<label>Extra notes (optional)<br>"
+                    "<textarea name='extra_notes' rows='3' cols='80'></textarea></label>"
+                    "<p><button>Submit decision</button></p></form>"
+                )
+            else:
+                form_html = (
+                    "<p class='muted'>Writes disabled — answer this prompt via "
+                    f"<code>POST /sessions/{_esc(session_id)}/hitl/answer</code> "
+                    "with an authenticated client.</p>"
+                )
             rows.append(
-                f"<div class='card'><h3>HITL pending — {_esc(p.request_id)}</h3>"
+                f"<div class='card hitl-alert'><h3>HITL pending — {_esc(p.request_id)}</h3>"
                 f"<pre>{prompt_text}</pre>"
-                f"<form method='post' action='/sessions/{_esc(session_id)}/hitl/answer'>"
-                "<input type='hidden' name='csrf_token' value=''>"
-                f"<input type='hidden' name='request_id' value='{html.escape(p.request_id)}'>"
-                "<label>Choice (a/e/m/s)<br>"
-                "<input type='text' name='choice' placeholder='a'></label><br><br>"
-                "<label>Extra notes (optional)<br>"
-                "<textarea name='extra_notes' rows='3' cols='80'></textarea></label>"
-                "<p><button>Submit decision</button></p></form></div>"
+                f"{form_html}</div>"
             )
         parts.append("".join(rows))
-    if cfg.writes_enabled:
+    parts.append(_render_session_detail(cfg, session_id))
+    if cfg.writes_enabled and csrf_token:
         try:
             notes = pending_chat_notes(db_path=cfg.web_db_path, session_id=session_id)
         except Exception:  # noqa: BLE001
@@ -4458,7 +4548,7 @@ def _render_session_with_hitl(cfg: DashboardConfig, session_id: str) -> str:
             "<div class='card'><h3>Chat notes (queued for next HITL)</h3>"
             f"<ul>{note_rows or '<li class=muted>none queued</li>'}</ul>"
             f"<form method='post' action='/sessions/{_esc(session_id)}/note'>"
-            "<input type='hidden' name='csrf_token' value=''>"
+            f"{csrf_field}"
             "<textarea name='note' rows='3' cols='80' placeholder='Note to ride into the next HITL prompt'></textarea>"
             "<p><button>Queue note</button></p></form></div>"
         )
@@ -4467,11 +4557,22 @@ def _render_session_with_hitl(cfg: DashboardConfig, session_id: str) -> str:
         parts.append(
             "<div class='card'><h3>Live events</h3>"
             "<p class='muted'>Streaming from "
-            f"<code>{sse_url}</code>. Click a chip to hide an event type.</p>"
+            f"<code>{sse_url}</code>. Click a chip to hide an event type. "
+            "Newest entries appear at the bottom; auto-scroll pauses when "
+            "you scroll up.</p>"
             "<div class='event-stream-filters' role='group' "
             "aria-label='Filter events by type'></div>"
             "<ul id='event-stream' class='event-stream' "
             f"data-sse-url='{sse_url}'></ul>"
+            "</div>"
+        )
+        stdout_url = f"/api/sessions/{_esc(session_id)}/stdout"
+        parts.append(
+            "<div class='card'><h3>Raw stdout/stderr</h3>"
+            "<p class='muted'>Streaming from "
+            f"<code>{stdout_url}</code>. Tracebacks and bare prints land here.</p>"
+            "<pre id='stdout-stream' class='stdout-stream' "
+            f"data-sse-url='{stdout_url}'></pre>"
             "</div>"
         )
     return "".join(parts)
@@ -4647,6 +4748,12 @@ def _route_session_events_sse_marker(cfg: DashboardConfig, params: dict[str, str
     return 200, "text/event-stream", f"__SSE__{params['sid']}"
 
 
+def _route_session_stdout_sse_marker(cfg: DashboardConfig, params: dict[str, str]) -> tuple[int, str, str]:
+    """Same dispatch trick as ``_route_session_events_sse_marker`` but
+    routes to the raw stdout/stderr tail instead of the JSONL events."""
+    return 200, "text/event-stream", f"__SSE_STDOUT__{params['sid']}"
+
+
 # ---------------------------------------------------------------------------
 # Tier C: webhook handler — returns sentinel; the do_POST handler blocks
 # ---------------------------------------------------------------------------
@@ -4669,5 +4776,6 @@ _ROUTES.extend([
     (re.compile(r"^/run/new/?$"), _route_run_new),
     (re.compile(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/hitl/pending/?$"), _route_hitl_pending),
     (re.compile(r"^/api/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/events/?$"), _route_session_events_sse_marker),
+    (re.compile(r"^/api/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/stdout/?$"), _route_session_stdout_sse_marker),
     (re.compile(r"^/hitl/webhook/?$"), _route_hitl_webhook_marker),
 ])

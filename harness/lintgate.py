@@ -416,6 +416,14 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
     # on all files since it's read-only.
     lintgate_cfg = state.get("lintgate_config", {}) or {}
     format_modified = bool(lintgate_cfg.get("format_modified_files", False))
+    # When true, a configured formatter that isn't on PATH is surfaced as
+    # a format error rather than a silent warning — so a build can't quietly
+    # ship unformatted code because the operator forgot to install ruff /
+    # prettier. Default off to preserve compatibility with CI environments
+    # that haven't installed every formatter.
+    strict_missing_formatter = bool(
+        lintgate_cfg.get("strict_missing_formatter", False)
+    )
 
     if not modified_files:
         logger.info("[lintgate_node] No modified files to check.")
@@ -552,11 +560,30 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
                     format_errors.append(f"{filepath}: {exc}")
                     logger.warning("[lintgate_node] Format error for %s: %s", filepath, exc)
         else:
-            logger.warning(
-                "[lintgate_node] Skipping formatter '%s' for %s extension: "
-                "tool not installed. Patches will not be auto-formatted. %s",
-                spec.command, ext, spec.install_hint,
-            )
+            if strict_missing_formatter:
+                # Surface as a format error so the existing diagnostic channel
+                # carries it into the repair / HITL flow rather than the build
+                # silently proceeding with unformatted code.
+                msg = (
+                    f"formatter '{spec.command}' not installed for {ext} "
+                    f"files — set lintgate.strict_missing_formatter=false to "
+                    f"downgrade to a warning. Install hint: {spec.install_hint}"
+                )
+                for filepath in files:
+                    format_errors.append(f"{filepath}: {msg}")
+                logger.error(
+                    "[lintgate_node] strict mode: formatter '%s' missing for %s "
+                    "(%d file(s)). %s",
+                    spec.command, ext, len(files), spec.install_hint,
+                )
+            else:
+                logger.warning(
+                    "[lintgate_node] Skipping formatter '%s' for %s extension: "
+                    "tool not installed. Patches will not be auto-formatted. "
+                    "Set lintgate.strict_missing_formatter=true to fail the "
+                    "build instead. %s",
+                    spec.command, ext, spec.install_hint,
+                )
 
         # --- Run Linter (optional) ---
         if spec.linter_command and is_tool_available(spec.linter_command):

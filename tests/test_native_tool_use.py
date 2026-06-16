@@ -1,0 +1,573 @@
+"""Regression tests for the B6 native tool-use wiring.
+
+Covers:
+    - Provider parse round-trips: Anthropic typed-block ``tool_use``
+      and OpenAI-shape ``tool_calls`` (with JSON-encoded ``arguments``)
+      land in ``LLMResponse.tool_calls`` in the canonical
+      ``{name, input, id}`` shape.
+    - Capability detection: when the routed model's ``supports_tools``
+      is False, ``Gateway.dispatch`` drops ``tools=`` silently so the
+      patching path falls back to the text DSL automatically.
+    - Mixed-mode responses: text + tool_use in the same turn populate
+      both ``content`` and ``tool_calls``.
+    - Message-shape converter normalises Anthropic-style typed-block
+      tool turns into OpenAI's ``role=tool`` / ``tool_calls`` shape.
+    - ``hash_stable_prefix`` includes the tools array, so swapping
+      tool definitions surfaces as drift.
+    - ``apply_patch_blocks`` applies pre-built PatchBlocks via the same
+      pipeline as ``process_llm_patch_output``.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import pytest
+
+from harness.gateway import (
+    AnthropicProvider,
+    Gateway,
+    GatewayConfig,
+    LLMResponse,
+    ModelSpec,
+    NodeRole,
+    OpenAIProvider,
+    TokenUsage,
+    _normalize_messages_for_openai_tools,
+    _parse_openai_tool_calls,
+    hash_stable_prefix,
+    register_model,
+)
+from harness.tool_schemas import (
+    PATCH_TOOLS,
+    to_anthropic_tools,
+    to_openai_tools,
+    tool_calls_to_patch_blocks,
+)
+
+
+# ---------------------------------------------------------------------------
+# Stub HTTP plumbing
+# ---------------------------------------------------------------------------
+
+class _StubHttpResponse:
+    def __init__(self, payload: dict[str, Any]):
+        self._payload = payload
+        self.status_code = 200
+        self.request = None
+        self.headers: dict[str, str] = {}
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+class _RecordingClient:
+    def __init__(self, response_payload: dict[str, Any]):
+        self.last_payload: dict[str, Any] | None = None
+        self._response_payload = response_payload
+
+    async def post(self, _path: str, json: dict[str, Any]) -> _StubHttpResponse:
+        self.last_payload = json
+        return _StubHttpResponse(self._response_payload)
+
+
+def _make_anthropic_provider(
+    response_payload: dict[str, Any],
+    *,
+    supports_tools: bool = True,
+    supports_cache: bool = True,
+) -> tuple[AnthropicProvider, _RecordingClient]:
+    spec = ModelSpec(
+        provider="anthropic",
+        model_id="claude-test",
+        context_window=200_000,
+        input_cost_per_1m=3.00,
+        output_cost_per_1m=15.00,
+        cached_input_cost_per_1m=0.30,
+        cache_creation_cost_per_1m=3.75,
+        api_base_url="https://api.anthropic.com/v1",
+        api_key="x",
+        supports_cache=supports_cache,
+        supports_tools=supports_tools,
+    )
+    provider = AnthropicProvider(spec, api_key="x")
+    provider.prompt_cache_enabled = supports_cache  # type: ignore[attr-defined]
+    client = _RecordingClient(response_payload)
+    provider._client = client  # type: ignore[assignment]
+    return provider, client
+
+
+def _make_openai_provider(
+    response_payload: dict[str, Any],
+    *,
+    supports_tools: bool = True,
+) -> tuple[OpenAIProvider, _RecordingClient]:
+    spec = ModelSpec(
+        provider="openai",
+        model_id="gpt-test",
+        context_window=128_000,
+        input_cost_per_1m=2.50,
+        output_cost_per_1m=10.00,
+        api_base_url="https://api.openai.com/v1",
+        api_key="x",
+        supports_tools=supports_tools,
+    )
+    provider = OpenAIProvider(spec, api_key="x")
+    client = _RecordingClient(response_payload)
+    provider._client = client  # type: ignore[assignment]
+    return provider, client
+
+
+# ---------------------------------------------------------------------------
+# 1. Provider response parsing
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_anthropic_parses_tool_use_blocks():
+    """tool_use blocks in the typed-block response land in LLMResponse.tool_calls."""
+    provider, client = _make_anthropic_provider({
+        "content": [
+            {"type": "text", "text": "I'll edit the file."},
+            {"type": "tool_use", "id": "toolu_01ABC", "name": "edit_file",
+             "input": {"file_path": "src/a.py",
+                       "old_string": "foo", "new_string": "bar"}},
+        ],
+        "usage": {"input_tokens": 5, "output_tokens": 12,
+                  "cache_read_input_tokens": 0,
+                  "cache_creation_input_tokens": 0},
+        "stop_reason": "tool_use",
+    })
+    response = await provider.chat_completion(
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "do it"},
+        ],
+        tools=PATCH_TOOLS,
+    )
+    assert response.content == "I'll edit the file."
+    assert len(response.tool_calls) == 1
+    call = response.tool_calls[0]
+    assert call["name"] == "edit_file"
+    assert call["id"] == "toolu_01ABC"
+    assert call["input"]["file_path"] == "src/a.py"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_attaches_tools_payload_with_cache_control():
+    provider, client = _make_anthropic_provider({
+        "content": [{"type": "text", "text": "ok"}],
+        "usage": {"input_tokens": 1, "output_tokens": 1,
+                  "cache_read_input_tokens": 0,
+                  "cache_creation_input_tokens": 0},
+        "stop_reason": "end_turn",
+    })
+    await provider.chat_completion(
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "go"},
+        ],
+        tools=PATCH_TOOLS,
+    )
+    assert client.last_payload is not None
+    tools = client.last_payload["tools"]
+    assert isinstance(tools, list)
+    assert tools[0]["name"] == "read_file"
+    # Last tool carries the cache_control marker so the whole tools
+    # array participates in the cacheable prefix.
+    assert tools[-1]["cache_control"] == {"type": "ephemeral"}
+
+
+@pytest.mark.asyncio
+async def test_anthropic_pure_text_response_has_empty_tool_calls():
+    provider, client = _make_anthropic_provider({
+        "content": [{"type": "text", "text": "just words"}],
+        "usage": {"input_tokens": 1, "output_tokens": 1,
+                  "cache_read_input_tokens": 0,
+                  "cache_creation_input_tokens": 0},
+        "stop_reason": "end_turn",
+    })
+    response = await provider.chat_completion(
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert response.content == "just words"
+    assert response.tool_calls == []
+
+
+@pytest.mark.asyncio
+async def test_openai_parses_tool_calls_with_json_arguments():
+    """OpenAI/DeepSeek ship arguments as a JSON-encoded string; the
+    parser must decode it back to a dict."""
+    provider, _ = _make_openai_provider({
+        "choices": [{
+            "message": {
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_42",
+                    "type": "function",
+                    "function": {
+                        "name": "create_file",
+                        "arguments": json.dumps({
+                            "file_path": "app/main.py",
+                            "content": "print('hi')\n",
+                        }),
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"prompt_tokens": 4, "completion_tokens": 6,
+                  "prompt_tokens_details": {"cached_tokens": 0}},
+    })
+    response = await provider.chat_completion(
+        messages=[{"role": "user", "content": "scaffold"}],
+        tools=PATCH_TOOLS,
+    )
+    assert response.content == ""  # null content normalises to ""
+    assert len(response.tool_calls) == 1
+    call = response.tool_calls[0]
+    assert call["name"] == "create_file"
+    assert call["input"]["file_path"] == "app/main.py"
+    assert call["input"]["content"] == "print('hi')\n"
+
+
+def test_parse_openai_tool_calls_drops_malformed_json():
+    """Per-call JSON parse failures are dropped rather than poisoning
+    the patcher with garbage arguments."""
+    message = {
+        "tool_calls": [
+            {"id": "1", "function": {"name": "edit_file", "arguments": "not json{"}},
+            {"id": "2", "function": {"name": "create_file", "arguments": "{\"file_path\":\"a\",\"content\":\"\"}"}},
+        ],
+    }
+    out = _parse_openai_tool_calls(message)
+    # Malformed call dropped; valid one survives.
+    assert len(out) == 1
+    assert out[0]["name"] == "create_file"
+
+
+def test_parse_openai_tool_calls_drops_missing_name():
+    message = {"tool_calls": [{"id": "1", "function": {"arguments": "{}"}}]}
+    assert _parse_openai_tool_calls(message) == []
+
+
+# ---------------------------------------------------------------------------
+# 2. Message-shape converter
+# ---------------------------------------------------------------------------
+
+def test_normalize_messages_for_openai_passes_text_through():
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello back"},
+    ]
+    assert _normalize_messages_for_openai_tools(msgs) == msgs
+
+
+def test_normalize_messages_converts_assistant_tool_use_blocks():
+    msgs = [
+        {"role": "user", "content": "edit"},
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "Sure."},
+            {"type": "tool_use", "id": "tu_1", "name": "edit_file",
+             "input": {"file_path": "a", "old_string": "x", "new_string": "y"}},
+        ]},
+    ]
+    out = _normalize_messages_for_openai_tools(msgs)
+    # First message passes through unchanged.
+    assert out[0] == {"role": "user", "content": "edit"}
+    # Assistant turn flattened.
+    assert out[1]["role"] == "assistant"
+    assert out[1]["content"] == "Sure."
+    assert len(out[1]["tool_calls"]) == 1
+    tc = out[1]["tool_calls"][0]
+    assert tc["id"] == "tu_1"
+    assert tc["type"] == "function"
+    assert tc["function"]["name"] == "edit_file"
+    assert json.loads(tc["function"]["arguments"]) == {
+        "file_path": "a", "old_string": "x", "new_string": "y",
+    }
+
+
+def test_normalize_messages_converts_tool_result_to_role_tool():
+    msgs = [
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "tu_1", "content": "file bytes"},
+        ]},
+    ]
+    out = _normalize_messages_for_openai_tools(msgs)
+    assert len(out) == 1
+    assert out[0] == {
+        "role": "tool", "tool_call_id": "tu_1", "content": "file bytes",
+    }
+
+
+def test_normalize_messages_handles_assistant_with_only_tool_use():
+    """An assistant turn that's *purely* tool_use (no narration) emits
+    content=None to satisfy OpenAI's schema."""
+    msgs = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "tu_1", "name": "read_file",
+             "input": {"file_path": "a"}},
+        ]},
+    ]
+    out = _normalize_messages_for_openai_tools(msgs)
+    assert out[0]["role"] == "assistant"
+    assert out[0]["content"] is None
+    assert len(out[0]["tool_calls"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# 3. Capability detection in Gateway.dispatch
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_gateway_drops_tools_when_use_structured_tools_is_off():
+    """When the operator hasn't opted in, ``tools=`` passed by a caller
+    must NOT reach the provider — the gateway silently drops it so the
+    text-DSL path stays in charge."""
+    register_model("stub:caps-off", ModelSpec(
+        provider="stub", model_id="caps", context_window=64_000,
+        input_cost_per_1m=0.1, output_cost_per_1m=0.2,
+        api_base_url="", api_key="x", supports_tools=True,
+    ))
+    cfg = GatewayConfig(
+        planning_primary="stub:caps-off",
+        patching_primary="stub:caps-off",
+        repair_primary="stub:caps-off",
+        use_structured_tools=False,
+    )
+    gw = Gateway(cfg)
+
+    seen_tools: list[Any] = []
+
+    class _Stub:
+        spec = ModelSpec(
+            provider="stub", model_id="caps", context_window=64_000,
+            input_cost_per_1m=0.1, output_cost_per_1m=0.2,
+            api_base_url="", api_key="x", supports_tools=True,
+        )
+        api_key = "x"
+
+        async def chat_completion(self, *, tools=None, **_kwargs: Any) -> LLMResponse:
+            seen_tools.append(tools)
+            return LLMResponse(
+                content="ok",
+                usage=TokenUsage(input_tokens=1, output_tokens=1,
+                                  model_name="stub:caps", cost_usd=0.0),
+                model="stub:caps",
+            )
+
+        async def close(self) -> None:
+            return None
+
+    gw._providers["stub:caps-off"] = _Stub()  # type: ignore[assignment]
+    await gw.dispatch(
+        messages=[{"role": "user", "content": "go"}],
+        role=NodeRole.PATCHING,
+        budget_remaining_usd=1.0,
+        tools=PATCH_TOOLS,
+    )
+    assert seen_tools == [None]
+
+
+@pytest.mark.asyncio
+async def test_gateway_drops_tools_when_model_does_not_support_them():
+    """Even with ``use_structured_tools=True``, a model declared
+    ``supports_tools=False`` must NOT receive the tool array — that
+    would 400 the request."""
+    register_model("stub:no-tools", ModelSpec(
+        provider="stub", model_id="no-tools", context_window=64_000,
+        input_cost_per_1m=0.1, output_cost_per_1m=0.2,
+        api_base_url="", api_key="x", supports_tools=False,
+    ))
+    cfg = GatewayConfig(
+        planning_primary="stub:no-tools",
+        patching_primary="stub:no-tools",
+        repair_primary="stub:no-tools",
+        use_structured_tools=True,
+    )
+    gw = Gateway(cfg)
+
+    seen_tools: list[Any] = []
+
+    class _Stub:
+        spec = ModelSpec(
+            provider="stub", model_id="no-tools", context_window=64_000,
+            input_cost_per_1m=0.1, output_cost_per_1m=0.2,
+            api_base_url="", api_key="x", supports_tools=False,
+        )
+        api_key = "x"
+
+        async def chat_completion(self, *, tools=None, **_kwargs: Any) -> LLMResponse:
+            seen_tools.append(tools)
+            return LLMResponse(
+                content="ok",
+                usage=TokenUsage(input_tokens=1, output_tokens=1,
+                                  model_name="stub:no-tools", cost_usd=0.0),
+                model="stub:no-tools",
+            )
+
+        async def close(self) -> None:
+            return None
+
+    gw._providers["stub:no-tools"] = _Stub()  # type: ignore[assignment]
+    await gw.dispatch(
+        messages=[{"role": "user", "content": "go"}],
+        role=NodeRole.PATCHING,
+        budget_remaining_usd=1.0,
+        tools=PATCH_TOOLS,
+    )
+    assert seen_tools == [None]
+
+
+@pytest.mark.asyncio
+async def test_gateway_threads_tools_through_when_caps_match():
+    register_model("stub:caps-on", ModelSpec(
+        provider="stub", model_id="caps-on", context_window=64_000,
+        input_cost_per_1m=0.1, output_cost_per_1m=0.2,
+        api_base_url="", api_key="x", supports_tools=True,
+    ))
+    cfg = GatewayConfig(
+        planning_primary="stub:caps-on",
+        patching_primary="stub:caps-on",
+        repair_primary="stub:caps-on",
+        use_structured_tools=True,
+    )
+    gw = Gateway(cfg)
+
+    seen_tools: list[Any] = []
+
+    class _Stub:
+        spec = ModelSpec(
+            provider="stub", model_id="caps-on", context_window=64_000,
+            input_cost_per_1m=0.1, output_cost_per_1m=0.2,
+            api_base_url="", api_key="x", supports_tools=True,
+        )
+        api_key = "x"
+
+        async def chat_completion(self, *, tools=None, **_kwargs: Any) -> LLMResponse:
+            seen_tools.append(tools)
+            return LLMResponse(
+                content="ok",
+                usage=TokenUsage(input_tokens=1, output_tokens=1,
+                                  model_name="stub:caps-on", cost_usd=0.0),
+                model="stub:caps-on",
+            )
+
+        async def close(self) -> None:
+            return None
+
+    gw._providers["stub:caps-on"] = _Stub()  # type: ignore[assignment]
+    await gw.dispatch(
+        messages=[{"role": "user", "content": "go"}],
+        role=NodeRole.PATCHING,
+        budget_remaining_usd=1.0,
+        tools=PATCH_TOOLS,
+    )
+    assert len(seen_tools) == 1
+    assert seen_tools[0] is not None
+    assert seen_tools[0][0]["name"] == "read_file"
+
+
+# ---------------------------------------------------------------------------
+# 4. hash_stable_prefix folds tools into the hash
+# ---------------------------------------------------------------------------
+
+def test_hash_stable_prefix_changes_when_tools_change():
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "p"},
+    ]
+    h_no_tools = hash_stable_prefix(msgs, n_stable=2)
+    h_with_tools = hash_stable_prefix(msgs, n_stable=2, tools=PATCH_TOOLS)
+    h_with_other_tools = hash_stable_prefix(msgs, n_stable=2, tools=[
+        {"name": "fake", "description": "x", "input_schema": {"type": "object"}},
+    ])
+    assert h_no_tools != h_with_tools
+    assert h_with_tools != h_with_other_tools
+
+
+# ---------------------------------------------------------------------------
+# 5. Tool-call → PatchBlock translator integration
+# ---------------------------------------------------------------------------
+
+def test_tool_calls_to_patch_blocks_partitions_reads_and_patches():
+    calls = [
+        {"name": "read_file", "id": "1", "input": {"file_path": "a.py"}},
+        {"name": "edit_file", "id": "2", "input": {
+            "file_path": "a.py", "old_string": "x", "new_string": "y",
+        }},
+        {"name": "create_file", "id": "3", "input": {
+            "file_path": "b.py", "content": "pass",
+        }},
+    ]
+    blocks, reads = tool_calls_to_patch_blocks(calls)
+    assert len(blocks) == 2
+    assert {b.file for b in blocks} == {"a.py", "b.py"}
+    assert len(reads) == 1
+    assert reads[0]["input"]["file_path"] == "a.py"
+
+
+# ---------------------------------------------------------------------------
+# 6. apply_patch_blocks end-to-end (uses the same pipeline as text DSL)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_apply_patch_blocks_writes_create_file_to_disk(tmp_path):
+    from harness.patcher import apply_patch_blocks
+    blocks, _reads = tool_calls_to_patch_blocks([{
+        "name": "create_file", "id": "1", "input": {
+            "file_path": "src/hello.py",
+            "content": "print('hi')\n",
+        },
+    }])
+    results, modified = await apply_patch_blocks(
+        blocks, str(tmp_path), [], allowed_paths=["src/"],
+    )
+    assert len(results) == 1
+    assert results[0].success, results[0].error
+    assert "src/hello.py" in modified
+    written = (tmp_path / "src" / "hello.py").read_text()
+    # The patcher normalises the trailing newline; the test just cares
+    # that the body lands.
+    assert written.startswith("print('hi')")
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_blocks_rejects_outside_allowlist(tmp_path):
+    from harness.patcher import apply_patch_blocks
+    blocks, _reads = tool_calls_to_patch_blocks([{
+        "name": "create_file", "id": "1", "input": {
+            "file_path": "secrets/passwords.txt",
+            "content": "no",
+        },
+    }])
+    results, modified = await apply_patch_blocks(
+        blocks, str(tmp_path), [], allowed_paths=["src/"],
+    )
+    assert len(results) == 1
+    assert not results[0].success
+    assert "not in skill allowlist" in (results[0].error or "")
+    assert modified == []
+
+
+# ---------------------------------------------------------------------------
+# 7. Adapter shape sanity
+# ---------------------------------------------------------------------------
+
+def test_to_openai_tools_wraps_in_function_envelope():
+    out = to_openai_tools(PATCH_TOOLS)
+    assert all(t["type"] == "function" for t in out)
+    assert {t["function"]["name"] for t in out} == {
+        t["name"] for t in PATCH_TOOLS
+    }
+
+
+def test_to_anthropic_tools_keeps_raw_shape():
+    out = to_anthropic_tools(PATCH_TOOLS)
+    assert {t["name"] for t in out} == {t["name"] for t in PATCH_TOOLS}
+    assert "input_schema" in out[0]

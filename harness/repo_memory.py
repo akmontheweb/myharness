@@ -229,6 +229,19 @@ def append_session_note(
         if modified_files
         else "no files modified"
     )
+    # Redact the operator's $HOME prefix from paths the memory file
+    # records so the file doesn't carry "/home/<user>/..." fragments
+    # forever. Memory files live under the operator's own home dir, but
+    # they're sometimes shared (synced across machines, committed as
+    # examples) and the substitution costs nothing. We replace the home
+    # prefix wherever it appears (not just at the start) since
+    # ``extra_notes`` can embed paths mid-string.
+    home_prefix = str(os.path.expanduser("~"))
+    def _redact_home(p: str) -> str:
+        if home_prefix and home_prefix in p:
+            return p.replace(home_prefix, "~")
+        return p
+
     section = (
         f"\n## Session {short_id} — {now}\n"
         f"- Prompt: {summary or '(no prompt summary)'}\n"
@@ -238,12 +251,12 @@ def append_session_note(
     if modified_files:
         # Cap the file listing — the planner doesn't need every name,
         # just enough flavour to recognise recent work.
-        preview = modified_files[:8]
+        preview = [_redact_home(p) for p in modified_files[:8]]
         section += "  - " + "\n  - ".join(preview) + "\n"
         if len(modified_files) > len(preview):
             section += f"  - ... ({len(modified_files) - len(preview)} more)\n"
     if extra_notes:
-        section += f"- Notes: {extra_notes.strip()}\n"
+        section += f"- Notes: {_redact_home(extra_notes.strip())}\n"
 
     try:
         prior = ""
@@ -291,8 +304,20 @@ def _trim_to_max_bytes(text: str, max_bytes: int) -> str:
 
 def _atomic_write_text(path: str, content: str) -> None:
     """Write text to ``path`` via ``<path>.tmp`` + ``os.replace`` so
-    readers never see a half-written file."""
+    readers never see a half-written file.
+
+    The destination file is also chmod'd to 0600 (owner read/write only).
+    Memory files record workspace paths and session metadata; tightening
+    permissions keeps them inaccessible to other local accounts even
+    though ``~/.harness`` lives under the operator's own home.
+    """
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        # Non-POSIX filesystems may reject chmod; fail open rather than
+        # block the memory write.
+        pass
     os.replace(tmp, path)

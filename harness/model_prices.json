@@ -1,7 +1,7 @@
 {
   "_comment": "Canonical model price catalogue — shipped with the harness.",
-  "_version": "2026-06-08",
-  "_update_guide": "Run `harness prices --refresh` (fetches from providers) or edit this file manually. Prices are USD per 1M tokens. User .harness_config.json 'models' entries always override these defaults.",
+  "_version": "2026-06-16",
+  "_update_guide": "Run `harness prices --refresh` (fetches from providers) or edit this file manually. Prices are USD per 1M tokens. User .harness_config.json 'models' entries always override these defaults. supports_tools tracks native function/tool calling — leave false for models that don't (older Ollama / proxies); the gateway falls back to the text DSL automatically when the routed model can't take tools=.",
 
   "anthropic:claude-opus-4-7": {
     "provider": "anthropic",
@@ -14,6 +14,7 @@
     "api_base_url": "https://api.anthropic.com/v1",
     "supports_thinking": true,
     "supports_cache": true,
+    "supports_tools": true,
     "anthropic_version": "2023-06-01",
     "thinking_budget_tokens": 8000
   },
@@ -28,6 +29,7 @@
     "api_base_url": "https://api.anthropic.com/v1",
     "supports_thinking": true,
     "supports_cache": true,
+    "supports_tools": true,
     "anthropic_version": "2023-06-01",
     "thinking_budget_tokens": 8000
   },
@@ -42,6 +44,7 @@
     "api_base_url": "https://api.anthropic.com/v1",
     "supports_thinking": false,
     "supports_cache": true,
+    "supports_tools": true,
     "anthropic_version": "2023-06-01"
   },
   "anthropic:claude-3-5-sonnet-20241022": {
@@ -55,6 +58,7 @@
     "api_base_url": "https://api.anthropic.com/v1",
     "supports_thinking": false,
     "supports_cache": true,
+    "supports_tools": true,
     "anthropic_version": "2023-06-01"
   },
   "anthropic:claude-3-5-haiku-20241022": {
@@ -68,6 +72,7 @@
     "api_base_url": "https://api.anthropic.com/v1",
     "supports_thinking": false,
     "supports_cache": true,
+    "supports_tools": true,
     "anthropic_version": "2023-06-01"
   },
   "openai:gpt-4o": {
@@ -78,7 +83,8 @@
     "output_cost_per_1m": 10.00,
     "cached_input_cost_per_1m": 1.25,
     "api_base_url": "https://api.openai.com/v1",
-    "supports_cache": true
+    "supports_cache": true,
+    "supports_tools": true
   },
   "openai:gpt-4o-mini": {
     "provider": "openai",
@@ -88,7 +94,8 @@
     "output_cost_per_1m": 0.60,
     "cached_input_cost_per_1m": 0.075,
     "api_base_url": "https://api.openai.com/v1",
-    "supports_cache": true
+    "supports_cache": true,
+    "supports_tools": true
   },
   "openai:o1": {
     "provider": "openai",
@@ -99,7 +106,8 @@
     "cached_input_cost_per_1m": 7.50,
     "api_base_url": "https://api.openai.com/v1",
     "supports_thinking": true,
-    "supports_cache": true
+    "supports_cache": true,
+    "supports_tools": true
   },
   "openai:o3-mini": {
     "provider": "openai",
@@ -110,7 +118,8 @@
     "cached_input_cost_per_1m": 0.55,
     "api_base_url": "https://api.openai.com/v1",
     "supports_thinking": true,
-    "supports_cache": true
+    "supports_cache": true,
+    "supports_tools": true
   },
   "deepseek:deepseek-chat": {
     "provider": "deepseek",
@@ -119,7 +128,8 @@
     "input_cost_per_1m": 0.27,
     "output_cost_per_1m": 1.10,
     "cached_input_cost_per_1m": 0.07,
-    "api_base_url": "https://api.deepseek.com/v1"
+    "api_base_url": "https://api.deepseek.com/v1",
+    "supports_tools": true
   },
   "deepseek:deepseek-reasoner": {
     "provider": "deepseek",
@@ -129,7 +139,8 @@
     "output_cost_per_1m": 2.19,
     "cached_input_cost_per_1m": 0.14,
     "api_base_url": "https://api.deepseek.com/v1",
-    "supports_thinking": true
+    "supports_thinking": true,
+    "supports_tools": true
   },
   "ollama:llama3.2": {
     "provider": "ollama",
@@ -137,7 +148,8 @@
     "context_window": 128000,
     "input_cost_per_1m": 0.0,
     "output_cost_per_1m": 0.0,
-    "api_base_url": "http://localhost:11434/v1"
+    "api_base_url": "http://localhost:11434/v1",
+    "supports_tools": true
   },
   "ollama:mistral": {
     "provider": "ollama",

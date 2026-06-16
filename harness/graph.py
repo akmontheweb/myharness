@@ -1137,6 +1137,208 @@ def _web_tool_cap_from_state(_state: "AgentState") -> int:
     return 3
 
 
+# Cap on read_file rounds inside one patching turn. Stops a chatty model
+# from reading the whole repo before emitting a single edit. The cap
+# applies to the number of *re-dispatches*; the model can ask for
+# multiple files in one round and each counts as a single round.
+_PATCHING_READ_FILE_CAP = 6
+# Cap on bytes returned per read_file tool_result so a single edit
+# attempt against a multi-megabyte file can't blow the context window.
+# Aligns with the harness's existing READ_FILE text-DSL cap.
+_PATCHING_READ_FILE_MAX_BYTES = 200_000
+
+
+def _build_assistant_tool_turn(response: Any) -> "MessageDict":
+    """Reconstruct the assistant turn from an LLM response that included
+    tool calls. Returns a ``MessageDict`` whose ``content`` is the
+    canonical Anthropic-style typed-block list ([{type: text, text:
+    ...}, {type: tool_use, id, name, input}, ...]).
+
+    The OpenAI-shape providers consume this through
+    :func:`gateway._normalize_messages_for_openai_tools`, so we keep
+    one in-memory representation.
+    """
+    blocks: list[dict[str, Any]] = []
+    if response.content:
+        blocks.append({"type": "text", "text": response.content})
+    for call in getattr(response, "tool_calls", None) or []:
+        blocks.append({
+            "type": "tool_use",
+            "id": call.get("id") or "",
+            "name": call.get("name") or "",
+            "input": call.get("input") or {},
+        })
+    return MessageDict(role="assistant", content=blocks)
+
+
+def _resolve_read_file_call(
+    call: dict[str, Any], workspace_root: str,
+) -> str:
+    """Resolve a single ``read_file`` tool call against ``workspace_root``.
+
+    Honours optional ``start_line`` / ``end_line`` inputs (1-indexed,
+    inclusive). Mirrors the byte cap of the existing text-DSL
+    READ_FILE resolver so a single read can't dominate the context
+    window. Returns the bytes (possibly truncated, with a marker) or
+    an error string — never raises.
+    """
+    args = call.get("input") or {}
+    rel_path = str(args.get("file_path") or "").strip()
+    if not rel_path:
+        return "Error: read_file requires file_path."
+    # Refuse absolute / traversal paths up front. The patcher would
+    # reject them on the apply side anyway; doing it here means the
+    # model gets a clear error in the same turn.
+    if rel_path.startswith("/") or ".." in rel_path.split("/"):
+        return f"Error: refused absolute / traversal path {rel_path!r}."
+    abs_path = os.path.join(workspace_root, rel_path)
+    if not os.path.isfile(abs_path):
+        return f"Error: file not found: {rel_path}"
+    try:
+        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError as exc:
+        return f"Error reading {rel_path}: {exc}"
+    start = args.get("start_line")
+    end = args.get("end_line")
+    if start is not None or end is not None:
+        try:
+            lines = content.splitlines()
+            s_idx = max(0, int(start) - 1) if start is not None else 0
+            e_idx = (
+                min(len(lines), int(end))
+                if end is not None else len(lines)
+            )
+            if e_idx < s_idx:
+                e_idx = s_idx
+            content = "\n".join(lines[s_idx:e_idx])
+        except (TypeError, ValueError):
+            return "Error: start_line / end_line must be integers."
+    encoded = content.encode("utf-8")
+    if len(encoded) > _PATCHING_READ_FILE_MAX_BYTES:
+        truncated = encoded[:_PATCHING_READ_FILE_MAX_BYTES].decode(
+            "utf-8", errors="replace",
+        )
+        return (
+            truncated
+            + f"\n\n[... truncated at "
+            f"{_PATCHING_READ_FILE_MAX_BYTES} bytes; full file is "
+            f"{len(encoded)} bytes. Re-read with start_line/end_line "
+            f"for a specific window.]"
+        )
+    return content
+
+
+async def _patching_tool_loop(
+    *,
+    gateway: Any,
+    messages: list["MessageDict"],
+    budget: float,
+    workspace: str,
+    use_tools: bool,
+    tools: list[dict[str, Any]],
+    state: "AgentState",
+) -> tuple[Any, float, list["MessageDict"], dict[str, str]]:
+    """Drive a patching/repair dispatch that may use native tool-use.
+
+    Single round when ``use_tools=False`` (legacy text-DSL behaviour).
+    When ``use_tools=True``, dispatches with ``tools=PATCH_TOOLS``; if
+    the model responds with ``read_file`` tool calls, resolves them
+    against the workspace and re-dispatches with ``tool_result`` blocks
+    appended, up to :data:`_PATCHING_READ_FILE_CAP` rounds.
+
+    The loop terminates as soon as the model returns a response that
+    contains *no* ``read_file`` calls — that means either it has the
+    patch operations it needs (other tool_calls) or it fell back to a
+    pure-text response.
+
+    Returns ``(final_response, budget_remaining, updated_messages,
+    files_seen)``. ``files_seen`` is the ``{rel_path: sha256}`` map of
+    every file the loop showed the model — the caller threads it into
+    :func:`apply_patch_blocks` so B5 drift detection / read-before-edit
+    sees the bytes the model just consumed.
+    """
+    from harness.gateway import NodeRole
+
+    dispatch_kwargs: dict[str, Any] = {}
+    if use_tools:
+        dispatch_kwargs["tools"] = tools
+
+    response, budget = await gateway.dispatch(
+        messages=list(messages),
+        role=NodeRole.PATCHING,
+        budget_remaining_usd=budget,
+        **dispatch_kwargs,
+    )
+
+    # Seed from any existing node_state.files_seen_by_llm so a resumed
+    # session doesn't lose prior reads.
+    files_seen: dict[str, str] = dict(
+        (state.get("node_state", {}) or {}).get("files_seen_by_llm") or {}
+    )
+
+    if not use_tools or not getattr(response, "tool_calls", None):
+        return response, budget, messages, files_seen
+
+    rounds = 0
+    while rounds < _PATCHING_READ_FILE_CAP:
+        tool_calls_list = getattr(response, "tool_calls", None) or []
+        read_calls = [
+            c for c in tool_calls_list if c.get("name") == "read_file"
+        ]
+        if not read_calls:
+            return response, budget, messages, files_seen
+        rounds += 1
+        # Persist the assistant turn — typed blocks so the next round's
+        # tool_result references match against the right tool_use ids.
+        messages.append(_build_assistant_tool_turn(response))
+        # Resolve each read_file and assemble the tool_result user turn.
+        tool_results: list[dict[str, Any]] = []
+        for call in read_calls:
+            result_text = _resolve_read_file_call(call, workspace)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": call.get("id", ""),
+                "content": result_text,
+            })
+            # Record the sha256 of the bytes we just showed so B5 drift
+            # detection / read-before-edit can use them on the next
+            # dispatch.
+            args = call.get("input") or {}
+            rel = str(args.get("file_path") or "").strip()
+            if rel and not result_text.startswith("Error:"):
+                try:
+                    import hashlib as _hl
+                    files_seen[rel] = _hl.sha256(
+                        result_text.encode("utf-8")
+                    ).hexdigest()
+                except Exception:  # noqa: BLE001 — best-effort
+                    pass
+        messages.append(MessageDict(role="user", content=tool_results))
+        # Re-dispatch.
+        try:
+            response, budget = await gateway.dispatch(
+                messages=list(messages),
+                role=NodeRole.PATCHING,
+                budget_remaining_usd=budget,
+                **dispatch_kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface and stop the loop
+            logger.warning(
+                "[patching_tool_loop] re-dispatch failed at round %d: %s",
+                rounds, exc,
+            )
+            break
+
+    if rounds >= _PATCHING_READ_FILE_CAP:
+        logger.info(
+            "[patching_tool_loop] hit cap of %d read_file rounds; "
+            "patching proceeds with what the LLM has so far.",
+            _PATCHING_READ_FILE_CAP,
+        )
+    return response, budget, messages, files_seen
+
+
 async def _run_tool_loop(
     *,
     initial_response_content: str,
@@ -1443,13 +1645,70 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
         # Append the planning response (with tool blocks stripped) to messages
         messages.append(MessageDict(role="assistant", content=final_content))
 
+        # Cross-check the plan's file inventory against the architecture
+        # spec's. Best-effort: when SPEC_ARCHITECTURE.md doesn't exist
+        # yet, lacks an inventory block, or the planner produced no
+        # inventory of its own, the check no-ops. When discrepancies are
+        # found we surface them as a system message the patcher (or a
+        # follow-up planner turn) will see — that turns silent drift
+        # into a concrete instruction to reconcile.
+        inventory_diag_count = 0
+        try:
+            from harness.architecture_inventory import (
+                cross_check_inventories,
+                parse_inventory,
+            )
+            workspace_path = state.get("workspace_path", "")
+            arch_path = (
+                os.path.join(workspace_path, "docs", "SPEC_ARCHITECTURE.md")
+                if workspace_path else ""
+            )
+            arch_files: list = []
+            if arch_path and os.path.isfile(arch_path):
+                with open(arch_path, "r", encoding="utf-8") as _f:
+                    arch_md = _f.read()
+                arch_files = parse_inventory(arch_md).files
+            plan_files = parse_inventory(final_content).files
+            if arch_files and plan_files:
+                diags = cross_check_inventories(arch_files, plan_files)
+                inventory_diag_count = len(diags)
+                if diags:
+                    blocking = [d for d in diags if d.is_error]
+                    advisory = [d for d in diags if not d.is_error]
+                    lines: list[str] = [
+                        "### Plan / architecture inventory mismatch",
+                        "",
+                        (
+                            "The plan you just produced disagrees with "
+                            "docs/SPEC_ARCHITECTURE.md on the file layout. "
+                            "Reconcile before patching — adjust the plan's "
+                            "file list (or the architecture spec) so they "
+                            "match. Diagnostics:"
+                        ),
+                        "",
+                    ]
+                    for d in blocking + advisory:
+                        lines.append(f"- {d.format_compiler_style()}")
+                    messages.append(MessageDict(
+                        role="system",
+                        content="\n".join(lines),
+                    ))
+                    logger.warning(
+                        "[planning_node] inventory cross-check found %d "
+                        "diagnostic(s) (%d blocking, %d advisory).",
+                        len(diags), len(blocking), len(advisory),
+                    )
+        except Exception as exc:  # noqa: BLE001 — cross-check is advisory
+            logger.debug("[planning_node] inventory cross-check skipped: %s", exc)
+
         logger.info(
-            "[planning_node] Blueprint generated. tokens_in=%d tokens_out=%d cost=$%.6f budget_left=$%.4f tool_rounds=%d",
+            "[planning_node] Blueprint generated. tokens_in=%d tokens_out=%d cost=$%.6f budget_left=$%.4f tool_rounds=%d inv_diags=%d",
             response.usage.input_tokens,
             response.usage.output_tokens,
             response.usage.cost_usd,
             new_budget,
             tool_rounds,
+            inventory_diag_count,
         )
 
         return {
@@ -1457,7 +1716,11 @@ async def planning_node(state: AgentState) -> dict[str, Any]:
             "token_tracker": token_tracker,
             "budget_remaining_usd": new_budget,
             "loop_counter": loop_counter,
-            "node_state": {"current_node": "planning", "plan_complete": True},
+            "node_state": {
+                "current_node": "planning",
+                "plan_complete": True,
+                "inventory_diag_count": inventory_diag_count,
+            },
         }
     except RuntimeError as exc:
         # Budget exhausted or other guardrail triggered
@@ -1500,10 +1763,17 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
 
     try:
         from harness.gateway import NodeRole
-        from harness.patcher import process_llm_patch_output
+        from harness.patcher import apply_patch_blocks, process_llm_patch_output
 
         messages = list(state.get("messages", []))
         budget = state.get("budget_remaining_usd", 2.00)
+        # B6 — decide once per node call whether to use native tool-use.
+        # Gated on (a) the operator's config switch, (b) the patching role's
+        # routed model supporting native tools (the gateway will silently
+        # drop tools= for models that can't take them, but checking here
+        # lets us also skip the text-DSL format reminder when tool-use is
+        # in play — tool definitions carry the same semantic content).
+        use_tools = bool(getattr(gateway.config, "use_structured_tools", False))
 
         # Compute the allowlist UP FRONT so we can both (a) surface it to the
         # LLM in the format reminder below and (b) feed the same list into
@@ -1617,12 +1887,37 @@ content:
 
 Quality: Write modular, production-ready code with proper error handling, type hints, and docstrings. Handle edge cases.
 Generate your patches NOW. Only the blocks above. No other text."""
-        messages.append({"role": "user", "content": _FORMAT_REMINDER})
+        _TOOL_USE_REMINDER = (
+            allowlist_preamble
+            + cr_preamble
+            + "[PATCHING — NATIVE TOOL-USE MODE]\n"
+            "The harness has exposed the patch operations as native tools "
+            "(`read_file`, `edit_file`, `create_file`, `delete_block`, "
+            "`insert_at_block`). Call them directly via the provider's "
+            "tool-use API instead of emitting the text DSL. Lead with "
+            "`read_file` for any file you intend to edit but have not yet "
+            "been shown this turn — the harness resolves it inline and "
+            "re-dispatches you in the same iteration with the bytes. "
+            "Production code only this turn; test files are handled by "
+            "a later phase.\n"
+            "Quality: modular, production-ready, with proper error "
+            "handling, type hints, and docstrings.\n"
+        )
+        messages.append({
+            "role": "user",
+            "content": _TOOL_USE_REMINDER if use_tools else _FORMAT_REMINDER,
+        })
 
-        response, new_budget = await gateway.dispatch(
-            messages=list(messages),
-            role=NodeRole.PATCHING,
-            budget_remaining_usd=budget,
+        from harness.tool_schemas import PATCH_TOOLS, tool_calls_to_patch_blocks
+
+        response, new_budget, messages, tool_files_seen = await _patching_tool_loop(
+            gateway=gateway,
+            messages=messages,
+            budget=budget,
+            workspace=workspace,
+            use_tools=use_tools,
+            tools=PATCH_TOOLS,
+            state=state,
         )
 
         # Update token tracker (per-stage attribution: patching)
@@ -1631,38 +1926,75 @@ Generate your patches NOW. Only the blocks above. No other text."""
             token_tracker, response.usage, role=NodeRole.PATCHING,
         )
 
-        # Phase 1 defensive filter: strip any blocks the LLM emitted
-        # against test paths despite the system-prompt instructions. The
-        # next phase (test_generation_node) handles tests; carrying them
-        # in here would just confuse the prod-import smoke check and
-        # diverge prod from a known-clean state. Logged so the operator
-        # can see if the LLM keeps trying.
-        filtered_response, dropped_test_blocks = (
-            _filter_test_blocks_from_patch_response(response.content)
-        )
-        if dropped_test_blocks:
-            logger.info(
-                "[patching_node:phase1] Dropped %d test-targeting block(s) "
-                "from this round — test generation happens in the next "
-                "phase. Dropped: %s",
-                len(dropped_test_blocks),
-                ", ".join(dropped_test_blocks[:10]),
-            )
-
-        # Apply patches to disk using the same allowlist we surfaced to the
-        # LLM above — keeps the LLM's expectation and the patcher's enforcement
-        # in lockstep.
         existing_modified = list(state.get("modified_files", []))
-        patch_results, modified_files = await process_llm_patch_output(
-            filtered_response,
-            workspace,
-            existing_modified,
-            allowed_paths=allowed_paths,
-        )
+
+        _resp_tool_calls = getattr(response, "tool_calls", None) or []
+        if _resp_tool_calls:
+            # Native tool-use path. Convert the LLM's tool calls into
+            # PatchBlock objects and apply via the structured pipeline.
+            # The read_file calls have already been resolved inside
+            # _patching_tool_loop — any tool_calls returned here are
+            # patch operations only.
+            blocks, _reads = tool_calls_to_patch_blocks(_resp_tool_calls)
+            # Phase 1 filter: drop any blocks targeting test paths even
+            # in tool-use mode. The LLM gets the same "production only"
+            # instruction; this is a belt-and-suspenders guard against
+            # an over-eager call.
+            kept_blocks, dropped_test_files = (
+                _filter_test_patch_blocks(blocks)
+            )
+            if dropped_test_files:
+                logger.info(
+                    "[patching_node:phase1] Dropped %d test-targeting "
+                    "tool_call(s): %s",
+                    len(dropped_test_files),
+                    ", ".join(dropped_test_files[:10]),
+                )
+            patch_results, modified_files = await apply_patch_blocks(
+                kept_blocks,
+                workspace,
+                existing_modified,
+                allowed_paths=allowed_paths,
+                files_seen_by_llm=tool_files_seen,
+                enforce_read_before_edit=bool(
+                    getattr(
+                        gateway.config, "enforce_read_before_edit", True,
+                    )
+                ),
+            )
+            filtered_response = response.content or ""
+            dropped_test_blocks = dropped_test_files
+        else:
+            # Text-DSL path (legacy / fallback when provider didn't
+            # support native tools or returned a pure-text response).
+            filtered_response, dropped_test_blocks = (
+                _filter_test_blocks_from_patch_response(response.content)
+            )
+            if dropped_test_blocks:
+                logger.info(
+                    "[patching_node:phase1] Dropped %d test-targeting block(s) "
+                    "from this round — test generation happens in the next "
+                    "phase. Dropped: %s",
+                    len(dropped_test_blocks),
+                    ", ".join(dropped_test_blocks[:10]),
+                )
+            # Apply patches to disk using the same allowlist we surfaced to the
+            # LLM above — keeps the LLM's expectation and the patcher's enforcement
+            # in lockstep.
+            patch_results, modified_files = await process_llm_patch_output(
+                filtered_response,
+                workspace,
+                existing_modified,
+                allowed_paths=allowed_paths,
+            )
 
         # Append the LLM response to messages (the original, unfiltered,
         # so the LLM's own history reflects what it actually emitted).
-        messages.append(MessageDict(role="assistant", content=response.content))
+        # In tool-use mode the assistant turn(s) were already appended
+        # inside _patching_tool_loop; only the text-DSL path needs to
+        # add a synthetic assistant message here.
+        if not _resp_tool_calls:
+            messages.append(MessageDict(role="assistant", content=response.content))
 
         # Report patch application results
         success_count = sum(1 for r in patch_results if r.success)
@@ -2228,6 +2560,28 @@ def _is_test_path(path: str) -> bool:
     if any(p.startswith(prefix) for prefix in _TEST_DIR_PREFIXES):
         return True
     return p in _TEST_INFRA_ROOT_FILES
+
+
+def _filter_test_patch_blocks(blocks: list[Any]) -> tuple[list[Any], list[str]]:
+    """Sister of :func:`_filter_test_blocks_from_patch_response` that
+    operates on pre-parsed :class:`PatchBlock` instances.
+
+    Used by the B6 native tool-use path in :func:`patching_node` —
+    `tool_calls_to_patch_blocks` returns ``PatchBlock`` objects directly,
+    so there is no text body to scan with the regex helper. Returns
+    ``(kept, dropped_files)``.
+    """
+    kept: list[Any] = []
+    dropped: list[str] = []
+    for block in blocks:
+        file_path = getattr(block, "file", "") or ""
+        if _is_test_path(file_path):
+            op = getattr(block, "operation", "")
+            op_name = getattr(op, "value", str(op))
+            dropped.append(f"{op_name.lower()}:{file_path}")
+            continue
+        kept.append(block)
+    return kept, dropped
 
 
 def _filter_test_blocks_from_patch_response(

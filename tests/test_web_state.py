@@ -10,9 +10,11 @@ Covers the four state owners:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import pytest
 
@@ -32,6 +34,7 @@ from harness.web_state import (
     mark_oneshot_consumed,
     open_web_db,
     pending_chat_notes,
+    prune_audit_log,
     queue_chat_note,
     save_run_preset,
 )
@@ -44,9 +47,13 @@ UTC = timezone.utc
 # ProcessRegistry
 # ---------------------------------------------------------------------------
 
-def _proc(session_id: str, *, pid: int = 100) -> WebProcess:
+def _proc(session_id: str, *, pid: Optional[int] = None) -> WebProcess:
+    # Default to the test process's own PID — guaranteed alive, so the
+    # registry's orphan-prune sweep never flips the entry to terminated
+    # behind the test's back.
     return WebProcess(
-        session_id=session_id, pid=pid, argv=["harness", "run"],
+        session_id=session_id, pid=pid if pid is not None else os.getpid(),
+        argv=["harness", "run"],
         log_path=f"/tmp/{session_id}.jsonl",
     )
 
@@ -95,7 +102,7 @@ def test_registry_thread_safety_smoke():
 
     def _writer():
         for i in range(200):
-            reg.register(_proc(f"sess-{i:04d}", pid=10_000 + i))
+            reg.register(_proc(f"sess-{i:04d}", pid=os.getpid()))
 
     def _terminator():
         for i in range(200):
@@ -258,6 +265,55 @@ def test_audit_log_records_actions(tmp_path):
     # Newest first.
     assert rows[0]["action"] == "run_now"
     assert rows[1]["target"] == "token_budget"
+
+
+def test_prune_audit_log_drops_rows_older_than_cutoff(tmp_path):
+    db = str(tmp_path / "web.db")
+    # Append two rows then back-date them so we can prove the cutoff bites.
+    append_audit(db_path=db, action="old1", target="t", detail="")
+    append_audit(db_path=db, action="old2", target="t", detail="")
+    old_ts = (datetime.now(UTC) - timedelta(days=120)).isoformat(timespec="seconds")
+    conn = open_web_db(db)
+    try:
+        with conn:
+            conn.execute("UPDATE audit_log SET ts = ?", (old_ts,))
+    finally:
+        conn.close()
+    # A fresh row stays.
+    append_audit(db_path=db, action="fresh", target="t", detail="")
+
+    removed = prune_audit_log(db_path=db, days=90)
+    assert removed == 2
+    remaining = list_audit(db_path=db, limit=10)
+    assert [r["action"] for r in remaining] == ["fresh"]
+
+
+def test_prune_audit_log_noop_when_days_zero(tmp_path):
+    db = str(tmp_path / "web.db")
+    append_audit(db_path=db, action="anything", target="t", detail="")
+    assert prune_audit_log(db_path=db, days=0) == 0
+    assert len(list_audit(db_path=db, limit=10)) == 1
+
+
+def test_registry_prunes_dead_pid_orphans():
+    """When a registered subprocess's PID disappears (SIGKILL, OOM kill,
+    dashboard restart, etc.), list_running / list_all should flip the
+    entry to terminated instead of showing a stale 'running' badge."""
+    reg = ProcessRegistry()
+    # PID 1 (init) always exists; the harness can never own it, so a
+    # WebProcess with pid=1 simulates a freshly registered "running"
+    # entry. Then we replace it with a PID we know is dead.
+    p = _proc("orphan-sess", pid=1)
+    reg.register(p)
+    assert reg.list_running()[0].session_id == "orphan-sess"
+    # Reassign to a PID that doesn't exist on any sane system.
+    p.pid = 0  # _pid_alive returns False for non-positive PIDs.
+    listed = reg.list_running()
+    assert listed == []
+    entry = reg.get("orphan-sess")
+    assert entry is not None
+    assert entry.is_running is False
+    assert entry.exit_code == -1
 
 
 def test_run_presets_round_trip(tmp_path):

@@ -523,6 +523,17 @@
   // CSS visibility. This replaces the legacy <pre id="live-events">
   // dump which had no filtering and no parsing.
 
+  // Tail-style append with sticky-bottom auto-scroll: only snap to
+  // the bottom when the operator is already near it. If they've
+  // scrolled up to read older entries, leave their position alone.
+  function appendWithStickyBottom(container, child, cap) {
+    var nearBottom =
+      (container.scrollHeight - container.scrollTop - container.clientHeight) < 32;
+    container.appendChild(child);
+    while (container.children.length > cap) container.removeChild(container.firstChild);
+    if (nearBottom) container.scrollTop = container.scrollHeight;
+  }
+
   function wireEventStream() {
     var ul = document.getElementById("event-stream");
     if (!ul || typeof EventSource === "undefined") return;
@@ -549,10 +560,41 @@
       body.textContent = JSON.stringify(rest, null, 2);
       li.appendChild(head);
       li.appendChild(body);
-      ul.insertBefore(li, ul.firstChild);
-      // Cap to 500 items in the DOM to avoid runaway memory.
-      while (ul.children.length > 500) ul.removeChild(ul.lastChild);
+      appendWithStickyBottom(ul, li, 500);
       registerFilter(kind);
+    };
+    es.addEventListener("close", function () { es.close(); });
+  }
+
+  // Raw stdout/stderr stream — a <pre> element that grows line-by-line.
+  // Trim oldest lines once the buffer exceeds a cap so memory stays bounded.
+  function wireStdoutStream() {
+    var pre = document.getElementById("stdout-stream");
+    if (!pre || typeof EventSource === "undefined") return;
+    var url = pre.getAttribute("data-sse-url");
+    if (!url) return;
+    var MAX_LINES = 2000;
+    var es = new EventSource(url);
+    es.onmessage = function (evt) {
+      var data;
+      try { data = JSON.parse(evt.data); } catch (_e) { data = { text: evt.data }; }
+      var text = (data && typeof data.text === "string") ? data.text : "";
+      var nearBottom =
+        (pre.scrollHeight - pre.scrollTop - pre.clientHeight) < 32;
+      pre.textContent += text + "\n";
+      // Trim from the front if we've blown past the line cap.
+      var content = pre.textContent;
+      var newlineCount = 0;
+      for (var i = content.length - 1; i >= 0; i--) {
+        if (content.charCodeAt(i) === 10) {
+          newlineCount++;
+          if (newlineCount > MAX_LINES) {
+            pre.textContent = content.substring(i + 1);
+            break;
+          }
+        }
+      }
+      if (nearBottom) pre.scrollTop = pre.scrollHeight;
     };
     es.addEventListener("close", function () { es.close(); });
   }
@@ -1109,6 +1151,7 @@
     wireAutoRefresh();
     wireNavToggle();
     wireEventStream();
+    wireStdoutStream();
     wireConfigTree();
     wireSessionPicker();
     wireSessionPurge();

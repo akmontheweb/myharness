@@ -17,6 +17,7 @@ Covers:
 from __future__ import annotations
 
 import os
+import stat
 
 from harness.repo_memory import (
     RepoMemoryConfig,
@@ -67,6 +68,53 @@ def test_append_then_read_roundtrip(tmp_path):
     assert "Add JWT auth" in content
     assert "src/auth.py" in content
     assert "success" in content
+
+
+def test_memory_file_permissions_are_owner_only(tmp_path):
+    """Memory files contain workspace paths and session metadata —
+    ``~/.harness`` already lives under the operator's home, but tightening
+    the file to 0600 means a malformed umask or a shared host can't
+    expose them to other local accounts."""
+    workspace = str(tmp_path / "ws")
+    os.makedirs(workspace)
+    cfg = RepoMemoryConfig(dir=str(tmp_path / "mem"))
+    path = append_session_note(
+        workspace,
+        session_id="perm-test",
+        prompt_summary="t",
+        modified_files=[],
+        exit_code=0,
+        cfg=cfg,
+    )
+    assert path is not None
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
+
+def test_memory_file_redacts_home_dir_prefix(tmp_path, monkeypatch):
+    """Absolute paths under the operator's $HOME get a ``~/...``
+    substitution before they land in the memory file."""
+    workspace = str(tmp_path / "ws")
+    os.makedirs(workspace)
+    fake_home = str(tmp_path / "homedir")
+    os.makedirs(fake_home)
+    monkeypatch.setenv("HOME", fake_home)
+    cfg = RepoMemoryConfig(dir=str(tmp_path / "mem"))
+    path = append_session_note(
+        workspace,
+        session_id="redact-test",
+        prompt_summary="t",
+        modified_files=[os.path.join(fake_home, "project", "main.py")],
+        exit_code=0,
+        cfg=cfg,
+        extra_notes=f"see {os.path.join(fake_home, 'logs', 'session.log')}",
+    )
+    assert path is not None
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    assert fake_home not in content
+    assert "~/project/main.py" in content
+    assert "~/logs/session.log" in content
 
 
 def test_multiple_appends_accumulate(tmp_path):

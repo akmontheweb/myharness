@@ -121,6 +121,13 @@ class ModelSpec:
     api_key: str = ""  # Optional: API key stored in config (env var takes precedence)
     supports_thinking: bool = False
     supports_cache: bool = False
+    # B6 capability flag — true for models that accept native function/tool
+    # calling on their wire format. Anthropic 3.x+/4.x all support it;
+    # OpenAI gpt-4+/o-series support it; DeepSeek v3+ supports it; Ollama
+    # is per-model (llama 3.1+, qwen 2.5+, mistral nemo). When false, the
+    # gateway refuses to attach PATCH_TOOLS to this model and the patching
+    # path falls back to the text DSL automatically.
+    supports_tools: bool = False
     # Anthropic API version header. Default is the documented stable; users
     # can override per-model via .harness_config.json when newer features
     # need a different version.
@@ -193,6 +200,7 @@ def load_model_prices(prices_path: Optional[str] = None, override: bool = False)
                 api_key=spec_dict.get("api_key", ""),
                 supports_thinking=bool(spec_dict.get("supports_thinking", False)),
                 supports_cache=bool(spec_dict.get("supports_cache", False)),
+                supports_tools=bool(spec_dict.get("supports_tools", False)),
                 anthropic_version=spec_dict.get("anthropic_version", "2023-06-01"),
                 thinking_budget_tokens=int(spec_dict.get("thinking_budget_tokens", 8000)),
             )
@@ -287,6 +295,7 @@ def register_models_from_config(config_dict: dict[str, Any]) -> int:
                     "api_key": baseline.api_key,
                     "supports_thinking": baseline.supports_thinking,
                     "supports_cache": baseline.supports_cache,
+                    "supports_tools": baseline.supports_tools,
                     "anthropic_version": baseline.anthropic_version,
                     "thinking_budget_tokens": baseline.thinking_budget_tokens,
                 })
@@ -304,6 +313,7 @@ def register_models_from_config(config_dict: dict[str, Any]) -> int:
                 api_key=merged.get("api_key", ""),
                 supports_thinking=bool(merged.get("supports_thinking", False)),
                 supports_cache=bool(merged.get("supports_cache", False)),
+                supports_tools=bool(merged.get("supports_tools", False)),
                 anthropic_version=merged.get("anthropic_version", "2023-06-01"),
                 thinking_budget_tokens=int(merged.get("thinking_budget_tokens", 8000)),
             )
@@ -384,9 +394,18 @@ class BaseLLM(ABC):
         temperature: float = 0.0,
         max_tokens: int = 4096,
         thinking: bool = False,
+        tools: Optional[list[dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> LLMResponse:
-        """Send a chat completion request and return a standardized response."""
+        """Send a chat completion request and return a standardized response.
+
+        ``tools`` is the canonical ``[{name, description, input_schema}, ...]``
+        list from :mod:`harness.tool_schemas`. Providers translate it to their
+        native wire format (Anthropic raw, OpenAI ``[{type: function, function:
+        {...}}]``) and populate ``LLMResponse.tool_calls`` with parsed
+        ``{name, input, id}`` dicts when the model emits tool-use blocks.
+        ``None`` (default) keeps the legacy text-DSL behaviour.
+        """
         ...
 
     @abstractmethod
@@ -416,6 +435,154 @@ def _parse_json_response(response: Any) -> dict[str, Any]:
         ) from exc
 
 
+def _normalize_messages_for_openai_tools(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Translate Anthropic-style typed-block tool turns into OpenAI's
+    ``role=tool`` / ``tool_calls`` shape.
+
+    The harness uses Anthropic's typed-block representation
+    (``content=[{"type": "tool_use", ...}]`` for the assistant turn,
+    ``content=[{"type": "tool_result", "tool_use_id": ..., "content":
+    ...}]`` for the follow-up user turn) as the *canonical* in-memory
+    format. OpenAI / DeepSeek / Ollama OpenAI-compat want a different
+    shape; this helper converts at the provider boundary so the
+    canonical format stays one thing.
+
+    Pass-through for any message that doesn't contain tool blocks —
+    plain text messages survive unchanged.
+    """
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            if role == "assistant":
+                text_parts: list[str] = []
+                tool_calls: list[dict[str, Any]] = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif btype == "tool_use":
+                        try:
+                            args = json.dumps(block.get("input") or {})
+                        except (TypeError, ValueError):
+                            args = "{}"
+                        tool_calls.append({
+                            "id": block.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": block.get("name", ""),
+                                "arguments": args,
+                            },
+                        })
+                if tool_calls:
+                    msg_out: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": ("\n".join(text_parts) or None),
+                        "tool_calls": tool_calls,
+                    }
+                    out.append(msg_out)
+                    continue
+            elif role == "user":
+                # Tool results land as one message per result with
+                # role=tool in OpenAI's shape. Interleave any text blocks
+                # as a follow-up user message so narration survives.
+                tool_results: list[tuple[str, str]] = []
+                trailing_text: list[str] = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "tool_result":
+                        tr_content = block.get("content", "")
+                        if isinstance(tr_content, list):
+                            # Nested content blocks → flatten to text.
+                            tr_content = "\n".join(
+                                str(b.get("text", "")) for b in tr_content
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            )
+                        tool_results.append((
+                            str(block.get("tool_use_id", "")),
+                            str(tr_content),
+                        ))
+                    elif btype == "text":
+                        trailing_text.append(str(block.get("text", "")))
+                if tool_results:
+                    for tool_use_id, tr_content in tool_results:
+                        out.append({
+                            "role": "tool",
+                            "tool_call_id": tool_use_id,
+                            "content": tr_content,
+                        })
+                    if trailing_text:
+                        out.append({
+                            "role": "user",
+                            "content": "\n".join(trailing_text),
+                        })
+                    continue
+        out.append(msg)
+    return out
+
+
+def _parse_openai_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Translate an OpenAI-compat ``message.tool_calls`` list into the
+    harness's canonical ``[{name, input, id}, ...]`` shape.
+
+    OpenAI ships ``arguments`` as a *JSON-encoded string* (not a dict),
+    which is one of the most common pitfalls when wiring native tool-use.
+    Each call gets a JSON.loads + a fallback that drops malformed calls
+    rather than poisoning the patcher with garbage arguments.
+
+    Used by all three OpenAI-shape providers (OpenAI, DeepSeek, Ollama-
+    via-OpenAI-compat). Anthropic has its own typed-block parser inline
+    in :meth:`AnthropicProvider.chat_completion`.
+    """
+    raw = message.get("tool_calls") or []
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for call in raw:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") or {}
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        args_raw = fn.get("arguments")
+        if isinstance(args_raw, dict):
+            args = args_raw
+        elif isinstance(args_raw, str):
+            try:
+                parsed = json.loads(args_raw) if args_raw.strip() else {}
+            except json.JSONDecodeError:
+                logger.warning(
+                    "[gateway] Dropping tool_call '%s' with malformed JSON "
+                    "arguments: %r",
+                    name, args_raw[:200],
+                )
+                continue
+            if not isinstance(parsed, dict):
+                logger.warning(
+                    "[gateway] Dropping tool_call '%s' — arguments parsed "
+                    "to %s, expected object.",
+                    name, type(parsed).__name__,
+                )
+                continue
+            args = parsed
+        else:
+            args = {}
+        out.append({
+            "name": name,
+            "input": args,
+            "id": str(call.get("id") or ""),
+        })
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 3. DeepSeek Provider Implementation
 # ---------------------------------------------------------------------------
@@ -430,9 +597,12 @@ class DeepSeekProvider(BaseLLM):
         temperature: float = 0.0,
         max_tokens: int = 4096,
         thinking: bool = False,
+        tools: Optional[list[dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> LLMResponse:
         client = await self._get_client()
+        if tools:
+            messages = _normalize_messages_for_openai_tools(messages)
         payload: dict[str, Any] = {
             "model": self.spec.model_id,
             "messages": messages,
@@ -442,6 +612,9 @@ class DeepSeekProvider(BaseLLM):
         }
         if thinking and self.spec.supports_thinking:
             payload["thinking"] = {"type": "enabled"}
+        if tools:
+            from harness.tool_schemas import to_openai_tools
+            payload["tools"] = to_openai_tools(tools)
 
         logger.debug("[deepseek] Sending completion request. model=%s tokens_est=%d", self.spec.model_id, len(messages))
 
@@ -453,8 +626,10 @@ class DeepSeekProvider(BaseLLM):
         usage.cost_usd = self.compute_cost(usage)
 
         choice = data.get("choices", [{}])[0]
-        content = choice.get("message", {}).get("content", "")
+        message = choice.get("message", {}) or {}
+        content = message.get("content") or ""
         finish_reason = choice.get("finish_reason", "stop")
+        tool_calls = _parse_openai_tool_calls(message)
 
         return LLMResponse(
             content=content,
@@ -462,6 +637,7 @@ class DeepSeekProvider(BaseLLM):
             model=self.spec.model_id,
             finish_reason=finish_reason,
             raw_response=data,
+            tool_calls=tool_calls,
         )
 
     def extract_usage(self, raw_response: dict[str, Any]) -> TokenUsage:
@@ -514,6 +690,7 @@ class AnthropicProvider(BaseLLM):
         temperature: float = 0.0,
         max_tokens: int = 4096,
         thinking: bool = False,
+        tools: Optional[list[dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> LLMResponse:
         client = await self._get_client()
@@ -549,6 +726,28 @@ class AnthropicProvider(BaseLLM):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+
+        # B6 native tool-use. Anthropic accepts the raw
+        # ``{name, description, input_schema}`` shape directly via
+        # ``tool_schemas.to_anthropic_tools``. When prompt caching is on,
+        # the tool array is part of the cacheable prefix — anchor a
+        # ``cache_control: ephemeral`` marker on the LAST tool so the
+        # whole array caches together.
+        if tools:
+            from harness.tool_schemas import to_anthropic_tools
+            anthropic_tools = to_anthropic_tools(tools)
+            if (
+                bool(getattr(self, "prompt_cache_enabled", True))
+                and bool(self.spec.supports_cache)
+                and anthropic_tools
+            ):
+                # Mutate a copy so the global PATCH_TOOLS list is untouched.
+                anthropic_tools[-1] = {
+                    **anthropic_tools[-1],
+                    "cache_control": {"type": "ephemeral"},
+                }
+            payload["tools"] = anthropic_tools
+
         # Prompt caching. When the model declares ``supports_cache`` and the
         # gateway has not disabled it via ``prompt_cache_enabled=False``,
         # rewrite the system block into list-of-blocks form with a
@@ -610,12 +809,23 @@ class AnthropicProvider(BaseLLM):
         usage = self.extract_usage(data)
         usage.cost_usd = self.compute_cost(usage)
 
-        # Anthropic returns content as a list of blocks; extract text
+        # Anthropic returns content as a list of typed blocks. Extract
+        # the text parts AND the tool_use blocks separately — the model
+        # can emit both in the same turn ("I'll start by reading the
+        # file" + a tool_use call).
         content_blocks = data.get("content", [])
         text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
         for block in content_blocks:
-            if block.get("type") == "text":
+            btype = block.get("type")
+            if btype == "text":
                 text_parts.append(block.get("text", ""))
+            elif btype == "tool_use":
+                tool_calls.append({
+                    "name": block.get("name", ""),
+                    "input": block.get("input") or {},
+                    "id": block.get("id", ""),
+                })
         content = "\n".join(text_parts)
 
         finish_reason = data.get("stop_reason", "stop")
@@ -626,6 +836,7 @@ class AnthropicProvider(BaseLLM):
             model=self.spec.model_id,
             finish_reason=finish_reason,
             raw_response=data,
+            tool_calls=tool_calls,
         )
 
     def extract_usage(self, raw_response: dict[str, Any]) -> TokenUsage:
@@ -675,9 +886,12 @@ class OpenAIProvider(BaseLLM):
         temperature: float = 0.0,
         max_tokens: int = 4096,
         thinking: bool = False,
+        tools: Optional[list[dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> LLMResponse:
         client = await self._get_client()
+        if tools:
+            messages = _normalize_messages_for_openai_tools(messages)
         payload: dict[str, Any] = {
             "model": self.spec.model_id,
             "messages": messages,
@@ -685,6 +899,9 @@ class OpenAIProvider(BaseLLM):
             "max_tokens": max_tokens,
             "stream": False,
         }
+        if tools:
+            from harness.tool_schemas import to_openai_tools
+            payload["tools"] = to_openai_tools(tools)
 
         logger.debug("[openai] Sending completion request. model=%s", self.spec.model_id)
 
@@ -696,8 +913,10 @@ class OpenAIProvider(BaseLLM):
         usage.cost_usd = self.compute_cost(usage)
 
         choice = data.get("choices", [{}])[0]
-        content = choice.get("message", {}).get("content", "")
+        message = choice.get("message", {}) or {}
+        content = message.get("content") or ""
         finish_reason = choice.get("finish_reason", "stop")
+        tool_calls = _parse_openai_tool_calls(message)
 
         return LLMResponse(
             content=content,
@@ -705,6 +924,7 @@ class OpenAIProvider(BaseLLM):
             model=self.spec.model_id,
             finish_reason=finish_reason,
             raw_response=data,
+            tool_calls=tool_calls,
         )
 
     def extract_usage(self, raw_response: dict[str, Any]) -> TokenUsage:
@@ -748,9 +968,12 @@ class OllamaProvider(BaseLLM):
         temperature: float = 0.0,
         max_tokens: int = 4096,
         thinking: bool = False,
+        tools: Optional[list[dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> LLMResponse:
         client = await self._get_client()
+        if tools:
+            messages = _normalize_messages_for_openai_tools(messages)
         payload: dict[str, Any] = {
             "model": self.spec.model_id,
             "messages": messages,
@@ -758,6 +981,9 @@ class OllamaProvider(BaseLLM):
             "max_tokens": max_tokens,
             "stream": False,
         }
+        if tools:
+            from harness.tool_schemas import to_openai_tools
+            payload["tools"] = to_openai_tools(tools)
 
         logger.debug("[ollama] Sending completion request. model=%s", self.spec.model_id)
 
@@ -769,8 +995,10 @@ class OllamaProvider(BaseLLM):
         usage.cost_usd = 0.0  # Local inference is free
 
         choice = data.get("choices", [{}])[0]
-        content = choice.get("message", {}).get("content", "")
+        message = choice.get("message", {}) or {}
+        content = message.get("content") or ""
         finish_reason = choice.get("finish_reason", "stop")
+        tool_calls = _parse_openai_tool_calls(message)
 
         return LLMResponse(
             content=content,
@@ -778,6 +1006,7 @@ class OllamaProvider(BaseLLM):
             model=self.spec.model_id,
             finish_reason=finish_reason,
             raw_response=data,
+            tool_calls=tool_calls,
         )
 
     def extract_usage(self, raw_response: dict[str, Any]) -> TokenUsage:
@@ -904,7 +1133,12 @@ def ensure_prefix_cache_anchor(messages: list[dict[str, Any]]) -> list[dict[str,
     return messages
 
 
-def hash_stable_prefix(messages: list[dict[str, Any]], n_stable: int = 2) -> str:
+def hash_stable_prefix(
+    messages: list[dict[str, Any]],
+    n_stable: int = 2,
+    *,
+    tools: Optional[list[dict[str, Any]]] = None,
+) -> str:
     """Hash the first ``n_stable`` messages of a request payload.
 
     Used by :class:`Gateway` to detect prefix drift across calls in the
@@ -914,6 +1148,12 @@ def hash_stable_prefix(messages: list[dict[str, Any]], n_stable: int = 2) -> str
     the same role, the gateway logs a warning + emits the
     ``cache_prefix_drift`` observability event so we can trace the leak
     back to the graph node that mutated a "should be stable" segment.
+
+    ``tools`` is folded into the hash when native tool-use is on —
+    Anthropic includes the tool array in its cacheable prefix, so a
+    change to the tool definitions has the same cache-miss footprint as
+    a change to the system prompt. We surface it through the same
+    drift-detection channel.
 
     The hash is deterministic across processes (no Python ``hash()`` salt),
     so it's safe to compare across resumed sessions. SHA-256 is overkill
@@ -932,6 +1172,9 @@ def hash_stable_prefix(messages: list[dict[str, Any]], n_stable: int = 2) -> str
         else:
             h.update(json.dumps(content, sort_keys=True, default=str).encode("utf-8"))
         h.update(b"\n---\n")
+    if tools:
+        h.update(b"tools:")
+        h.update(json.dumps(tools, sort_keys=True, default=str).encode("utf-8"))
     return h.hexdigest()
 
 
@@ -1228,12 +1471,13 @@ class GatewayConfig:
     # INSERT_AT_BLOCK against any file the LLM has not yet been shown this
     # turn (via pre-flight injection, READ_FILE resolution, or the patcher's
     # closest-match window). Mirrors Claude Code's Read-before-Edit
-    # invariant. Default false so existing prompts that rely on memory of
-    # earlier patches keep working; flip to true after the LLM has been
-    # taught to lead with READ_FILE for unfamiliar files. Drift detection
-    # (per-file sha256 comparison) runs unconditionally whenever the host
-    # has recorded a hash for the file.
-    enforce_read_before_edit: bool = False
+    # invariant. Default true: blind REPLACE_BLOCK on an unread file is the
+    # most common patch-failure mode for web-app builds (lots of small
+    # files), so the gate is on out of the box. Operators who depend on
+    # the lax mode can set ``patcher.enforce_read_before_edit: false`` in
+    # config.json. Drift detection (per-file sha256 comparison) runs
+    # unconditionally whenever the host has recorded a hash for the file.
+    enforce_read_before_edit: bool = True
     # B6: when true, providers that support native function/tool calling
     # (Anthropic Messages API, OpenAI / DeepSeek / Ollama OpenAI-compat)
     # pass the PATCH_TOOLS schema (see harness/tool_schemas.py) as
@@ -1584,6 +1828,7 @@ class Gateway:
         budget_remaining_usd: float,
         force_local: bool = False,
         model_override: Optional[str] = None,
+        tools: Optional[list[dict[str, Any]]] = None,
         **llm_kwargs: Any,
     ) -> tuple[LLMResponse, float]:
         """
@@ -1722,6 +1967,24 @@ class Gateway:
 
         spec = provider.spec
 
+        # --- B6 native tool-use gate ---
+        # ``tools`` only flows through to the provider when (a) the gateway
+        # is configured for structured tools and (b) the routed model
+        # actually supports them. If either is false we drop the tool
+        # array silently and let the caller's text-DSL parsing handle the
+        # response. This keeps an operator who flips ``use_structured_tools``
+        # but routes patching to an Ollama model without tool support from
+        # hard-failing every patching turn.
+        effective_tools: Optional[list[dict[str, Any]]] = None
+        if tools and self.config.use_structured_tools and spec.supports_tools:
+            effective_tools = list(tools)
+        elif tools and not (self.config.use_structured_tools and spec.supports_tools):
+            logger.debug(
+                "[gateway] tools= passed but suppressed (use_structured_tools=%s, "
+                "model=%s supports_tools=%s).",
+                self.config.use_structured_tools, model_key, spec.supports_tools,
+            )
+
         # --- Redact secrets from messages before transmission ---
         # Fail-closed: if the redactor cannot be loaded (missing module,
         # syntax error in the file, broken install), refuse to send rather
@@ -1752,7 +2015,9 @@ class Gateway:
             _sid = "unknown"
             emit_event = None  # type: ignore[assignment]
         try:
-            _prefix_hash = hash_stable_prefix(messages, n_stable=2)
+            _prefix_hash = hash_stable_prefix(
+                messages, n_stable=2, tools=effective_tools,
+            )
             _drift_key = (_sid, role.value)
             _last_hash = self._prefix_hashes.get(_drift_key)
             if _last_hash is not None and _last_hash != _prefix_hash:
@@ -1847,6 +2112,7 @@ class Gateway:
             return await provider.chat_completion(
                 messages=messages,
                 thinking=thinking,
+                tools=effective_tools,
                 **llm_kwargs,
             )
 
@@ -1875,11 +2141,20 @@ class Gateway:
         # raise EmptyLLMResponseError so the caller (repair / HITL router)
         # can short-circuit to a clear operator message instead of wasting
         # three repair iterations.
+        #
+        # B6 caveat: in native tool-use mode the model can legitimately
+        # emit a tool-only turn (zero text, one or more ``tool_use``
+        # blocks). ``response.tool_calls`` carries those — treat the
+        # response as non-empty even when ``content`` is blank.
+        def _is_empty(r: LLMResponse) -> bool:
+            if r.tool_calls:
+                return False
+            return r.content is None or (
+                isinstance(r.content, str) and not r.content.strip()
+            )
+
         empty_retry_attempts = 2
-        while (
-            response.content is None
-            or (isinstance(response.content, str) and not response.content.strip())
-        ) and empty_retry_attempts > 0:
+        while _is_empty(response) and empty_retry_attempts > 0:
             logger.warning(
                 "[gateway] Provider returned empty content (model=%s role=%s). "
                 "Retrying (%d remaining).",
@@ -1895,9 +2170,7 @@ class Gateway:
             except Exception:  # noqa: BLE001 — let the empty path below raise cleanly
                 break
 
-        if response.content is None or (
-            isinstance(response.content, str) and not response.content.strip()
-        ):
+        if _is_empty(response):
             try:
                 from harness.observability import log_failure
                 log_failure(
@@ -2387,7 +2660,7 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         dump_max_files=_resolve_dump_max_files(config_dict),
         enforce_read_before_edit=bool(
             (config_dict.get("patcher", {}) or {}).get(
-                "enforce_read_before_edit", False,
+                "enforce_read_before_edit", True,
             )
         ),
         use_structured_tools=bool(

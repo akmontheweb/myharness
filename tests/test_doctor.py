@@ -14,9 +14,30 @@ from harness.cli import (
     _doctor_check_checkpoint_db,
     _doctor_check_config,
     _doctor_check_git,
+    _doctor_check_patcher_mode,
     _doctor_check_sandbox,
     _format_doctor_line,
 )
+
+
+class TestDoctorPatcherMode:
+    def test_default_mode_reports_b5_on_b6_off(self):
+        status, detail = _doctor_check_patcher_mode({})
+        assert status == "pass"
+        assert "read-before-edit ON" in detail
+        assert "native tool-use OFF" in detail
+        assert "text DSL active" in detail
+
+    def test_b5_off_b6_on_surfaces_both(self):
+        status, detail = _doctor_check_patcher_mode({
+            "patcher": {
+                "enforce_read_before_edit": False,
+                "use_structured_tools": True,
+            },
+        })
+        assert status == "pass"
+        assert "read-before-edit OFF" in detail
+        assert "native tool-use ON" in detail
 
 
 @pytest.fixture(autouse=True)

@@ -31,7 +31,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -116,6 +116,28 @@ def open_web_db(path: str = _DEFAULT_WEB_DB) -> sqlite3.Connection:
 # 2. Process registry — in-memory, thread-safe
 # ---------------------------------------------------------------------------
 
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this pid currently exists on the system.
+
+    Mirrors ``harness.cli._is_pid_alive`` — duplicated here so web_state
+    has no import cycle on cli.py. Signal 0 is the POSIX existence probe;
+    it doesn't actually deliver a signal.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but is owned by someone else — still alive.
+        return True
+    except OSError:
+        return False
+
+
 @dataclass
 class WebProcess:
     """A single ``harness run`` subprocess spawned by the dashboard.
@@ -190,6 +212,7 @@ class ProcessRegistry:
         retained for ``terminated_ttl_seconds`` so the UI can still show
         the last outcome before they vanish."""
         with self._lock:
+            self._prune_dead_locked()
             self._prune_expired_locked()
             return sorted(
                 self._procs.values(),
@@ -198,6 +221,7 @@ class ProcessRegistry:
 
     def list_running(self) -> list[WebProcess]:
         with self._lock:
+            self._prune_dead_locked()
             return [p for p in self._procs.values() if p.is_running]
 
     def has_running_for_workspace(self, workspace: str) -> bool:
@@ -208,6 +232,7 @@ class ProcessRegistry:
         if not wanted:
             return False
         with self._lock:
+            self._prune_dead_locked()
             return any(
                 p.is_running and (p.workspace_path or "").strip() == wanted
                 for p in self._procs.values()
@@ -216,6 +241,19 @@ class ProcessRegistry:
     def remove(self, session_id: str) -> None:
         with self._lock:
             self._procs.pop(session_id, None)
+
+    def _prune_dead_locked(self) -> None:
+        """Flip any "still running" entry whose PID is no longer alive
+        to terminated. Without this, a subprocess killed with SIGKILL
+        (which the watcher thread can't catch via ``proc.wait``) leaves
+        a permanent "running" entry in the registry — and the UI keeps
+        showing a stale badge until the dashboard restarts."""
+        if not self._procs:
+            return
+        for sid, p in list(self._procs.items()):
+            if p.is_running and not _pid_alive(p.pid):
+                p.exit_code = -1
+                p.terminated_at = time.time()
 
     def _prune_expired_locked(self) -> None:
         if not self._procs:
@@ -574,6 +612,37 @@ def list_audit(*, db_path: str, limit: int = 50) -> list[dict[str, Any]]:
              "target": str(r[2]), "detail": str(r[3] or "")}
             for r in rows
         ]
+    finally:
+        conn.close()
+
+
+def prune_audit_log(*, db_path: str, days: int = 90) -> int:
+    """Delete ``audit_log`` rows older than ``days`` days. Returns the
+    number of rows removed.
+
+    The audit log is append-only and otherwise grows forever. We don't
+    rely on the deletion for correctness — even an unbounded table only
+    matters in long-running deployments — but a 90-day default keeps
+    web.db a sensible size without throwing away anything an operator
+    realistically needs.
+
+    Callers should invoke once at server start; ``ts`` is the ISO-8601
+    UTC timestamp the rows were written with, so the comparison is a
+    string compare against the cutoff in the same format.
+    """
+    if days <= 0:
+        return 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=int(days))).isoformat(
+        timespec="seconds",
+    )
+    conn = open_web_db(db_path)
+    try:
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM audit_log WHERE ts < ?",
+                (cutoff,),
+            )
+            return int(cur.rowcount or 0)
     finally:
         conn.close()
 

@@ -1825,8 +1825,37 @@ async def process_llm_patch_output(
     blocks = parse_patch_blocks(llm_output)
     logger.info("[patcher] Parsed %d patch blocks from LLM output.", len(blocks))
 
+    return await apply_patch_blocks(
+        blocks,
+        workspace_root,
+        existing_modified_files,
+        allowed_paths,
+        files_seen_by_llm=files_seen_by_llm,
+        enforce_read_before_edit=enforce_read_before_edit,
+    )
+
+
+async def apply_patch_blocks(
+    blocks: list[PatchBlock],
+    workspace_root: str,
+    existing_modified_files: Optional[list[str]] = None,
+    allowed_paths: Optional["Iterable[str]"] = None,
+    *,
+    files_seen_by_llm: Optional[dict[str, str]] = None,
+    enforce_read_before_edit: bool = False,
+) -> tuple[list[PatchResult], list[str]]:
+    """Apply pre-parsed :class:`PatchBlock` instances using the same
+    allowlist / B5 / hybrid-patcher pipeline as
+    :func:`process_llm_patch_output`.
+
+    Exists so callers that already have structured patches in hand —
+    notably the B6 native tool-use path, where
+    ``tool_calls_to_patch_blocks`` returns ``PatchBlock`` objects
+    directly — can reuse the apply pipeline without round-tripping
+    through the text DSL.
+    """
     if not blocks:
-        logger.warning("[patcher] No patch blocks found in LLM output.")
+        logger.warning("[patcher] No patch blocks to apply.")
         return [], existing_modified_files or []
 
     # If an allowlist is configured, partition blocks into allowed/rejected

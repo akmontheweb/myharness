@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional, Sequence
@@ -1519,18 +1520,52 @@ async def run_trivy_scan(
     """Trivy filesystem scan for dependency / package vulnerabilities.
 
     Picks up vulnerable transitive deps (npm, pip, gomod, cargo, etc.)
-    that SAST scanners can't see. Higher timeout because the first run
-    pulls the vuln database (~150 MB).
+    that SAST scanners can't see.
+
+    The vulnerability DB is cached under ``~/.harness/cache/trivy`` and
+    refreshed at most once every 24 hours; after that, ``--skip-db-update``
+    is added so repeated scans within a single session (or back-to-back
+    builds in CI) don't re-pull the ~150 MB DB on every invocation.
     """
     resolved = shutil.which(trivy_path) if trivy_path else shutil.which("trivy")
     if not resolved:
         logger.debug("[security_scan] trivy not on PATH. Skipping dep-vuln scan.")
         return ScannerOutcome(scanner="trivy", status=ScannerStatus.NOT_INSTALLED)
 
+    cache_dir = os.path.expanduser("~/.harness/cache/trivy")
+    skip_db_update = False
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        stamp_path = os.path.join(cache_dir, ".db_refreshed_at")
+        now = time.time()
+        if os.path.isfile(stamp_path):
+            try:
+                last = os.path.getmtime(stamp_path)
+            except OSError:
+                last = 0.0
+            if now - last < 24 * 60 * 60:
+                skip_db_update = True
+        if not skip_db_update:
+            # Touch the stamp BEFORE the scan; if trivy fails mid-download the
+            # next call retries on its own DB-update path, no need to block.
+            try:
+                with open(stamp_path, "w", encoding="utf-8") as _f:
+                    _f.write(str(now))
+            except OSError:
+                pass
+    except OSError as exc:
+        logger.debug("[security_scan] trivy cache setup skipped: %s", exc)
+        cache_dir = ""
+
     cmd = [
         resolved, "fs", "--format", "json", "--quiet", "--no-progress",
-        "--exit-code", "0", workspace_path,
+        "--exit-code", "0",
     ]
+    if cache_dir:
+        cmd.extend(["--cache-dir", cache_dir])
+    if skip_db_update:
+        cmd.append("--skip-db-update")
+    cmd.append(workspace_path)
     exit_code, stdout, stderr = await _run_subprocess_scanner(
         cmd, timeout_seconds=timeout_seconds, label="trivy",
     )

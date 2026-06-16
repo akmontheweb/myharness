@@ -545,6 +545,116 @@ print('exists:', os.path.isfile(memory_file_path(ws, cfg)))
 
 ---
 
+## 14. Dashboard shows a session as "running" forever (stale badge)
+
+### Symptom
+
+The web dashboard's status / live page keeps showing a session in the
+"running" state long after the `harness run` subprocess actually exited.
+Most common cause: the child was killed with `SIGKILL` (which the
+parent's watcher thread can't trap via `proc.wait`), or the dashboard
+process itself was hard-restarted.
+
+### Diagnose
+
+```bash
+# Look at the registry's view (this is what the UI renders)
+curl -fsS -H "Authorization: Bearer $DASH_TOKEN" \
+  http://127.0.0.1:8729/live | grep running
+
+# Then check whether the PID actually exists:
+ps -p <PID-FROM-UI>
+```
+
+### Fix
+
+The dashboard now sweeps the registry for orphan PIDs on every
+`/live`, `/status`, and "running for workspace?" lookup (see
+`ProcessRegistry._prune_dead_locked`). One refresh of the page after
+the child died is enough to flip the badge to terminated.
+
+If a badge persists across multiple refreshes:
+
+1. The dashboard process itself is wedged — `harness web stop` then
+   `harness web start`.
+2. Or the PID was *recycled* by the kernel between the kill and the
+   check (rare but possible on busy hosts). Restarting the dashboard
+   clears the registry.
+
+---
+
+## 15. Dashboard marker file corrupt — `harness web start` refuses to launch
+
+### Symptom
+
+`harness web start` exits with "another dashboard is already running"
+even though no process is listening on the port. The marker file at
+`~/.harness/web.lock` may have a malformed JSON body, a PID that
+doesn't exist, or stale ownership from a previous boot.
+
+### Diagnose
+
+```bash
+cat ~/.harness/web.lock     # what does the marker think is running?
+ps -p $(jq -r .pid ~/.harness/web.lock 2>/dev/null) || echo "stale"
+ss -tlnp | grep 8729        # is anything listening on the dashboard port?
+```
+
+A stale marker has a PID that doesn't exist; a corrupt marker fails to
+parse as JSON.
+
+### Fix
+
+```bash
+rm ~/.harness/web.lock
+harness web start
+```
+
+The lock is a freshness hint, not a critical lock — the dashboard
+itself rebinds the socket on start, so a stray marker can't actually
+prevent a clean boot once removed.
+
+---
+
+## 16. FD-limit pressure when running many dashboard-spawned builds
+
+### Symptom
+
+Long-lived dashboards that spawn many `harness run` subprocesses
+("Run now" / "Run resume" / scheduled one-shot jobs) eventually start
+hitting `OSError: [Errno 24] Too many open files` from inside the
+spawn path.
+
+### Diagnose
+
+```bash
+# How many FDs is the dashboard process holding?
+ls /proc/$(jq -r .pid ~/.harness/web.lock)/fd | wc -l
+
+# And what does the OS allow?
+ulimit -n
+```
+
+A few hundred is normal. Several thousand suggests an FD leak.
+
+### Fix
+
+The known leak in the spawn path (parent retaining the per-session
+stdout sink) was fixed; see `spawn_harness_run` / `spawn_harness_resume`
+in `harness/dashboard.py`. If you're still climbing, raise the soft
+limit before invoking the dashboard:
+
+```bash
+ulimit -n 8192
+harness web start
+```
+
+For systemd, set `LimitNOFILE=` in the unit file. The Docker base
+image picks the host value at start — bump it on the host or set
+`--ulimit nofile=...` on `docker run`.
+
+---
+
 ## Appendix: Useful one-liners
 
 ```bash
