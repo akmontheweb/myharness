@@ -349,6 +349,35 @@ class HitlQueue:
             return {}
         return dict(entry.response)
 
+    def clear_pending(self, request_id: str) -> bool:
+        """Remove a pending entry without delivering a response.
+
+        Used by the webhook handler's timeout branch so an abandoned
+        prompt doesn't leak into the dashboard's HITL panel after
+        the harness side gives up waiting. Returns True when an entry
+        was found and removed, False when there was nothing to remove.
+        """
+        with self._lock:
+            return self._pending.pop(request_id, None) is not None
+
+    def clear_pending_for_session(self, session_id: str) -> int:
+        """Remove every pending entry for a session that has ended.
+
+        Used by the dashboard's HITL renderer when it notices the
+        session log's tail event is ``session_end`` — without this
+        the in-memory queue would surface a stale "REQUIREMENT
+        REFINEMENT GATE" for runs that already shut down. Returns
+        the count of entries removed for caller-side logging.
+        """
+        with self._lock:
+            stale_ids = [
+                rid for rid, entry in self._pending.items()
+                if entry.session_id == session_id
+            ]
+            for rid in stale_ids:
+                self._pending.pop(rid, None)
+            return len(stale_ids)
+
 
 # ---------------------------------------------------------------------------
 # 4. Chat-note queue — per-session free-text notes that ride the next HITL

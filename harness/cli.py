@@ -2274,16 +2274,18 @@ async def synthesize_requirements(
     ]
 
     try:
-        response, budget = await gateway.dispatch(
+        content_raw, cost_total = await _dispatch_with_continuation(
+            gateway=gateway,
             messages=messages,
             role=NodeRole.PLANNING,
             budget_remaining_usd=2.00,
+            log_label="requirements",
         )
     except Exception as exc:
         raise RuntimeError(f"LLM synthesis failed: {exc}") from exc
 
     from harness.trust import validate_synthesized_spec
-    content, trust_errors = validate_synthesized_spec(response.content.strip())
+    content, trust_errors = validate_synthesized_spec(content_raw.strip())
     if trust_errors:
         raise RuntimeError(f"Synthesised spec failed trust validation: {trust_errors}")
 
@@ -2299,7 +2301,7 @@ async def synthesize_requirements(
             f.write(content)
 
     logger.info("[requirements] SPEC_REQUIREMENTS.md written to %s (%d chars, cost=$%.6f).",
-                 spec_path, len(content), response.usage.cost_usd)
+                 spec_path, len(content), cost_total)
     return spec_path
 
 
@@ -2317,6 +2319,68 @@ def _read_spec_file(spec_path: str) -> str:
             return f.read()
     except OSError:
         return ""
+
+
+async def _dispatch_with_continuation(
+    *,
+    gateway: Any,
+    messages: list[dict[str, str]],
+    role: Any,
+    budget_remaining_usd: float,
+    log_label: str,
+    max_continuations: int = 3,
+) -> tuple[str, float]:
+    """Dispatch a planning-role completion that may exceed the model's
+    per-call ``max_tokens``. When the LLM signals
+    ``finish_reason == "length"`` we feed the partial back as an
+    assistant turn and ask it to continue from where it stopped,
+    repeating up to ``max_continuations`` extra cycles. Used by the
+    spec-synthesis helpers so a 4096-token output cap doesn't truncate
+    a multi-section Markdown document mid-sentence — that truncation
+    is what produced session web-6d5ef9b18f6a's missing §4–§7 (and the
+    downstream "backend code only, no frontend" build output).
+
+    Returns ``(concatenated_content, total_cost_usd)``.
+    """
+    chunks: list[str] = []
+    working = list(messages)
+    total_cost = 0.0
+    budget = budget_remaining_usd
+    for cycle in range(max_continuations + 1):
+        response, budget = await gateway.dispatch(
+            messages=working,
+            role=role,
+            budget_remaining_usd=budget,
+        )
+        chunk = response.content or ""
+        chunks.append(chunk)
+        total_cost += response.usage.cost_usd
+        # Stub gateways in tests historically omit finish_reason on
+        # their canned response — treat missing field as a clean stop.
+        if getattr(response, "finish_reason", "stop") != "length":
+            break
+        if cycle == max_continuations:
+            logger.warning(
+                "[%s] LLM still hit the output token cap after %d "
+                "continuation cycle(s); accepting truncated output.",
+                log_label, max_continuations,
+            )
+            break
+        logger.info(
+            "[%s] LLM hit output token cap (cycle %d/%d) — requesting "
+            "continuation.",
+            log_label, cycle + 1, max_continuations,
+        )
+        working = working + [
+            {"role": "assistant", "content": chunk},
+            {"role": "user", "content": (
+                "You stopped mid-document because you hit the output "
+                "token cap. Continue from EXACTLY where you left off — "
+                "do not repeat any preceding heading, table, sentence, "
+                "or partial word. Output only the remaining content."
+            )},
+        ]
+    return "".join(chunks), total_cost
 
 
 _ARCHITECTURE_SYNTHESIS_PROMPT = """You are a Principal Software Architect.
@@ -2435,16 +2499,18 @@ async def synthesize_architecture(
     ]
 
     try:
-        response, _ = await gateway.dispatch(
+        content_raw, cost_total = await _dispatch_with_continuation(
+            gateway=gateway,
             messages=messages,
             role=NodeRole.PLANNING,
             budget_remaining_usd=2.00,
+            log_label="architecture",
         )
     except Exception as exc:
         raise RuntimeError(f"LLM architecture synthesis failed: {exc}") from exc
 
     from harness.trust import validate_synthesized_spec
-    content, trust_errors = validate_synthesized_spec(response.content.strip())
+    content, trust_errors = validate_synthesized_spec(content_raw.strip())
     if trust_errors:
         raise RuntimeError(f"Synthesised architecture spec failed trust validation: {trust_errors}")
 
@@ -2460,7 +2526,7 @@ async def synthesize_architecture(
 
     logger.info(
         "[architecture] SPEC_ARCHITECTURE.md written to %s (%d chars, cost=$%.6f).",
-        spec_path, len(content), response.usage.cost_usd,
+        spec_path, len(content), cost_total,
     )
     return spec_path
 
@@ -2500,13 +2566,15 @@ updated SPEC_REQUIREMENTS.md document."""
         {"role": "user", "content": refine_prompt},
     ]
 
-    response, budget = await gateway.dispatch(
+    content_raw, _cost_total = await _dispatch_with_continuation(
+        gateway=gateway,
         messages=messages,
         role=NodeRole.PLANNING,
         budget_remaining_usd=2.00,
+        log_label="requirements:refine",
     )
 
-    content = response.content.strip()
+    content = content_raw.strip()
     if not content:
         raise RuntimeError("LLM returned empty content for specification refinement.")
 

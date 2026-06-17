@@ -1920,13 +1920,94 @@ Generate your patches NOW. Only the blocks above. No other text."""
             state=state,
         )
 
-        # Update token tracker (per-stage attribution: patching)
+        # Continuation on finish_reason=="length": the patching role's
+        # output cap (8192 tokens by default — see
+        # config/config.json:llm_dispatch.max_tokens_per_role.patching)
+        # is enough for a few hundred lines of patches, but a full-stack
+        # blueprint that wants both backend AND frontend modules
+        # routinely runs past it. Without continuation the harness
+        # accepts the truncated DSL, moves into repair, and never
+        # re-introduces the missing files — session web-6d5ef9b18f6a
+        # is the canonical example (backend only, no React tree).
+        # Only the text-DSL path needs an outer loop; tool-use mode
+        # already multi-turns inside _patching_tool_loop and a second
+        # continuation here would double-charge for content the LLM
+        # already finalised.
+        _initial_tool_calls = getattr(response, "tool_calls", None) or []
+        accumulated_text_chunks: list[str] = [response.content or ""]
+        _PATCHING_CONTINUE_PROMPT = (
+            "You hit the output token cap mid-patch. Continue with "
+            "ADDITIONAL CREATE_FILE / REPLACE_BLOCK / DELETE_BLOCK / "
+            "INSERT_AT_BLOCK blocks for the remaining files in the "
+            "architecture inventory (e.g. the frontend / client tier "
+            "when the backend was emitted first). Do NOT repeat "
+            "blocks you've already emitted; emit only the missing "
+            "ones. Same DSL rules as before — block syntax only, "
+            "no prose outside the blocks."
+        )
+        continuation_cycles = 0
+        # ``getattr`` with a "stop" default keeps stub responses in
+        # tests (which historically omit finish_reason) on the
+        # non-continuation path — only real gateway responses with an
+        # explicit "length" trigger the loop.
+        while (
+            not _initial_tool_calls
+            and getattr(response, "finish_reason", "stop") == "length"
+            and continuation_cycles < 3
+        ):
+            continuation_cycles += 1
+            logger.info(
+                "[patching_node] Initial patch round hit output token "
+                "cap (cycle %d/3) — requesting continuation.",
+                continuation_cycles,
+            )
+            messages.append(MessageDict(
+                role="assistant", content=response.content or "",
+            ))
+            messages.append(MessageDict(
+                role="user", content=_PATCHING_CONTINUE_PROMPT,
+            ))
+            response, new_budget, messages, tool_files_seen = await _patching_tool_loop(
+                gateway=gateway,
+                messages=messages,
+                budget=new_budget,
+                workspace=workspace,
+                use_tools=use_tools,
+                tools=PATCH_TOOLS,
+                state=state,
+            )
+            accumulated_text_chunks.append(response.content or "")
+        if (
+            continuation_cycles >= 3
+            and getattr(response, "finish_reason", "stop") == "length"
+        ):
+            logger.warning(
+                "[patching_node] LLM still truncated after 3 "
+                "continuation cycle(s); accepting what landed and "
+                "moving on to repair.",
+            )
+
+        # Update token tracker (per-stage attribution: patching).
+        # Note: aggregate_tokens here only sees the FINAL response's
+        # usage — the intermediate continuation dispatches were
+        # already individually emitted by gateway.dispatch's
+        # per-call event log, so cost accounting at the session
+        # level is intact; the token-tracker just reflects the last
+        # slice. Refining the aggregator to sum across cycles is a
+        # future cleanup if cost-per-role attribution drifts.
         token_tracker = state.get("token_tracker", {})
         token_tracker = gateway.aggregate_tokens(
             token_tracker, response.usage, role=NodeRole.PATCHING,
         )
 
         existing_modified = list(state.get("modified_files", []))
+
+        # Pre-join the text-DSL chunks once; the text-DSL branch
+        # below feeds this concatenation through patch parsing so
+        # continuation patches land on disk alongside the initial
+        # round's blocks. Tool-use mode ignores it (tool calls were
+        # already executed inside the loop).
+        combined_response_text = "\n".join(accumulated_text_chunks)
 
         _resp_tool_calls = getattr(response, "tool_calls", None) or []
         if _resp_tool_calls:
@@ -1967,8 +2048,12 @@ Generate your patches NOW. Only the blocks above. No other text."""
         else:
             # Text-DSL path (legacy / fallback when provider didn't
             # support native tools or returned a pure-text response).
+            # combined_response_text is the concatenation of the
+            # initial response and any continuation cycles above —
+            # without it the patcher would only ever see the first
+            # truncated slice when finish_reason was "length".
             filtered_response, dropped_test_blocks = (
-                _filter_test_blocks_from_patch_response(response.content)
+                _filter_test_blocks_from_patch_response(combined_response_text)
             )
             if dropped_test_blocks:
                 logger.info(
@@ -1992,7 +2077,10 @@ Generate your patches NOW. Only the blocks above. No other text."""
         # so the LLM's own history reflects what it actually emitted).
         # In tool-use mode the assistant turn(s) were already appended
         # inside _patching_tool_loop; only the text-DSL path needs to
-        # add a synthetic assistant message here.
+        # add a synthetic assistant message here. We append only the
+        # FINAL chunk — earlier chunks were appended inside the
+        # continuation loop as it advanced, so re-appending them now
+        # would double them in the conversation history.
         if not _resp_tool_calls:
             messages.append(MessageDict(role="assistant", content=response.content))
 

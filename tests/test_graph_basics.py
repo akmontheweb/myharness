@@ -1,6 +1,6 @@
 """Tests for harness/graph.py — orchestration basics."""
 
-
+import asyncio
 
 from harness.graph import (
     apply_memory_cleanse,
@@ -378,3 +378,155 @@ class TestRouteAfterSecurityScan:
         )
         # Findings exist + low attempts → repair_node regardless of flag.
         assert route_after_security_scan(state) == "repair_node"
+
+
+class _PatchingResponse:
+    """Stand-in for the gateway response object the patching node
+    consumes — needs ``content``, ``finish_reason``, ``tool_calls``,
+    and ``usage`` (with input/output/cost fields)."""
+
+    class _Usage:
+        input_tokens = 100
+        output_tokens = 200
+        cost_usd = 0.001
+        cached_tokens = 0
+
+    def __init__(self, content: str, finish_reason: str):
+        self.content = content
+        self.finish_reason = finish_reason
+        self.tool_calls = []
+        self.usage = self._Usage()
+
+
+class TestPatchingNodeContinuation:
+    """When the patching LLM hits its 8192-token output cap
+    mid-blueprint (session web-6d5ef9b18f6a's symptom — backend
+    emitted, frontend never), the node now re-dispatches with a
+    "continue" prompt and concatenates the chunks before handing
+    them to the patcher."""
+
+    def _install_gateway_stub(self, monkeypatch):
+        from harness import graph as graph_mod
+
+        class _Cfg:
+            use_structured_tools = False
+            enforce_read_before_edit = False
+
+        class _Gw:
+            config = _Cfg()
+
+            def aggregate_tokens(self, tracker, usage, role=None):
+                out = dict(tracker or {})
+                out["total_cost_usd"] = out.get("total_cost_usd", 0.0) + usage.cost_usd
+                return out
+
+        gw = _Gw()
+        graph_mod.set_gateway(gw)
+        monkeypatch.setattr(graph_mod, "_build_patcher_allowlist", lambda ws: [])
+        return graph_mod
+
+    def test_continues_when_finish_reason_is_length(self, monkeypatch, tmp_path):
+        graph_mod = self._install_gateway_stub(monkeypatch)
+
+        # First call → "length"; second call → "stop". The text-DSL
+        # path should concatenate both response bodies before patch
+        # parsing.
+        responses = [
+            _PatchingResponse("<<<CREATE_FILE>>>\nfile: backend/a.py\ncontent:\nx\n<<<END_CREATE_FILE>>>", "length"),
+            _PatchingResponse("<<<CREATE_FILE>>>\nfile: frontend/index.js\ncontent:\ny\n<<<END_CREATE_FILE>>>", "stop"),
+        ]
+        call_messages: list[list[dict]] = []
+
+        async def fake_tool_loop(**kwargs):
+            call_messages.append(list(kwargs["messages"]))
+            resp = responses.pop(0)
+            return resp, kwargs["budget"] - 0.10, kwargs["messages"], {}
+
+        monkeypatch.setattr(graph_mod, "_patching_tool_loop", fake_tool_loop)
+
+        captured: dict = {}
+
+        async def fake_apply(content, ws, existing, allowed_paths=None):
+            captured["content"] = content
+            return [], []
+
+        import harness.patcher as patcher_mod
+        monkeypatch.setattr(
+            patcher_mod, "process_llm_patch_output", fake_apply,
+        )
+
+        state = {
+            "messages": [{"role": "system", "content": "you are a patcher"}],
+            "budget_remaining_usd": 2.0,
+            "workspace_path": str(tmp_path),
+            "modified_files": [],
+            "loop_counter": {},
+            "token_tracker": {},
+        }
+
+        result = asyncio.run(graph_mod.patching_node(state))
+
+        # Two dispatches happened (initial + 1 continuation).
+        assert len(call_messages) == 2
+        # The second dispatch saw the partial as an assistant turn
+        # plus a continue-prompt as the trailing user turn.
+        continuation_msgs = call_messages[1]
+        assert continuation_msgs[-2]["role"] == "assistant"
+        assert "backend/a.py" in continuation_msgs[-2]["content"]
+        assert continuation_msgs[-1]["role"] == "user"
+        assert "hit the output token cap" in continuation_msgs[-1]["content"]
+        # The patcher saw BOTH chunks concatenated — without this the
+        # frontend CREATE_FILE block would never reach disk.
+        assert "backend/a.py" in captured["content"]
+        assert "frontend/index.js" in captured["content"]
+        # Node returned cleanly with both files in modified_files
+        # provided by the fake apply (empty here — we only assert
+        # the call shape).
+        assert "messages" in result
+
+    def test_caps_continuation_at_three_cycles(self, monkeypatch, tmp_path):
+        """Pathological case: LLM keeps returning ``length``. The
+        node must not loop forever — three continuation cycles is
+        the ceiling, after which the node accepts what landed."""
+        graph_mod = self._install_gateway_stub(monkeypatch)
+
+        # Initial + 3 continuations = 4 dispatches, all "length".
+        responses = [
+            _PatchingResponse(f"chunk{i} ", "length") for i in range(1, 5)
+        ]
+        dispatches: list[int] = []
+
+        async def fake_tool_loop(**kwargs):
+            dispatches.append(1)
+            resp = responses.pop(0)
+            return resp, kwargs["budget"] - 0.10, kwargs["messages"], {}
+
+        monkeypatch.setattr(graph_mod, "_patching_tool_loop", fake_tool_loop)
+
+        captured: dict = {}
+
+        async def fake_apply(content, ws, existing, allowed_paths=None):
+            captured["content"] = content
+            return [], []
+
+        import harness.patcher as patcher_mod
+        monkeypatch.setattr(
+            patcher_mod, "process_llm_patch_output", fake_apply,
+        )
+
+        state = {
+            "messages": [{"role": "system", "content": "you are a patcher"}],
+            "budget_remaining_usd": 2.0,
+            "workspace_path": str(tmp_path),
+            "modified_files": [],
+            "loop_counter": {},
+            "token_tracker": {},
+        }
+
+        asyncio.run(graph_mod.patching_node(state))
+
+        # 4 = initial + 3 continuation cycles. No more.
+        assert len(dispatches) == 4
+        # All four chunks reached the patcher.
+        assert "chunk1" in captured["content"]
+        assert "chunk4" in captured["content"]

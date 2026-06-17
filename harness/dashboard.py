@@ -3724,6 +3724,12 @@ def make_request_handler(
             # forever. Tunable via dashboard.hitl_webhook_timeout_seconds.
             timeout = float(cfg.hitl_webhook_timeout_seconds or 600.0)
             if not entry.event.wait(timeout=timeout):
+                # Purge the abandoned entry before returning 504 — the
+                # dashboard's HITL renderer reads the same queue and
+                # would otherwise keep surfacing the gate after the
+                # harness side gave up. See clear_pending in
+                # harness/web_state.py.
+                get_hitl_queue().clear_pending(request_id)
                 self._send(504, "text/plain", "504 operator did not respond in time\n")
                 return
             answer = get_hitl_queue().pop_response(request_id)
@@ -4722,7 +4728,32 @@ def _render_pending_hitl_rows(cfg: DashboardConfig, session_id: str) -> str:
     csrf_field = (
         f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"
     )
-    pending = get_hitl_queue().list_pending_for_session(session_id)
+    queue = get_hitl_queue()
+    pending = queue.list_pending_for_session(session_id)
+    # If we still hold pending entries for a session whose log tail
+    # is ``session_end``, the harness side has already shut down —
+    # the only way the queue still holds them is through a leak
+    # (webhook timed out before our purge landed, or the harness
+    # was killed mid-prompt). Drop them now so the operator console
+    # stops surfacing a stale "REQUIREMENT REFINEMENT GATE" after
+    # shutdown. Belt + suspenders with the timeout-path purge in
+    # ``_handle_hitl_webhook``.
+    if pending:
+        log_path = os.path.join(
+            os.path.expanduser(cfg.log_dir), f"{session_id}.jsonl",
+        )
+        if (
+            os.path.isfile(log_path)
+            and _last_event_name(log_path) == "session_end"
+        ):
+            removed = queue.clear_pending_for_session(session_id)
+            if removed:
+                logger.info(
+                    "[hitl] Cleared %d stale pending prompt(s) for "
+                    "session %s (log tail is session_end).",
+                    removed, session_id,
+                )
+            pending = []
     if not pending:
         return ""
     rows: list[str] = []

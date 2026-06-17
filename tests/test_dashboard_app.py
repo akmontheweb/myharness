@@ -678,6 +678,124 @@ def test_hitl_webhook_round_trip(tmp_path):
     assert "ok" in body_json["extra_notes"]
 
 
+def test_hitl_webhook_timeout_purges_pending_entry(tmp_path):
+    """When the operator never answers and the webhook handler hits
+    its configured timeout, the pending entry must be removed from
+    the in-memory queue. Otherwise the dashboard's HITL renderer
+    would keep surfacing a stale "REQUIREMENT REFINEMENT GATE" for a
+    session that's already torn down."""
+    # 200ms — fast enough that the test doesn't take 10 minutes.
+    cfg = _make_cfg(tmp_path, hitl_webhook_timeout_seconds=0.2)
+    handle, base_url = _start(cfg)
+    received: dict = {}
+
+    def _simulated_harness():
+        body = json.dumps({"request_id": "req-orphan", "gate": "REQUIREMENTS"})
+        req = urllib.request.Request(
+            base_url + "/hitl/webhook?session=sess-abandon",
+            data=body.encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=6.0) as resp:
+                received["status"] = resp.status
+                received["body"] = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            received["status"] = exc.code
+            received["body"] = exc.read().decode("utf-8")
+        except Exception as exc:  # noqa: BLE001
+            received["error"] = repr(exc)
+
+    t = threading.Thread(target=_simulated_harness)
+    t.start()
+    # Wait for the handler to hit its timeout and return 504.
+    t.join(timeout=4.0)
+    try:
+        # Operator never answered — the handler must have returned 504.
+        assert received.get("status") == 504, received
+        # And critically, the queue must be empty for this session.
+        # Without the clear_pending in the timeout branch the entry
+        # would leak and a subsequent _render_pending_hitl_rows call
+        # would resurface it.
+        leftover = get_hitl_queue().list_pending_for_session("sess-abandon")
+        assert leftover == [], (
+            f"timeout branch leaked pending entry: {leftover}"
+        )
+    finally:
+        handle.shutdown()
+
+
+def test_render_pending_hitl_rows_purges_on_session_end(tmp_path):
+    """If the harness session has shut down (its log tail event is
+    ``session_end``) but a pending HITL entry is still in the queue,
+    the renderer must drop it instead of showing the gate. This is
+    the belt-and-suspenders complement to the timeout-branch purge —
+    it catches leaks from any future code path that misses cleanup."""
+    from harness.dashboard import _render_pending_hitl_rows
+
+    cfg = _make_cfg(tmp_path)
+    # Seed a session log whose tail event is session_end.
+    log_dir = os.path.expanduser(cfg.log_dir)
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "sess-ended.jsonl")
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"event": "session_start", "timestamp": "2026-06-15T10:00:00Z"}) + "\n")
+        f.write(json.dumps({"event": "session_end", "timestamp": "2026-06-15T10:05:00Z", "exit_code": 0}) + "\n")
+
+    # Plant a stale pending HITL entry that should NOT be rendered.
+    get_hitl_queue().register_pending(
+        request_id="leaked-req",
+        session_id="sess-ended",
+        prompt={"gate": "REQUIREMENTS", "message": "[Requirements] Select action"},
+    )
+
+    rendered = _render_pending_hitl_rows(cfg, "sess-ended")
+
+    assert rendered == "", (
+        "expected stale pending HITL to be filtered out after session_end"
+    )
+    # And the queue itself should be cleared so a follow-up render
+    # doesn't re-walk the same dead entries.
+    assert get_hitl_queue().list_pending_for_session("sess-ended") == []
+
+
+def test_render_pending_hitl_rows_keeps_entries_for_live_session(tmp_path):
+    """The session_end filter must NOT fire while the session is
+    still mid-run (no session_end event in the log tail). Otherwise
+    the gate would disappear before the operator could click an
+    answer."""
+    from harness.dashboard import _render_pending_hitl_rows
+
+    cfg = _make_cfg(tmp_path)
+    log_dir = os.path.expanduser(cfg.log_dir)
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "sess-live.jsonl")
+    with open(log_path, "w", encoding="utf-8") as f:
+        # Last event is hitl_pending — the harness is actively
+        # waiting for an answer.
+        f.write(json.dumps({"event": "session_start", "timestamp": "2026-06-15T10:00:00Z"}) + "\n")
+        f.write(json.dumps({"event": "hitl_pending", "timestamp": "2026-06-15T10:01:00Z"}) + "\n")
+
+    get_hitl_queue().register_pending(
+        request_id="live-req",
+        session_id="sess-live",
+        prompt={"gate": "REQUIREMENTS", "message": "[Requirements] Select action"},
+    )
+
+    rendered = _render_pending_hitl_rows(cfg, "sess-live")
+
+    # The render path renders an empty string when writes are disabled
+    # AND no csrf is available; with writes_enabled in _make_cfg the
+    # card body should land. Check for the gate marker.
+    assert "live-req" in rendered, (
+        f"expected pending HITL to render for live session, got: {rendered!r}"
+    )
+    assert get_hitl_queue().list_pending_for_session("sess-live"), (
+        "live session's pending entry was incorrectly purged"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 9. SSE stream emits events written to the log
 # ---------------------------------------------------------------------------

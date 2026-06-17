@@ -650,3 +650,111 @@ class TestDoctorExternalTools:
 
         assert rows["trivy"][0] == "skip"
         assert rows["gitleaks"][0] == "warn"
+
+
+# ---------------------------------------------------------------------------
+# _dispatch_with_continuation — recovers from finish_reason="length"
+# ---------------------------------------------------------------------------
+
+class _StubResponse:
+    def __init__(self, content: str, finish_reason: str = "stop"):
+        self.content = content
+        self.finish_reason = finish_reason
+
+        class _Usage:
+            input_tokens = 100
+            output_tokens = 200
+            cost_usd = 0.001
+        self.usage = _Usage()
+
+
+class _ChunkedGateway:
+    """Returns canned (content, finish_reason) tuples in order. Used to
+    simulate an LLM that hits its output token cap mid-document on
+    cycle N and finally stops on a later cycle."""
+
+    def __init__(self, chunks: list[tuple[str, str]]):
+        self._chunks = list(chunks)
+        self.dispatched_messages: list[list[dict]] = []
+
+    async def dispatch(self, *, messages, role, budget_remaining_usd, **kwargs):
+        self.dispatched_messages.append([dict(m) for m in messages])
+        content, finish_reason = self._chunks.pop(0)
+        return _StubResponse(content, finish_reason), budget_remaining_usd - 0.10
+
+
+class TestDispatchWithContinuation:
+    """The architecture/requirements writers used to truncate at the
+    planning role's 4096-token output cap and never resume — session
+    web-6d5ef9b18f6a's SPEC_ARCHITECTURE.md ended mid-sentence in §3
+    and the patching round that followed never saw the frontend
+    inventory. The helper now feeds the partial back as an assistant
+    turn and asks the LLM to continue."""
+
+    def test_single_stop_returns_content_unchanged(self):
+        import asyncio
+        from harness.cli import _dispatch_with_continuation
+
+        gw = _ChunkedGateway([("# Spec\n\nDone.", "stop")])
+        content, cost = asyncio.run(_dispatch_with_continuation(
+            gateway=gw,
+            messages=[{"role": "user", "content": "synthesize"}],
+            role="planning",
+            budget_remaining_usd=2.0,
+            log_label="test",
+        ))
+        assert content == "# Spec\n\nDone."
+        assert cost == pytest.approx(0.001)
+        assert len(gw.dispatched_messages) == 1
+
+    def test_length_then_stop_concatenates_chunks(self):
+        import asyncio
+        from harness.cli import _dispatch_with_continuation
+
+        gw = _ChunkedGateway([
+            ("# Section 1\n\nFirst half.", "length"),
+            (" Second half.\n# Section 2\n", "stop"),
+        ])
+        content, cost = asyncio.run(_dispatch_with_continuation(
+            gateway=gw,
+            messages=[{"role": "user", "content": "synthesize"}],
+            role="planning",
+            budget_remaining_usd=2.0,
+            log_label="test",
+        ))
+        assert content == "# Section 1\n\nFirst half. Second half.\n# Section 2\n"
+        # Two dispatches paid for; the helper sums their costs.
+        assert cost == pytest.approx(0.002)
+        # The second dispatch must have received the partial as an
+        # assistant turn plus a user "continue" prompt.
+        second_msgs = gw.dispatched_messages[1]
+        assert second_msgs[-2]["role"] == "assistant"
+        assert second_msgs[-2]["content"] == "# Section 1\n\nFirst half."
+        assert second_msgs[-1]["role"] == "user"
+        assert "EXACTLY where you left off" in second_msgs[-1]["content"]
+
+    def test_caps_continuations_at_max(self):
+        """Never-stops case — the helper bails after max_continuations
+        and returns whatever it accumulated rather than looping
+        forever."""
+        import asyncio
+        from harness.cli import _dispatch_with_continuation
+
+        # Initial + 3 continuations = 4 dispatches, all "length".
+        gw = _ChunkedGateway([
+            ("chunk1 ", "length"),
+            ("chunk2 ", "length"),
+            ("chunk3 ", "length"),
+            ("chunk4", "length"),
+        ])
+        content, cost = asyncio.run(_dispatch_with_continuation(
+            gateway=gw,
+            messages=[{"role": "user", "content": "x"}],
+            role="planning",
+            budget_remaining_usd=2.0,
+            log_label="test",
+            max_continuations=3,
+        ))
+        assert content == "chunk1 chunk2 chunk3 chunk4"
+        assert len(gw.dispatched_messages) == 4
+        assert cost == pytest.approx(0.004)

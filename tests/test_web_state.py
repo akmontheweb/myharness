@@ -175,6 +175,38 @@ def test_hitl_queue_holds_handler_until_event_set():
     assert received == [{"choice": "a"}]
 
 
+def test_hitl_queue_clear_pending_drops_entry_and_reports_true():
+    q = HitlQueue()
+    q.register_pending(request_id="r", session_id="s", prompt={})
+    assert q.clear_pending("r") is True
+    # The entry must be gone so a re-render doesn't surface it.
+    assert q.list_pending_for_session("s") == []
+
+
+def test_hitl_queue_clear_pending_unknown_returns_false():
+    q = HitlQueue()
+    assert q.clear_pending("never-registered") is False
+
+
+def test_hitl_queue_clear_pending_for_session_only_targets_that_session():
+    q = HitlQueue()
+    q.register_pending(request_id="a1", session_id="A", prompt={})
+    q.register_pending(request_id="a2", session_id="A", prompt={})
+    q.register_pending(request_id="b1", session_id="B", prompt={})
+    removed = q.clear_pending_for_session("A")
+    assert removed == 2
+    assert q.list_pending_for_session("A") == []
+    assert {p.request_id for p in q.list_pending_for_session("B")} == {"b1"}
+
+
+def test_hitl_queue_clear_pending_for_session_returns_zero_when_nothing():
+    q = HitlQueue()
+    q.register_pending(request_id="r", session_id="other", prompt={})
+    assert q.clear_pending_for_session("missing") == 0
+    # Untouched.
+    assert {p.request_id for p in q.list_pending_for_session("other")} == {"r"}
+
+
 # ---------------------------------------------------------------------------
 # chat_notes table
 # ---------------------------------------------------------------------------
