@@ -347,62 +347,84 @@ async def _web_fetch_impl(
         # validate_outbound_url. With follow_redirects=True, httpx would
         # silently follow a 302 to http://169.254.169.254/...; the
         # original-URL validator never sees it.
+        #
+        # Streamed bounded read (audit §4.11): use client.stream(...) and
+        # accumulate up to the byte cap rather than letting response.content
+        # buffer the entire body. Without this, a gigabyte target only the
+        # 20s timeout (or httpx's 4 GiB stream cap) stops the OOM.
         current_url = url
+        body_bytes = b""
+        ct = ""
+        status_code = 0
+        encoding = None
+        truncated = False
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(cfg.timeout_seconds, connect=10.0),
             follow_redirects=False,
             headers=headers,
         ) as client:
-            response = None
             for hop in range(5):  # bounded redirect chain
-                response = await client.get(current_url)
-                if response.status_code not in (301, 302, 303, 307, 308):
+                async with client.stream("GET", current_url) as response:
+                    status_code = response.status_code
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        next_loc = response.headers.get("location") or ""
+                        if not next_loc:
+                            break
+                        # Resolve relative Location values against the current URL.
+                        try:
+                            from urllib.parse import urljoin
+                            candidate = urljoin(current_url, next_loc)
+                        except Exception:  # noqa: BLE001
+                            return {"url": url, "error": f"unparseable Location header at hop {hop}: {next_loc!r}"}
+                        try:
+                            validate_outbound_url(candidate, allow_private_ips=cfg.allow_private_ips)
+                        except ValueError as exc:
+                            return {
+                                "url": url,
+                                "status_code": response.status_code,
+                                "error": f"redirect target rejected at hop {hop}: {exc}",
+                            }
+                        current_url = candidate
+                        continue  # follow the validated redirect
+                    # Final response — content-type gate before streaming.
+                    ct = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+                    if ct and not any(
+                        ct == allowed or ct.startswith(allowed) for allowed in _ALLOWED_CONTENT_TYPES
+                    ):
+                        return {
+                            "url": url,
+                            "status_code": response.status_code,
+                            "content_type": ct,
+                            "error": (
+                                f"content-type {ct!r} not in allowlist. "
+                                f"Allowed prefixes: {_ALLOWED_CONTENT_TYPES}"
+                            ),
+                        }
+                    encoding = response.encoding
+                    buf = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        if not chunk:
+                            continue
+                        remaining = cap - len(buf)
+                        if remaining <= 0:
+                            truncated = True
+                            break
+                        buf.extend(chunk[:remaining])
+                        if len(chunk) > remaining:
+                            truncated = True
+                            break
+                    body_bytes = bytes(buf)
                     break
-                next_loc = response.headers.get("location") or ""
-                if not next_loc:
-                    break
-                # Resolve relative Location values against the current URL.
-                try:
-                    from urllib.parse import urljoin
-                    candidate = urljoin(current_url, next_loc)
-                except Exception:  # noqa: BLE001
-                    return {"url": url, "error": f"unparseable Location header at hop {hop}: {next_loc!r}"}
-                try:
-                    validate_outbound_url(candidate, allow_private_ips=cfg.allow_private_ips)
-                except ValueError as exc:
-                    return {
-                        "url": url,
-                        "status_code": response.status_code,
-                        "error": f"redirect target rejected at hop {hop}: {exc}",
-                    }
-                current_url = candidate
             else:
                 return {"url": url, "error": "redirect chain exceeded 5 hops"}
 
-        assert response is not None  # one of the loop iterations ran
-        # Validate content-type
-        ct = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
-        if ct and not any(ct == allowed or ct.startswith(allowed) for allowed in _ALLOWED_CONTENT_TYPES):
-            return {
-                "url": url,
-                "status_code": response.status_code,
-                "content_type": ct,
-                "error": (
-                    f"content-type {ct!r} not in allowlist. "
-                    f"Allowed prefixes: {_ALLOWED_CONTENT_TYPES}"
-                ),
-            }
-        body_bytes = response.content[:cap]
-        truncated = len(response.content) > cap
         # Decode using response's apparent encoding; fall back to utf-8
-        text = body_bytes.decode(
-            response.encoding or "utf-8", errors="replace"
-        )
+        text = body_bytes.decode(encoding or "utf-8", errors="replace")
         if ct.startswith("text/html"):
             text = html_to_text(text)
         return {
             "url": url,
-            "status_code": response.status_code,
+            "status_code": status_code,
             "content_type": ct,
             "content": text,
             "truncated": truncated,

@@ -419,20 +419,51 @@ class BaseLLM(ABC):
         ...
 
 
+class ProviderEmbeddedError(RuntimeError):
+    """Raised when a provider returns HTTP 200 but the JSON body
+    carries a structured error object (Azure OpenAI quota path,
+    intermediate proxies, some self-hosted servers). Audit §4.7."""
+
+    def __init__(self, message: str, *, payload: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.payload = payload or {}
+
+
 def _parse_json_response(response: Any) -> dict[str, Any]:
     """
-    Parse a JSON response body, converting JSONDecodeError into an
-    HTTPStatusError-like exception so retry_with_backoff treats it as
-    a retryable server error rather than letting it escape uncaught.
+    Parse a JSON response body, converting JSONDecodeError into a
+    synthesised HTTP 502 so retry_with_backoff treats it as a retryable
+    server error rather than letting a real 200 + malformed body
+    propagate as a non-retryable error. Audit §4.3.
     """
     try:
         return response.json()  # type: ignore[no-any-return]
     except Exception as exc:
+        # Forge a 502 (Bad Gateway) so the existing 5xx retry path
+        # picks this up — a transient proxy error page mid-stream
+        # used to escape as a non-retryable 200 (audit §4.3).
+        try:
+            response.status_code = 502
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
         raise httpx.HTTPStatusError(
             f"Malformed JSON in response body: {exc}",
             request=response.request,
             response=response,
         ) from exc
+
+
+def _check_provider_embedded_error(data: Any) -> None:
+    """Inspect a parsed provider response and raise ProviderEmbeddedError
+    if the body carries an ``{"error": {...}}`` envelope despite a
+    200-OK status. Audit §4.7."""
+    if not isinstance(data, dict):
+        return
+    err = data.get("error")
+    if not isinstance(err, dict):
+        return
+    msg = str(err.get("message") or err.get("type") or "provider error")
+    raise ProviderEmbeddedError(msg, payload=err)
 
 
 def _normalize_messages_for_openai_tools(
@@ -621,6 +652,7 @@ class DeepSeekProvider(BaseLLM):
         response = await client.post("/chat/completions", json=payload)
         response.raise_for_status()
         data: dict[str, Any] = _parse_json_response(response)
+        _check_provider_embedded_error(data)  # audit §4.7
 
         usage = self.extract_usage(data)
         usage.cost_usd = self.compute_cost(usage)
@@ -805,6 +837,7 @@ class AnthropicProvider(BaseLLM):
         response = await client.post("/messages", json=payload)
         response.raise_for_status()
         data: dict[str, Any] = _parse_json_response(response)
+        _check_provider_embedded_error(data)  # audit §4.7
 
         usage = self.extract_usage(data)
         usage.cost_usd = self.compute_cost(usage)
@@ -908,6 +941,7 @@ class OpenAIProvider(BaseLLM):
         response = await client.post("/chat/completions", json=payload)
         response.raise_for_status()
         data: dict[str, Any] = _parse_json_response(response)
+        _check_provider_embedded_error(data)  # audit §4.7
 
         usage = self.extract_usage(data)
         usage.cost_usd = self.compute_cost(usage)
@@ -990,6 +1024,7 @@ class OllamaProvider(BaseLLM):
         response = await client.post("/chat/completions", json=payload)
         response.raise_for_status()
         data: dict[str, Any] = _parse_json_response(response)
+        _check_provider_embedded_error(data)  # audit §4.7
 
         usage = self.extract_usage(data)
         usage.cost_usd = 0.0  # Local inference is free
@@ -1283,24 +1318,46 @@ async def retry_with_backoff(
     max_retries: int = 5,
     base_delay: float = 1.0,
     max_delay: float = 60.0,
+    max_total_seconds: float = 300.0,
+    rate_limit_observer: Optional[Callable[[], None]] = None,
     **kwargs: Any,
 ) -> LLMResponse:
     """
     Execute an async LLM call with exponential backoff + random jitter.
 
-    Handles HTTP 429 (rate limit), 5xx (server errors), and connection errors.
-    After max_retries, re-raises the last exception.
+    Handles HTTP 429 (rate limit), 5xx (server errors), connection errors,
+    AND read/connect/write timeouts (audit §4.1 — these all derive from
+    ``httpx.TimeoutException`` which the earlier except clause omitted).
 
-    Backoff formula: min(max_delay, base_delay * 2^attempt) * (0.5 + random * 0.5)
-    This gives a jitter range of 50%-100% of the exponential base.
+    After max_retries OR after ``max_total_seconds`` of cumulative sleep
+    (audit §4.13), re-raises the last exception. Headers like
+    ``Retry-After: 86400`` are now clamped to ``max_delay`` so a
+    misconfigured provider can't make a single dispatch sleep for 24h.
+
+    Jitter applied to the clamped delay (audit §4.12) so that long
+    backoffs don't collapse to ~max_delay-floor with zero variance —
+    that produced synchronized retry storms across concurrent dispatches.
+
+    ``rate_limit_observer`` (audit §4.2): invoked once per 429 received,
+    not just once per fully-exhausted dispatch — the gateway uses this
+    to drive the circuit breaker on individual 429s.
+
+    Backoff: ``delay = min(base_delay * 2^attempt, max_delay)``
+             then jittered via ``delay * (0.5 + random * 0.5)``.
     """
     last_exception: Optional[Exception] = None
+    cumulative_sleep = 0.0
     for attempt in range(max_retries + 1):
         try:
             return await fn(*args, **kwargs)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             if status == 429:
+                if rate_limit_observer is not None:
+                    try:
+                        rate_limit_observer()
+                    except Exception:  # noqa: BLE001
+                        pass
                 delay = _delay_from_rate_limit_headers(exc.response.headers, base_delay, attempt)
                 logger.warning("[gateway] Rate limited (429). Attempt %d/%d. Delay=%.2fs",
                                 attempt + 1, max_retries + 1, delay)
@@ -1310,15 +1367,33 @@ async def retry_with_backoff(
             else:
                 raise  # Non-retryable HTTP error (4xx except 429)
             last_exception = exc
-        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError, httpx.PoolTimeout) as exc:
+        except httpx.TimeoutException as exc:
+            # Audit §4.1: Connect / Read / Write / Pool timeouts all
+            # derive from TimeoutException — catching them here makes
+            # the most common transient failure mode retryable.
+            delay = base_delay * (2 ** attempt)
+            logger.warning("[gateway] Timeout (%s). Attempt %d/%d. %s",
+                           type(exc).__name__, attempt + 1, max_retries + 1, exc)
+            last_exception = exc
+        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as exc:
             delay = base_delay * (2 ** attempt)
             logger.warning("[gateway] Connection error. Attempt %d/%d. %s", attempt + 1, max_retries + 1, exc)
             last_exception = exc
 
         if attempt < max_retries:
-            # Apply jitter: 50%-100% of computed delay
+            # Clamp to max_delay BEFORE applying jitter so jitter range
+            # stays meaningful at high attempts (audit §4.12).
+            delay = min(delay, max_delay)
             jittered = delay * (0.5 + random.random() * 0.5)
-            jittered = min(jittered, max_delay)
+            # Enforce overall budget on cumulative sleep (audit §4.13).
+            if cumulative_sleep + jittered > max_total_seconds:
+                logger.warning(
+                    "[gateway] Backoff cumulative-sleep budget (%.0fs) "
+                    "exhausted after %d attempt(s); giving up.",
+                    max_total_seconds, attempt + 1,
+                )
+                break
+            cumulative_sleep += jittered
             logger.debug("[gateway] Backing off for %.2fs before retry.", jittered)
             await asyncio.sleep(jittered)
 
@@ -1341,18 +1416,21 @@ def _delay_from_rate_limit_headers(
     """
     from datetime import datetime, timezone
 
-    # 1. Retry-After (numeric seconds or HTTP-date)
+    # 1. Retry-After (numeric seconds or HTTP-date). Clamp to a sane
+    # ceiling so a misconfigured provider returning ``Retry-After: 86400``
+    # can't make us sleep for 24h on a single dispatch (audit §4.13).
+    _RA_MAX = 300.0
     retry_after = headers.get("Retry-After")
     if retry_after is not None:
         try:
-            return max(0.0, float(retry_after))
+            return max(0.0, min(float(retry_after), _RA_MAX))
         except ValueError:
             try:
                 from email.utils import parsedate_to_datetime
                 dt = parsedate_to_datetime(retry_after)
                 delta = (dt - datetime.now(timezone.utc)).total_seconds()
                 if delta > 0:
-                    return delta
+                    return min(delta, _RA_MAX)
             except (TypeError, ValueError):
                 pass
 
@@ -1901,13 +1979,26 @@ class Gateway:
 
         # If budget is low and not forcing local, fall back to ollama to preserve budget
         if budget_remaining_usd < 0.05 and not force_local and not self.config.force_local_only:
-            logger.info(
-                "[gateway] Budget low ($%.4f). Switching to local Ollama to preserve remaining budget.",
-                budget_remaining_usd,
-            )
-            model_key = f"ollama:{self.config.ollama_local_model}"
-            force_local = True
-            thinking = False
+            # Audit §4.8: skip the rewrite when ``ollama_local_model`` isn't
+            # configured. Without the guard, ``model_key = "ollama:"``
+            # crashed in ``_get_provider`` with a cryptic ValueError exactly
+            # when the operator most needed graceful degradation. Let the
+            # dispatch continue with the originally-selected model and
+            # surface a clear BudgetTooLowError if it ultimately fails.
+            if not (self.config.ollama_local_model or "").strip():
+                logger.warning(
+                    "[gateway] Budget low ($%.4f) but ollama_local_model "
+                    "is unset — staying on %s rather than crashing.",
+                    budget_remaining_usd, model_key,
+                )
+            else:
+                logger.info(
+                    "[gateway] Budget low ($%.4f). Switching to local Ollama to preserve remaining budget.",
+                    budget_remaining_usd,
+                )
+                model_key = f"ollama:{self.config.ollama_local_model}"
+                force_local = True
+                thinking = False
 
         provider = await self._get_provider(model_key)
 
@@ -2135,11 +2226,18 @@ class Gateway:
         # P1.9: instrument the retry path so a 429/503 burst that exhausts
         # retries gets recorded for the circuit breaker. Non-rate-limit
         # exceptions propagate unchanged.
+        #
+        # Audit §4.2: count EVERY 429 we encounter, not just full
+        # exhaustion. The rate_limit_observer hook fires per-429 inside
+        # retry_with_backoff so the breaker can trip on much shorter
+        # bursts than the old (3 fully-exhausted dispatches) threshold
+        # ever permitted (effectively ~18 actual 429s with max_retries=5).
         try:
             response = await retry_with_backoff(
                 _call,
                 max_retries=self.config.max_retries,
                 base_delay=self.config.base_delay,
+                rate_limit_observer=self._record_rate_limit_failure,
             )
         except httpx.HTTPStatusError as exc:
             try:
@@ -2147,6 +2245,9 @@ class Gateway:
             except Exception:  # noqa: BLE001
                 status = 0
             if status == 429 or status >= 500:
+                # _record_rate_limit_failure may have already been called
+                # via the observer hook above; one extra record on full
+                # exhaustion is fine — the deque is bounded.
                 self._record_rate_limit_failure()
             raise
 
@@ -2169,6 +2270,11 @@ class Gateway:
                 isinstance(r.content, str) and not r.content.strip()
             )
 
+        # Track cumulative cost across empty-retries (audit §4.4). The
+        # provider charges for every attempt server-side; the earlier
+        # code deducted only the LAST response's cost so up to 2x of
+        # the cost-per-call slipped past the local budget enforcer.
+        accumulated_cost = float(getattr(response.usage, "cost_usd", 0.0) or 0.0)
         empty_retry_attempts = 2
         while _is_empty(response) and empty_retry_attempts > 0:
             logger.warning(
@@ -2182,7 +2288,9 @@ class Gateway:
                     _call,
                     max_retries=self.config.max_retries,
                     base_delay=self.config.base_delay,
+                    rate_limit_observer=self._record_rate_limit_failure,
                 )
+                accumulated_cost += float(getattr(response.usage, "cost_usd", 0.0) or 0.0)
             except Exception:  # noqa: BLE001 — let the empty path below raise cleanly
                 break
 
@@ -2204,8 +2312,10 @@ class Gateway:
                 f"HITL rather than looping."
             )
 
-        # Deduct cost from budget
-        cost = response.usage.cost_usd
+        # Deduct cost from budget — use the accumulated sum across any
+        # empty-retries (audit §4.4) so the operator's hard cap isn't
+        # silently breached by partial-failure tails.
+        cost = accumulated_cost or response.usage.cost_usd
         new_budget = budget_remaining_usd - cost
         elapsed_ms = round((_time.monotonic() - _dispatch_start) * 1000)
 

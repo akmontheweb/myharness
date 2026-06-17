@@ -159,6 +159,25 @@ async def test_web_fetch_skill_rejects_localhost_url_via_ssrf_guard():
 # WebFetchSkill — HTTP path stubbed via httpx mock transport
 # ---------------------------------------------------------------------------
 
+class _MockStreamResponse:
+    """Async-context-manager wrapper that mimics httpx.Client.stream(...).
+
+    After EDGE_CASE_AUDIT.md §4.11 the web fetch path uses
+    ``client.stream(...) → aiter_bytes()`` instead of ``client.get`` →
+    ``response.content`` so it can bound memory on huge bodies. The
+    test mock now mirrors that interface.
+    """
+
+    def __init__(self, response: httpx.Response):
+        self._response = response
+
+    async def __aenter__(self) -> httpx.Response:
+        return self._response
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+
 class _MockAsyncClient:
     """Stand-in for httpx.AsyncClient used by the fetch path."""
 
@@ -175,6 +194,21 @@ class _MockAsyncClient:
     async def get(self, url: str) -> httpx.Response:
         self._captured.append(url)
         return self._response
+
+    def stream(self, method: str, url: str) -> _MockStreamResponse:  # noqa: ARG002
+        self._captured.append(url)
+
+        # Wrap the canned httpx.Response with an aiter_bytes that
+        # streams the content in small chunks so the new code's
+        # cap-while-iterating path is exercised.
+        async def _aiter(self_inner):
+            data = self_inner._content or b""
+            chunk = 1024
+            for i in range(0, len(data), chunk):
+                yield data[i:i + chunk]
+
+        self._response.aiter_bytes = lambda: _aiter(self._response)
+        return _MockStreamResponse(self._response)
 
 
 @pytest.mark.asyncio

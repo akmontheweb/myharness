@@ -231,6 +231,18 @@ class _FakeProcStdout:
                 return self._lines.pop(0)
             return b""
 
+    async def readuntil(self, separator: bytes = b"\n") -> bytes:
+        """Mimic asyncio.StreamReader.readuntil; the real MCP client now
+        uses readuntil so it can bound a single-line read with
+        LimitOverrunError (audit §4.9). The fake stream just delegates to
+        readline since each pushed message already ends in ``\\n``."""
+        line = await self.readline()
+        if not line:
+            # asyncio.StreamReader raises IncompleteReadError on EOF;
+            # match that contract.
+            raise asyncio.IncompleteReadError(b"", None)
+        return line
+
     async def push(self, msg: dict[str, Any]) -> None:
         async with self._cond:
             self._lines.append((json.dumps(msg) + "\n").encode("utf-8"))

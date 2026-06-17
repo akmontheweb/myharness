@@ -393,10 +393,17 @@ class OpenAIEmbeddingsBackend(IndexBackend):
                 "tfidf."
             )
         import httpx
+        import time as _time
         vectors_json: list[str] = []
+        # Audit §4.10: filter out empty chunks (otherwise OpenAI rejects
+        # the whole batch with "input is invalid"), bound retries with
+        # a backoff that tolerates transient 429/5xx, and honour the
+        # operator's ssl_verify setting.
+        verify = bool(getattr(self.cfg, "ssl_verify", True))
         with httpx.Client(
             timeout=httpx.Timeout(60.0, connect=10.0),
             base_url=self.cfg.openai_api_base,
+            verify=verify,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -404,15 +411,43 @@ class OpenAIEmbeddingsBackend(IndexBackend):
         ) as client:
             for batch_start in range(0, len(chunks), self._BATCH_SIZE):
                 batch = chunks[batch_start : batch_start + self._BATCH_SIZE]
-                payload = {
-                    "model": self.cfg.openai_model,
-                    "input": [c.content[:8000] for c in batch],
-                }
-                response = client.post("/embeddings", json=payload)
-                response.raise_for_status()
-                data = response.json()
+                inputs = [c.content[:8000] for c in batch if c.content and c.content.strip()]
+                if not inputs:
+                    # Every chunk in this batch was blank — emit empty
+                    # vectors so the position alignment with `chunks`
+                    # holds for the caller's index build.
+                    for _ in batch:
+                        vectors_json.append("[]")
+                    continue
+                payload = {"model": self.cfg.openai_model, "input": inputs}
+                # Bounded retry loop (audit §4.10) — small embedding
+                # request set, so a flat 4-attempt schedule with
+                # exponential backoff is enough.
+                last_exc: Optional[Exception] = None
+                response = None
+                for attempt in range(4):
+                    try:
+                        response = client.post("/embeddings", json=payload)
+                        response.raise_for_status()
+                        break
+                    except httpx.HTTPStatusError as exc:
+                        last_exc = exc
+                        sc = exc.response.status_code
+                        if sc != 429 and sc < 500:
+                            raise
+                    except (httpx.ConnectError, httpx.ReadError,
+                            httpx.TimeoutException) as exc:
+                        last_exc = exc
+                    _time.sleep(min(60.0, 1.0 * (2 ** attempt)))
+                else:
+                    if last_exc is not None:
+                        raise last_exc
+                data = response.json() if response is not None else {}
                 for item in data.get("data", []):
                     vectors_json.append(json.dumps(item.get("embedding", []), ensure_ascii=False))
+                # Backfill empties for any blank chunks we filtered out.
+                while len(vectors_json) < batch_start + len(batch):
+                    vectors_json.append("[]")
         return vectors_json
 
     def vectorize_query(self, query: str) -> str:

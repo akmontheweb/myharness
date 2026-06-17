@@ -364,12 +364,41 @@ class StdioMcpClient:
         self._proc.stdin.write(line)
         await self._proc.stdin.drain()
 
+    # Hard cap on a single JSON-RPC line. A misbehaving server returning
+    # multi-MB without a newline could OOM the harness via unbounded
+    # buffer growth — audit §4.9. 10 MiB comfortably accommodates real
+    # tool-result payloads while bounding the worst case.
+    _MAX_RPC_LINE_BYTES: int = 10 * 1024 * 1024
+
     async def _read_loop(self) -> None:
         if self._proc is None or self._proc.stdout is None:
             return
         try:
             while True:
-                line = await self._proc.stdout.readline()
+                try:
+                    line = await self._proc.stdout.readuntil(b"\n")
+                except asyncio.LimitOverrunError as exc:
+                    # The pipe has more than the StreamReader's limit
+                    # buffered without a newline — surface a clear error
+                    # then break (audit §4.9).
+                    logger.error(
+                        "[mcp:%s] server emitted a line exceeding %d bytes "
+                        "without a newline; dropping transport.",
+                        self.config.name, getattr(exc, "consumed", 0),
+                    )
+                    break
+                except asyncio.IncompleteReadError as exc:
+                    # EOF / partial — emit whatever was buffered (if any)
+                    # then exit the loop on next iteration.
+                    line = exc.partial
+                    if not line:
+                        break
+                if len(line) > self._MAX_RPC_LINE_BYTES:
+                    logger.error(
+                        "[mcp:%s] dropping oversize line (%d bytes)",
+                        self.config.name, len(line),
+                    )
+                    continue
                 if not line:
                     break
                 try:
