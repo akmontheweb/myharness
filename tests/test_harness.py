@@ -2823,6 +2823,193 @@ class TestGatekeeperAutoApprove:
 
 
 # ===========================================================================
+# HITL gatekeeper / interactive review — dropdown labels & question wording
+# ===========================================================================
+
+class TestGatekeeperPromptIsLabeled:
+    """The dashboard renders the HITL prompt's options as a <select>
+    dropdown with ``[key] description`` text. Before this regression
+    pack, the gatekeeper passed ``["a", "e", "m", "s"]`` with no
+    matching ``option_labels`` — so operators saw bare letters and
+    had to consult docs to know what each meant. The vague question
+    text ("Select action") didn't help either.
+
+    These tests capture the kwargs handed to ``channel.prompt`` and
+    assert (a) each option key has a human-readable label, (b) the
+    label mentions the action it triggers (Approve / Refine / etc.),
+    and (c) the question text references the actual spec phase.
+    """
+
+    @staticmethod
+    def _seed_workspace_with(tmpdir: str, filename: str) -> str:
+        docs = os.path.join(tmpdir, "docs")
+        os.makedirs(docs, exist_ok=True)
+        path = os.path.join(docs, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# spec\n")
+        return path
+
+    @staticmethod
+    def _capture_channel(answer: str):
+        """Channel stub that records every prompt() call and returns
+        ``answer`` so the gatekeeper exits the menu loop without
+        looping forever."""
+        captured: list[dict] = []
+
+        class _Channel:
+            def prompt(self, message, options, *, default=None,
+                       option_labels=None, **kwargs):
+                captured.append({
+                    "message": message,
+                    "options": list(options),
+                    "default": default,
+                    "option_labels": dict(option_labels or {}),
+                })
+                return answer
+
+            def notes(self, *args, **kwargs):
+                return ""
+
+            def confirm(self, *args, **kwargs):
+                return False
+
+            def wait_for_manual_edit(self, *args, **kwargs):
+                return None
+
+        return _Channel(), captured
+
+    def test_requirements_gate_passes_labels_and_contextual_question(self, monkeypatch):
+        from harness.cli import human_gatekeeper_node
+        from harness.hitl import set_channel, reset_channel
+
+        # Force the interactive path — auto-approve would short-circuit
+        # before any prompt() call. Drop the env knobs the helper reads.
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("HARNESS_AUTO_APPROVE", raising=False)
+        monkeypatch.setattr(
+            "harness.cli._gatekeeper_auto_approves", lambda: False,
+        )
+
+        channel, captured = self._capture_channel("a")
+        set_channel(channel)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                spec_path = self._seed_workspace_with(
+                    tmpdir, "SPEC_REQUIREMENTS.md",
+                )
+                state = {
+                    "current_gate": "REQUIREMENTS",
+                    "workspace_path": tmpdir,
+                    "spec_requirements_path": spec_path,
+                    "messages": [],
+                    "loop_counter": {},
+                }
+                human_gatekeeper_node(state)
+        finally:
+            reset_channel()
+
+        assert len(captured) == 1, captured
+        call = captured[0]
+        # The question must name the phase, not "Select action".
+        assert "Requirements" in call["message"], call["message"]
+        assert "Select action" not in call["message"]
+        # Every key must have a description, and the description must
+        # mention the action verb so the dropdown reads naturally.
+        labels = call["option_labels"]
+        assert set(labels.keys()) == {"a", "e", "m", "s"}, labels
+        assert "Approve" in labels["a"]
+        assert "Refine" in labels["e"]
+        assert "Pause" in labels["m"] or "manual" in labels["m"].lower()
+        assert "Save" in labels["s"] or "quit" in labels["s"].lower()
+
+    def test_architecture_gate_passes_labels_specific_to_phase(self, monkeypatch):
+        from harness.cli import human_gatekeeper_node
+        from harness.hitl import set_channel, reset_channel
+
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("HARNESS_AUTO_APPROVE", raising=False)
+        monkeypatch.setattr(
+            "harness.cli._gatekeeper_auto_approves", lambda: False,
+        )
+
+        channel, captured = self._capture_channel("a")
+        set_channel(channel)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                spec_path = self._seed_workspace_with(
+                    tmpdir, "SPEC_ARCHITECTURE.md",
+                )
+                state = {
+                    "current_gate": "ARCHITECTURE",
+                    "workspace_path": tmpdir,
+                    "spec_architecture_path": spec_path,
+                    "messages": [],
+                    "loop_counter": {},
+                }
+                human_gatekeeper_node(state)
+        finally:
+            reset_channel()
+
+        call = captured[0]
+        assert "Architecture" in call["message"]
+        labels = call["option_labels"]
+        # The architecture phase's [a] description must say what it
+        # progresses TO (coding/patching), not the generic "next phase".
+        assert "coding" in labels["a"].lower() or "patch" in labels["a"].lower()
+
+
+def test_interactive_review_loop_prompt_uses_labeled_options(monkeypatch, tmp_path):
+    """``interactive_review_loop`` is the second HITL prompt operators
+    see (between requirements synthesis and the gatekeeper). It used
+    to fire the same vague ``[Requirements] Select action`` prompt
+    with bare ``["a","b","c"]`` options."""
+    import asyncio as _asyncio
+    from harness import cli as cli_mod
+    from harness.hitl import set_channel, reset_channel
+
+    spec_path = tmp_path / "SPEC_REQUIREMENTS.md"
+    spec_path.write_text("# Spec\n", encoding="utf-8")
+
+    captured: list[dict] = []
+
+    class _Channel:
+        def prompt(self, message, options, *, default=None,
+                   option_labels=None, **kwargs):
+            captured.append({
+                "message": message,
+                "options": list(options),
+                "default": default,
+                "option_labels": dict(option_labels or {}),
+            })
+            return "a"  # approve, exit loop
+
+        def notes(self, *a, **k):
+            return ""
+
+        def confirm(self, *a, **k):
+            return False
+
+        def wait_for_manual_edit(self, *a, **k):
+            return None
+
+    set_channel(_Channel())
+    try:
+        _asyncio.run(cli_mod.interactive_review_loop(str(spec_path), gateway=None))
+    finally:
+        reset_channel()
+
+    assert len(captured) == 1, captured
+    call = captured[0]
+    assert "Select action" not in call["message"]
+    assert "requirement" in call["message"].lower()
+    labels = call["option_labels"]
+    assert set(labels.keys()) == {"a", "b", "c"}
+    assert "Approve" in labels["a"]
+    assert "Refine" in labels["b"]
+    assert "Manual" in labels["c"] or "IDE" in labels["c"]
+
+
+# ===========================================================================
 # GRAPH TESTS
 # ===========================================================================
 

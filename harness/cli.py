@@ -1475,35 +1475,46 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
         print("=" * 72)
         print()
 
+        # Build a single labels dict per gate. Used for both the stdin
+        # menu printout AND the option_labels parameter to channel.prompt
+        # — the dashboard renders the same dict as <option> text so the
+        # operator sees the action description instead of a bare letter.
         if gate == "REQUIREMENTS":
             print(f"Requirements written to {file_label}. Please review the specification.")
-            print("Options:")
-            print(f"  [a] Approve & Proceed to {next_phase}")
-            print("  [e] Refine via text feedback")
-            print("  [m] Pause for manual local edits in IDE")
-            print("  [s] Save & Quit (resume later)")
+            gate_options: dict[str, str] = {
+                "a": f"Approve & proceed to {next_phase}",
+                "e": "Refine via text feedback",
+                "m": "Pause for manual local edits in IDE",
+                "s": "Save & quit (resume later)",
+            }
         elif gate == "ARCHITECTURE":
             print(f"Technical layout blueprints written to {file_label}. Please review module boundaries.")
-            print("Options:")
-            print("  [a] Approve & Begin Coding/Patching")
-            print("  [e] Refine layout parameters")
-            print("  [m] Pause for manual edits")
-            print("  [s] Save & Quit (resume later)")
-        elif gate == "DEPLOYMENT":
+            gate_options = {
+                "a": "Approve & begin coding / patching",
+                "e": "Refine layout parameters",
+                "m": "Pause for manual edits",
+                "s": "Save & quit (resume later)",
+            }
+        else:  # DEPLOYMENT
             print(f"Application fully compiled. Docker Composition written to {file_label}.")
             print("Please review container network bridges and volumes before firing.")
-            print("Options:")
-            print(f"  [a] Approve & Execute Infrastructure {next_phase}")
-            print("  [e] Refine variables")
-            print("  [m] Pause for manual edits")
-            print("  [s] Save & Quit (resume later)")
+            gate_options = {
+                "a": f"Approve & execute infrastructure {next_phase}",
+                "e": "Refine deployment variables",
+                "m": "Pause for manual edits",
+                "s": "Save & quit (resume later)",
+            }
+        print("Options:")
+        for _key, _label in gate_options.items():
+            print(f"  [{_key}] {_label}")
         print()
 
         from harness.hitl import get_channel as _get_channel
         choice = _get_channel().prompt(
-            f"[HITL:{gate_label}] Select action",
-            ["a", "e", "m", "s"],
+            f"How would you like to proceed with the {gate_desc}?",
+            list(gate_options.keys()),
             default="a",
+            option_labels=gate_options,
         )
 
         if choice == "a":
@@ -2622,17 +2633,25 @@ async def interactive_review_loop(spec_path: str, gateway: Any) -> str:
         print(f"  Specification: {spec_path}")
         print(f"  Size: {spec_size:,} characters")
         print("=" * 72)
+        # Single labels dict drives both the stdin menu printout and the
+        # dashboard dropdown option_labels — operators on the web UI saw
+        # bare letters before this and had to memorise what each meant.
+        review_options: dict[str, str] = {
+            "a": "Approve — lock this specification and proceed to graph execution",
+            "b": "Refine — provide additional notes to improve the specification",
+            "c": "Manual — edit the file in your IDE, then press Enter to continue",
+        }
         print()
-        print("[A] Approve — Lock this specification and proceed to graph execution.")
-        print("[B] Refine — Provide additional notes to improve the specification.")
-        print("[C] Manual — Edit the file in your IDE, then press Enter to continue.")
+        for _key, _label in review_options.items():
+            print(f"[{_key.upper()}] {_label}")
         print()
 
         from harness.hitl import get_channel as _get_channel
         choice = _get_channel().prompt(
-            "[Requirements] Select action",
-            ["a", "b", "c"],
+            "How would you like to handle the synthesized requirements specification?",
+            list(review_options.keys()),
             default="a",
+            option_labels=review_options,
         )
 
         if choice == "a":
