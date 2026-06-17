@@ -1185,6 +1185,13 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
 
         continue_map = dispatch_cfg.get("continue_on_length", {})
         if isinstance(continue_map, dict):
+            # Validate role names against the NodeRole enum so typos
+            # like "planing" don't silently no-op (audit §5.13).
+            try:
+                from harness.gateway import NodeRole as _NodeRole
+                valid_role_names = {r.value for r in _NodeRole}
+            except Exception:  # noqa: BLE001 — fail open if import breaks
+                valid_role_names = set()
             for role_name, role_flag in continue_map.items():
                 if not isinstance(role_name, str) or not role_name.strip():
                     errors.append(
@@ -1196,6 +1203,17 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
                     errors.append(
                         f"'llm_dispatch.continue_on_length.{role_name}' "
                         f"must be a bool, got {type(role_flag).__name__}."
+                    )
+                if valid_role_names and role_name not in valid_role_names:
+                    import difflib as _difflib
+                    suggestion = _difflib.get_close_matches(
+                        role_name, valid_role_names, n=1, cutoff=0.6,
+                    )
+                    hint = f" (did you mean {suggestion[0]!r}?)" if suggestion else ""
+                    errors.append(
+                        f"'llm_dispatch.continue_on_length.{role_name}' "
+                        f"is not a known NodeRole value{hint}. "
+                        f"Valid: {sorted(valid_role_names)}"
                     )
 
     # --- 5. Env var presence for every model referenced by routing ---
@@ -1419,9 +1437,14 @@ def _gatekeeper_auto_approves(gate_name: Optional[str] = None) -> bool:
     """
     if gate_name is not None and not _hitl_gate_enabled(gate_name):
         return True   # operator opted out via --hitl-<gate>=false
+    # Mirror :func:`harness.hitl._is_truthy_env` — accept the same
+    # canonical set ({true,1,yes,on,y}) so GitLab / Jenkins / CircleCI /
+    # TeamCity (which commonly set CI=1) trigger the auto-approve path
+    # rather than hanging on input(). Audit §5.5.
+    _truthy = {"true", "1", "yes", "on", "y"}
     return (
-        os.environ.get("CI", "").lower() == "true"
-        or os.environ.get("HARNESS_AUTO_APPROVE", "").lower() == "true"
+        os.environ.get("CI", "").strip().lower() in _truthy
+        or os.environ.get("HARNESS_AUTO_APPROVE", "").strip().lower() in _truthy
         or not sys.stdin.isatty()
     )
 
@@ -3011,7 +3034,19 @@ def _archive_consumed_change_requests(
             archived.append({"cr_id": cr_id, "archived_as": None, "source_missing": True})
             continue
         try:
-            os.replace(src, dst)
+            try:
+                os.replace(src, dst)
+            except OSError as exc:
+                # Cross-filesystem rename (NFS, bind-mount, btrfs subvol)
+                # produces EXDEV — os.replace can't span filesystems. Fall
+                # back to shutil.move so the archive still works there.
+                # Audit §5.9.
+                import errno as _errno
+                if getattr(exc, "errno", None) == _errno.EXDEV:
+                    import shutil as _shutil
+                    _shutil.move(src, dst)
+                else:
+                    raise
             archived.append({
                 "cr_id": cr_id,
                 "archived_as": os.path.basename(dst),
@@ -3036,10 +3071,13 @@ def _archive_consumed_change_requests(
         "change_requests": archived,
         "modified_files": list(modified_files),
     }
+    # Atomic write so a SIGKILL mid-write leaves the old manifest (or
+    # nothing) — never a truncated JSON document that subsequent reads
+    # fail to parse. Audit §5.10.
     try:
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2, sort_keys=True)
-    except OSError as exc:
+        from harness.metrics import write_atomic
+        write_atomic(manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
             "[change_requests] Could not write manifest %s: %s",
             manifest_path, exc,
@@ -4405,6 +4443,15 @@ async def cmd_resume(args: argparse.Namespace) -> int:
 
     workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
     if _refuse_if_workspace_is_harness_root(workspace_path):
+        return 1
+
+    # Acquire the workspace lock (audit §5.1). cmd_run already takes the
+    # lock; resume previously did not, so two concurrent
+    # ``harness resume --session-id X`` invocations against the same
+    # workspace could clobber each other's patches.
+    force = bool(getattr(args, "force_lock", False))
+    lock_handle = _acquire_workspace_lock(workspace_path, force=force)
+    if lock_handle is False:
         return 1
 
     # Record git mode for the resumed session — same contract as cmd_run.

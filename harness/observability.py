@@ -21,6 +21,7 @@ import logging
 import logging.handlers
 import os
 import sys
+import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -259,6 +260,24 @@ def configure_logging(
         expanded_dir = os.path.expanduser(log_dir)
         os.makedirs(expanded_dir, exist_ok=True)
         candidate_path = os.path.join(expanded_dir, f"{session_id}.jsonl")
+        # Audit §5.12: if the canonical session log already exists AND
+        # is being actively appended (different process), suffix this
+        # writer's filename with our PID so the RotatingFileHandler's
+        # doRollover doesn't race another process for the same files.
+        # Metrics aggregation globs <session_id>*.jsonl so multi-PID
+        # variants are still discovered and summed.
+        if os.path.exists(candidate_path):
+            try:
+                # Heuristic: file modified in the last 30s → assume a
+                # live writer. Otherwise it's just our prior crash;
+                # reuse the canonical name.
+                age = time.time() - os.stat(candidate_path).st_mtime
+            except OSError:
+                age = 1e9
+            if age < 30.0:
+                candidate_path = os.path.join(
+                    expanded_dir, f"{session_id}.{os.getpid()}.jsonl",
+                )
         file_handler: logging.Handler
         if max_bytes and max_bytes > 0:
             from logging.handlers import RotatingFileHandler

@@ -51,6 +51,16 @@ logger = logging.getLogger(__name__)
 # 1. HitlChannel ABC
 # ---------------------------------------------------------------------------
 
+class HitlChannelUnavailable(RuntimeError):
+    """Raised by a channel when its transport is unreachable.
+
+    Used by HttpChannel to fail-CLOSED instead of silently returning
+    the gate's ``default`` when the webhook is down (audit §5.7).
+    The caller should treat this as "operator absent" and refuse the
+    pending action — never assume approval.
+    """
+
+
 class HitlChannel(ABC):
     """Abstract base for all HITL I/O transports."""
 
@@ -107,11 +117,23 @@ class HitlChannel(ABC):
 # 2. StdinChannel
 # ---------------------------------------------------------------------------
 
+_TRUE_VALUES = {"true", "1", "yes", "on", "y"}
+
+
+def _is_truthy_env(name: str) -> bool:
+    """Treat the env var as truthy if its lowered value is in the
+    canonical set (audit §5.5). Earlier code compared CI strictly to
+    "true" — GitLab/Jenkins/CircleCI/TeamCity commonly set CI=1 or
+    CI=yes, leaving those CI runs to hit the interactive input() path
+    and hang on non-TTY."""
+    return os.environ.get(name, "").strip().lower() in _TRUE_VALUES
+
+
 def _auto_approve() -> bool:
     """True when the environment requests non-interactive execution."""
     return (
-        os.environ.get("CI", "").lower() == "true"
-        or os.environ.get("HARNESS_AUTO_APPROVE", "").lower() == "true"
+        _is_truthy_env("CI")
+        or _is_truthy_env("HARNESS_AUTO_APPROVE")
         or not sys.stdin.isatty()
     )
 
@@ -419,13 +441,32 @@ class HttpChannel(HitlChannel):
                 last_err = exc
 
             if attempt < self.max_retries:
-                time.sleep(min(2 ** attempt, 8))  # brief backoff between retries
+                # Bounded backoff. Synchronous sleep — HttpChannel is a
+                # sync-interface channel, so callers running from an
+                # asyncio loop block. Per audit §5.8 the per-attempt
+                # cap is reduced from 8s to 2s so the total maximum
+                # blocking (across the default 3 retries) is ≤ 6s
+                # rather than ~14s. Callers needing zero loop blocking
+                # should drive HttpChannel via run_in_executor.
+                time.sleep(min(2 ** attempt, 2))
 
+        # Fail-CLOSED (audit §5.7): when the webhook is unreachable we
+        # were returning the gate's ``default``. For REQUIREMENTS /
+        # ARCHITECTURE gates the default is "approve", so an unreachable
+        # operator silently auto-approved destructive workflow advances.
+        # Now: raise so the caller decides (cmd_run wraps gatekeeper
+        # calls and surfaces a clear "HITL channel unavailable" error
+        # rather than silently approving).
         logger.error(
-            "[hitl:http] Webhook failed after %d attempt(s): %s. Using default: %r.",
+            "[hitl:http] Webhook failed after %d attempt(s): %s. "
+            "Raising HitlChannelUnavailable instead of silently "
+            "returning the default %r — audit §5.7.",
             self.max_retries + 1, last_err, default_answer,
         )
-        return default_answer
+        raise HitlChannelUnavailable(
+            f"webhook {self.url!r} unreachable after "
+            f"{self.max_retries + 1} attempt(s); last error: {last_err}"
+        )
 
     def prompt(
         self,

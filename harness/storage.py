@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -534,6 +535,9 @@ BaseCheckpointer = BaseCheckpointSaver  # alias for backwards-compat
 # 3. Session ID Management
 # ---------------------------------------------------------------------------
 
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
 def generate_session_id(user_provided: Optional[str] = None) -> str:
     """
     Generate a session ID. Returns the user-provided value if given,
@@ -544,9 +548,20 @@ def generate_session_id(user_provided: Optional[str] = None) -> str:
 
     Returns:
         A session ID string.
+
+    Raises ValueError when ``user_provided`` is non-empty but contains
+    characters that would corrupt downstream filenames (log JSONL,
+    CR archive directory, git branch name) or break shell echo (NUL,
+    control chars, RTL override, path separators). Audit §5.2.
     """
     if user_provided and user_provided.strip():
         session_id = user_provided.strip()
+        if not _SESSION_ID_RE.fullmatch(session_id):
+            raise ValueError(
+                f"--session-id {session_id!r} must match [A-Za-z0-9._-]{{1,64}}. "
+                f"The value flows into log filenames, archive directory names, "
+                f"and git branch names; unsanitised values can break those paths."
+            )
         logger.info("[storage] Using user-provided session ID: %s", session_id)
         return session_id
 
@@ -840,7 +855,16 @@ async def inspect_session(
             loop_counters=dict(loop_counters) if loop_counters else {},
             created_at=created_fmt,
             updated_at=updated_fmt,
-            is_active=exit_code not in (0, -1) and exit_code != 0,
+            # is_active = "session is still in flight (no terminal exit)".
+            # exit_code is -1 BOTH for never-built (compiler_node hasn't run yet)
+            # and for sessions that ended without recording a real code. The
+            # earlier formula `not in (0, -1) and != 0` excluded both meanings
+            # of -1, so a never-built session was reported INACTIVE — which
+            # under-counts running sessions in `harness status` and in the
+            # dashboard. Now: active when there's no recorded exit code OR
+            # the recorded value is -1 AND we've never built (current_node
+            # isn't a terminal node). Audit §5.3 (BREAKING).
+            is_active=(exit_code is None) or (exit_code == -1 and current_node not in ("END", "human_intervention_node")),
             workspace_path=workspace_path,
         )
 

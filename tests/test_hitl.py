@@ -365,22 +365,27 @@ class TestHttpChannel:
         finally:
             server.shutdown()
 
-    def test_falls_back_to_default_on_server_error(self):
-        # 500 response → fallback to default, no exception raised
+    def test_raises_on_server_error(self):
+        # Per audit §5.7 the channel now fails CLOSED instead of silently
+        # returning the gate's default — the default is "approve" for the
+        # spec-discovery gates, so a webhook outage used to silently
+        # auto-approve.
+        from harness.hitl import HitlChannelUnavailable
         server, url, _ = self._serve(b'{"error": "boom"}', status=500)
         try:
             ch = HttpChannel(url, max_retries=0)
-            result = ch.prompt("Choose", ["a", "b"], default="a")
-            assert result == "a"
+            with pytest.raises(HitlChannelUnavailable):
+                ch.prompt("Choose", ["a", "b"], default="a")
         finally:
             server.shutdown()
 
-    def test_falls_back_to_default_on_bad_json(self):
+    def test_raises_on_bad_json(self):
+        from harness.hitl import HitlChannelUnavailable
         server, url, _ = self._serve(b"not json at all", status=200)
         try:
             ch = HttpChannel(url, max_retries=0)
-            result = ch.confirm("Proceed?", default=False)
-            assert result is False  # default, not an exception
+            with pytest.raises(HitlChannelUnavailable):
+                ch.confirm("Proceed?", default=False)
         finally:
             server.shutdown()
 
@@ -388,20 +393,21 @@ class TestHttpChannel:
         ch = HttpChannel("http://127.0.0.1:9999")
         assert ch.is_interactive() is True
 
-    def test_connection_timeout_fallback(self):
-        """If the webhook server is unreachable, should fallback to default."""
+    def test_connection_timeout_raises(self):
+        """If the webhook server is unreachable, raise — audit §5.7."""
+        from harness.hitl import HitlChannelUnavailable
         ch = HttpChannel("http://127.0.0.1:1", max_retries=0)  # invalid port
-        # Should not raise, should return default
-        result = ch.prompt("Choose", ["a", "b"], default="a")
-        assert result == "a"
+        with pytest.raises(HitlChannelUnavailable):
+            ch.prompt("Choose", ["a", "b"], default="a")
 
-    def test_non_200_status_with_valid_json(self):
-        """Non-200 status should fallback even if JSON is valid."""
+    def test_non_200_status_raises(self):
+        """Non-200 status raises HitlChannelUnavailable — audit §5.7."""
+        from harness.hitl import HitlChannelUnavailable
         server, url, _ = self._serve(b'{"answer": "should_ignore"}', status=400)
         try:
             ch = HttpChannel(url, max_retries=0)
-            result = ch.prompt("Choose", ["a", "b"], default="b")
-            assert result == "b"  # falls back to default, ignores answer
+            with pytest.raises(HitlChannelUnavailable):
+                ch.prompt("Choose", ["a", "b"], default="b")
         finally:
             server.shutdown()
 

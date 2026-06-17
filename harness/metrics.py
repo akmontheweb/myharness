@@ -156,6 +156,11 @@ def _sorted_session_log_files(session_id: str, log_dir: str) -> list[str]:
     Older content has a higher suffix; the live file (no suffix) has the
     newest content. We return [.N, .N-1, ..., .1, .jsonl] so the caller
     can append-iterate in time order.
+
+    Audit §5.12: also picks up the multi-process variants
+    ``<id>.<pid>.jsonl[.N]`` that observability.configure_logging mints
+    when two processes share the same session_id (force-lock). Sum is
+    chronologically correct across all variants because we mtime-sort.
     """
     expanded = os.path.expanduser(log_dir)
     primary = os.path.join(expanded, f"{session_id}.jsonl")
@@ -164,28 +169,52 @@ def _sorted_session_log_files(session_id: str, log_dir: str) -> list[str]:
         key=lambda p: int(_ROTATION_SUFFIX_RE.search(p).group(1)) if _ROTATION_SUFFIX_RE.search(p) else 0,
         reverse=True,
     )
+    # Per-PID variants (e.g. <id>.<pid>.jsonl and their rotated backups).
+    # Match digit-only mid segment to avoid colliding with the canonical
+    # rotated form (which is <id>.jsonl.<N>).
+    pid_variants: list[str] = []
+    pid_re = re.compile(rf"^{re.escape(session_id)}\.\d+\.jsonl(?:\.\d+)?$")
+    try:
+        for entry in os.listdir(expanded):
+            if pid_re.match(entry):
+                pid_variants.append(os.path.join(expanded, entry))
+    except OSError:
+        pass
     files: list[str] = []
     files.extend(rotated)
     if os.path.exists(primary):
         files.append(primary)
+    # Sort PID variants by mtime ascending so newest content is last.
+    pid_variants.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0)
+    files.extend(pid_variants)
     return files
 
 
 _SESSION_FILENAME_RE = re.compile(r"\.jsonl(\.\d+)?$")
+_PID_VARIANT_RE = re.compile(r"\.\d+\.jsonl(?:\.\d+)?$")
 
 
 def list_sessions(log_dir: str) -> list[str]:
     """Return distinct session IDs discovered from filenames in log_dir.
 
-    Matches both ``<id>.jsonl`` (live) and ``<id>.jsonl.N`` (rotated
-    backup). Returns a sorted list (deterministic for snapshot tests /
-    table output).
+    Matches:
+      - ``<id>.jsonl``          (live, canonical)
+      - ``<id>.jsonl.N``        (rotated backup)
+      - ``<id>.<pid>.jsonl``    (per-PID variant — audit §5.12)
+      - ``<id>.<pid>.jsonl.N``  (rotated backup of per-PID variant)
+
+    Returns a sorted list (deterministic for snapshot tests / table output).
     """
     expanded = os.path.expanduser(log_dir)
     if not os.path.isdir(expanded):
         return []
     seen: set[str] = set()
     for entry in os.listdir(expanded):
+        # Strip PID variant first so the canonical <id> is recovered.
+        m = _PID_VARIANT_RE.search(entry)
+        if m:
+            seen.add(entry[: m.start()])
+            continue
         m = _SESSION_FILENAME_RE.search(entry)
         if m:
             seen.add(entry[: m.start()])
@@ -496,23 +525,53 @@ def _format_ts_span(first: Optional[datetime], last: Optional[datetime]) -> str:
 def write_atomic(dest_path: str, content: str) -> None:
     """Write ``content`` to ``dest_path`` atomically.
 
-    Strategy: write into ``<dest>.tmp`` in the same directory, fsync,
-    then ``os.replace`` over the destination. A reader that opens the
-    final path always sees either the previous version or the new one,
-    never a half-written file (matters for node_exporter textfile
-    collector and similar scrapers).
+    Strategy: write into a unique ``<dest>.<pid>.<uuid>.tmp`` in the
+    same directory, fsync the file, ``os.replace`` over the destination,
+    then fsync the containing directory so the rename survives a power
+    loss. A reader that opens the final path always sees either the
+    previous version or the new one, never a half-written file (matters
+    for node_exporter textfile collector and similar scrapers).
+
+    The earlier implementation used a fixed ``<dest>.tmp`` name, so two
+    concurrent writers (same dest path) collided on the staging file
+    and one overwrote the other mid-stream. Audit §5.11.
     """
+    import uuid as _uuid
     dest_dir = os.path.dirname(dest_path) or "."
     os.makedirs(dest_dir, exist_ok=True)
-    tmp_path = dest_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(content)
-        fh.flush()
+    tmp_path = f"{dest_path}.{os.getpid()}.{_uuid.uuid4().hex[:8]}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                # fsync can fail on some filesystems (tmpfs in restricted
+                # containers); the durability guarantee weakens but the
+                # atomicity from rename still holds.
+                pass
+        os.replace(tmp_path, dest_path)
+        # Audit §5.11: fsync the parent directory so the directory
+        # entry change (the rename) is persisted, not just the file
+        # body. Without this, a power loss between rename and dir-flush
+        # can leave the old name pointing at the new inode or vice
+        # versa on some filesystems.
         try:
-            os.fsync(fh.fileno())
-        except OSError:
-            # fsync can fail on some filesystems (tmpfs in restricted
-            # containers); the durability guarantee weakens but the
-            # atomicity from rename still holds.
+            dir_fd = os.open(dest_dir, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except (OSError, AttributeError):
+            # O_DIRECTORY isn't available on Windows; skip the dir
+            # sync there.
             pass
-    os.replace(tmp_path, dest_path)
+    except Exception:
+        # Clean up the staging tmp so we don't leak <dest>.<pid>.<uuid>.tmp
+        # files into the metrics dir on a partial write.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
