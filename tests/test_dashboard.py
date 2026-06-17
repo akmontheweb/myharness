@@ -1169,8 +1169,9 @@ def test_config_ui_renders_sandbox_section_via_tree_editor(tmp_path, monkeypatch
     assert "value='docker'" in body
     # Per-section save button preserves "Save sandbox" wording.
     assert "Save sandbox" in body
-    # Footer "deployment.json" notice still present.
-    assert "deployment.json" in body
+    # Deployment defaults moved into config.json (deployment_defaults
+    # section) — the old footer pointing at deployment.json is gone.
+    assert "deployment.json" not in body
 
 
 def test_config_ui_groups_related_sections_with_collapsible_headers(tmp_path, monkeypatch):

@@ -115,7 +115,7 @@ harness/
 │   ├── _acquire_workspace_lock()# fcntl single-writer lock (FR-038); --force-lock override
 │   ├── discover_config()        # Hierarchical merge: workspace → home → cli.json
 │   ├── _validate_config_keys()  # Recursive top-level + nested typo detection (FR-030)
-│   ├── load_deployment_defaults()  # Optional org-wide deployment.json policy (FR-048)
+│   ├── load_deployment_defaults()  # Optional org-wide policy from config.json deployment_defaults section (FR-048)
 │   ├── cmd_run / cmd_resume / cmd_status / cmd_purge / cmd_metrics
 │   ├── cmd_doctor()             # 6-check healthcheck (FR-025)
 │   ├── _doctor_check_git / global_config / api_keys / sandbox / checkpoint_db / config
@@ -154,7 +154,7 @@ harness/
 │   ├── human_intervention_node() # Set HITL flags
 │   ├── requirements_discovery_node() # LLM: 8-sector requirements discovery (delta-mode in CR sessions)
 │   ├── architecture_discovery_node() # LLM: 8-sector architecture discovery (delta-mode in CR sessions)
-│   ├── deployment_discovery_node()   # LLM: 4-sector deployment discovery (deployment.json defaults injected)
+│   ├── deployment_discovery_node()   # LLM: 4-sector deployment discovery (deployment_defaults section of config.json injected)
 │   ├── ingest_change_requests_node() # Parse change_requests/*.txt, assign CR-N IDs (FR-045)
 │   ├── reverse_engineer_architecture_node() # One-shot SPEC_ARCHITECTURE.md synthesis on first contact (FR-046)
 │   ├── write_spec_node() # Serialize discovery to .md files (delta-merge in CR sessions)
@@ -529,7 +529,7 @@ AgentState fields and which nodes write to them:
 │ change_request_files     │ ingest_change_requests_node                   │
 │ archive_target_dir       │ run_graph (applied/<sid>/ destination)        │
 │ change_requests_config   │ run_graph (from config["change_requests"])    │
-│ deployment_defaults      │ run_graph (from config/deployment.json)       │
+│ deployment_defaults      │ run_graph (from config["deployment_defaults"])│
 │ sandbox_config           │ run_graph (from config["sandbox"])            │
 │ lintgate_config          │ run_graph (from config["lintgate"])           │
 │ deployment_config        │ run_graph (from config["deployment"])         │
@@ -830,13 +830,13 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 **Trade-off**: The change-request flow runs through the same HITL gates as greenfield, so users do not get to skip discovery just because the repo "already exists." Delta-mode discovery and gatekeeper short-circuits keep the friction proportional to the size of the change. The `applied/<session-id>/` archive accumulates over time; operators rotate or prune it manually.
 
-### 5.33 Optional Org-Wide `deployment.json` Policy + Enter-to-Accept Discovery (FR-048)
+### 5.33 Optional Org-Wide `deployment_defaults` Section + Enter-to-Accept Discovery (FR-048)
 
-**Decision**: Discovery prompts now bake a default value into each question, and a bare Enter records the default as the answer. An optional `~/.harness/deployment.json` (or `config/deployment.json`; template at `config/deployment.json.example`) declares pre-resolved deployment-discovery fields (`target_environment`, `container_runtime`, `reverse_proxy`, `secret_store`, …). `load_deployment_defaults()` loads it at startup and `deployment_discovery_node` injects the resolved fields into the planner prompt so no question fires for them. Absent file = full questionnaire as before.
+**Decision**: Discovery prompts now bake a default value into each question, and a bare Enter records the default as the answer. An optional `deployment_defaults` section in `config/config.json` (schema documented in `config/config.json.example`) declares pre-resolved deployment-discovery fields (`network.reverse_proxy`, `secrets.manager`, `storage.volume_root`, `infra_sync.conflict_policy`, …) across four sub-sections: `network`, `storage`, `secrets`, `infra_sync`. `load_deployment_defaults(cfg)` pulls the section out of the parsed config at startup and `deployment_discovery_node` injects the resolved fields into the planner prompt so no question fires for them. Absent section (or `{}`) = full questionnaire as before.
 
-**Rationale**: Most teams have a fixed deployment story (same target env, same reverse proxy, same secret store across all projects). Re-answering the same questions on every project was friction with no signal. An org-wide policy file with per-question defaults captures the team's standard once and lets the discovery loop focus on the project-specific unknowns.
+**Rationale**: Most teams have a fixed deployment story (same target env, same reverse proxy, same secret store across all projects). Re-answering the same questions on every project was friction with no signal. Consolidating the policy into `config.json` (rather than a second standalone file) honors the harness's "single SOLE config source" principle — one strict validator covers everything, the dashboard's generic config-tree editor renders the section for free, and operators never have to wonder which file owns which knob.
 
-**Trade-off**: Defaults baked into discovery prompts can drift from policy if both are edited independently; the org-wide file wins because it is loaded at startup and treated as already-resolved by the planner. The `_KNOWN_NESTED_KEYS` whitelist is the authoritative schema for `deployment.json` — typos there get the same WARN-and-ignore treatment as the main config.
+**Trade-off**: Defaults baked into discovery prompts can drift from policy if both are edited independently; the section's values win because they are loaded at startup and treated as already-resolved by the planner. The `_KNOWN_NESTED_KEYS["deployment_defaults"]` whitelist enumerates the four sub-section keys; leaf fields inside each sub-section are intentionally NOT enumerated so operators can set organisation-specific policies the harness has never heard of.
 
 ### 5.34 Setup Wizard for Bare `harness run` (FR-047)
 
@@ -1013,7 +1013,7 @@ AgentState
 ├── change_request_files: list[dict] # [{cr_id: int, original_name: str, abs_path: str}]
 ├── archive_target_dir: str          # change_requests/applied/<session-id>/ (set in run_graph)
 ├── change_requests_config: dict[str, Any]  # config["change_requests"] (e.g. reverse_engineer_budget_usd)
-├── deployment_defaults: dict[str, Any]     # Org-wide deployment.json policy (FR-048); empty when absent
+├── deployment_defaults: dict[str, Any]     # Org-wide policy from config.json deployment_defaults section (FR-048); empty when absent
 ├── sandbox_config: dict[str, Any]          # config["sandbox"] threaded into state (P0)
 ├── lintgate_config: dict[str, Any]         # config["lintgate"] threaded into state
 └── deployment_config: dict[str, Any]       # config["deployment"] threaded into state
@@ -1208,8 +1208,7 @@ schedule.db
 | `cli.json` | Shipped with package | Absolute fallback defaults |
 | `~/.harness/config.json` | User home | Global default models and settings |
 | `.harness_config.json` | Workspace root | Per-project override (highest priority) |
-| `~/.harness/deployment.json` (optional) | User home | Org-wide deployment-discovery defaults (FR-048); absent = full questionnaire |
-| `config/deployment.json.example` | Repo root | Template for the optional org-wide deployment policy |
+| `config/config.json` → `deployment_defaults` (optional) | Repo config | Org-wide deployment-discovery defaults (FR-048); absent / `{}` = full questionnaire. Schema documented in `config/config.json.example`. |
 | `requirements-prod.txt` | Repo root | Exact transitive pins for reproducible pilot installs (`pip install -e . --constraint requirements-prod.txt`) |
 | `LICENSE` | Repo root | MIT license; referenced from `pyproject.toml` so wheels ship it |
 

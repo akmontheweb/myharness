@@ -613,7 +613,7 @@ _CONFIG_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         "deployment",
         "Deployment",
-        ("deployment",),
+        ("deployment", "deployment_defaults"),
     ),
     (
         "scheduling",

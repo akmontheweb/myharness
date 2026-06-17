@@ -359,7 +359,9 @@ class TestRouteAfterSecurityScan:
         import harness.impact as impact_mod
         monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         # The new fast-path: --deploy-dev true + --cd-discovery false →
-        # straight to deployment_node, which reads deployment.json.
+        # straight to deployment_node, which synthesises the blueprint
+        # from workspace telemetry alone (plus any deployment_defaults
+        # section of config.json).
         state = self._clean_state(dev_deployment=True, cd_discovery=False)
         assert route_after_security_scan(state) == "deployment_node"
 

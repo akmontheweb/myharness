@@ -92,6 +92,32 @@ class TestValidateConfigStrict:
         assert "Unknown nested key 'token_budget.hrad_cap_usd'" in msg
         assert "hard_cap_usd" in msg  # difflib suggestion
 
+    def test_deployment_defaults_valid_passes(self, openai_key):
+        # A populated deployment_defaults section with the four known
+        # sub-sections (network, storage, secrets, infra_sync) is
+        # accepted; LEAF keys inside the sub-sections are intentionally
+        # not enumerated — operators may set organisation-specific
+        # policies the harness has never heard of.
+        cfg = _min_valid_config()
+        cfg["deployment_defaults"] = {
+            "network": {"reverse_proxy": "caddy", "tls_strategy": "letsencrypt"},
+            "storage": {"volume_root": "/var/lib/app"},
+            "secrets": {"manager": "vault"},
+            "infra_sync": {"conflict_policy": "abort"},
+        }
+        validate_config_strict(cfg, source="test")
+
+    def test_deployment_defaults_typoed_subsection_raises(self, openai_key):
+        # Typo in a sub-section name (network → netwrok) is caught at
+        # depth 1 by the nested-key validator, with a difflib hint.
+        cfg = _min_valid_config()
+        cfg["deployment_defaults"] = {"netwrok": {}}
+        with pytest.raises(ConfigError) as exc:
+            validate_config_strict(cfg, source="test")
+        msg = str(exc.value)
+        assert "Unknown nested key 'deployment_defaults.netwrok'" in msg
+        assert "network" in msg  # difflib suggestion
+
     def test_missing_models_raises(self, openai_key):
         cfg = _min_valid_config()
         cfg["models"] = {}

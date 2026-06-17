@@ -2468,10 +2468,6 @@ def _render_configure_harness(cfg: DashboardConfig) -> str:
         "the strict validator before landing.</p>"
         f"<div class='config-groups'>{''.join(group_blocks)}</div>"
         "</div>"
-        "<div class='card'>"
-        "<p class='muted'>Deployment defaults live in <code>config/deployment.json</code> — "
-        "edit directly until web editing lands for that file.</p>"
-        "</div>"
         "</div>"
     )
 

@@ -316,102 +316,33 @@ def load_raw_config() -> dict[str, Any]:
     return _strip_comments(raw)
 
 
-def _get_deployment_defaults_path() -> str:
-    """Resolve the optional deployment-defaults file path:
-    ``<myharness_root>/config/deployment.json``.
+def load_deployment_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Pull the optional ``deployment_defaults`` section out of the
+    already-loaded canonical config.
 
-    Lives alongside the canonical ``config.json``. Loaded by
-    :func:`load_deployment_defaults`.
+    Returns ``{}`` when the section is absent. When populated, the four
+    sub-sections (``network``, ``storage``, ``secrets``, ``infra_sync``)
+    are threaded into ``deployment_discovery_node`` so the planning LLM
+    treats every populated field as a resolved policy and skips emitting
+    a question for it.
+
+    Section shape (known sub-section keys, type checks) is enforced by
+    :func:`validate_config_strict` at startup, so this function is a
+    pure dict lookup + INFO log. Unknown LEAF keys inside the four
+    sub-sections are passed through verbatim — operators may set
+    organization-specific policies the harness has never heard of.
     """
-    package_dir = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.dirname(package_dir)
-    return os.path.join(repo_root, "config", "deployment.json")
-
-
-def load_deployment_defaults() -> dict[str, Any]:
-    """Load the optional deployment-policy defaults from
-    ``<repo_root>/config/deployment.json``.
-
-    Unlike :func:`load_raw_config`, this file is OPTIONAL. When absent the
-    function returns ``{}`` and the deployment discovery questionnaire runs
-    in its current full-questionnaire mode. When present, the parsed
-    object is threaded into the deployment_discovery_node so the planning
-    LLM treats every populated field as a resolved policy and skips
-    emitting a question for it.
-
-    The file is intended for tech-stack-agnostic deployment policy
-    (reverse proxy choice, TLS strategy, secret manager, UID/GID,
-    backup destination, conflict policy, ...) — the same answers
-    operators would type into every run inside one organization.
-
-    Validation is intentionally light:
-    - Top-level must be a JSON object.
-    - ``schema_version``, when present, must equal 1.
-    - Known top-level section keys (``network``, ``storage``,
-      ``secrets``, ``infra_sync``) must be objects when present.
-    - Unknown leaf keys inside sections are passed through to the LLM
-      verbatim. This is intentional — operators may set
-      organization-specific policies the harness has never heard of.
-
-    Malformed JSON, unreadable file, or wrong shapes raise
-    :class:`ConfigError` so the harness exits with code 2 at startup
-    (mirrors :func:`load_raw_config`'s contract — bad config never
-    silently degrades).
-    """
-    path = _get_deployment_defaults_path()
-    if not os.path.isfile(path):
-        logger.info(
-            "[cli] No deployment.json at %s — deployment discovery will run "
-            "the full questionnaire. Drop a populated config/deployment.json "
-            "to suppress org-wide policy questions.",
-            path,
-        )
+    section = cfg.get("deployment_defaults") or {}
+    if not isinstance(section, dict):
         return {}
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except json.JSONDecodeError as exc:
-        raise ConfigError(
-            f"Invalid JSON in {path}: {exc}. "
-            f"Fix the JSON syntax or delete the file to fall back to the "
-            f"full deployment questionnaire."
-        ) from exc
-    except OSError as exc:
-        raise ConfigError(
-            f"Cannot read {path}: {exc}. "
-            f"Fix the file permissions or delete the file."
-        ) from exc
-
-    if not isinstance(raw, dict):
-        raise ConfigError(
-            f"{path} must contain a JSON object at the top level, got "
-            f"{type(raw).__name__}."
-        )
-
-    stripped = _strip_comments(raw)
-
-    schema_version = stripped.get("schema_version", 1)
-    if schema_version != 1:
-        raise ConfigError(
-            f"{path}: unsupported schema_version {schema_version!r}. "
-            f"Only schema_version 1 is recognised by this harness."
-        )
-
-    for section in ("network", "storage", "secrets", "infra_sync"):
-        if section in stripped and not isinstance(stripped[section], dict):
-            raise ConfigError(
-                f"{path}: '{section}' must be a JSON object, got "
-                f"{type(stripped[section]).__name__}."
-            )
-
     populated = [s for s in ("network", "storage", "secrets", "infra_sync")
-                 if stripped.get(s)]
+                 if section.get(s)]
     logger.info(
-        "[cli] Loaded deployment defaults from %s (sections populated: %s).",
-        path, populated or "none",
+        "[cli] Loaded deployment defaults from config.json "
+        "(sections populated: %s).",
+        populated or "none",
     )
-    return stripped
+    return section
 
 
 def discover_config(workspace_path: Optional[str] = None) -> dict[str, Any]:
@@ -522,6 +453,13 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # Read-only web dashboard. Started with `harness web`. Default
     # bind 127.0.0.1; optional bearer-token auth. See harness/dashboard.py.
     "dashboard",
+    # Optional org-wide deployment policy (reverse proxy, TLS strategy,
+    # secret manager, UID/GID, backup destination, conflict policy, ...).
+    # Populated fields are treated as RESOLVED by the planning LLM in
+    # deployment_discovery_node — it skips emitting interview questions
+    # for them. Empty / absent section keeps today's full-questionnaire
+    # behaviour. See load_deployment_defaults() in this file.
+    "deployment_defaults",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -579,6 +517,14 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "deployment": frozenset({
         "enabled", "compose_file",
         "health_check_interval_seconds", "health_check_timeout_seconds",
+    }),
+    # Org-wide deployment-policy defaults. The four sub-sections are
+    # the only keys validated here; LEAF fields inside each sub-section
+    # are intentionally NOT enumerated — operators may set
+    # organization-specific policies the harness has never heard of and
+    # they're passed verbatim to the planning LLM.
+    "deployment_defaults": frozenset({
+        "network", "storage", "secrets", "infra_sync",
     }),
     "lintgate": frozenset({
         "format_modified_files",
@@ -893,6 +839,10 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "deployment.compose_file": (str,),
     "deployment.health_check_interval_seconds": (int,),
     "deployment.health_check_timeout_seconds": (int,),
+    "deployment_defaults.network": (dict,),
+    "deployment_defaults.storage": (dict,),
+    "deployment_defaults.secrets": (dict,),
+    "deployment_defaults.infra_sync": (dict,),
 }
 
 # model_routing fields that must reference an entry in `models` when
@@ -4199,7 +4149,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         "  CD discovery: %s",
         "enabled (--cd-discovery true)"
         if getattr(args, "cd_discovery", False)
-        else "disabled (deployment will read deployment.json)",
+        else "disabled (deployment skips the LLM interview)",
     )
     if spec_override:
         logger.info("  Spec:       SPEC_REQUIREMENTS.md (+SPEC_ARCHITECTURE.md) (%d chars)", len(spec_override))
@@ -4224,14 +4174,15 @@ async def cmd_run(args: argparse.Namespace) -> int:
             # route_after_security_scan in harness/graph.py.
             dev_deployment=getattr(args, "deploy_dev", False),
             # Container-deployment discovery toggle. When False AND
-            # --deploy-dev is True, the deployment step reads
-            # deployment.json directly instead of synthesising a
-            # blueprint via deployment_discovery_node. See
-            # route_after_security_scan in harness/graph.py.
+            # --deploy-dev is True, the deployment step skips the LLM
+            # interview and synthesises the blueprint from workspace
+            # telemetry alone (using deployment_defaults from config.json
+            # where present). See route_after_security_scan in
+            # harness/graph.py.
             cd_discovery=getattr(args, "cd_discovery", False),
             lintgate_config=config.get("lintgate", {}),
             deployment_config=config.get("deployment", {}),
-            deployment_defaults=load_deployment_defaults(),
+            deployment_defaults=load_deployment_defaults(config),
             sandbox_config=config.get("sandbox", {}),
             test_generation_config=config.get("test_generation", {}),
             speculative_config=config.get("speculative", {}),
@@ -4583,7 +4534,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
             is_resume=True,
             lintgate_config=config.get("lintgate", {}),
             deployment_config=config.get("deployment", {}),
-            deployment_defaults=load_deployment_defaults(),
+            deployment_defaults=load_deployment_defaults(config),
             sandbox_config=config.get("sandbox", {}),
             test_generation_config=config.get("test_generation", {}),
             speculative_config=config.get("speculative", {}),
@@ -6892,10 +6843,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # --deploy-dev true|false. When true, the harness continues past the
     # security scan into the deployment phase: either runs
-    # deployment_discovery_node (when --cd-discovery is true) or reads
-    # deployment.json (when --cd-discovery is false), then deploys to
-    # the dev environment via `docker compose up`. Default false stops
-    # right after the security scan.
+    # deployment_discovery_node (when --cd-discovery is true) or skips it
+    # (when --cd-discovery is false), then deploys to the dev environment
+    # via `docker compose up`. Default false stops right after the
+    # security scan.
     run_parser.add_argument(
         "--deploy-dev",
         type=_bool_choice,
@@ -6904,16 +6855,15 @@ def build_parser() -> argparse.ArgumentParser:
         dest="deploy_dev",
         help=(
             "When true, continue past the security scan into deployment "
-            "(either discovery+blueprint or deployment.json-driven, "
-            "controlled by --cd-discovery), then `docker compose up`. "
-            "Defaults to false."
+            "(with or without LLM-driven discovery, controlled by "
+            "--cd-discovery), then `docker compose up`. Defaults to false."
         ),
     )
     # --cd-discovery true|false. When true and --deploy-dev is also true,
     # runs deployment_discovery_node to synthesise DEPLOYMENT_BLUEPRINT.md
-    # before deploying. When false, the deployment step reads
-    # deployment.json directly. When --deploy-dev is false this flag has
-    # no observable effect.
+    # before deploying. When false, the deployment step skips the LLM
+    # interview and synthesises the blueprint from workspace telemetry
+    # alone. When --deploy-dev is false this flag has no observable effect.
     run_parser.add_argument(
         "--cd-discovery",
         type=_bool_choice,
@@ -6924,7 +6874,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Container-deployment discovery. When true (and --deploy-dev "
             "is true), synthesise DEPLOYMENT_BLUEPRINT.md from the "
             "codebase before deploying. When false, the deployment step "
-            "reads deployment.json directly. Defaults to false."
+            "skips the LLM interview and synthesises the blueprint from "
+            "workspace telemetry alone. Defaults to false."
         ),
     )
     # P1.7: workspace-lock override. When another live `harness run` holds

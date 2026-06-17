@@ -5460,7 +5460,8 @@ class TestSecurityScanRouting:
 
     def test_route_after_security_scan_clean_no_cd_discovery(self):
         # --deploy-dev true + --cd-discovery false → straight to
-        # deployment_node, which reads deployment.json.
+        # deployment_node, which synthesises the blueprint from workspace
+        # telemetry (plus the deployment_defaults section of config.json).
         from harness.graph import route_after_security_scan
         with tempfile.TemporaryDirectory() as tmpdir:
             state = _make_state(tmpdir, dev_deployment=True)

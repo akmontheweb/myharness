@@ -162,15 +162,16 @@ class AgentState(TypedDict, total=False):
     # Container-deployment discovery toggle. Only meaningful when
     # dev_deployment is True. When True, deployment_discovery_node runs
     # and synthesises DEPLOYMENT_BLUEPRINT.md from the codebase. When
-    # False, the deployment step reads deployment.json directly and
-    # skips the LLM-driven discovery. Set by the `--cd-discovery` CLI
-    # flag on `harness run`; default False (matches the new operator-
-    # autonomous baseline).
+    # False, the deployment step skips the LLM-driven discovery and
+    # synthesises the blueprint from workspace telemetry alone. Set by
+    # the `--cd-discovery` CLI flag on `harness run`; default False
+    # (matches the new operator-autonomous baseline).
     cd_discovery: bool
-    # Optional org-wide deployment policy loaded from config/deployment.json.
-    # When populated, deployment_discovery_node injects it into the planning
-    # LLM's prompt so already-resolved fields don't produce questions. Empty
-    # dict = no file present = current full-questionnaire behaviour. See
+    # Optional org-wide deployment policy loaded from the
+    # ``deployment_defaults`` section of config.json. When populated,
+    # deployment_discovery_node injects it into the planning LLM's prompt
+    # so already-resolved fields don't produce questions. Empty dict =
+    # no section present = current full-questionnaire behaviour. See
     # load_deployment_defaults() in cli.py for the schema.
     deployment_defaults: dict[str, Any]
     run_prod_import_smoke_check: bool
@@ -6151,24 +6152,25 @@ async def deployment_discovery_node(state: AgentState) -> dict[str, Any]:
     question_count = state.get("node_state", {}).get("discovery_question_count", 0)
     is_followup = question_count > 0
 
-    # Optional org-wide policy from config/deployment.json. When non-empty,
-    # the planning LLM is told to treat every populated field as RESOLVED
-    # and skip emitting a question for it. When empty, the prompt block
-    # below is omitted and the questionnaire runs in its current full mode.
+    # Optional org-wide policy from the ``deployment_defaults`` section of
+    # config.json. When non-empty, the planning LLM is told to treat every
+    # populated field as RESOLVED and skip emitting a question for it. When
+    # empty, the prompt block below is omitted and the questionnaire runs
+    # in its current full mode.
     deployment_defaults = state.get("deployment_defaults", {}) or {}
     resolved_block = ""
     if deployment_defaults:
         resolved_block = (
             "\n\n## Pre-resolved deployment policies (operator-supplied)\n\n"
             "The operator has already declared the following deployment "
-            "policies via config/deployment.json. Treat every populated "
-            "field below as RESOLVED — do NOT emit a question whose answer "
-            "is already given here. Generate questions ONLY for sectors / "
-            "fields not covered and for stack-specific details (e.g. "
-            "per-service ports, volume paths) that this policy does not "
-            "specify. If every sector is fully covered, return "
-            '{"complete": true} on round 1 and skip the interview '
-            "entirely. The values below carry into "
+            "policies via the ``deployment_defaults`` section of config.json. "
+            "Treat every populated field below as RESOLVED — do NOT emit a "
+            "question whose answer is already given here. Generate "
+            "questions ONLY for sectors / fields not covered and for "
+            "stack-specific details (e.g. per-service ports, volume paths) "
+            "that this policy does not specify. If every sector is fully "
+            'covered, return {"complete": true} on round 1 and skip the '
+            "interview entirely. The values below carry into "
             "DEPLOYMENT_BLUEPRINT.md verbatim.\n\n"
             "```json\n"
             + json.dumps(deployment_defaults, indent=2, sort_keys=True)
@@ -7233,8 +7235,10 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
         No security findings AND dev_deployment=True
           AND cd_discovery=False                       → deployment_node
                                                           (skip discovery; the
-                                                          deploy step reads
-                                                          deployment.json)
+                                                          deploy step synthesises
+                                                          the blueprint from
+                                                          workspace telemetry
+                                                          alone)
         Security findings AND sec_attempts < 2         → repair_node
         Security findings AND sec_attempts >= 2        → human_intervention_node
         budget_remaining <= 0                          → human_intervention_node
@@ -7282,15 +7286,16 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
             return "__end__"
         # --cd-discovery picks between the LLM-driven blueprint pipeline
         # (deployment_discovery_node → interview → gatekeeper →
-        # deployment_node) and the deployment.json-driven fast path
-        # (straight to deployment_node, which reads
-        # deployment_defaults via state and synthesises the blueprint
-        # from workspace telemetry alone). Both end in deployment_node.
+        # deployment_node) and the telemetry-only fast path (straight to
+        # deployment_node, which synthesises the blueprint from workspace
+        # telemetry — and the deployment_defaults section of config.json
+        # where present — without an LLM interview). Both end in
+        # deployment_node.
         if not state.get("cd_discovery", False):
             logger.info(
                 "[router] Security scan clean. --cd-discovery=false; "
                 "skipping deployment discovery interview and routing "
-                "straight to deployment_node (reads deployment.json)."
+                "straight to deployment_node (telemetry-only blueprint)."
             )
             return "deployment_node"
         logger.info("[router] Security scan clean. Routing to deployment discovery.")
@@ -7643,7 +7648,9 @@ def build_graph() -> Any:
             "deployment_discovery_node": "deployment_discovery_node",
             # Fast-path for --deploy-dev=true + --cd-discovery=false:
             # the router routes straight to deployment_node, which
-            # picks up deployment.json via state.deployment_defaults.
+            # synthesises the blueprint from workspace telemetry alone
+            # (with state.deployment_defaults pulled from the
+            # ``deployment_defaults`` section of config.json where set).
             "deployment_node": "deployment_node",
             "repair_node": "repair_node",
             "human_intervention_node": "human_intervention_node",
