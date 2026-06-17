@@ -1038,8 +1038,19 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
 
         logger.info("[speculative] Complete: %.2fs, winner=Variant %d.", elapsed, winner.index)
 
+        # Merge winner.modified_files into the prior accumulated list
+        # (audit §6.2). When speculative runs as ``after_n_repair_failures``
+        # the patching_node already produced files; replacing here would
+        # drop those from state and downstream nodes (lintgate /
+        # test_generation / repair) would lose visibility of them.
+        prior_modified_winner: list[str] = list(state.get("modified_files", []) or [])
+        merged_winner_modified = list(prior_modified_winner)
+        for f in winner.modified_files:
+            if f not in merged_winner_modified:
+                merged_winner_modified.append(f)
+
         return {
-            "modified_files": winner.modified_files,
+            "modified_files": merged_winner_modified,
             "messages": messages_out,
             "token_tracker": token_tracker,
             "node_state": {

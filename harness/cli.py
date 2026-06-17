@@ -615,7 +615,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "enforce_read_before_edit", "use_structured_tools",
     }),
     # Pre-build smoke checks (see compiler_node prod-import step).
-    "compiler": frozenset({"run_prod_import_smoke_check"}),
+    "compiler": frozenset({"run_prod_import_smoke_check", "advisory_exit_codes"}),
     # Web research tools. enabled toggles registration of web_fetch +
     # web_search in the SkillRegistry. max_bytes / max_results cap result
     # size. search_backend selects the search provider (only

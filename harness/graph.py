@@ -1491,6 +1491,30 @@ async def _patching_tool_loop(
             "patching proceeds with what the LLM has so far.",
             _PATCHING_READ_FILE_CAP,
         )
+        # Audit §6.3: tell the model the read-cap is hit and ask it
+        # to emit patches now. Without this synthetic note, the final
+        # response still carries unfulfilled ``read_file`` tool_calls
+        # which downstream code treats as "the LLM is asking for more
+        # files" — the LLM never learns to stop and produce patches.
+        try:
+            # Best-effort one more dispatch with a guiding nudge.
+            messages.append(MessageDict(
+                role="user",
+                content=(
+                    f"[System]: You've used the read_file tool "
+                    f"{_PATCHING_READ_FILE_CAP} times — the cap is reached. "
+                    f"Emit SEARCH/REPLACE patches now using the file content "
+                    f"you've already seen. Do NOT call read_file again."
+                ),
+            ))
+            response, budget = await gateway.dispatch(
+                messages=list(messages),
+                role=NodeRole.PATCHING,
+                budget_remaining_usd=budget,
+                **dispatch_kwargs,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, caller has the cap response
+            logger.debug("[patching_tool_loop] post-cap dispatch failed: %s", exc)
     return response, budget, messages, files_seen
 
 
@@ -2296,6 +2320,25 @@ Generate your patches NOW. Only the blocks above. No other text."""
             )
         messages.append(MessageDict(role="system", content=status_msg))
 
+        # Audit §6.4: surface a cross-file impact warning so the LLM
+        # sees downstream files that reference modified symbols and
+        # can update them in the same turn. The module ships an
+        # ImpactAnalyzer; previously nothing called it. Best-effort:
+        # any analyzer crash is swallowed so a malformed dependency
+        # graph never blocks a successful patch.
+        if modified_files:
+            try:
+                from harness.impact import ImpactAnalyzer
+                impact_cfg = (state.get("impact_config") or {}) if isinstance(state, dict) else {}
+                _impact = ImpactAnalyzer(
+                    workspace_path=workspace,
+                    max_scan_files=int(impact_cfg.get("max_scan_files", 500)),
+                    enabled=bool(impact_cfg.get("enabled", True)),
+                )
+                _impact.analyze_and_warn(list(modified_files), messages)
+            except Exception as _impact_exc:  # noqa: BLE001
+                logger.debug("[impact] analysis failed (%s); skipping warning.", _impact_exc)
+
         logger.info(
             "[patching_node] Patches applied. tokens_in=%d tokens_out=%d cost=$%.6f budget_left=$%.4f "
             "patches=%d succeed=%d fail=%d",
@@ -2547,10 +2590,17 @@ _NO_TESTS_PATTERNS: tuple[re.Pattern[str], ...] = (
 # requirements file (or its transitive deps) can't be satisfied together.
 # The error message rarely names BOTH sides of the conflict, so the repair
 # LLM is forced to guess — autofix strips the pins entirely instead.
+# pip's resolver emits one of these lines when version pins in the build's
+# requirements file (or its transitive deps) can't be satisfied together.
+# The error message rarely names BOTH sides of the conflict, so the repair
+# LLM is forced to guess — autofix strips the pins entirely instead.
+#
+# Audit §6.10: bounded ``[^\n]{1,500}`` instead of ``.+`` to avoid
+# catastrophic backtracking on pathological single-line pip logs.
 _PIP_RESOLUTION_CONFLICT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?m)^ERROR: ResolutionImpossible\b"),
     re.compile(
-        r"(?m)^ERROR: Cannot install .+ because these package versions have "
+        r"(?m)^ERROR: Cannot install [^\n]{1,500} because these package versions have "
         r"conflicting dependencies"
     ),
     re.compile(
@@ -3991,6 +4041,25 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     compiler_errors: list[Any] = [d.to_dict() for d in result.diagnostics]
     raw_log: str = result.raw_output
 
+    # Audit §6.8: allow operators to declare non-zero exit codes as
+    # ``advisory`` for this build_command — useful for tools like
+    # ``terraform validate`` that emit non-zero on benign drift. Listed
+    # codes get folded to 0 so the repair loop doesn't fire on noise.
+    compiler_cfg = state.get("compiler_config") or {}
+    advisory_codes = compiler_cfg.get("advisory_exit_codes") or []
+    if exit_code != 0 and isinstance(advisory_codes, list):
+        try:
+            advisory_set = {int(c) for c in advisory_codes}
+        except (TypeError, ValueError):
+            advisory_set = set()
+        if exit_code in advisory_set:
+            logger.warning(
+                "[compiler_node] Build exited with advisory code %d (per "
+                "compiler.advisory_exit_codes config); treating as success.",
+                exit_code,
+            )
+            exit_code = 0
+
     logger.info(
         "[compiler_node] Build finished with exit code %d. %d diagnostic(s) extracted.",
         exit_code,
@@ -4864,6 +4933,21 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             ):
                 rb_misses[r.file] = rb_misses.get(r.file, 0) + 1
         loop_counter["replace_block_misses_per_file"] = rb_misses
+
+        # Audit §6.4: surface cross-file impact warnings after repair
+        # patches too. Best-effort.
+        if modified_files:
+            try:
+                from harness.impact import ImpactAnalyzer as _ImpactAnalyzer
+                impact_cfg = (state.get("impact_config") or {}) if isinstance(state, dict) else {}
+                _impact = _ImpactAnalyzer(
+                    workspace_path=workspace,
+                    max_scan_files=int(impact_cfg.get("max_scan_files", 500)),
+                    enabled=bool(impact_cfg.get("enabled", True)),
+                )
+                _impact.analyze_and_warn(list(modified_files), messages)
+            except Exception as _impact_exc:  # noqa: BLE001
+                logger.debug("[impact] analysis failed (%s); skipping warning.", _impact_exc)
 
         # Per-iteration commit (C3): when this round landed any patches,
         # commit the working tree with a structured per-iteration message

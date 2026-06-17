@@ -288,7 +288,7 @@ def _try_compiler_suggestion(
         return None
 
     try:
-        with open(file_path, "r", encoding="utf-8") as fh:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
             source = fh.read()
     except OSError:
         return None
@@ -419,8 +419,11 @@ def _try_missing_import(
         return None
 
     # Defend against re-running on a file that already has the import.
+    # errors="replace" so a mixed-encoding file (UnicodeDecodeError is a
+    # ValueError, not OSError) doesn't crash the autofix and skip the
+    # diagnostic's LLM-fallback (audit §6.6).
     try:
-        with open(file_abs, "r", encoding="utf-8") as fh:
+        with open(file_abs, "r", encoding="utf-8", errors="replace") as fh:
             head = fh.read()
     except OSError:
         return None
@@ -621,7 +624,15 @@ def _build_import_statement(
 
 
 def _python_module_path(def_path: str, workspace_path: str) -> str:
-    """Convert ``workspace/foo/bar/baz.py`` → ``foo.bar.baz``."""
+    """Convert ``workspace/foo/bar/baz.py`` → ``foo.bar.baz``.
+
+    Returns ``""`` (caller treats as "no usable import suggestion")
+    when any path component would be invalid as a Python module name —
+    e.g. ``my-pkg/foo.py`` blindly produces ``from my-pkg.foo import bar``
+    which is a SyntaxError, and the LLM then sees a worse error than
+    the original NameError. Audit §6.7.
+    """
+    import keyword
     rel = os.path.relpath(def_path, workspace_path)
     if rel.endswith(".py"):
         rel = rel[:-3]
@@ -630,6 +641,11 @@ def _python_module_path(def_path: str, workspace_path: str) -> str:
     rel = rel.replace(os.sep, ".")
     if rel.endswith(".__init__"):
         rel = rel[: -len(".__init__")]
+    if not rel:
+        return ""
+    for part in rel.split("."):
+        if not part.isidentifier() or keyword.iskeyword(part):
+            return ""
     return rel
 
 
@@ -932,8 +948,10 @@ def _fix_bandit(
     if not os.path.isfile(file_abs):
         return None
 
+    # errors="replace" so a Unicode-decode failure doesn't dynamite the
+    # autofix path (audit §6.6).
     try:
-        with open(file_abs, "r", encoding="utf-8") as fh:
+        with open(file_abs, "r", encoding="utf-8", errors="replace") as fh:
             source = fh.read()
     except OSError:
         return None
@@ -1004,8 +1022,10 @@ def _fix_gitleaks(
     file_abs = os.path.join(workspace_path, rel_file)
     if not os.path.isfile(file_abs):
         return None
+    # errors="replace" so a Unicode-decode failure doesn't dynamite the
+    # autofix path (audit §6.6).
     try:
-        with open(file_abs, "r", encoding="utf-8") as fh:
+        with open(file_abs, "r", encoding="utf-8", errors="replace") as fh:
             source = fh.read()
     except OSError:
         return None
@@ -1069,8 +1089,10 @@ def _fix_trivy(
     package = pkg_match.group("pkg")
     installed = pkg_match.group("ver")
 
+    # errors="replace" so a Unicode-decode failure doesn't dynamite the
+    # autofix path (audit §6.6).
     try:
-        with open(file_abs, "r", encoding="utf-8") as fh:
+        with open(file_abs, "r", encoding="utf-8", errors="replace") as fh:
             source = fh.read()
     except OSError:
         return None
@@ -1217,7 +1239,7 @@ def _try_asset_reference_fix(
         return None
 
     try:
-        with open(file_path, "r", encoding="utf-8") as fh:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
             source = fh.read()
     except OSError:
         return None
