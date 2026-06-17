@@ -30,9 +30,6 @@ Thumbs.db
 *.db
 /tmp/.harness/
 
-# In-repo global config — holds API keys; never commit.
-/config/config.json
-
 # Test artifacts
 .coverage
 .coverage.*
