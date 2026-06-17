@@ -6,7 +6,7 @@ When the user types ``harness run`` with no flags, ``cmd_run`` calls
 needed to start a run. The wizard first asks whether this is a new
 session or a resume of an existing checkpointed session:
 
-- "new"    → API keys, workspace, prompt, --git, --new-build, --discover.
+- "new"    → API keys, workspace, prompt, --git, --new-build, --spec-discovery.
 - "resume" → session id (picked from a recent-sessions list or typed
              free-text); ``cmd_run`` then delegates to ``cmd_resume``.
 
@@ -46,9 +46,9 @@ def run_setup_wizard(args: argparse.Namespace) -> str:
            env vars for models referenced by ``model_routing``.
         2. Workspace path.
         3. Engineering prompt / task.
-        4. ``--git enable|disable``.
+        4. ``--git true|false``.
         5. ``--new-build true|false``.
-        6. ``--discover true|false``.
+        6. ``--spec-discovery true|false``.
         7. Summary + confirm. ``n`` loops back into the wizard from step 2.
 
     Returns ``"run"`` for a fresh run or ``"resume"`` to delegate to
@@ -126,7 +126,7 @@ def run_setup_wizard(args: argparse.Namespace) -> str:
     args.prompt = prompt
     args.git = git_mode
     args.new_build = new_build
-    args.discover = discover
+    args.spec_discovery = discover
     # If the operator picks --new-build via the wizard, they've already
     # given explicit consent — skip the secondary --yes prompt that
     # cmd_run would otherwise show.
@@ -374,14 +374,14 @@ def _ask_prompt(channel) -> str:
         print("  The prompt can't be empty. Try again.")
 
 
-def _ask_git(channel) -> str:
-    print("\nStep 3 of 5: Is the workspace a git repository?")
-    print("  e = enable  (GitGuardian stashes / branches / rolls back)")
-    print("  d = disable (skip every git step — pick this if no git repo)")
+def _ask_git(channel) -> bool:
+    print("\nStep 3 of 5: Enable GitGuardian for the workspace?")
+    print("  y = true   (GitGuardian stashes / branches / rolls back; requires a git repo)")
+    print("  n = false  (skip every git step — pick this if no git repo)")
     choice = channel.prompt(
-        "Choose [e/d]", options=["e", "d"], default="e",
+        "Choose [y/n]", options=["y", "n"], default="n",
     ).strip().lower()
-    return "enable" if choice == "e" else "disable"
+    return choice == "y"
 
 
 def _ask_new_build(channel) -> bool:
@@ -404,16 +404,16 @@ def _ask_discover(channel) -> bool:
 
 
 def _print_summary(
-    workspace: str, prompt: str, git_mode: str, new_build: bool, discover: bool,
+    workspace: str, prompt: str, git_mode: bool, new_build: bool, discover: bool,
 ) -> None:
     print()
     print("-" * 72)
     print("Summary")
     print("-" * 72)
-    print(f"  Workspace : {workspace}")
+    print(f"  Workspace        : {workspace}")
     short_prompt = prompt if len(prompt) <= 60 else prompt[:57] + "..."
-    print(f"  Prompt    : {short_prompt}")
-    print(f"  --git     : {git_mode}")
-    print(f"  --new-build: {'true' if new_build else 'false'}")
-    print(f"  --discover: {'true' if discover else 'false'}")
+    print(f"  Prompt           : {short_prompt}")
+    print(f"  --git            : {'true' if git_mode else 'false'}")
+    print(f"  --new-build      : {'true' if new_build else 'false'}")
+    print(f"  --spec-discovery : {'true' if discover else 'false'}")
     print("-" * 72)

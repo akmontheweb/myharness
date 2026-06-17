@@ -353,7 +353,7 @@ def test_run_presets_round_trip(tmp_path):
     save_run_preset(
         db_path=db, name="nightly-retest",
         workspace="/repo", prompt="Regenerate failing tests",
-        harness_args=["--new_build=false"],
+        harness_args=["--new-build", "false"],
     )
     save_run_preset(
         db_path=db, name="full-rebuild",
@@ -363,7 +363,7 @@ def test_run_presets_round_trip(tmp_path):
     names = [p["name"] for p in presets]
     assert "nightly-retest" in names and "full-rebuild" in names
     nightly = next(p for p in presets if p["name"] == "nightly-retest")
-    assert nightly["harness_args"] == ["--new_build=false"]
+    assert nightly["harness_args"] == ["--new-build", "false"]
     delete_run_preset(db_path=db, name="nightly-retest")
     after = [p["name"] for p in list_run_presets(db_path=db)]
     assert "nightly-retest" not in after

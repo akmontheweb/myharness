@@ -5665,7 +5665,7 @@ async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
         "messages": new_messages,
         "change_request_files": records,
         # Discovery pipeline runs in delta mode for change-request sessions
-        # regardless of the operator's --discover flag — the gatekeeper is
+        # regardless of the operator's --spec-discovery flag — the gatekeeper is
         # the whole point of the folder convention. Clear skip_discovery
         # so route_after_spec_review honors interview follow-ups instead
         # of short-circuiting to the gatekeeper.
@@ -5779,7 +5779,7 @@ def route_after_start(state: AgentState) -> Literal[
         )
         return "ingest_change_requests_node"
     if state.get("skip_discovery", False):
-        logger.info("[router] --skip-discovery active. Routing START → patching_node.")
+        logger.info("[router] spec discovery skipped. Routing START → patching_node.")
         return "patching_node"
     return "requirements_discovery_node"
 
@@ -6521,7 +6521,7 @@ async def review_and_revise_spec(
       - ``harness.cli.cmd_run`` (pre-flight path, after
         ``synthesize_requirements``) — the reviewer fires whenever
         ``doc_reviewer_primary`` is configured, independent of
-        ``--discover``.
+        ``--spec-discovery``.
 
     Returns a dict with: ``review_path``, ``critique`` (parsed dict),
     ``new_budget_usd``, ``token_usage_list`` (list of provider Usage

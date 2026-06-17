@@ -402,8 +402,8 @@ class RunFlag:
     """One CLI flag the operator can toggle from the Run Harness page.
 
     ``kind`` is one of the ``FORM_KIND_*`` constants. ``flag`` is the
-    canonical long-form (e.g. ``--allow-network``); ``flag_off`` is the
-    explicit-off form for tri-valued flags (e.g. ``--git=disable``).
+    canonical long-form (e.g. ``--allow-network``); SELECT flags emit
+    ``--flag=value`` for the bool-choice flags such as ``--git false``.
     ``yes_emits_flag`` controls how ``FORM_KIND_YES_NO`` collapses to an
     argv list: True means "yes" emits the flag and "no" omits it
     (store_true semantics); False is the opposite.
@@ -425,23 +425,20 @@ class RunFlag:
         return f"flag.{self.name}"
 
 
-# Operator-facing schema of every flag the Run page surfaces. Mirrors
-# the interactive `harness run` wizard (see :func:`harness.wizard.run_setup_wizard`)
-# which asks for exactly five things: workspace, prompt, git mode, new
-# build, discover. Workspace + prompt have dedicated inputs at the top
-# of the form; the remaining three live in this list. Operators reach
-# the other CLI flags (build-cmd, allow-network, verbose, etc.) from the
-# terminal — keeping the web page in sync with the wizard avoids
-# burying the common path under a wall of advanced toggles.
+# Operator-facing schema of every flag the Run page surfaces. Workspace +
+# prompt have dedicated inputs at the top of the form; the bool-choice
+# flags below mirror the `harness run` argparse surface in cli.py
+# (build_parser → run_parser). Operators still reach text flags
+# (build-cmd, allow-network, verbose, etc.) from the terminal.
 _RUN_FLAGS: tuple[RunFlag, ...] = (
     RunFlag(
         name="git",
         label="Git mode",
-        description="'enable' (default) uses git for stash/patch-branch/rollback. 'disable' skips every git-aware step — pick this when the target repo isn't under git.",
+        description="Enable GitGuardian stash/patch-branch/rollback for the workspace. True requires a git workspace; false skips every git-aware step. Defaults to false. Security scanners still run either way.",
         kind=FORM_KIND_SELECT,
         flag="--git",
-        default="enable",
-        choices=("enable", "disable"),
+        default="false",
+        choices=("false", "true"),
     ),
     RunFlag(
         name="new_build",
@@ -453,12 +450,67 @@ _RUN_FLAGS: tuple[RunFlag, ...] = (
         choices=("false", "true"),
     ),
     RunFlag(
-        name="discover",
-        label="Run discovery",
-        description="Run the full requirements/architecture/deployment discovery interview before code generation. Recommended for greenfield projects; skipped by default for incremental patching.",
-        kind=FORM_KIND_YES_NO,
-        flag="--discover",
-        default="no",
+        name="spec_discovery",
+        label="Spec discovery",
+        description="When true, run BOTH the requirements and architecture discovery interviews before code generation. Recommended for greenfield projects. Defaults to false.",
+        kind=FORM_KIND_SELECT,
+        flag="--spec-discovery",
+        default="false",
+        choices=("false", "true"),
+    ),
+    RunFlag(
+        name="deploy_dev",
+        label="Deploy to dev",
+        description="When true, continue past the security scan into deployment (with or without LLM-driven discovery, controlled by --cd-discovery), then `docker compose up`. Defaults to false.",
+        kind=FORM_KIND_SELECT,
+        flag="--deploy-dev",
+        default="false",
+        choices=("false", "true"),
+    ),
+    RunFlag(
+        name="cd_discovery",
+        label="Container-deployment discovery",
+        description="When true (and Deploy to dev is also true), synthesise DEPLOYMENT_BLUEPRINT.md from the codebase before deploying. Otherwise the blueprint is synthesised from workspace telemetry alone. Defaults to false.",
+        kind=FORM_KIND_SELECT,
+        flag="--cd-discovery",
+        default="false",
+        choices=("false", "true"),
+    ),
+    RunFlag(
+        name="hitl_req",
+        label="HITL: requirements gate",
+        description="When true, prompt the operator at the requirements gate (both the pre-graph interactive review and the in-graph REQUIREMENTS gatekeeper). Defaults to false (auto-approve).",
+        kind=FORM_KIND_SELECT,
+        flag="--hitl-req",
+        default="false",
+        choices=("false", "true"),
+    ),
+    RunFlag(
+        name="hitl_arch",
+        label="HITL: architecture gate",
+        description="When true, prompt the operator at the ARCHITECTURE gatekeeper. Defaults to false (auto-approve).",
+        kind=FORM_KIND_SELECT,
+        flag="--hitl-arch",
+        default="false",
+        choices=("false", "true"),
+    ),
+    RunFlag(
+        name="hitl_repair",
+        label="HITL: repair-loop menu",
+        description="When true, fire the repair-loop HITL menu when iteration limits trip. Defaults to false (auto-resume).",
+        kind=FORM_KIND_SELECT,
+        flag="--hitl-repair",
+        default="false",
+        choices=("false", "true"),
+    ),
+    RunFlag(
+        name="hitl_deployment",
+        label="HITL: deployment gate",
+        description="When true, prompt the operator at the DEPLOYMENT gatekeeper before the dev deploy fires. Defaults to false (auto-approve).",
+        kind=FORM_KIND_SELECT,
+        flag="--hitl-deployment",
+        default="false",
+        choices=("false", "true"),
     ),
 )
 
@@ -474,7 +526,7 @@ def build_run_argv_from_form(
     """Translate a POSTed Run Harness form into a list of CLI argv tokens.
 
     Returns ``(argv, errors)`` — errors is a list of operator-facing
-    messages keyed by flag name (e.g. "spec_review_cycles: must be 0-5"),
+    messages keyed by flag name (e.g. "git: value 'maybe' not in ['false', 'true']"),
     suitable for surfacing back to the form.
 
     Unset / blank fields collapse to "use the CLI default" (i.e. they

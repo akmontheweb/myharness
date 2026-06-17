@@ -446,7 +446,7 @@ def build_run_command(cfg: ScheduleConfig, job: Job) -> list[str]:
     """Build the argv for ``harness run`` for this job. Pure function;
     no I/O. Used by ``harness schedule list`` for transparency too.
     """
-    cmd = [cfg.harness_binary, "run", "-r", job.workspace]
+    cmd = [cfg.harness_binary, "run", "-w", job.workspace]
     if job.prompt:
         cmd += ["-p", job.prompt]
     cmd += list(job.harness_args)

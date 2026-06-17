@@ -323,7 +323,7 @@ class TestGatewayConfigPropagation:
 class TestRouteAfterSecurityScan:
     """Routing decisions after security_scan_node.
 
-    Covers the --dev-deployment opt-in gate that controls whether a clean
+    Covers the --deploy-dev opt-in gate that controls whether a clean
     security scan rolls forward into deployment_discovery_node or stops at
     END. route_after_security_scan imports ``_is_flutter_project`` inside
     the function body, so we monkeypatch the attribute on

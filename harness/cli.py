@@ -92,7 +92,7 @@ def _get_harness_version() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Git mode (--git=enable|disable) — process-wide state
+# Git mode (--git true|false) — process-wide state
 # ---------------------------------------------------------------------------
 
 # Module-level pin: set once at the top of cmd_run / cmd_resume from
@@ -115,7 +115,7 @@ def _git_enabled() -> bool:
 
 class _NullGitGuardian:
     """No-op stand-in for :class:`harness.security.GitGuardian` used when
-    ``--git=disable``. Mirrors every public method GitGuardian exposes so
+    ``--git false``. Mirrors every public method GitGuardian exposes so
     the rest of cmd_run / cmd_resume don't have to gate each call site.
     Returns benign defaults: ``False`` from booleans, ``None`` from
     branch lookups. The harness treats those values the same way it would
@@ -138,13 +138,13 @@ class _NullGitGuardian:
 
 
 def _make_git_guardian(workspace_path: str):
-    """Return a real ``GitGuardian`` when ``--git=enable`` is in effect,
+    """Return a real ``GitGuardian`` when ``--git true`` is in effect,
     otherwise a no-op :class:`_NullGitGuardian`. One place to swap so the
     call sites stay clean."""
     if _git_enabled():
         from harness.security import GitGuardian
         return GitGuardian(workspace_path)
-    logger.info("[git] --git=disable — using no-op GitGuardian stub.")
+    logger.info("[git] --git false — using no-op GitGuardian stub.")
     return _NullGitGuardian(workspace_path)
 
 
@@ -415,7 +415,7 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "product_spec_dir",
     # Operator-configurable name of the folder at the workspace root that
     # holds change-request .txt files for non-greenfield runs. Optional;
-    # defaults to "change_requests". When --new_build=false the folder
+    # defaults to "change_requests". When --new-build false the folder
     # MUST contain at least one .txt — see _load_consolidated_change_requests.
     "change_requests_dir",
     # Observability + debugging knobs. See _dump_repair_prompt_to_disk and
@@ -2995,7 +2995,7 @@ def _archive_consumed_change_requests(
 def _list_workspace_entries_to_delete(
     workspace_path: str, spec_dirname: str,
 ) -> list[str]:
-    """Enumerate the workspace-root entries that ``--new_build=true``
+    """Enumerate the workspace-root entries that ``--new-build true``
     would delete. Mirrors the preserved-set logic in
     :func:`_perform_new_build_reset` so the preview shown to the
     operator matches what the destructive pass would actually touch.
@@ -3068,11 +3068,11 @@ def _print_new_build_preview(
     checkpoint_sessions: list[Any],
 ) -> None:
     """Print a human-friendly preview of every destructive action
-    ``--new_build=true`` is about to take, so the operator can review
+    ``--new-build true`` is about to take, so the operator can review
     before confirming."""
     print(file=sys.stderr)
     print("=" * 72, file=sys.stderr)
-    print("--new_build=true — REVIEW BEFORE PROCEEDING", file=sys.stderr)
+    print("--new-build true — REVIEW BEFORE PROCEEDING", file=sys.stderr)
     print("=" * 72, file=sys.stderr)
     print(f"Workspace:           {workspace_path}", file=sys.stderr)
     print(f"Preserved at root:   `{spec_dirname}/`, `.git/`", file=sys.stderr)
@@ -3123,7 +3123,7 @@ def _print_new_build_preview(
 def _perform_new_build_reset(
     workspace_path: str, spec_dirname: str,
 ) -> None:
-    """When ``--new_build=true`` fires, hard-reset the workspace.
+    """When ``--new-build true`` fires, hard-reset the workspace.
 
     Three steps:
 
@@ -3139,7 +3139,7 @@ def _perform_new_build_reset(
     will still create the patch branch from whatever the working tree
     looks like after this function returns.
 
-    When ``--git=disable`` (``_git_enabled()`` is False), steps 1 and 3
+    When ``--git false`` (``_git_enabled()`` is False), steps 1 and 3
     are skipped and step 2 runs without a commit — the file deletion
     still happens so the workspace is cleaned for a fresh run, but no
     git subprocess calls are made.
@@ -3180,7 +3180,7 @@ def _perform_new_build_reset(
     else:
         base_branch = None
         logger.info(
-            "[new_build] --git=disable — clearing workspace files without "
+            "[new_build] --git false — clearing workspace files without "
             "git operations (no checkout, no commit, no branch cleanup)."
         )
 
@@ -3213,7 +3213,7 @@ def _perform_new_build_reset(
 
     staged = _git("diff", "--cached", "--name-only")
     if staged.returncode == 0 and staged.stdout.strip():
-        commit = _git("commit", "-m", "harness: --new_build reset")
+        commit = _git("commit", "-m", "harness: --new-build reset")
         if commit.returncode == 0:
             logger.info(
                 "[new_build] Committed reset on '%s' (deleted %d entry/entries).",
@@ -3255,7 +3255,7 @@ async def _purge_workspace_checkpoints(
     """Delete every checkpoint session (and per-session JSONL transcript)
     whose stored ``workspace_path`` matches the workspace being reset.
 
-    Used by ``--new_build=true`` cleanup so that "starting fresh" includes
+    Used by ``--new-build true`` cleanup so that "starting fresh" includes
     the persistence layer, not just the working tree. Session ↔ workspace
     association is indirect (the workspace path lives in the serialized
     LangGraph checkpoint blob under ``channel_values.workspace_path``),
@@ -3365,14 +3365,14 @@ async def _purge_workspace_checkpoints(
 def _attempt_git_rollback(workspace_path: str) -> None:
     """Attempt a git checkout to restore modified files to their original state.
 
-    No-op when ``--git=disable`` — without a repo there's no rollback target,
+    No-op when ``--git false`` — without a repo there's no rollback target,
     so the workspace stays in whatever state the failure produced. The log
     line makes that explicit so the operator knows their files weren't
     silently restored.
     """
     if not _git_enabled():
         logger.info(
-            "[HITL] Git rollback skipped: --git=disable. Workspace files "
+            "[HITL] Git rollback skipped: --git false. Workspace files "
             "remain in the state the failure left them in."
         )
         return
@@ -3537,12 +3537,12 @@ async def cmd_run(args: argparse.Namespace) -> int:
         7. Handle HITL breakpoints if triggered.
 
     Examples:
-        harness run -r /path/to/repo -p "Add JWT authentication"
-        harness run -r ./myproject -p "Refactor the auth module" --new_build=false
+        harness run -w /path/to/repo -p "Add JWT authentication"
+        harness run -w ./myproject -p "Refactor the auth module" --new-build false
     """
     # Bare invocation: `harness run` with no --workspace and no --prompt.
     # Drop into the interactive setup wizard, which fills in args.workspace,
-    # args.prompt, args.git, args.new_build, and args.discover before we
+    # args.prompt, args.git, args.new_build, and args.spec_discovery before we
     # continue — OR, when the operator picks "resume existing session",
     # sets args.session_id and tells us to hand off to cmd_resume instead.
     # Half-bare (one flag set, the other missing) is the same error as
@@ -3718,12 +3718,12 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # --- Change-request mode detection (existing-project delta path) ---
     # The harness routes an existing project's bug-fix / feature-add work
     # through the gatekeeper pipeline (PR-2+) by reading `.txt` files from
-    # `change_requests_dir`. The hard rule is: when --new_build=false the
+    # `change_requests_dir`. The hard rule is: when --new-build false the
     # folder MUST contain at least one .txt file. This replaces the old
     # implicit "use the existing product_spec" path with a file-driven
     # workflow that gives every run a checked-in audit trail.
     #
-    # When --new_build=true (greenfield), the change_requests/ folder is
+    # When --new-build true (greenfield), the change_requests/ folder is
     # ignored — greenfield uses product_spec_dir as before.
     new_build_active = bool(getattr(args, "new_build", False))
     cr_dir_abs = _resolve_change_requests_dir(
@@ -3749,14 +3749,14 @@ async def cmd_run(args: argparse.Namespace) -> int:
             "  1. Create the folder if it does not exist.\n"
             "  2. Add one or more `.txt` files describing the changes.\n"
             "  3. Re-run `harness run`.\n\n"
-            "If you are starting a fresh build, pass --new_build=true\n"
+            "If you are starting a fresh build, pass --new-build true\n"
             "instead — that flow uses `product_spec_dir` and skips this\n"
             "check.\n",
             file=sys.stderr,
         )
         print("=" * 72, file=sys.stderr)
         logger.error(
-            "[change_requests] --new_build=false but no .txt files at %s",
+            "[change_requests] --new-build false but no .txt files at %s",
             cr_dir_abs,
         )
         return 1
@@ -3821,7 +3821,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     # In change-request mode (existing-project deltas) the product_spec
     # folder is not consulted — the change_requests/ folder drives the run
     # instead. The config value's NAME is still validated above so other
-    # subsystems that reference spec_dirname (e.g. --new_build cleanup
+    # subsystems that reference spec_dirname (e.g. --new-build cleanup
     # preserves it) keep working.
     preloaded_consolidated_spec: Optional[str] = None
     if not change_request_mode:
@@ -3833,7 +3833,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             # stderr describing whether the folder is missing or empty.
             return 1
 
-    # --new_build cleanup runs BEFORE GitGuardian creates the session's
+    # --new-build cleanup runs BEFORE GitGuardian creates the session's
     # patch branch, so the new branch forks from a clean base. The reset is
     # destructive (deletes most files at workspace root and commits the
     # deletions on master/main), but the operator opted in by passing the
@@ -3857,7 +3857,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             # cleanup functions will be no-ops; we still call them so
             # the log line ("No prior checkpoints", etc.) appears.
             logger.info(
-                "[new_build] --new_build=true but nothing to clean "
+                "[new_build] --new-build true but nothing to clean "
                 "(no extra files at workspace root, no orphan patch "
                 "branches, no prior checkpoints for this workspace). "
                 "Skipping the confirmation prompt."
@@ -3875,13 +3875,13 @@ async def cmd_run(args: argparse.Namespace) -> int:
             else:
                 from harness.hitl import get_channel as _get_channel
                 confirmed = _get_channel().confirm(
-                    "Proceed with the destructive --new_build reset above?",
+                    "Proceed with the destructive --new-build reset above?",
                     default=False,
                 )
                 if not confirmed:
                     print(
-                        "\n--new_build reset cancelled. Re-run without "
-                        "--new_build=true (or fix the workspace state) "
+                        "\n--new-build reset cancelled. Re-run without "
+                        "--new-build true (or fix the workspace state) "
                         "before retrying.",
                         file=sys.stderr,
                     )
@@ -3890,7 +3890,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
                     )
                     return 1
         logger.warning(
-            "[new_build] --new_build=true — resetting workspace before "
+            "[new_build] --new-build true — resetting workspace before "
             "starting the session. Files outside `%s/` and `.git/` will be "
             "deleted from the base branch.", spec_dirname,
         )
@@ -3903,7 +3903,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         await _purge_workspace_checkpoints(workspace_path, config)
 
     # Initialize GitGuardian for branch lifecycle management. When
-    # --git=disable, _make_git_guardian returns a no-op stub so the
+    # --git false, _make_git_guardian returns a no-op stub so the
     # downstream rollback/pop_stash call sites don't need to gate
     # individually.
     git_guardian = _make_git_guardian(workspace_path)
@@ -3947,7 +3947,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
                 gateway=gateway,
             )
             # Pre-flight spec review: fire whenever doc_reviewer_primary is
-            # configured, regardless of whether --discover was passed.
+            # configured, regardless of whether --spec-discovery was passed.
             # Previously the reviewer only ran inside the discovery flow
             # (write_spec_node → spec_review_node), so any run started from
             # a manifest skipped it silently.
@@ -4243,7 +4243,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         git_guardian.commit_all_changes(session_id, modified_files, exit_code)
         git_guardian.restore_original_branch()
         git_guardian.pop_stash()
-        # When --dev-deployment was not passed, the harness ended right after
+        # When --deploy-dev was not passed, the harness ended right after
         # the security scan; surface the next step explicitly so operators
         # upgrading from the old auto-deploy default see why no Dockerfiles
         # / docker-compose run happened. Flutter projects always end here
@@ -4511,7 +4511,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     # the checkpoint) and just checks it out — same primitive on both
     # paths. If the operator deleted the branch between suspend ↔ resume
     # we recreate it; if they switched to a different branch we re-attach
-    # to the agent one. When --git=disable, _make_git_guardian returns a
+    # to the agent one. When --git false, _make_git_guardian returns a
     # no-op stub matching the same interface.
     git_guardian = _make_git_guardian(workspace_path)
     git_guardian.stash_if_dirty()
@@ -6192,7 +6192,7 @@ def cmd_gh_issue(args: argparse.Namespace) -> int:
         return 1
     print(f"Wrote {path}")
     print(
-        "Next: run `harness run -r {} -p \"fix CR\" --new_build=false` "
+        "Next: run `harness run -w {} -p \"fix CR\" --new-build false` "
         "to process the new change request.".format(workspace_path)
     )
     return 0
@@ -6828,7 +6828,7 @@ def build_parser() -> argparse.ArgumentParser:
     # --spec-discovery true|false. When true, both the requirements
     # discovery interview AND the architecture discovery interview run
     # before the patcher. False (default) skips the discovery chain
-    # entirely — matches the prior --discover-not-passed behaviour.
+    # entirely and routes straight to the patcher.
     run_parser.add_argument(
         "--spec-discovery",
         type=_bool_choice,

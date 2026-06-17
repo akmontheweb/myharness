@@ -527,7 +527,7 @@ class TestIngestSetsDiscoveryActive:
         state = {
             "change_request_mode": True,
             "change_requests_dir_abs": str(cr_dir),
-            "skip_discovery": True,   # simulates --discover not passed
+            "skip_discovery": True,   # simulates --spec-discovery false (the default)
             "messages": [
                 {"role": "system", "content": "sys"},
                 {"role": "user", "content": "seed"},

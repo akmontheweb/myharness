@@ -277,13 +277,23 @@ def test_all_sections_returns_known_sections():
 # 6. Run-harness CLI flag form
 # ---------------------------------------------------------------------------
 
-def test_run_flags_mirrors_cli_wizard():
-    """The Run page surfaces exactly the three flags the interactive CLI
-    wizard asks for (besides workspace + prompt, which have dedicated
-    inputs). Other `harness run` flags stay on the terminal."""
+def test_run_flags_covers_run_parser_bools():
+    """The Run page surfaces every bool-choice flag the `harness run`
+    argparse surface accepts (besides workspace + prompt, which have
+    dedicated inputs). Text/integer flags stay on the terminal."""
     from harness.web_forms import run_flags
     names = {f.name for f in run_flags()}
-    assert names == {"git", "new_build", "discover"}
+    assert names == {
+        "git",
+        "new_build",
+        "spec_discovery",
+        "deploy_dev",
+        "cd_discovery",
+        "hitl_req",
+        "hitl_arch",
+        "hitl_repair",
+        "hitl_deployment",
+    }
 
 
 def test_build_run_argv_empty_form_produces_no_args():
@@ -295,29 +305,56 @@ def test_build_run_argv_empty_form_produces_no_args():
     assert argv == []
 
 
-def test_build_run_argv_discover_yes_emits_flag():
+def test_build_run_argv_spec_discovery_true_emits_flag():
     from harness.web_forms import build_run_argv_from_form
-    argv, errors = build_run_argv_from_form({"flag.discover": "yes"})
+    argv, errors = build_run_argv_from_form({"flag.spec_discovery": "true"})
     assert errors == []
-    assert "--discover" in argv
+    assert "--spec-discovery=true" in argv
 
 
-def test_build_run_argv_discover_no_omits_flag():
+def test_build_run_argv_spec_discovery_false_omits_flag():
     from harness.web_forms import build_run_argv_from_form
-    argv, errors = build_run_argv_from_form({"flag.discover": "no"})
+    argv, errors = build_run_argv_from_form({"flag.spec_discovery": "false"})
     assert errors == []
-    assert "--discover" not in argv
+    # The CLI already defaults to false, so emitting the token would be noise.
+    assert not any(a.startswith("--spec-discovery") for a in argv)
 
 
 def test_build_run_argv_select_emits_flag_equals_value():
     from harness.web_forms import build_run_argv_from_form
     argv, errors = build_run_argv_from_form({
         "flag.new_build": "true",
-        "flag.git": "disable",
+        "flag.git": "true",
     })
     assert errors == []
     assert "--new-build=true" in argv
-    assert "--git=disable" in argv
+    assert "--git=true" in argv
+
+
+def test_build_run_argv_hitl_flags_emit_when_true():
+    from harness.web_forms import build_run_argv_from_form
+    argv, errors = build_run_argv_from_form({
+        "flag.hitl_req": "true",
+        "flag.hitl_arch": "true",
+        "flag.hitl_repair": "true",
+        "flag.hitl_deployment": "true",
+    })
+    assert errors == []
+    assert "--hitl-req=true" in argv
+    assert "--hitl-arch=true" in argv
+    assert "--hitl-repair=true" in argv
+    assert "--hitl-deployment=true" in argv
+
+
+def test_build_run_argv_deploy_dev_and_cd_discovery():
+    from harness.web_forms import build_run_argv_from_form
+    argv, errors = build_run_argv_from_form({
+        "flag.deploy_dev": "true",
+        "flag.cd_discovery": "true",
+    })
+    assert errors == []
+    assert "--deploy-dev=true" in argv
+    assert "--cd-discovery=true" in argv
 
 
 def test_build_run_argv_new_build_true_also_emits_yes():
@@ -347,6 +384,8 @@ def test_build_run_argv_select_rejects_unknown_choice():
     assert any("git" in e for e in errors)
     # Even on error the argv list is well-formed (no partial flags).
     assert "--git" not in " ".join(argv)
+    # And the new choice set is true/false, not enable/disable.
+    assert any("['false', 'true']" in e for e in errors)
 
 
 # ---------------------------------------------------------------------------

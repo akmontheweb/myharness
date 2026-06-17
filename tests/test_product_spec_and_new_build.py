@@ -1,4 +1,4 @@
-"""Tests for the product_spec_dir mandate and --new_build cleanup.
+"""Tests for the product_spec_dir mandate and --new-build cleanup.
 
 Covers:
 - _resolve_product_spec_dir (relative vs absolute paths, ~ expansion).
@@ -160,7 +160,7 @@ class TestLoadConsolidatedProductSpec:
 
 
 # ---------------------------------------------------------------------------
-# --new_build reset
+# --new-build reset
 # ---------------------------------------------------------------------------
 
 def _init_repo(path: str) -> None:
@@ -207,7 +207,7 @@ class TestPerformNewBuildReset:
             ["git", "-C", str(ws), "log", "--oneline"],
             capture_output=True, text=True, check=True,
         )
-        assert "--new_build reset" in log.stdout
+        assert "--new-build reset" in log.stdout
 
     def test_orphan_patch_branches_deleted(self, tmp_path):
         from harness.cli import _perform_new_build_reset
@@ -252,7 +252,7 @@ class TestPerformNewBuildReset:
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint + JSONL purge (--new_build=true)
+# Checkpoint + JSONL purge (--new-build true)
 # ---------------------------------------------------------------------------
 
 def _make_summary(thread_id: str, workspace_path: str):
@@ -555,7 +555,7 @@ class TestNewBuildPreviewPrinting:
             checkpoint_sessions=[_make_summary("sess-1", "/tmp/ws")],
         )
         err = capsys.readouterr().err
-        assert "--new_build=true — REVIEW BEFORE PROCEEDING" in err
+        assert "--new-build true — REVIEW BEFORE PROCEEDING" in err
         assert "/tmp/ws" in err
         assert "product_spec" in err
         assert "stale.py" in err

@@ -124,10 +124,10 @@ harness/
 │   ├── hitl_menu_loop()         # 7-action HITL menu: [v/r/e/m/b/s/q]
 │   ├── _emit_output()           # Routes machine-readable metrics to file / stdout
 │   ├── _archive_consumed_change_requests()  # Move consumed CR-*.txt into applied/<sid>/ + manifest.json (FR-045)
-│   ├── _make_git_guardian()     # Returns no-op stub when --git=disable (FR-049)
+│   ├── _make_git_guardian()     # Returns no-op stub when --git false (FR-049)
 │   └── interactive_review_loop()# Pre-flight manifest review
 ├── wizard.py             # Interactive setup wizard for bare `harness run` (FR-047)
-│   ├── run_setup_wizard()       # Top-level: new vs resume → workspace → prompt-source → --new_build → --git
+│   ├── run_setup_wizard()       # Top-level: new vs resume → workspace → prompt → --git → --new-build → --spec-discovery
 │   ├── _prompt_new_or_resume()  # First fork: greenfield/brownfield or `harness resume <id>`
 │   ├── _choose_session()        # Lists checkpointed sessions newest-first for resume
 │   └── _confirm_change_requests_folder()  # Detects change_requests/ and offers brownfield mode
@@ -163,7 +163,7 @@ harness/
 │   ├── route_after_compiler()    # Conditional: repair / HITL (short-circuits on llm_silent) / security_scan
 │   ├── route_after_discovery()   # Conditional: write_spec / discovery loop (capped at max_discovery_iterations, FR-043)
 │   ├── route_after_gatekeeper()  # Conditional: next phase / refinement loop
-│   ├── route_after_security_scan() # Conditional: repair / HITL / END (Flutter, FR-028) / END (no --dev-deployment, FR-044) / deployment_discovery
+│   ├── route_after_security_scan() # Conditional: repair / HITL / END (Flutter, FR-028) / END (no --deploy-dev, FR-044) / deployment_discovery (--cd-discovery true) / deployment_node (--cd-discovery false)
 │   ├── route_after_hitl()        # Conditional: compiler / END
 │   ├── _build_patcher_allowlist()# Conservative fallback when source root unclear (FR-041); includes Node-JS allowlist
 │   ├── _apply_toolchain_adaptation() # pip/npm network auto-enable gated by config opt-in (FR-042)
@@ -469,7 +469,7 @@ harness/
 14. Flutter detected? ─yes─▶ [END]  (FR-028 — mobile builds bypass docker compose)
     │ no                       │
     ▼                          │
-14b. --dev-deployment set? ─no─▶ [END]  (FR-044 — deployment phase is opt-in)
+14b. --deploy-dev true? ─no─▶ [END]  (FR-044 — deployment phase is opt-in)
     │ yes                      │
     ▼                          │
 15. deployment_discovery_node │
@@ -523,7 +523,7 @@ AgentState fields and which nodes write to them:
 │ spec_requirements_path   │ write_spec_node                               │
 │ spec_architecture_path   │ write_spec_node, reverse_engineer_architecture│
 │ deployment_blueprint_path│ generate_deployment_spec_node                 │
-│ dev_deployment           │ run_graph (from --dev-deployment CLI flag)    │
+│ dev_deployment           │ run_graph (from --deploy-dev CLI flag)        │
 │ change_request_mode      │ run_graph (from CLI / wizard)                 │
 │ change_requests_dir_abs  │ run_graph (resolved folder path)              │
 │ change_request_files     │ ingest_change_requests_node                   │
@@ -617,7 +617,7 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 **Rationale**: LLMs produce better code when given exhaustive context. The multi-phase discovery eliminates ambiguous requirements before patches are generated, reducing downstream repair loops.
 
-**Trade-off**: Adds significant pre-generation latency and LLM token cost. Discovery is **off by default**; opt in with `--discover` on greenfield projects or when working from a blank workspace. The legacy `--skip-discovery` flag remains as a hidden no-op alias for scripts.
+**Trade-off**: Adds significant pre-generation latency and LLM token cost. Discovery is **off by default**; opt in with `--spec-discovery true` on greenfield projects or when working from a blank workspace.
 
 ### 5.5 Secret Redaction Before Every API Call
 
@@ -814,13 +814,13 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 **Trade-off**: Metrics live entirely on disk (the JSONL logs are the source of truth). Purging logs deletes the metrics record too — by design, since `harness purge --session-id` is the GDPR-deletion path. For longer-term retention, operators redirect `logging.log_dir` and `metrics.metrics_dir` to a managed location.
 
-### 5.31 Opt-In Deployment Phase (`--dev-deployment`)
+### 5.31 Opt-In Deployment Phase (`--deploy-dev`)
 
-**Decision**: The deployment phase is gated by a new CLI flag `--dev-deployment` (default `False`). The flag is threaded into `AgentState["dev_deployment"]` via `run_graph(dev_deployment=...)` and `create_initial_state(dev_deployment=...)`. `route_after_security_scan` reads `state.get("dev_deployment", False)` after a clean scan; without it the router returns `"__end__"`. The narrower `deployment.enabled` config switch still exists and gates only the docker step inside `deployment_node` (so a user can opt into the phase but still skip `docker compose up`).
+**Decision**: The deployment phase is gated by the CLI flag `--deploy-dev true|false` (default `false`). The flag is threaded into `AgentState["dev_deployment"]` via `run_graph(dev_deployment=...)` and `create_initial_state(dev_deployment=...)`. `route_after_security_scan` reads `state.get("dev_deployment", False)` after a clean scan; without it the router returns `"__end__"`. When set, a companion flag `--cd-discovery true|false` (default `false`) chooses between the LLM-driven discovery path (`deployment_discovery_node` → blueprint synthesis) and the deployment.json-driven fast path (straight to `deployment_node`). The narrower `deployment.enabled` config switch still exists and gates only the docker step inside `deployment_node`.
 
 **Rationale**: Users split cleanly into two camps — "generate code and ship via my own pipeline" and "bring it up locally." The old auto-deploy default surprised the first camp by mutating the workspace with Dockerfiles and starting containers. Making the phase opt-in respects both intents, and keeping `deployment.enabled` as an independent narrower gate avoids forcing the operator to choose between "no phase at all" and "phase including docker run."
 
-**Trade-off**: Default behaviour changed — previously a clean security scan auto-rolled into deployment; now the run ends and the operator must re-run with `--dev-deployment`. CI scripts and demo recordings that relied on auto-deploy need to add the flag. The `[cli] Code generated at <path>. Deployment phase skipped.` log line makes the new default visible on the first post-upgrade run.
+**Trade-off**: Default behaviour changed — previously a clean security scan auto-rolled into deployment; now the run ends and the operator must re-run with `--deploy-dev true`. CI scripts and demo recordings that relied on auto-deploy need to add the flag. The `[cli] Code generated at <path>. Deployment phase skipped.` log line makes the new default visible on the first post-upgrade run.
 
 ### 5.32 Change-Request Folder Mode (FR-045 / FR-046)
 
@@ -840,9 +840,9 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 ### 5.34 Setup Wizard for Bare `harness run` (FR-047)
 
-**Decision**: When `harness run` is invoked without `-r`, `-p`, or `--manifest`, the CLI hands off to `harness/wizard.py:run_setup_wizard`. The wizard first asks new-vs-resume; for new it walks workspace → prompt-source → `--new_build` (defaults `false` so the harness does not clobber files in an existing repo) → `--git`. Resume lists checkpointed sessions newest-first and re-enters `cmd_resume`. Any direct flag bypasses the wizard.
+**Decision**: When `harness run` is invoked without `-w` and `-p`, the CLI hands off to `harness/wizard.py:run_setup_wizard`. The wizard first asks new-vs-resume; for new it walks workspace → prompt → `--git` (defaults `false` so non-git workspaces work) → `--new-build` (defaults `false` so the harness does not clobber files in an existing repo) → `--spec-discovery` (defaults `false`). Resume lists checkpointed sessions newest-first and re-enters `cmd_resume`. Direct flags bypass the wizard.
 
-**Rationale**: The harness used to fail with an argparse error when invoked bare. Operators ran `harness run --help`, hand-built a command, and often missed `--git` or `--new_build`. A wizard turns first-run discovery into a guided dialog without changing the contract for power users — flags still work.
+**Rationale**: The harness used to fail with an argparse error when invoked bare. Operators ran `harness run --help`, hand-built a command, and often missed `--git` or `--new-build`. A wizard turns first-run discovery into a guided dialog without changing the contract for power users — flags still work.
 
 **Trade-off**: Two paths to invoke the same `cmd_run` (wizard vs flags). Tests exercise both; the wizard is kept thin (it just resolves into the same `args` namespace `argparse` would have produced).
 
@@ -1256,5 +1256,5 @@ API keys can also live in `models["<provider>:<model>"].api_key` inside any conf
 - `<workspace>/.harness_session.lock` — fcntl single-writer lock; auto-released when the process exits
 - `<workspace>/change_requests/` — Operator-authored `CR-N-<name>.txt` files; consumed change-request inputs (FR-045)
 - `<workspace>/change_requests/applied/<session-id>/` — Archive of consumed `.txt` files + `manifest.json` recording `status` (`success` / `cancelled` / `failed-build`) and the linked modified files
-- `<workspace>/Dockerfile` / `docker-compose.yml` / `Caddyfile` — Only produced when `--dev-deployment` is passed (FR-044)
+- `<workspace>/Dockerfile` / `docker-compose.yml` / `Caddyfile` — Only produced when `--deploy-dev true` is passed (FR-044)
 - `/tmp/.harness/` — Temporary sandbox build logs (auto-cleaned)

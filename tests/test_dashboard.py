@@ -1094,10 +1094,10 @@ def test_run_page_renders_form_when_writes_enabled(tmp_path, monkeypatch):
 
 
 def test_run_page_renders_per_flag_inputs(tmp_path, monkeypatch):
-    """The Run Harness page mirrors the interactive CLI wizard: workspace
-    + prompt have dedicated inputs at the top, and the Run options table
-    surfaces exactly the three wizard fields (git mode, new build,
-    discover). Other CLI flags stay on the terminal."""
+    """The Run Harness page surfaces every bool-choice run flag the CLI
+    accepts: --git, --new-build, --spec-discovery, --deploy-dev,
+    --cd-discovery, and the four --hitl-* gates. Text/integer flags
+    (build-cmd, session-id, etc.) stay on the terminal."""
     monkeypatch.setenv("FAKE_CSRF", "tok")
     cfg = _make_cfg(
         tmp_path,
@@ -1109,29 +1109,37 @@ def test_run_page_renders_per_flag_inputs(tmp_path, monkeypatch):
     # The legacy "Extra harness args" combined textbox is gone.
     assert "Extra harness args" not in body
     assert "name='extra_args'" not in body
-    # --git enable/disable select.
-    assert "name='flag.git'" in body
-    assert "<option value='enable'" in body and "<option value='disable'" in body
-    # --new-build true/false select.
-    assert "name='flag.new_build'" in body
+    # Every bool-choice flag renders a true/false select.
+    for fname in (
+        "flag.git",
+        "flag.new_build",
+        "flag.spec_discovery",
+        "flag.deploy_dev",
+        "flag.cd_discovery",
+        "flag.hitl_req",
+        "flag.hitl_arch",
+        "flag.hitl_repair",
+        "flag.hitl_deployment",
+    ):
+        assert f"name='{fname}'" in body, f"missing form field {fname!r} on Run page"
     assert "<option value='true'" in body and "<option value='false'" in body
-    # --discover yes/no select.
-    assert "name='flag.discover'" in body
-    assert "<option value='yes'" in body and "<option value='no'" in body
-    # Flags NOT in the wizard stay off the web page — the operator gets
+    # Flags NOT in the form stay off the web page — the operator gets
     # them on the terminal. Catching their absence here is the drift
     # detector for "did someone add another input?".
     for absent in (
         "flag.build_cmd", "flag.output_dir", "flag.session_id",
         "flag.thread_id", "flag.allow_network", "flag.verbose",
-        "flag.dev_deployment", "flag.force_lock", "flag.assume_yes",
+        "flag.force_lock", "flag.assume_yes",
         "flag.spec_review_cycles", "flag.code_review_cycles",
     ):
         assert absent not in body, f"unexpected flag input {absent!r} on Run page"
     # CLI flag names are echoed so operators learn the vocabulary.
-    assert "--git" in body
-    assert "--new-build" in body
-    assert "--discover" in body
+    for flag in (
+        "--git", "--new-build", "--spec-discovery", "--deploy-dev",
+        "--cd-discovery", "--hitl-req", "--hitl-arch", "--hitl-repair",
+        "--hitl-deployment",
+    ):
+        assert flag in body, f"expected {flag!r} to appear in /run body"
 
 
 # --- Configure Harness ------------------------------------------------------

@@ -277,14 +277,14 @@ def test_build_run_command_includes_prompt_and_extra_args():
         schedule=parse_schedule("daily 02:00"),
         workspace="/tmp/ws",
         prompt="do the thing",
-        harness_args=["--new_build=false", "-v"],
+        harness_args=["--new-build", "false", "-v"],
     )
     cfg = ScheduleConfig()
     argv = build_run_command(cfg, job)
     assert "run" in argv
-    assert "-r" in argv and "/tmp/ws" in argv
+    assert "-w" in argv and "/tmp/ws" in argv
     assert "-p" in argv and "do the thing" in argv
-    assert "--new_build=false" in argv and "-v" in argv
+    assert "--new-build" in argv and "false" in argv and "-v" in argv
 
 
 # ---------------------------------------------------------------------------

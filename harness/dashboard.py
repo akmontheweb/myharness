@@ -4616,7 +4616,7 @@ def _render_run_new(cfg: DashboardConfig, csrf_token: Optional[str], flash: str 
         "<label>Workspace path<br><input type='text' name='workspace' style='width:80%' required></label><br><br>"
         "<label>Prompt<br><textarea name='prompt' rows='4' cols='80' required></textarea></label><br><br>"
         "<label>Extra args (space-separated)<br>"
-        "<input type='text' name='extra_args' placeholder='--new_build=false --allow-network' style='width:80%'></label>"
+        "<input type='text' name='extra_args' placeholder='--new-build false --allow-network true' style='width:80%'></label>"
         "<p><button type='submit'>Run now</button></p></div></form>"
         "<form method='post' action='/run/schedule'>"
         f"<input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>"

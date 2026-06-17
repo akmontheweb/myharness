@@ -5471,7 +5471,7 @@ class TestSecurityScanRouting:
             assert route_after_security_scan(state) == "deployment_node"
 
     def test_route_after_security_scan_clean_without_dev_deployment(self):
-        # New default: clean scan + no --dev-deployment → END. The whole
+        # New default: clean scan + no --deploy-dev → END. The whole
         # deployment phase (discovery, blueprint, gatekeeper, docker
         # compose up) is skipped.
         from harness.graph import route_after_security_scan
