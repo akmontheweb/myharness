@@ -412,6 +412,38 @@ class TestHttpChannel:
             server.shutdown()
 
 
+# ---------------------------------------------------------------------------
+# Audit §5.5: CI / HARNESS_AUTO_APPROVE canonical-truthy regex
+# ---------------------------------------------------------------------------
+
+
+class TestAutoApproveTruthyRegex:
+    @pytest.mark.parametrize("value", ["true", "TRUE", "1", "yes", "YES", "on", "y"])
+    def test_truthy_ci_values_trigger_auto_approve(self, monkeypatch, value):
+        from harness.hitl import _auto_approve
+        # Force isatty so the OTHER auto-approve trigger doesn't fire.
+        import sys as _sys
+        monkeypatch.setattr(_sys.stdin, "isatty", lambda: True)
+        monkeypatch.delenv("HARNESS_AUTO_APPROVE", raising=False)
+        monkeypatch.setenv("CI", value)
+        assert _auto_approve() is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", "off", ""])
+    def test_non_truthy_ci_values_do_not_trigger(self, monkeypatch, value):
+        from harness.hitl import _auto_approve
+        import sys as _sys
+        monkeypatch.setattr(_sys.stdin, "isatty", lambda: True)
+        monkeypatch.delenv("HARNESS_AUTO_APPROVE", raising=False)
+        monkeypatch.setenv("CI", value)
+        assert _auto_approve() is False
+
+
+# ---------------------------------------------------------------------------
+# Audit §3.14: HitlQueue.register_pending overwrite refusal — already covered
+# in test_audit_web_state.py; no duplicate here.
+# ---------------------------------------------------------------------------
+
+
 class TestFileChannelEdgeCases:
     """Additional coverage for FileChannel edge cases."""
 

@@ -373,8 +373,25 @@ def _open_history(cfg: ScheduleConfig) -> sqlite3.Connection:
             conn.execute("PRAGMA busy_timeout=5000;")
         except sqlite3.DatabaseError:  # pragma: no cover — best-effort
             pass
-        conn.executescript(_SCHEMA_SQL)
+        # CREATE TABLE IF NOT EXISTS first (it's a no-op against an
+        # existing legacy table). Then migrate the pid column BEFORE
+        # the index-creation pass — the new idx_schedule_in_flight
+        # index references the pid column and would otherwise fail on
+        # a legacy table that doesn't have it yet.
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS schedule_runs (
+                job_name        TEXT NOT NULL,
+                started_at      TEXT NOT NULL,
+                ended_at        TEXT,
+                exit_code       INTEGER,
+                duration_sec    REAL,
+                log_path        TEXT,
+                pid             INTEGER,
+                PRIMARY KEY (job_name, started_at)
+            );
+        """)
         _ensure_schedule_pid_column(conn)
+        conn.executescript(_SCHEMA_SQL)
     except Exception:
         try:
             conn.close()

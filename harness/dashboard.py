@@ -1137,14 +1137,26 @@ def _redact_secret_fields_for_audit(section: Any, parsed: Any) -> Any:
 
     ``section`` is the :class:`FormSection` shape returned by
     ``web_forms.build_section`` — each ``FormField`` carries a
-    ``secret: bool`` and a ``dotted_key`` (e.g. ``models.0.api_key``).
+    ``secret: bool`` and a ``dotted_key`` (e.g. ``dashboard.token_env``).
+
+    ``parsed`` is the SECTION-RELATIVE payload (without the section
+    prefix), so we strip the section name from each field's dotted_key
+    before matching against the walk-derived paths.
     """
     try:
         from harness.web_forms import FormSection  # noqa: F401 — type hint only
+        section_name = getattr(section, "section", "") or ""
+        prefix = f"{section_name}." if section_name else ""
         secret_keys: set[str] = set()
         for field in getattr(section, "fields", []) or []:
             if getattr(field, "secret", False):
-                secret_keys.add(getattr(field, "dotted_key", "") or "")
+                full = getattr(field, "dotted_key", "") or ""
+                # Strip the section prefix so the key matches the walk
+                # path produced from the section-relative parsed dict.
+                if prefix and full.startswith(prefix):
+                    secret_keys.add(full[len(prefix):])
+                else:
+                    secret_keys.add(full)
         if not secret_keys:
             return parsed
     except Exception:  # noqa: BLE001 — best-effort

@@ -118,3 +118,60 @@ def test_unlocked_workspace_lock_succeeds(tmp_path):
     assert result not in (False, None)
     # Lock file actually exists.
     assert os.path.isfile(os.path.join(workspace, ".harness_session.lock"))
+
+
+# ---------------------------------------------------------------------------
+# Audit §1.9 — truncate-AFTER-flock + per-workspace handle dict
+# ---------------------------------------------------------------------------
+
+
+def test_pid_written_after_lock_acquired(tmp_path):
+    """The lock file should carry the holder's pid, written AFTER flock —
+    the earlier 'open mode=w' truncated BEFORE flock, so concurrent
+    acquirers could wipe the holder's diagnostic line."""
+    if sys.platform == "win32":
+        pytest.skip("fcntl unavailable on Windows native")
+    import harness.cli as cli_mod
+    workspace = str(tmp_path)
+    fh = cli_mod._acquire_workspace_lock(workspace, force=False)
+    assert fh not in (False, None)
+    contents = open(os.path.join(workspace, ".harness_session.lock"), encoding="utf-8").read()
+    assert f"pid={os.getpid()}" in contents
+
+
+def test_two_distinct_workspaces_share_module_slot_dict(tmp_path, monkeypatch):
+    """The handle dict is keyed by workspace realpath so acquiring two
+    different workspaces in the same process doesn't overwrite the first
+    lock's handle (which would let GC release the fcntl lock)."""
+    if sys.platform == "win32":
+        pytest.skip("fcntl unavailable on Windows native")
+    import harness.cli as cli_mod
+    ws_a = tmp_path / "wa"
+    ws_b = tmp_path / "wb"
+    ws_a.mkdir()
+    ws_b.mkdir()
+    fh_a = cli_mod._acquire_workspace_lock(str(ws_a), force=False)
+    fh_b = cli_mod._acquire_workspace_lock(str(ws_b), force=False)
+    assert fh_a not in (False, None)
+    assert fh_b not in (False, None)
+    # Per-path dict: both handles must survive in the module slot.
+    assert os.path.realpath(str(ws_a)) in cli_mod._WORKSPACE_LOCK_HANDLES
+    assert os.path.realpath(str(ws_b)) in cli_mod._WORKSPACE_LOCK_HANDLES
+
+
+def test_open_does_not_truncate_lock_file_before_flock(tmp_path):
+    """Regression: pre-write a sentinel line into the lock file and verify
+    a successful acquire still ends with our pid line (the pid is written
+    AFTER flock; the seek+truncate explicitly happens under the lock)."""
+    if sys.platform == "win32":
+        pytest.skip("fcntl unavailable on Windows native")
+    import harness.cli as cli_mod
+    workspace = str(tmp_path)
+    lock_path = os.path.join(workspace, ".harness_session.lock")
+    open(lock_path, "w", encoding="utf-8").write("sentinel-before-acquire\n")
+    fh = cli_mod._acquire_workspace_lock(workspace, force=False)
+    assert fh not in (False, None)
+    contents = open(lock_path, encoding="utf-8").read()
+    # Sentinel is gone (we truncated AFTER flock); our pid line is present.
+    assert "sentinel-before-acquire" not in contents
+    assert f"pid={os.getpid()}" in contents
