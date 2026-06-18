@@ -4,16 +4,20 @@ Self-serve recovery for the failure modes operators hit most often. Each
 entry has a one-line symptom, a diagnostic command that confirms the
 cause, and a fix recipe with explicit commands.
 
-When in doubt, **run `harness doctor` first** — it executes six healthchecks
-(git repo, global config, API keys, sandbox backend, checkpoint DB, config
-parse) and prints a colored summary pointing at the broken subsystem.
+When in doubt, **run `harness doctor` first** — it executes a strict-validation
+pass on the canonical config plus per-subsystem healthchecks (git repo,
+product spec, live API-key ping, tree-sitter, sandbox backend, checkpoint
+DB, patcher mode, external tools, optional MCP servers) and prints a
+colored summary pointing at the broken subsystem. The harness reads ONE
+config file: `<myharness_root>/config/config.json`. There is no
+`~/.harness/config.json` and no per-workspace overrides.
 
 ```bash
 harness doctor -r /path/to/workspace
 ```
 
 If `doctor` is green and you're still stuck, the entries below cover the
-five failure modes that have actually caused operator pain. They are
+failure modes that have actually caused operator pain. They are
 ordered by frequency, not severity.
 
 ---
@@ -25,7 +29,7 @@ ordered by frequency, not severity.
 ```
 [resume] Checkpoint for session '<id>' is corrupted: ...
   Options:
-    - Start a fresh session with `harness run -r <ws> -p '<prompt>'`.
+    - Start a fresh session with `harness run -w <ws> -p '<prompt>'`.
     - Restore checkpoints.db from a known-good backup.
     - Run `harness purge --session-id <id>` to drop only this session.
 ```
@@ -50,10 +54,10 @@ Choose one of three paths, in order of preference:
    cp ~/.harness/checkpoints.db.bak ~/.harness/checkpoints.db
    harness resume --session-id <id>
    ```
-2. **Drop only the broken session, keep all others**:
+2. **Drop only the broken session, keep all others** (`harness purge` also removes the rotated JSONL log files for the session):
    ```bash
    harness purge --session-id <id>
-   harness run -r <ws> -p "<original prompt>"   # start fresh
+   harness run -w <ws> -p "<original prompt>"   # start fresh
    ```
 3. **Last resort, nuke everything**:
    ```bash
@@ -106,20 +110,22 @@ thing that's broken.
 
 - **Raise the cap and resume** (most common):
   ```bash
-  # Edit ~/.harness_config.json (workspace) or ~/.harness/config.json (user-global):
+  # Edit <myharness_root>/config/config.json:
   #   "token_budget": { "hard_cap_usd": 5.00 }
   harness resume --session-id <id>
   ```
 - **Re-route an expensive node to a cheaper model**: edit `model_routing.*`
-  in the same config to point a hot node (e.g. `code_reviewer_primary`)
+  in the same file to point a hot node (e.g. `code_reviewer_primary`)
   at a smaller model.
 - **Force local Ollama for the rest of the session**: set
-  `model_routing.force_local_only: true` and resume.
+  `model_routing.force_local_only: true` (and ensure
+  `model_routing.ollama_local_model` references an installed Ollama model)
+  then resume.
 
-**Why it happens.** Discovery loops, doc reviews, and code reviews can each
-take 3–5 LLM round-trips. A complex workspace with all three active will
-land in the $1–$3 range. The default `hard_cap_usd: 2.00` is a guardrail,
-not a target.
+**Why it happens.** Discovery loops, doc reviews, code reviews, and the
+auto-test-generation node can each take 3–5 LLM round-trips. A complex
+workspace with all of them active will land in the $1–$3 range. The
+shipped `hard_cap_usd: 3.00` is a guardrail, not a target.
 
 ---
 
@@ -145,9 +151,8 @@ harness doctor
 # and whether the binary/daemon is reachable.
 
 # Manual probes:
-docker info       # for docker backend
-podman info       # for podman backend
-which firejail    # for firejail backend
+docker info               # for docker backend
+unshare --user echo ok    # for unshare backend (Linux/WSL2 only)
 ```
 
 **Fix**
@@ -158,10 +163,12 @@ which firejail    # for firejail backend
   sudo usermod -aG docker $USER && newgrp docker
   ```
 - **Wrong backend selected** — edit `sandbox.backend` in
-  `~/.harness_config.json`. Valid values: `docker`, `podman`, `firejail`,
-  `none` (no sandbox, host execution — use only when isolation isn't
-  needed, e.g. CI).
-- **Image missing** — let the harness pull on first run, or pre-pull:
+  `<myharness_root>/config/config.json`. Valid values: `auto` (try docker
+  → unshare), `docker`, `unshare` (Linux user-namespaces), `bare`
+  (host execution — requires `HARNESS_ALLOW_UNSAFE_SANDBOX=true` and
+  should only ever run in a disposable VM).
+- **Image missing** — let the compiler_node auto-swap to a stack-specific
+  image on first run, or pre-pull:
   ```bash
   docker pull python:3.12-slim
   ```
@@ -199,10 +206,11 @@ ps -p <PID>          # is the PID still alive?
   ```
 - **Holder dead, lock stale**:
   ```bash
-  harness run -r <ws> -p "<prompt>" --force-lock
+  harness run -w <ws> -p "<prompt>" --force-lock
   ```
   `--force-lock` releases the stale lock and acquires a fresh one. It
   logs a WARNING so the override is visible in the session record.
+  `harness resume` also accepts `--force-lock`.
 
 **Why it happens.** The lock is an `fcntl.flock` exclusive lock — the OS
 releases it when the process dies. A SIGKILL'd process should release
@@ -237,8 +245,8 @@ grep llm_circuit_open ~/.harness/logs/<session-id>.jsonl
 
 - **Provider outage** — wait it out, or switch routes:
   ```bash
-  # In ~/.harness/config.json, point the affected node at a different model:
-  #   "model_routing": { "planning_primary": "anthropic:claude-sonnet-4-6" }
+  # In <myharness_root>/config/config.json, point the affected node at a different model:
+  #   "model_routing": { "planning_primary": "anthropic:claude-sonnet-4" }
   harness resume --session-id <id>
   ```
 - **API key revoked, out of credit, or wrong model id** — `harness doctor`
@@ -279,6 +287,9 @@ provider's quota is too low for the workload).
 
 ### Diagnose
 ```bash
+# `harness doctor` lists every configured server and the start outcome:
+harness doctor 2>&1 | grep '^mcp:'
+
 # Print the resolved server commands the harness will run:
 python -c "
 from harness.mcp_client import McpPoolConfig
@@ -289,13 +300,14 @@ for s in cfg.servers:
 "
 
 # Manually start the server to see its stderr:
-npx -y @modelcontextprotocol/server-time   # adjust to your config
+npx -y @modelcontextprotocol/server-fetch   # adjust to your config
 ```
 
 ### Fix
 - **Command not in allowlist:** Add the binary basename to
-  `mcp.command_allowlist` (the built-in allowlist covers `npx`, `npm`,
-  `node`, `python`, `python3`, `uvx`, `pipx`, `docker`).
+  `mcp.command_allowlist` in `config/config.json` (the built-in allowlist
+  covers `npx`, `npm`, `node`, `python`, `python3`, `uvx`, `pipx`,
+  `docker`).
 - **Filesystem server rejected:** Set
   `mcp.allow_local_filesystem_servers: true` if you've reviewed the
   blast radius — filesystem MCP gives the LLM raw host I/O.
@@ -303,6 +315,9 @@ npx -y @modelcontextprotocol/server-time   # adjust to your config
   harness so the package is cached: `npx -y @scope/server-name --help`.
 - **Server crashes with `MODULE_NOT_FOUND`:** Check Node.js version
   meets the server's `engines` requirement.
+- **Tools/call payload too large:** Raise `mcp.result_max_bytes` (default
+  `200000`) if downstream LLM truncation is the wrong outcome for your
+  server.
 
 ---
 
@@ -338,7 +353,7 @@ grep cache_prefix_drift ~/.harness/logs/<id>.jsonl |
   happening; the event surfaces them.
 - To roll back Anthropic cache markers entirely (e.g. a provider API
   change rejects the payload shape), set
-  `llm_dispatch.prompt_cache_enabled: false` in `config.json`.
+  `llm_dispatch.prompt_cache_enabled: false` in `config/config.json`.
 
 ---
 
@@ -363,14 +378,19 @@ harness schedule validate
 ```
 
 ### Fix
-- **Daemon not running:** Start it. The daemon does not auto-launch on
-  `harness run`; it's a separate process.
-- **Job marked `enabled: false`:** Flip to `true` in `config.json` and
-  restart the daemon.
+- **Daemon not running:** Start it (`harness schedule run`). The daemon
+  does not auto-launch on `harness run`; it's a separate process.
+- **`schedule.enabled` is `false`:** Flip to `true` in
+  `config/config.json` and restart the daemon.
+- **Job marked `enabled: false`:** Flip to `true` on the per-job entry
+  in `schedule.jobs[]` and restart the daemon.
 - **Cron syntax silently fell through:** `harness schedule validate`
-  surfaces the rejection. Common mistakes: `daily 2:30` (must be
-  `02:30`); `weekly monday 03:00` (must be `mon`); full POSIX cron
-  like `30 2 * * mon` (use the supported subset).
+  surfaces the rejection. Supported subset: `every 15m` / `every 6h` /
+  `every 3d` / `hourly :MM` / `daily HH:MM` / `weekly DAY HH:MM` (all
+  times UTC; DAY ∈ `mon`–`sun`). Full POSIX cron like `30 2 * * mon` is
+  NOT supported — use the subset above.
+- **Run a job out of band:** `harness schedule once <name>` fires it
+  immediately, regardless of schedule.
 - **In-flight job stuck:** Check the per-job log under
   `~/.harness/schedule_logs/<job>/` — the daemon won't fire a second
   instance while the previous one is alive. Kill the stale process
@@ -388,14 +408,17 @@ harness schedule validate
 ### Diagnose
 ```bash
 # Is the dashboard actually running on the expected port?
-ss -tlnp | grep 8729       # default port
+ss -tlnp | grep 9000       # default port (override with --port)
+
+# Read the marker file to see what start parameters the live instance has:
+cat ~/.harness/web.lock
 
 # What token does the dashboard expect?
 echo $DASH_TOKEN | head -c 8   # first 8 chars only — don't paste full
 
 # Test bearer auth manually:
 curl -fsS -H "Authorization: Bearer $DASH_TOKEN" \
-  http://127.0.0.1:8729/sessions
+  http://127.0.0.1:9000/sessions
 ```
 
 ### Fix
@@ -406,9 +429,9 @@ curl -fsS -H "Authorization: Bearer $DASH_TOKEN" \
   `dashboard.csrf_token_env` pins it. After a restart, the browser's
   cookie is stale — reload the page to get a fresh cookie.
 - **403 "writes disabled":** Writes are on by default. If you see this
-  after starting `harness web`, something in `config.json` set
-  `dashboard.writes_enabled: false` — flip it back to `true` (or remove
-  the override entirely).
+  after starting `harness web start`, something in `config/config.json`
+  set `dashboard.writes_enabled: false` — flip it back to `true`
+  (or remove the override entirely).
 - **Browser refuses to set cookies on HTTP:** Default
   `SameSite=Strict` cookies work on `http://localhost` but some
   browsers tighten this. Use a real domain + HTTPS via a reverse
@@ -426,15 +449,15 @@ curl -fsS -H "Authorization: Bearer $DASH_TOKEN" \
 ### Diagnose
 ```bash
 # Check whether the dashboard is reachable from the harness:
-curl -fsS http://127.0.0.1:8729/      # adjust host:port
+curl -fsS http://127.0.0.1:9000/      # adjust host:port
 ```
 
 ### Fix
-- Default block is 600 s (10 minutes). After that the harness falls
+- Default block is 600 s (10 minutes), set by
+  `dashboard.hitl_webhook_timeout_seconds`. After that the harness falls
   back to the next configured channel — `StdinChannel` by default.
-- Tell the operator to answer faster, OR raise the dashboard's
-  internal block timeout (currently hardcoded in
-  `harness/dashboard.py:_handle_hitl_webhook`).
+  Raise the value in `config/config.json` if your operators routinely
+  need longer to respond.
 - If the dashboard process restarts while the harness's POST is in
   flight, the connection drops and the harness sees a connection
   reset; the gate falls through to stdin.
@@ -444,7 +467,7 @@ curl -fsS http://127.0.0.1:8729/      # adjust host:port
 ## 11. `~/.harness/web.db` corrupt — dashboard crashes on startup
 
 ### Symptom
-- `harness web` logs `sqlite3.DatabaseError: database disk image
+- `harness web start` logs `sqlite3.DatabaseError: database disk image
   is malformed`.
 - The dashboard UI shows 500 errors on `/run/schedule` or
   `/sessions/<id>/note`.
@@ -461,9 +484,9 @@ sqlite3 ~/.harness/web.db "PRAGMA integrity_check;"
   empty tables. Audit log + saved presets + queued chat notes are
   lost; runs and schedule state are unaffected.
   ```bash
-  systemctl stop harness-dashboard.service   # or kill the process
+  harness web stop                                  # or systemctl stop
   mv ~/.harness/web.db ~/.harness/web.db.broken
-  systemctl start harness-dashboard.service
+  harness web start                                 # or systemctl start
   ```
 - **Schema mismatch after harness upgrade:** Same fix — wipe and
   recreate. The schema is `CREATE TABLE IF NOT EXISTS` at module
@@ -495,14 +518,15 @@ for p in walker.walk('.'):
 ```
 
 ### Fix
-- **Never built:** Run `harness index build -r /path/to/workspace`.
+- **Never built:** Run `harness index build -w /path/to/workspace`.
 - **Built but the workspace path changed:** The index is keyed by
   workspace path SHA. Re-build it after moving the workspace.
-- **Chunker excludes the files you expect:** Edit
-  `repo_index.exclude_globs` / `repo_index.text_extensions` in
-  `config.json`. The default skips `node_modules`, `__pycache__`,
-  `.venv`, `dist`, `build`, `target`, lock files, and `.min.js` /
-  `.min.css`.
+- **`repo_index.enabled: false`:** Flip to `true` in
+  `config/config.json` so the planner injects retrieval results.
+- **Chunker excludes the files you expect:** Edit `repo_index.*` in
+  `config/config.json`. The defaults skip `node_modules`,
+  `__pycache__`, `.venv`, `dist`, `build`, `target`, lock files, and
+  `.min.js` / `.min.css`.
 - **`openai_embeddings` backend, missing API key:** Loader logs a
   WARN and falls back to TF-IDF. Set `OPENAI_API_KEY` or accept the
   TF-IDF backend.
@@ -531,7 +555,7 @@ print('exists:', os.path.isfile(memory_file_path(ws, cfg)))
 ```
 
 ### Fix
-- **`memory.enabled: false`:** Flip to `true` in `config.json`.
+- **`memory.enabled: false`:** Flip to `true` in `config/config.json`.
 - **Memory file written for a different repo identity:** The identity
   is `SHA256(git remote get-url origin)` when a remote is configured,
   else `SHA256(absolute workspace path)`. Cloning the same repo to a
@@ -541,7 +565,9 @@ print('exists:', os.path.isfile(memory_file_path(ws, cfg)))
   you want continuity.
 - **File grew past `inject_max_bytes`:** Older `## Session ...`
   entries drop from the injection (FIFO trim by section boundary).
-  Increase `memory.inject_max_bytes` if needed.
+  Increase `memory.inject_max_bytes` (default 8000) in
+  `config/config.json` if needed. `memory.max_bytes` (default 100000)
+  caps the file itself.
 
 ---
 
@@ -560,7 +586,7 @@ process itself was hard-restarted.
 ```bash
 # Look at the registry's view (this is what the UI renders)
 curl -fsS -H "Authorization: Bearer $DASH_TOKEN" \
-  http://127.0.0.1:8729/live | grep running
+  http://127.0.0.1:9000/live | grep running
 
 # Then check whether the PID actually exists:
 ps -p <PID-FROM-UI>
@@ -587,17 +613,24 @@ If a badge persists across multiple refreshes:
 
 ### Symptom
 
-`harness web start` exits with "another dashboard is already running"
-even though no process is listening on the port. The marker file at
-`~/.harness/web.lock` may have a malformed JSON body, a PID that
-doesn't exist, or stale ownership from a previous boot.
+`harness web start` exits with "a harness web instance is already
+running (pid X, ...)" even though no process is listening on the
+port. The marker file at `~/.harness/web.lock` may have a malformed
+JSON body, a PID that doesn't exist, or stale ownership from a
+previous boot.
+
+The marker has the schema
+`{pid, host, port, mode, log_path, started_at}` and is written
+atomically (tempfile + os.replace), so partial writes are rare —
+but SIGKILL on the dashboard or a host crash mid-shutdown leaves a
+stale marker pointing at a now-dead pid.
 
 ### Diagnose
 
 ```bash
 cat ~/.harness/web.lock     # what does the marker think is running?
 ps -p $(jq -r .pid ~/.harness/web.lock 2>/dev/null) || echo "stale"
-ss -tlnp | grep 8729        # is anything listening on the dashboard port?
+ss -tlnp | grep 9000        # is anything listening on the dashboard port?
 ```
 
 A stale marker has a PID that doesn't exist; a corrupt marker fails to
@@ -605,14 +638,19 @@ parse as JSON.
 
 ### Fix
 
+`harness web start` is supposed to auto-clean a stale marker (the
+dashboard checks `os.kill(pid, 0)` and treats `ProcessLookupError` as
+"prior process gone, marker is junk"). If the auto-clean isn't
+happening, remove the marker by hand:
+
 ```bash
 rm ~/.harness/web.lock
 harness web start
 ```
 
-The lock is a freshness hint, not a critical lock — the dashboard
-itself rebinds the socket on start, so a stray marker can't actually
-prevent a clean boot once removed.
+The marker is a freshness hint, not a critical lock — the dashboard
+itself rebinds the listening socket on start, so a stray marker can't
+actually prevent a clean boot once removed.
 
 ---
 
@@ -646,12 +684,72 @@ limit before invoking the dashboard:
 
 ```bash
 ulimit -n 8192
-harness web start
+harness web start --background yes
 ```
 
 For systemd, set `LimitNOFILE=` in the unit file. The Docker base
 image picks the host value at start — bump it on the host or set
 `--ulimit nofile=...` on `docker run`.
+
+---
+
+## 17. Startup `ConfigError` — harness exits 2 before any work happens
+
+### Symptom
+
+`harness run`, `resume`, `doctor`, `metrics`, `purge`, or any other
+subcommand exits immediately with a multi-line error to stderr that
+ends with `exit code 2`. No log file, no checkpoint, no LLM call —
+the harness refused to start because strict config validation found a
+problem.
+
+Common error openings:
+- `Canonical config not found at <path>` — the file is missing entirely.
+- `Invalid JSON in <path>: ...` — `config/config.json` doesn't parse.
+- `Unknown key 'X' at <path>` — a typo (e.g. `token_budget.hrad_cap_usd`).
+- `model_routing.planning_primary references unknown model 'Y'` — the
+  routing key points at a `models` entry that doesn't exist.
+- `Provider 'anthropic' requires env var 'ANTHROPIC_API_KEY' (not set)` —
+  a routed provider has no key in env or `models[].api_key`.
+- `product_spec_dir not set in config.json` — the mandatory key is
+  missing.
+
+### Diagnose
+
+```bash
+# Run doctor — its `config` row repeats the same error in its first slot
+# and skips every downstream check until config is clean:
+harness doctor
+
+# Verify the canonical path the harness resolves to:
+python -c "from harness.cli import _get_global_config_path; print(_get_global_config_path())"
+
+# Validate the JSON in isolation:
+python -m json.tool <myharness_root>/config/config.json > /dev/null
+```
+
+### Fix
+
+- **File missing:** re-run `python3 scripts/setup.py` (the bootstrap
+  script writes a minimal canonical config) or restore the file from
+  git.
+- **Typoed key:** the error names the offending key. Fix the
+  spelling — the harness knows the canonical key names and won't
+  silently no-op.
+- **Bad routing reference:** add the model under `models` or change
+  the routing key to a model that exists. The shipped config has
+  pre-populated entries you can copy-paste.
+- **Missing env var:** set the matching `{PROVIDER}_API_KEY` env var.
+  As a last resort, populate `models["<key>"].api_key` directly — but
+  don't commit live keys to git.
+- **Missing `product_spec_dir`:** add a top-level
+  `"product_spec_dir": "product_spec"` (or whatever folder name you
+  use), create the folder at your workspace root, and drop at least
+  one `.txt` file in.
+
+The dashboard's Configure Harness page runs the same validator and
+shows the same error inline, so non-CLI operators can fix and save
+without leaving the browser.
 
 ---
 
@@ -704,11 +802,18 @@ grep cache_prefix_drift "$last_log" | jq -c '{role, prev_hash, now_hash}'
 
 # Currently-pending HITL prompts (dashboard process must be alive):
 curl -fsS -H "Authorization: Bearer $DASH_TOKEN" \
-  http://127.0.0.1:8729/sessions/SESSION-ID-HERE/hitl/pending | jq .
+  http://127.0.0.1:9000/sessions/SESSION-ID-HERE/hitl/pending | jq .
 
 # Live SSE event stream for one session (Ctrl-C to stop):
 curl -fsS -N -H "Authorization: Bearer $DASH_TOKEN" \
-  http://127.0.0.1:8729/api/sessions/SESSION-ID-HERE/events
+  http://127.0.0.1:9000/api/sessions/SESSION-ID-HERE/events
+
+# Inspect the canonical config without loading it:
+jq 'del(.. | .api_key?)' <myharness_root>/config/config.json | less
+
+# Clear harness-owned Docker cache volumes (sandbox.cache_volumes=true):
+harness cache clear --dry-run        # preview
+harness cache clear --session-id <id>
 ```
 
 ## Escalation

@@ -888,11 +888,11 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 ### 5.40 Runtime-Extensible Skills Directory (FR-055)
 
-**Decision**: `register_builtin_skills(config)` walks `~/.harness/skills/` (or the path named by `skills.user_skills_dir`) and imports every non-`_`-prefixed `*.py` file via `importlib.util.spec_from_file_location`. Each file's module-level body runs at import time; calls to `harness.skills.register(MySkill(...))` populate the global registry. Per-file try/except wraps each import so one bad file logs and is skipped.
+**Decision**: `register_builtin_skills(config)` walks `~/.harness/user_skills/` (or the path named by `skills.user_skills_dir`) and imports every non-`_`-prefixed `*.py` file via `importlib.util.spec_from_file_location`. Each file's module-level body runs at import time; calls to `harness.skills.register(MySkill(...))` populate the global skill registry; calls to `harness.web_tools.register_backend(name, factory)` populate the web-search backend registry. Per-file try/except wraps each import so one bad file logs and is skipped. The legacy default `~/.harness/skills/` is honoured as a fallback when the new default doesn't exist but the legacy directory does — a one-time INFO log fires so operators know to migrate.
 
-**Rationale**: Pre-shipped style guides (`harness/skills/*.md`) are not user-extensible. Letting operators drop `*.py` files into a directory matches the Claude Code skills loader pattern and keeps the harness's plugin model boringly simple — no manifest files, no entry point declarations, just import + register.
+**Rationale**: Pre-shipped stack scaffolds (`harness/skills/*.md` inside the installed package) are reference documents the planner reads — not user-extensible. The user dir was originally also called `~/.harness/skills`, which collided with the bundled folder's name and led operators to drop `*.py` files in the wrong place. Renaming the user dir to `~/.harness/user_skills/` removes the ambiguity without forcing existing installs to migrate eagerly. Letting operators drop `*.py` files into the directory matches the Claude Code skills loader pattern and keeps the plugin model boringly simple — no manifest files, no entry point declarations, just import + register.
 
-**Trade-off**: Running arbitrary Python at startup is a foot-gun if `~/.harness/skills/` is world-writable; the doctor doesn't probe this. Operators are expected to treat the directory like their `~/.bashrc` — trusted source.
+**Trade-off**: Running arbitrary Python at startup is a foot-gun if `~/.harness/user_skills/` is world-writable; the doctor doesn't probe this. Operators are expected to treat the directory like their `~/.bashrc` — trusted source.
 
 ### 5.41 Repository Semantic Retrieval (FR-056)
 

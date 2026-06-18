@@ -655,8 +655,11 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     # Skill loader. user_skills_dir is the path the SkillRegistry walks at
     # startup to import user-supplied *.py files (each can call
-    # harness.skills.register to add tools / pipelines / sub-agents).
-    # Defaults to ~/.harness/skills.
+    # harness.skills.register to add tools / pipelines / sub-agents, or
+    # harness.web_tools.register_backend to plug in an alternative
+    # search backend). Defaults to ~/.harness/user_skills (the legacy
+    # ~/.harness/skills path is still honoured with a deprecation log
+    # so existing installs don't break).
     "skills": frozenset({"user_skills_dir"}),
     # Per-repo memory. enabled toggles the whole feature. dir is the
     # directory holding ``<repo_id>.md`` files. max_bytes is the FIFO

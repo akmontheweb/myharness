@@ -36,9 +36,16 @@ before re-entering the LLM conversation so fetched HTML can't smuggle
 API keys or other secrets back into the next dispatch.
 
 Default search backend is ``duckduckgo_lite`` — no API key required —
-because the goal is "works out of the box". For volume / enterprise
-usage swap in ``tavily`` / ``brave`` / ``serpapi`` via
-``web_tools.search_backend`` once the slice that adds them lands.
+because the goal is "works out of the box". Additional backends are
+pluggable via :func:`register_backend`: third-party packages ship a
+:class:`SearchBackend` subclass and call ``register_backend("tavily",
+TavilyBackend)`` at import time, then operators flip
+``web_tools.search_backend: "tavily"`` in ``config/config.json``. The
+:func:`harness.skills.load_user_skills_directory` walker imports every
+``*.py`` under ``skills.user_skills_dir`` at startup, so a user-supplied
+backend file that calls ``register_backend(...)`` at module level
+participates in the registry exactly like the built-ins. The harness
+itself never grows a dependency on any particular search provider.
 """
 
 from __future__ import annotations
@@ -293,20 +300,114 @@ class DuckDuckGoLiteBackend(SearchBackend):
         return results
 
 
+# ---------------------------------------------------------------------------
+# 3b. Pluggable backend registry
+# ---------------------------------------------------------------------------
+#
+# Built-ins register themselves below; user skills (loaded by
+# ``harness.skills.load_user_skills_directory``) can call ``register_backend``
+# at module top-level to add their own. Names are normalised to lowercase
+# so ``"Tavily"`` and ``"tavily"`` resolve to the same factory; aliases
+# share a single underlying factory entry.
+#
+# Factory signature: ``Callable[..., SearchBackend]`` accepting a
+# ``timeout_seconds`` keyword. Concrete backends should accept and honour
+# this kwarg so the operator's ``web_tools.timeout_seconds`` actually
+# bounds the HTTP call.
+
+_BackendFactory = Any  # Callable[..., SearchBackend] — kept loose for compat
+_BACKEND_REGISTRY: dict[str, _BackendFactory] = {}
+
+
+def register_backend(
+    name: str,
+    factory: _BackendFactory,
+    *,
+    aliases: Optional[list[str]] = None,
+) -> None:
+    """Register a search-backend factory under ``name`` (and optional
+    aliases). Idempotent: re-registering the same name overwrites the
+    prior factory and logs an INFO so operators see when a user-skill
+    file shadows a built-in.
+
+    The harness itself never knows about specific backends — every
+    addition (Tavily, Brave, SerpAPI, an in-house provider) flows
+    through this function. Built-ins call it once at module load;
+    user modules call it from their top-level on first import.
+
+    Args:
+        name: The canonical registry key. Lower-cased before storage.
+        factory: A callable that returns a :class:`SearchBackend` when
+            invoked with ``timeout_seconds=<float>``. Usually the
+            ``SearchBackend`` subclass itself.
+        aliases: Optional alternative names that should resolve to the
+            same factory (e.g. ``["ddg", "duckduckgo"]`` for the DDG
+            built-in).
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("backend name must be a non-empty string")
+    key = name.strip().lower()
+    if key in _BACKEND_REGISTRY and _BACKEND_REGISTRY[key] is not factory:
+        logger.info(
+            "[web_tools] backend %r re-registered (factory %r replaces %r).",
+            key, factory, _BACKEND_REGISTRY[key],
+        )
+    _BACKEND_REGISTRY[key] = factory
+    for alias in aliases or ():
+        if not isinstance(alias, str) or not alias.strip():
+            continue
+        _BACKEND_REGISTRY[alias.strip().lower()] = factory
+
+
+def unregister_backend(name: str) -> None:
+    """Remove ``name`` from the registry if present. Idempotent.
+    Primarily for tests; production code never calls this."""
+    _BACKEND_REGISTRY.pop(name.strip().lower(), None)
+
+
+def registered_backends() -> list[str]:
+    """Return the sorted list of currently-registered backend names
+    (including aliases). Used by error messages and ``harness doctor``
+    so the operator sees what's actually available."""
+    return sorted(_BACKEND_REGISTRY.keys())
+
+
 def make_search_backend(
     name: str, *, timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS
 ) -> SearchBackend:
-    """Resolve a backend name to an instance. ``duckduckgo_lite`` is the
-    only one shipped today; tavily / brave / serpapi land in a follow-up
-    slice.
+    """Resolve a backend name to a fresh :class:`SearchBackend` instance.
+
+    Lookup is registry-driven: built-ins register at module load,
+    user-skill modules register at startup via the skill walker, and
+    third-party packages register at import time. The harness has no
+    hardcoded knowledge of any specific provider beyond the
+    ``duckduckgo_lite`` default it ships for out-of-the-box usability.
+
+    Raises ``ValueError`` listing every registered name when ``name``
+    doesn't resolve.
     """
-    if name in ("duckduckgo_lite", "ddg", "duckduckgo"):
-        return DuckDuckGoLiteBackend(timeout_seconds=timeout_seconds)
-    raise ValueError(
-        f"Unknown search backend {name!r}. "
-        f"Supported: duckduckgo_lite. "
-        f"Tavily / Brave / SerpAPI backends are planned for a follow-up slice."
-    )
+    key = (name or "").strip().lower()
+    factory = _BACKEND_REGISTRY.get(key)
+    if factory is None:
+        registered = registered_backends()
+        raise ValueError(
+            f"Unknown search backend {name!r}. "
+            f"Registered: {registered or '<none>'}. "
+            f"Add one by calling harness.web_tools.register_backend(...) "
+            f"from a user-skill file under skills.user_skills_dir."
+        )
+    return factory(timeout_seconds=timeout_seconds)
+
+
+# Built-in registration — happens once at module load. DDG keeps its
+# legacy aliases so existing configs that say "ddg" or "duckduckgo"
+# keep resolving. Any future built-in added here follows the same
+# pattern; nothing else in the file needs to change to add one.
+register_backend(
+    "duckduckgo_lite",
+    DuckDuckGoLiteBackend,
+    aliases=["ddg", "duckduckgo"],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -499,45 +600,139 @@ async def _web_search_impl(
     max_results: Optional[int] = None,
     _backend_factory: Optional[Any] = None,
 ) -> dict[str, Any]:
+    """Run a web search through the configured backend chain.
+
+    Dispatch order is whatever ``cfg.active_backends()`` returns:
+    the primary named by ``web_tools.search_backend`` first, then
+    every enabled entry from ``web_tools.backends`` in the order
+    the operator wrote them in ``config/config.json``. Each backend
+    is tried in turn; on **exception** (HTTP error, quota exhausted,
+    missing API key, unknown registered name) the impl logs the
+    failure and moves on. The first backend that returns *without
+    raising* wins — including the empty-results case, because zero
+    hits is a legitimate "nothing matched this query" outcome rather
+    than a backend failure (falling back on empty results would
+    silently double the cost on hard queries and hide the
+    "nothing found" signal from the LLM).
+
+    No backend is ever pinned in code; every name in
+    ``active_backends()`` flows from the operator's config.
+
+    Returns one of:
+      - ``{"query", "backend", "results"}`` on success — ``backend``
+        names the entry that actually served, which is the primary
+        unless a fallback fired.
+      - ``{"query", "backend", "results", "fallback_from"}`` when a
+        fallback served — ``fallback_from`` lists every prior
+        backend that errored, in attempt order, so the operator
+        and the LLM can both see what gave up.
+      - ``{"error": "..."}`` when every active backend errors, the
+        chain is empty, or the call is malformed.
+    """
     if not cfg.enabled:
         return {"error": "web_tools disabled in config (web_tools.enabled=false)"}
     if not isinstance(query, str) or not query.strip():
         return {"error": "query must be a non-empty string"}
     cap = int(max_results) if max_results is not None else cfg.max_results
     cap = max(1, min(cap, cfg.max_results))
-    try:
-        factory = _backend_factory or make_search_backend
-        backend = factory(cfg.search_backend, timeout_seconds=cfg.timeout_seconds)
-        results = await backend.search(query, max_results=cap)
-    except ValueError as exc:
-        # Backend name unknown.
-        return {"error": str(exc)}
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("[web_search] unexpected error for query=%r", query)
-        return {"error": f"unexpected error: {exc}"}
-    return {
-        "query": query,
-        "backend": cfg.search_backend,
-        "results": [r.to_dict() for r in results],
-    }
+
+    factory = _backend_factory or make_search_backend
+    chain = cfg.active_backends()
+    if not chain:
+        return {"error": (
+            "no active search backends configured — set "
+            "web_tools.search_backend to a registered name (or add "
+            "enabled entries under web_tools.backends)."
+        )}
+
+    failures: list[tuple[str, str]] = []   # (backend_name, error_str)
+    for entry in chain:
+        name = entry.get("search_backend") or ""
+        if not name:
+            continue
+        try:
+            backend = factory(name, timeout_seconds=cfg.timeout_seconds)
+            results = await backend.search(query, max_results=cap)
+        except ValueError as exc:
+            # Registry miss: name not in _BACKEND_REGISTRY. Likely a
+            # config typo in this entry. Don't kill the chain — a sibling
+            # entry may resolve fine.
+            failures.append((name, str(exc)))
+            logger.warning(
+                "[web_search] backend %r unresolved (%s); trying next entry.",
+                name, exc,
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001
+            # Live failure (HTTP, quota, missing key, network). Log with
+            # traceback so the cause is visible in ~/.harness/logs and
+            # fall through to the next entry in the chain.
+            failures.append((name, f"{type(exc).__name__}: {exc}"))
+            logger.exception(
+                "[web_search] backend %r failed for query=%r; trying next entry.",
+                name, query,
+            )
+            continue
+
+        # First non-raising backend wins — including the empty-results
+        # case (see docstring rationale). Annotate the response with
+        # any prior failures so the operator can see fallback fired.
+        payload: dict[str, Any] = {
+            "query": query,
+            "backend": name,
+            "results": [r.to_dict() for r in results],
+        }
+        if failures:
+            payload["fallback_from"] = [
+                {"backend": fname, "error": ferr} for fname, ferr in failures
+            ]
+            logger.warning(
+                "[web_search] served from fallback backend %r after %d "
+                "prior failure(s): %s",
+                name, len(failures),
+                ", ".join(f"{fname}({ferr})" for fname, ferr in failures),
+            )
+        return payload
+
+    # Exhausted the chain — every active backend raised. Surface an
+    # aggregate error so the LLM can see what was tried and decide
+    # whether to retry, reformulate, or proceed without web context.
+    detail = "; ".join(f"{fname}: {ferr}" for fname, ferr in failures) \
+        or "no backends attempted"
+    return {"error": f"all configured search backends failed — {detail}"}
 
 
 class WebSearchSkill(ToolSkill):
-    """Search the web via the configured backend (default
-    ``duckduckgo_lite``). Returns a list of ``{title, url, snippet}``
-    results so the LLM can pick a URL and ``web_fetch`` it.
+    """Search the web via the configured backend chain (primary first,
+    then any operator-listed fallbacks). Returns a list of
+    ``{title, url, snippet}`` results so the LLM can pick a URL and
+    ``web_fetch`` it. The harness has no hardcoded backend — every
+    name flows from ``config/config.json``.
     """
 
     SKILL_NAME = "web_search"
 
     def __init__(self, cfg: WebToolsConfig):
+        primary = cfg.search_backend or "<unset>"
+        fallback_names = [
+            str(e.get("search_backend") or "")
+            for e in cfg.active_backends()[1:]
+            if e.get("search_backend")
+        ]
+        if fallback_names:
+            chain_hint = (
+                f"Primary backend: {primary!r}; fallback chain: "
+                f"{fallback_names}. The harness tries each in config "
+                f"order until one returns without raising."
+            )
+        else:
+            chain_hint = f"Primary backend: {primary!r} (no fallbacks configured)."
         schema = SkillSchema(
             name=self.SKILL_NAME,
             description=(
                 "Search the web and return a list of result titles, URLs, and "
                 "snippets. Use to discover authoritative sources before "
-                "fetching one with web_fetch. Default backend: "
-                f"{cfg.search_backend!r}."
+                f"fetching one with web_fetch. {chain_hint}"
             ),
             skill_type=SkillType.TOOL,
             parameters=[
@@ -551,9 +746,11 @@ class WebSearchSkill(ToolSkill):
                 ),
             ],
             returns_description=(
-                "Object with `query`, `backend`, and `results` "
-                "(list of `{title, url, snippet}`). On failure, `error` is "
-                "set instead of `results`."
+                "Object with `query`, `backend`, and `results` (list of "
+                "`{title, url, snippet}`). When a fallback served, "
+                "`fallback_from` lists the prior backends that errored. "
+                "On total failure (every active backend raised), `error` "
+                "names the chain and the per-backend error."
             ),
             tags=["web", "research", "search"],
         )

@@ -141,18 +141,18 @@
     "llm_dispatch": {
         "max_tokens_default": 16384,
         "max_tokens_per_role": {
-            "planning": 4096,
+            "planning": 16384,
             "patching": 16384,
-            "repair": 8192,
-            "doc_reviewer": 4096,
+            "repair": 16384,
+            "doc_reviewer": 16384,
             "code_reviewer": 16384
         },
         "continue_on_length": {
-            "planning": false,
+            "planning": true,
             "patching": true,
-            "repair": false,
-            "doc_reviewer": false,
-            "code_reviewer": false
+            "repair": true,
+            "doc_reviewer": true,
+            "code_reviewer": true
         },
         "prompt_cache_enabled": true
     },
@@ -172,6 +172,18 @@
     "lintgate": {
         "format_modified_files": false,
         "strict_missing_formatter": false
+    },
+    "_security_comment": "Security-scan gate policy (loaded by SecurityScanPolicy.from_config in harness/security.py). block_on / warn_on / ignore_below partition findings by severity; the harness routes block_on findings to repair_node and only logs warn_on. scanners selects which of {gitleaks, bandit, semgrep, trivy} actually run. allowlist_rules silently drops findings whose rule_id matches — use this to suppress noisy or false-positive rules that the LLM cannot meaningfully fix (e.g. a ws:// example inside a markdown spec that the patcher's allowlist forbids editing anyway, creating an infinite repair loop). max_findings_to_route_to_repair caps the number of findings handed to the repair LLM in one round so a 200-finding semgrep run doesn't drown the dispatch. The CommandValidator (allowed_commands / blocked_patterns / allow_all_commands / allow_network_in_build) shares this block; only its defaults are documented in harness/security.py.",
+    "security": {
+        "block_on": ["critical", "high"],
+        "warn_on": ["medium"],
+        "ignore_below": "low",
+        "scanners": ["gitleaks", "bandit", "semgrep", "trivy"],
+        "_allowlist_rules_comment": "Rule IDs to drop silently before block/warn partitioning. Add a rule here when the LLM cannot fix the flagged location (e.g. an example in docs/ that the patcher's allowlist refuses to edit) and a real repair loop would spin forever. The string must match the scanner's rule_id exactly — grep for `Rule: <id>` in ~/.harness/debug/<session>_*_repair_*.txt to find it.",
+        "allowlist_rules": [
+            "javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket"
+        ],
+        "max_findings_to_route_to_repair": 10
     },
     "_speculative_comment": "Configuration-driven speculative compilation (#12 rebuild). Six independent strategy axes; the shipped defaults aim for positive ROI on typical workloads. (1) trigger decides WHEN speculative engages: 'always' fires every patching pass (high cost); 'first_attempt_only' is the legacy default; 'after_n_repair_failures' (DEFAULT) holds back until sequential repair has stalled \u2014 the high-value moment; 'manual' fires only when state.force_speculative is set. n_repair_failures_threshold (default 2) is the gate for the after_n_repair_failures trigger. (2) diversity_mode decides HOW variants differ: 'temperature' spreads temps over one model (legacy); 'prompt' fixes the model but varies a per-variant system-prompt style; 'model' (DEFAULT) routes each variant through a different model from variant_models \u2014 real architectural independence beats temperature noise; 'mixed' combines models and styles. (3) cost_strategy decides the COST shape: 'equal_cost' (legacy 3x cost); 'cheap_first_sequential' (DEFAULT) dispatches the cheap_model first, then expensive_model only if needed \u2014 expected cost ~1.1x; 'cheap_parallel_then_expensive' fires all-but-one cheap and one expensive in parallel; 'all_cheap' uses cheap_model for every variant; 'gradient_low_to_high' assigns ``variant_models`` in monotonic cost order (variant 0 \u2192 variant_models[0], \u2026, variant N \u2192 variant_models[N]) so operators can distribute speculative runs across a low\u2192high cost ladder of LLMs without modulo cycling. (4) selection_strategy: 'first_pass' (DEFAULT, alias 'first_success'); 'fewest_changes'; 'voted' dispatches voting.n_judges adversarial reviewers per passing variant (reuses fanout #11) and picks the highest-vote-rate; 'all_pass' requires every variant to pass. (5) salvage_strategy: 'none' (DEFAULT \u2014 fall back to sequential repair against the untouched workspace, strictly safer than the legacy merge); 'fewest_errors'; 'voted_partial'; 'merge' (legacy behaviour; documented failure mode of incoherent workspaces). (6) num_variants \u2208 [1, 10]; max_concurrency \u2208 [1, 10] caps parallelism; temperature \u2208 [0.0, 1.5]. variant_models is a list of model keys used by diversity_mode \u2208 {model, mixed}. variant_prompt_styles is a list of styles (e.g. 'minimal-diff', 'balanced', 'thorough') or names from the built-in style library used by diversity_mode \u2208 {prompt, mixed}. expensive_model + cheap_model are referenced by the cost_strategy axes. Legacy configs without the new keys auto-upgrade to {trigger: first_attempt_only, diversity_mode: temperature, cost_strategy: equal_cost, salvage_strategy: merge} with a one-time warning so existing operators see exactly today's behaviour.",
     "speculative": {
@@ -218,17 +230,19 @@
     "patcher": {
         "enforce_read_before_edit": false
     },
-    "_web_tools_comment": "Web research tools (web_fetch + web_search) exposed to the planner / patcher / repair LLM via text-DSL blocks like <<<WEB_FETCH url=\"...\">>> and <<<WEB_SEARCH query=\"...\">>>. enabled=false (default) keeps the skills unregistered so the harness behaves byte-identically to pre-tool runs. Flip to true to let the planner pull documentation, RFCs, and search results before deciding on an implementation. max_bytes caps response size per fetch (default 200 KB \u2248 50 K tokens). max_results caps search results. search_backend chooses the search provider \u2014 only 'duckduckgo_lite' ships today (no API key required); Tavily / Brave / SerpAPI land in a follow-up. allow_private_ips opens the SSRF guard for trusted internal targets (e.g. an internal docs portal on 10.0.0.0/8) \u2014 leave false on multi-tenant or untrusted-prompt hosts. timeout_seconds bounds each HTTP call. tool_call_cap_per_dispatch caps how many tool rounds the LLM may run inside a single graph-node call before the interceptor forces it to proceed.",
+    "_web_tools_comment": "Web research tools (web_fetch + web_search) exposed to the planner / patcher / repair LLM via text-DSL blocks like <<<WEB_FETCH url=\"...\">>> and <<<WEB_SEARCH query=\"...\">>>. enabled=false (default) keeps the skills unregistered so the harness behaves byte-identically to pre-tool runs. Flip to true to let the planner pull documentation, RFCs, and search results before deciding on an implementation. max_bytes caps response size per fetch (default 200 KB \u2248 50 K tokens). max_results caps search results. search_backend names the PRIMARY search provider registered in harness/web_tools.py's backend registry \u2014 the harness ships ONLY 'duckduckgo_lite' as a built-in (with 'ddg' / 'duckduckgo' aliases), no API key required. Additional providers (Tavily, Brave, SerpAPI, in-house) are pluggable via the user-skills directory: drop a *.py file under ~/.harness/user_skills/ that subclasses harness.web_tools.SearchBackend and calls harness.web_tools.register_backend(\"tavily\", TavilyBackend) at module top-level. The harness itself has zero dependency on any specific provider. After registration, set search_backend to the registered name (e.g. \"tavily\") and api_key_env to the env var holding the provider's key (e.g. \"TAVILY_API_KEY\"). An unknown name returned by a backend lookup falls through to the next configured backend (see ``backends`` below) rather than aborting the whole call. The PRIMARY is dispatched first; if it raises (HTTP error, quota, missing key, network outage, unresolved name) the harness walks the ``backends`` array in declared order until one returns without raising. Empty results are treated as success \u2014 the chain stops on the first non-raising backend. When every active backend errors, the response is an aggregate ``{\"error\": ...}`` naming each attempted backend and its cause so the LLM can decide whether to retry, reformulate, or proceed without web context. allow_private_ips opens the SSRF guard for trusted internal targets (e.g. an internal docs portal on 10.0.0.0/8) \u2014 leave false on multi-tenant or untrusted-prompt hosts. timeout_seconds bounds each HTTP call (applied per backend, not for the whole chain). tool_call_cap_per_dispatch caps how many tool rounds the LLM may run inside a single graph-node call before the interceptor forces it to proceed.",
     "web_tools": {
-        "enabled": false,
+        "enabled": true,
         "max_bytes": 200000,
         "max_results": 5,
-        "search_backend": "duckduckgo_lite",
-        "api_key_env": "",
+        "_search_backend_comment": "Name of the primary search backend. Must match a name registered in harness/web_tools.py's _BACKEND_REGISTRY \u2014 either a built-in ('duckduckgo_lite' / 'ddg' / 'duckduckgo') or one added by a user-skill file calling register_backend(). To switch providers, change the string and (re)start the harness; for long-running daemons (`harness web start`, `harness schedule run`) restart the process so the new config is read.",
+        "search_backend": "tavily",
+        "_api_key_env_comment": "Name of the env var holding the API key for the primary backend. Ignored by built-in 'duckduckgo_lite' (no key needed). User-supplied backends are expected to read this name and resolve the value at dispatch time via os.environ.get(). Never put the live key here \u2014 only the env var NAME.",
+        "api_key_env": "TAVILY_API_KEY",
         "allow_private_ips": false,
         "timeout_seconds": 20,
         "tool_call_cap_per_dispatch": 3,
-        "_backends_comment": "Optional additional search-backend entries surfaced in the configure-page web-tools card with + Add. Each entry: {name, enabled, search_backend, api_key_env}. The top-level scalars above describe the PRIMARY backend; ``active_backends()`` walks primary first then every enabled entry from this list.",
+        "_backends_comment": "Ordered fallback chain for the web_search skill. The primary backend is the top-level ``search_backend`` above; every enabled entry in this list is tried in order AFTER the primary if (and only if) the primary raises (HTTP error, quota exhausted, missing API key, unresolved name). Empty results from a backend are NOT treated as failure — zero hits is a legitimate 'nothing matched' outcome and the chain stops there to avoid silently doubling cost on hard queries and hiding the no-match signal from the LLM. Each entry: {name, enabled, search_backend, api_key_env}. ``name`` is an operator label shown in logs / dashboard; ``search_backend`` is the registered name (must resolve through the same _BACKEND_REGISTRY as the primary, built-in or user-supplied via register_backend()); ``api_key_env`` is the env var holding the provider's key. Set ``enabled: false`` to keep an entry in the config but skip it at dispatch. Example chain — Tavily primary with DDG as the cheap fallback: ``backends: [{name: \"ddg-fallback\", enabled: true, search_backend: \"duckduckgo_lite\", api_key_env: \"\"}]``. When a fallback fires, the response includes a ``fallback_from`` field listing every backend that errored before the one that served, so the LLM and operator can both see what gave up.",
         "backends": []
     },
     "_mcp_comment": "Model Context Protocol client pool. When enabled=true, each entry in 'servers' spawns as a subprocess (stdio transport \u2014 HTTP/SSE is a follow-up slice) and the harness registers each advertised tool into the SkillRegistry as mcp__<server>__<tool>. The planner / patcher / repair LLM invokes them via <<<MCP_CALL server=\"x\" tool=\"y\" args='{...}'>>> blocks intercepted in graph._run_tool_loop. Default false keeps the harness byte-identical to pre-MCP runs. tool_call_timeout_seconds bounds every JSON-RPC tools/call. command_allowlist EXTENDS the built-in safe allowlist (npx, npm, node, python, python3, uvx, pipx, docker) with operator-trusted binaries \u2014 add a binary basename here to whitelist it. allow_local_filesystem_servers gates the official @modelcontextprotocol/server-filesystem (and lookalikes) because filesystem MCP bypasses the build sandbox and grants the LLM raw host I/O \u2014 must be explicit. result_max_bytes caps each tools/call response payload pushed back into the LLM conversation (default 200 KB). servers is a list of {name, transport, command, env, api_key_env} \u2014 see harness/mcp_client.py:McpServerConfig for the per-field contract. A failed server start is logged and skipped \u2014 one bad server never blocks the rest of the pool.",
@@ -259,9 +273,9 @@
             }
         ]
     },
-    "_skills_comment": "Runtime-extensible skill loader. user_skills_dir is the path the SkillRegistry walks at startup; each *.py file under it is imported and may call harness.skills.register(MySkill(...)) to add a ToolSkill / PipelineSkill / SubAgentSkill that the planner can invoke. Failures (syntax error, missing import) are logged and skipped \u2014 one bad file doesn't take down startup. Default ~/.harness/skills.",
+    "_skills_comment": "Runtime-extensible skill loader. user_skills_dir is the path the SkillRegistry walks at startup; each *.py file under it is imported and may call harness.skills.register(MySkill(...)) to add a ToolSkill / PipelineSkill / SubAgentSkill that the planner can invoke, OR harness.web_tools.register_backend(name, factory) to plug in an alternative web-search backend (Tavily, Brave, SerpAPI, in-house) without forking the harness. Failures (syntax error, missing import) are logged and skipped \u2014 one bad file doesn't take down startup. Default ~/.harness/user_skills (named to disambiguate from the bundled markdown scaffolds at harness/skills/ inside the installed package). Existing installs that still have *.py files at the legacy ~/.harness/skills path keep working: the loader falls back to that path when the new default is empty and logs a one-time deprecation INFO.",
     "skills": {
-        "user_skills_dir": "~/.harness/skills"
+        "user_skills_dir": "~/.harness/user_skills"
     },
     "_memory_comment": "Per-repository session memory. When enabled=true (default), the planner reads the prior-session log (~/.harness/memory/<repo_id>.md) at the start of every harness run and injects the most recent entries as system context, and cmd_run appends a fresh entry on exit. Repo identity = SHA-256 of `git remote get-url origin` if available, else the workspace path. max_bytes caps the file itself (FIFO trim drops oldest sections). inject_max_bytes caps what the planner sees on each run.",
     "memory": {
@@ -317,23 +331,23 @@
         "_network_comment": "Sector 1: NETWORK TOPOLOGY. Org-wide answers for reverse proxy, TLS, public ports, host-side port allocation, Docker networking, and DNS.",
         "network": {
             "_reverse_proxy_comment": "Reverse proxy that fronts the app and terminates TLS. Possible values: caddy | nginx | traefik | envoy | haproxy | none.",
-            "reverse_proxy": "caddy",
+            "reverse_proxy": "none",
             "_tls_strategy_comment": "How TLS certificates are obtained and renewed. Possible values: letsencrypt | self-signed | manual | none.",
-            "tls_strategy": "letsencrypt",
+            "tls_strategy": "none",
             "_tls_contact_email_comment": "Email handed to the ACME provider for expiry notices. Free text; REQUIRED when tls_strategy=letsencrypt, ignored otherwise.",
-            "tls_contact_email": "ops@example.com",
+            "tls_contact_email": "",
             "_public_http_port_comment": "Host port that serves plain HTTP (used by ACME HTTP-01 challenges and HTTP→HTTPS redirects). Integer 1–65535; typically 80, sometimes 8080 on rootless hosts.",
             "public_http_port": 80,
             "_public_https_port_comment": "Host port that serves HTTPS. Integer 1–65535; typically 443, sometimes 8443 on rootless hosts.",
             "public_https_port": 443,
             "_host_port_range_comment": "Range [min, max] (two integers, 1–65535, min<max) of ephemeral host ports the harness may auto-allocate when publishing per-service containers. Pick a band that does not collide with other tenants on the host.",
-            "host_port_range": [8000, 8999],
+            "host_port_range": [8000, 9000],
             "_docker_network_mode_comment": "Docker network driver applied to the project compose stack. Possible values: bridge | host | overlay | macvlan | none.",
             "docker_network_mode": "bridge",
             "_primary_domain_comment": "Fully-qualified domain name where the deployed app is reachable from the public internet. Free text (FQDN); used as the SAN in the issued certificate and as the default vhost on the reverse proxy.",
-            "primary_domain": "app.example.com",
+            "primary_domain": "localhost",
             "_dns_provider_comment": "DNS provider whose API the harness may call for DNS-01 challenges and record management. Possible values: cloudflare | route53 | gcp | azure | manual | none.",
-            "dns_provider": "cloudflare"
+            "dns_provider": "none"
         },
         "_storage_comment": "Sector 2: DATA & STORAGE PERSISTENCE. Org-wide answers for volume layout, container UID/GID convention, backup destination, and multi-host storage. Stack-specific volume paths (e.g. /var/lib/postgresql/data) are still derived from telemetry — this section captures the policy decisions that wrap them.",
         "storage": {

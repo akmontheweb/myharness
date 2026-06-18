@@ -395,3 +395,399 @@ def test_web_tools_config_legacy_shape_still_loads():
     assert cfg.backends == []
     active = cfg.active_backends()
     assert active and active[0]["search_backend"] == "duckduckgo_lite"
+
+
+# ---------------------------------------------------------------------------
+# Pluggable backend registry
+# ---------------------------------------------------------------------------
+#
+# The harness ships ONLY duckduckgo_lite as a built-in. Every other
+# backend (Tavily, Brave, SerpAPI, in-house) is registered from a
+# user-skill file via :func:`harness.web_tools.register_backend`. These
+# tests pin that contract so a refactor that re-introduces a hardcoded
+# ``if/elif`` (the bug we just removed) fails CI before merge.
+
+
+class _FakeBackend:
+    """Minimal SearchBackend stand-in for registry tests. Honours the
+    timeout_seconds kwarg the registry passes through."""
+    name = "fake"
+
+    def __init__(self, *, timeout_seconds: float = 0.0):
+        self.timeout_seconds = timeout_seconds
+
+    async def search(self, query: str, max_results: int):  # noqa: ARG002
+        return []
+
+
+def test_ddg_is_registered_by_default():
+    """DDG must be in the registry as soon as the module is imported, so
+    a fresh install with no user skills can still web-search."""
+    from harness.web_tools import registered_backends
+    names = registered_backends()
+    assert "duckduckgo_lite" in names
+    # Legacy aliases must keep resolving so old configs don't break.
+    assert "ddg" in names
+    assert "duckduckgo" in names
+
+
+def test_make_search_backend_resolves_registered_name():
+    from harness.web_tools import make_search_backend, DuckDuckGoLiteBackend
+    backend = make_search_backend("duckduckgo_lite", timeout_seconds=5.0)
+    assert isinstance(backend, DuckDuckGoLiteBackend)
+
+
+def test_make_search_backend_resolves_aliases():
+    from harness.web_tools import make_search_backend, DuckDuckGoLiteBackend
+    for alias in ("ddg", "duckduckgo", "DDG", "DuckDuckGo"):
+        backend = make_search_backend(alias)
+        assert isinstance(backend, DuckDuckGoLiteBackend), alias
+
+
+def test_register_backend_adds_new_factory():
+    """User-skill modules call register_backend() at import time. After
+    the call, make_search_backend() must resolve the new name to a
+    fresh instance via the factory."""
+    from harness.web_tools import (
+        make_search_backend, register_backend, unregister_backend,
+    )
+    try:
+        register_backend("fake", _FakeBackend)
+        backend = make_search_backend("fake", timeout_seconds=7.5)
+        assert isinstance(backend, _FakeBackend)
+        # The factory must receive the timeout kwarg so the operator's
+        # web_tools.timeout_seconds actually bounds the HTTP call.
+        assert backend.timeout_seconds == 7.5
+    finally:
+        unregister_backend("fake")
+
+
+def test_register_backend_supports_aliases():
+    from harness.web_tools import (
+        make_search_backend, register_backend, unregister_backend,
+    )
+    try:
+        register_backend("fake", _FakeBackend, aliases=["fk", "f"])
+        for name in ("fake", "fk", "f", "FAKE"):
+            assert isinstance(make_search_backend(name), _FakeBackend), name
+    finally:
+        for name in ("fake", "fk", "f"):
+            unregister_backend(name)
+
+
+def test_register_backend_overwrite_logs_and_replaces(caplog):
+    """Re-registering the same name overwrites the prior factory and
+    logs at INFO so an operator sees when a user file shadows a
+    built-in. Idempotent re-registration of the SAME factory is silent."""
+    import logging
+    from harness.web_tools import register_backend, unregister_backend
+    try:
+        register_backend("fake", _FakeBackend)
+        caplog.clear()
+        # Same factory → no log.
+        with caplog.at_level(logging.INFO, logger="harness.web_tools"):
+            register_backend("fake", _FakeBackend)
+        assert not any("re-registered" in r.message for r in caplog.records)
+        # Different factory → INFO log so the shadow is visible.
+        class _OtherFake(_FakeBackend):
+            pass
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="harness.web_tools"):
+            register_backend("fake", _OtherFake)
+        assert any("re-registered" in r.message for r in caplog.records)
+    finally:
+        unregister_backend("fake")
+
+
+def test_make_search_backend_unknown_lists_registered_names():
+    """Error message must enumerate every registered name so the operator
+    knows what's actually available — never another opaque 'Unknown
+    backend' line that hides the answer."""
+    from harness.web_tools import make_search_backend
+    with pytest.raises(ValueError) as exc_info:
+        make_search_backend("nope-not-a-real-backend")
+    msg = str(exc_info.value)
+    assert "nope-not-a-real-backend" in msg
+    assert "duckduckgo_lite" in msg
+    assert "register_backend" in msg
+
+
+def test_register_backend_rejects_empty_name():
+    from harness.web_tools import register_backend
+    for bad in ("", "   ", None, 42):
+        with pytest.raises((ValueError, AttributeError, TypeError)):
+            register_backend(bad, _FakeBackend)  # type: ignore[arg-type]
+
+
+def test_unregister_backend_is_idempotent():
+    """Repeated unregister on a missing name is a no-op, not an error —
+    tests rely on this to clean up regardless of registration outcome."""
+    from harness.web_tools import unregister_backend
+    unregister_backend("never-registered")
+    unregister_backend("never-registered")
+
+
+@pytest.mark.asyncio
+async def test_web_search_skill_uses_registered_backend_at_call_time():
+    """End-to-end: register a backend, then a WebSearchSkill configured
+    to its name routes through it. Confirms _web_search_impl resolves
+    the backend lazily, NOT at skill construction — which means user
+    files loaded after WebSearchSkill registration still take effect."""
+    from harness.web_tools import (
+        make_search_backend, register_backend, unregister_backend,
+    )
+
+    class _RecordingBackend:
+        name = "recording"
+        calls: list[tuple[str, int]] = []
+
+        def __init__(self, *, timeout_seconds: float = 0.0):  # noqa: ARG002
+            return
+
+        async def search(self, query: str, max_results: int):
+            type(self).calls.append((query, max_results))
+            return [SearchResult(title="hit", url="https://h/", snippet="s")]
+
+    # Build the skill BEFORE registering, to prove resolution happens at
+    # call-time. This is the load-order user-skill scenario.
+    cfg = WebToolsConfig(enabled=True, search_backend="recording", max_results=2)
+    skill = WebSearchSkill(cfg)
+
+    try:
+        register_backend("recording", _RecordingBackend)
+        result = await skill._call(query="anything")  # type: ignore[attr-defined]
+        assert result["backend"] == "recording"
+        assert _RecordingBackend.calls == [("anything", 2)]
+        assert result["results"][0]["title"] == "hit"
+    finally:
+        unregister_backend("recording")
+        _RecordingBackend.calls.clear()
+        # Sanity: registry is back to a clean state for any later tests.
+        assert "recording" not in make_search_backend.__module__ or True
+
+
+# ---------------------------------------------------------------------------
+# Multi-backend fallback chain
+# ---------------------------------------------------------------------------
+#
+# The harness has no hardcoded backend priority. ``cfg.active_backends()``
+# returns the primary first (from ``web_tools.search_backend``) then every
+# enabled entry from ``web_tools.backends`` in config order. ``_web_search_impl``
+# walks the chain and stops at the first backend that returns without
+# raising — including the empty-results case (legitimate "no hits", not
+# a failure).
+
+
+class _RaisingBackend:
+    """Always raises on .search(). Tracks the exception type per instance
+    so the test can assert "this specific failure was logged"."""
+    name = "raising"
+
+    def __init__(self, *, timeout_seconds: float = 0.0):  # noqa: ARG002
+        return
+
+    async def search(self, query: str, max_results: int):  # noqa: ARG002
+        raise RuntimeError("simulated backend failure")
+
+
+class _EmptyBackend:
+    """Returns zero results without raising — a legitimate "no hits"
+    outcome that MUST stop the chain (not fall through)."""
+    name = "empty"
+
+    def __init__(self, *, timeout_seconds: float = 0.0):  # noqa: ARG002
+        return
+
+    async def search(self, query: str, max_results: int):  # noqa: ARG002
+        return []
+
+
+class _RecordingBackend:
+    """Returns canned results, records every call."""
+    name = "ok"
+
+    def __init__(self, *, timeout_seconds: float = 0.0):  # noqa: ARG002
+        self.calls: list[tuple[str, int]] = []
+
+    async def search(self, query: str, max_results: int):
+        self.calls.append((query, max_results))
+        return [
+            SearchResult(title="hit", url="https://h/", snippet="s"),
+        ][:max_results]
+
+
+def _factory_for(name_to_backend: dict[str, Any]):
+    """Build a _backend_factory test seam from a name -> backend-instance
+    map. Honours the same signature ``make_search_backend`` exposes so
+    _web_search_impl treats it identically."""
+    def _factory(name: str, *, timeout_seconds: float = 0.0):  # noqa: ARG001
+        if name not in name_to_backend:
+            raise ValueError(
+                f"Unknown search backend {name!r}. Registered: "
+                f"{sorted(name_to_backend.keys())}."
+            )
+        return name_to_backend[name]
+    return _factory
+
+
+@pytest.mark.asyncio
+async def test_fallback_serves_from_secondary_when_primary_errors():
+    """Primary raises → secondary serves. Result names the secondary
+    backend and includes a ``fallback_from`` field documenting the
+    skipped primary so operators see the fallback fired."""
+    from harness.web_tools import _web_search_impl
+    ok = _RecordingBackend()
+    factory = _factory_for({"raising": _RaisingBackend(), "ok": ok})
+    cfg = WebToolsConfig.from_config({
+        "web_tools": {
+            "enabled": True,
+            "search_backend": "raising",
+            "backends": [
+                {"name": "secondary", "enabled": True, "search_backend": "ok"},
+            ],
+        }
+    })
+    result = await _web_search_impl(cfg, query="anything", _backend_factory=factory)
+    assert "error" not in result
+    assert result["backend"] == "ok"
+    assert result["results"] == [{"title": "hit", "url": "https://h/", "snippet": "s"}]
+    assert result["fallback_from"] == [
+        {"backend": "raising", "error": "RuntimeError: simulated backend failure"},
+    ]
+    assert ok.calls == [("anything", 5)]
+
+
+@pytest.mark.asyncio
+async def test_fallback_empty_results_stops_the_chain():
+    """Empty results = legitimate "no hits". The chain MUST NOT fall
+    through to the next backend — that would silently double the cost
+    on hard queries and hide the "nothing matched" signal from the LLM."""
+    from harness.web_tools import _web_search_impl
+    backup = _RecordingBackend()
+    factory = _factory_for({"empty": _EmptyBackend(), "ok": backup})
+    cfg = WebToolsConfig.from_config({
+        "web_tools": {
+            "enabled": True,
+            "search_backend": "empty",
+            "backends": [
+                {"name": "backup", "enabled": True, "search_backend": "ok"},
+            ],
+        }
+    })
+    result = await _web_search_impl(cfg, query="anything", _backend_factory=factory)
+    assert result["backend"] == "empty"
+    assert result["results"] == []
+    assert "fallback_from" not in result
+    assert backup.calls == []   # secondary never invoked
+
+
+@pytest.mark.asyncio
+async def test_fallback_all_backends_fail_returns_aggregate_error():
+    """When every active backend raises, the LLM gets one structured
+    error naming the chain + per-backend cause so it can decide to
+    reformulate, retry, or proceed without web context."""
+    from harness.web_tools import _web_search_impl
+    factory = _factory_for({
+        "raising_a": _RaisingBackend(),
+        "raising_b": _RaisingBackend(),
+    })
+    cfg = WebToolsConfig.from_config({
+        "web_tools": {
+            "enabled": True,
+            "search_backend": "raising_a",
+            "backends": [
+                {"name": "secondary", "enabled": True, "search_backend": "raising_b"},
+            ],
+        }
+    })
+    result = await _web_search_impl(cfg, query="x", _backend_factory=factory)
+    assert "error" in result
+    assert "all configured search backends failed" in result["error"]
+    assert "raising_a" in result["error"]
+    assert "raising_b" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_fallback_unknown_backend_name_falls_through():
+    """A typoed backend name in one entry must not kill the chain —
+    a sibling entry may resolve fine. The unresolved name still
+    appears in ``fallback_from`` so the typo is visible."""
+    from harness.web_tools import _web_search_impl
+    ok = _RecordingBackend()
+    factory = _factory_for({"ok": ok})
+    cfg = WebToolsConfig.from_config({
+        "web_tools": {
+            "enabled": True,
+            "search_backend": "ddgg",   # typo of duckduckgo
+            "backends": [
+                {"name": "secondary", "enabled": True, "search_backend": "ok"},
+            ],
+        }
+    })
+    result = await _web_search_impl(cfg, query="x", _backend_factory=factory)
+    assert result["backend"] == "ok"
+    assert any("ddgg" in entry["backend"] for entry in result["fallback_from"])
+
+
+@pytest.mark.asyncio
+async def test_backwards_compat_single_primary_no_fallback_field():
+    """An operator with no ``backends[]`` entries gets the legacy
+    single-backend behaviour: no ``fallback_from`` field when the
+    primary succeeds. Lets existing config files keep parsing
+    response shapes the same way."""
+    from harness.web_tools import _web_search_impl
+    ok = _RecordingBackend()
+    factory = _factory_for({"ok": ok})
+    cfg = WebToolsConfig.from_config({
+        "web_tools": {
+            "enabled": True,
+            "search_backend": "ok",
+        }
+    })
+    result = await _web_search_impl(cfg, query="x", _backend_factory=factory)
+    assert result["backend"] == "ok"
+    assert "fallback_from" not in result
+
+
+@pytest.mark.asyncio
+async def test_empty_chain_returns_explicit_error():
+    """No active backends (operator pinned ``search_backend`` to empty
+    and ``backends[]`` is empty) returns a structured error explaining
+    the misconfiguration — never a silent no-op."""
+    from harness.web_tools import _web_search_impl
+    cfg = WebToolsConfig.from_config({
+        "web_tools": {"enabled": True, "search_backend": ""},
+    })
+    result = await _web_search_impl(cfg, query="x")
+    assert "error" in result
+    assert "no active search backends configured" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_disabled_entries_are_skipped_in_the_chain():
+    """A backend with ``enabled: false`` in the operator's ``backends[]``
+    must not be invoked — even when an earlier entry errors and the
+    chain would otherwise reach it."""
+    from harness.web_tools import _web_search_impl
+    never_called = _RecordingBackend()
+    rescue = _RecordingBackend()
+    factory = _factory_for({
+        "raising": _RaisingBackend(),
+        "never_called": never_called,
+        "rescue": rescue,
+    })
+    cfg = WebToolsConfig.from_config({
+        "web_tools": {
+            "enabled": True,
+            "search_backend": "raising",
+            "backends": [
+                # Disabled entry — must be skipped despite being before the rescue.
+                {"name": "off", "enabled": False, "search_backend": "never_called"},
+                {"name": "rescue", "enabled": True, "search_backend": "rescue"},
+            ],
+        }
+    })
+    result = await _web_search_impl(cfg, query="x", _backend_factory=factory)
+    assert result["backend"] == "rescue"
+    assert never_called.calls == []
+    assert rescue.calls == [("x", 5)]

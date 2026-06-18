@@ -404,16 +404,19 @@ def _write_web_input_sidecar(workspace: str, text: str) -> str:
 
 
 def _resolved_user_skills_dir(cfg: "DashboardConfig") -> str:
-    """Resolve ``skills.user_skills_dir`` from the live config, falling
-    back to the same ``~/.harness/skills`` default that
-    ``harness.skills`` uses."""
+    """Resolve ``skills.user_skills_dir`` from the live config.
+
+    Delegates to :func:`harness.skills._resolve_user_skills_dir` so the
+    dashboard sees the same default + legacy-fallback behaviour as the
+    runtime loader — including the one-time deprecation INFO when an
+    operator's files still live at the legacy ``~/.harness/skills`` path.
+    """
     try:
         live = read_config_file(cfg) or {}
     except Exception:  # noqa: BLE001 — defaults are fine if the config is broken
         live = {}
-    raw = ((live.get("skills") or {}).get("user_skills_dir")
-           or "~/.harness/skills")
-    return os.path.abspath(os.path.expanduser(str(raw)))
+    from harness.skills import _resolve_user_skills_dir
+    return os.path.abspath(_resolve_user_skills_dir(live))
 
 
 def _persist_user_skill(
@@ -2478,7 +2481,7 @@ def _render_configure_harness(cfg: DashboardConfig) -> str:
             for known_key in ("gh_path", "default_owner", "default_repo"):
                 live_value.setdefault(known_key, "")
         if section_key == "skills" and isinstance(live_value, dict):
-            live_value.setdefault("user_skills_dir", "~/.harness/skills")
+            live_value.setdefault("user_skills_dir", "~/.harness/user_skills")
         allow_add = section_key not in closed_shape_sections
         # model_routing gets a custom grouped renderer — Role → Primary/
         # Fallback → Model + Thinking — instead of the generic flat tree.

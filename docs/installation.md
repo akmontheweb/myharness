@@ -13,7 +13,7 @@ git clone <repo-url> myharness && cd myharness
 python3 scripts/setup.py          # or `make setup`
 ```
 
-It walks 11 phases interactively: platform / Python 3.11+ / git / sandbox-backend probes → venv creation → `pip install -e .` → LLM-provider wizard (writes `~/.harness/config.json` and persists the API key to your shell rc file with your consent) → `harness doctor` verification → optional install commands for security scanners and formatters. Re-runs are idempotent.
+It walks 11 phases interactively: platform / Python 3.11+ / git / sandbox-backend probes → venv creation → `pip install -e .` → LLM-provider wizard (writes `<repo>/config/config.json` and persists the API key to your shell rc file with your consent) → `harness doctor` verification → optional install commands for security scanners and formatters. Re-runs are idempotent.
 
 Flags worth knowing: `--venv <path>` overrides the default `~/.venvs/harness`, `--dev` adds the `[dev]` extras, `--provider <anthropic|openai|deepseek|ollama>` skips the wizard prompt, `--non-interactive` is for CI, `--no-doctor` skips the final verification. Run `python3 scripts/setup.py --help` for the full list.
 
@@ -25,10 +25,9 @@ This guide is for an operator standing the harness up on a new workstation or se
 
 Out of scope:
 
-- **Contributor onboarding** (pre-commit hooks, the `make test` loop, PR workflow) — see [CONTRIBUTING.md](../CONTRIBUTING.md).
-- **Configuration field reference** (every key in `.harness_config.json`) — see [docs/SPEC_REQUIREMENTS.md](SPEC_REQUIREMENTS.md).
+- **Configuration field reference** (every key in `<repo>/config/config.json`) — see [docs/SPEC_REQUIREMENTS.md](SPEC_REQUIREMENTS.md).
 - **Architecture deep-dive** (graph topology, module map, sandbox internals) — see [docs/SPEC_ARCHITECTURE.md](SPEC_ARCHITECTURE.md).
-- **Day-to-day usage** (command flags, workflows) — see the [README](../README.md).
+- **Mid-session recovery** (checkpoint corruption, budget exhaustion, lock contention, stuck dashboards) — see [docs/RUNBOOK.md](RUNBOOK.md).
 
 ## 2. Pick Your Platform Track
 
@@ -45,13 +44,18 @@ On Windows, **WSL2 is recommended** because the harness was developed Linux-firs
 
 ### What's new since v1.0
 
-Three additions have shipped that change operator-facing setup or behaviour:
+The biggest operator-facing changes since the layered-config era:
 
-- **Deterministic autofix** — compiler-suggested fixes (rustc / gcc / clang fixits), missing-import insertion, and a small set of known-safe security autofixes (e.g. Bandit `B201` `debug=True → False`, Trivy version bumps with `FixedVersion`) now land **without** an LLM call. Nothing to install or configure; surfaces in logs as `[autofix]` lines.
+- **Single canonical config** — the harness now reads exactly one file: `<repo>/config/config.json`. There is no `~/.harness/config.json`, no per-workspace `.harness_config.json`, no shipped `harness/cli.json` defaults. Strict validation rejects unknown keys, wrong types, missing required fields, and missing API key env vars at startup — before any LLM call. A legacy `.harness_config.json` left in a workspace logs one INFO line and is otherwise ignored. See §8.
+- **Mandatory `product_spec_dir`** — every run must point at a workspace-root folder of `.txt` files describing the product to build. `harness doctor` and `harness run` both refuse to start when the key is missing, malformed, or the folder is empty.
+- **Greenfield-vs-change-request modes** — `harness run --new-build true` wipes the workspace (except `product_spec/` and `.git/`) and resets to a clean base branch; `--new-build false` (the default) reads `.txt` files from `change_requests/` for steady-state work. Pair with `--yes` for unattended automation.
+- **Interactive wizard on bare `harness run`** — invoking `harness run` with no flags drops the operator into a wizard that resolves API keys, workspace, prompt, and mode. The wizard never writes to disk; each bare run re-asks.
+- **Deterministic autofix** — compiler-suggested fixes (rustc / gcc / clang fixits), missing-import insertion, and a small set of known-safe security autofixes (e.g. Bandit `B201` `debug=True → False`, Trivy version bumps with `FixedVersion`) now land **without** an LLM call. Surfaces in logs as `[autofix]` lines.
 - **Env-misconfig short-circuit** — when the sandbox build fails because a runtime is missing (`pytest` not installed in `python:3.12-slim`, `npm: command not found`), the router now exits to HITL on the **first** compile with a focused message instead of burning 3 LLM repair iterations. See §13 → Troubleshooting → HITL triggers.
-- **Auto test generation** — after every patching round, a new node writes stack-canonical unit tests for the modified source files and runs them deterministically in the sandbox before lintgate. Requires a configured LLM API key. See **§8.5 Test generation** below for the config, the per-stack runner commands, and the sandbox-image caveat.
-
-If you've deployed the harness before, the deltas you need to re-read are §6 (LLM keys are now mandatory for a green run), the new §8.5, and the three new rows in §13.
+- **Auto test generation** — after every patching round, a node writes stack-canonical unit tests for the modified source files and runs them deterministically in the sandbox before lintgate. Requires a configured LLM API key. See **§8.5 Test generation** below.
+- **Carbon web UI** — `harness web start` / `harness web stop` runs a single-instance dashboard (default bind `127.0.0.1:9000`) for browsing sessions, editing config, viewing memory, scheduling runs, and answering HITL prompts in-browser. See §11.
+- **Scheduled-job daemon** — `harness schedule run` fires `harness run` jobs from `config.json` on a cron-style timer. See §11.
+- **Repo-index, per-repo memory, MCP client pool** — opt-in subsystems controlled from `config.json`. See the per-section comments in the shipped file for the contract.
 
 ## 3. Prerequisites
 
@@ -105,11 +109,14 @@ Reboot if prompted, set up the Ubuntu user, then **inside the WSL distro** follo
 
 ## 4. Choose a Sandbox Backend
 
+The `sandbox.backend` key in `config.json` accepts `auto` (default), `docker`, `unshare`, or `bare`. `auto` probes Docker first and falls back to `unshare` on Linux/WSL2.
+
 | Backend | Linux | macOS | Win + WSL2 | Win native | Isolation |
 |---------|-------|-------|------------|------------|-----------|
 | `docker` (recommended) | ✓ | ✓ Docker Desktop | ✓ Docker Desktop + WSL integration | ✓ Docker Desktop, Linux containers | Strongest |
 | `unshare` | ✓ | ✗ | ✓ inside the distro | ✗ not on Windows | Linux namespaces |
 | `bare` (unsafe) | opt-in | opt-in | opt-in | opt-in | None — runs LLM-generated commands directly on the host |
+| `auto` | tries docker → falls back to unshare; both unavailable = startup failure |
 
 ### Docker
 
@@ -124,7 +131,7 @@ Reboot if prompted, set up the Ubuntu user, then **inside the WSL distro** follo
 
 - **macOS**: install [Docker Desktop](https://www.docker.com/products/docker-desktop/). Start it once and let it finish initializing.
 - **Windows + WSL2**: install Docker Desktop on the Windows host, then in **Settings → Resources → WSL Integration** enable integration for your Ubuntu-22.04 distro.
-- **Windows native**: install Docker Desktop. Confirm it's running in **Linux containers** mode (right-click the tray icon → "Switch to Linux containers" if needed). The harness's default sandbox image is `ubuntu:22.04`, which requires Linux containers.
+- **Windows native**: install Docker Desktop. Confirm it's running in **Linux containers** mode (right-click the tray icon → "Switch to Linux containers" if needed). The default sandbox image is `harness-builder:latest`; the compiler node auto-swaps to a stack-specific image (`python:3.12-slim`, `node:20-slim`, `golang:1.22`, `rust:1.79-slim`, `eclipse-temurin:21-jdk`, `dart:stable`, …) based on tokens it recognises in `build_command`.
 
 ### unshare
 
@@ -138,7 +145,7 @@ If you see `ok`, you're good. If it fails, user namespaces are disabled at the k
 
 ### bare
 
-Opt-in only, by setting `HARNESS_ALLOW_UNSAFE_SANDBOX=true`. Never enable outside a disposable VM — it runs LLM-generated build commands directly on the host with zero isolation.
+Opt-in only — the harness refuses to run with `sandbox.backend = "bare"` unless the operator sets `HARNESS_ALLOW_UNSAFE_SANDBOX=true`. Never enable outside a disposable VM — it runs LLM-generated build commands directly on the host with zero isolation.
 
 ## 5. Clone & Install the Package
 
@@ -196,7 +203,7 @@ For an editable install (recompile-free local edits), substitute `pip install -e
 
 ## 6. Provision API Keys (Required)
 
-> As of the auto test-generation feature (see [§8.5](#85-test-generation-new)), a configured LLM API key is **required** to reach a green build. The test-generation node refuses to run without one and routes the session to HITL with a focused `env_misconfig:llm_api_key` message.
+> A configured LLM API key is **required** to reach a green build. Strict config validation in `discover_config()` exits with code 2 at startup when any provider referenced by `model_routing` has no key. The auto-test-generation node additionally refuses to run without one and routes to HITL with `env_misconfig:llm_api_key`.
 
 Set at least one of these, depending on which providers appear in your `model_routing` (§8):
 
@@ -235,7 +242,7 @@ setx ANTHROPIC_API_KEY "sk-..."
 
 `setx` makes the variable permanent but does **not** update the current shell. Open a new `cmd` window.
 
-> **Do not** embed API keys in `.harness_config.json`. Use env vars so the config file stays committable.
+> **Do not** embed live API keys in `config/config.json`. The schema slot is kept for documentation only; the gateway reads env vars at dispatch time and ignores any non-empty `api_key` field.
 
 ## 7. (Optional) Install External Tools
 
@@ -317,53 +324,84 @@ Filesystem MCP servers (`@modelcontextprotocol/server-filesystem`) bypass the ha
 
 ## 8. Configure the Harness
 
-Configuration layers, lowest to highest priority:
+The harness reads exactly one config file: `<myharness_root>/config/config.json`. There are no fallbacks, no per-workspace overrides, no auto-generated files. The setup wizard writes this file with sane defaults; thereafter every behaviour change goes here.
 
-1. `harness/cli.json` — shipped defaults, do not edit.
-2. `~/.harness/config.json` (Linux/macOS/WSL2) or `%USERPROFILE%\.harness\config.json` (Windows native) — your user-global config. Put model definitions and routing here.
-3. `<workspace>/.harness_config.json` — per-project overrides, auto-generated on first run.
+Strict validation runs at every CLI entry point before any logging, lock, or LLM-gateway initialisation:
+- Unknown top-level or nested keys → fail (catches typos like `token_budget.hrad_cap_usd` that used to silently no-op).
+- Missing required fields (`product_spec_dir`, the three `*_primary` routing keys) → fail.
+- Wrong types, malformed model keys, dangling routing references → fail.
+- A provider referenced in `model_routing` with no `{PROVIDER}_API_KEY` env var → fail.
 
-A minimal user-global config:
+On any failure the harness prints the multi-line ConfigError to stderr and exits with code 2. The dashboard editor (Configure Harness page) and `harness doctor` run the same validator so the same mistakes surface in the same words.
+
+A minimal `config/config.json` body:
 
 ```json
 {
+  "product_spec_dir": "product_spec",
+  "build_command": "make build",
+  "allow_network": true,
   "models": {
-    "claude-sonnet": {
+    "anthropic:claude-sonnet-4": {
       "provider": "anthropic",
-      "model_id": "claude-sonnet-4-6",
-      "context_window": 200000
+      "model_id": "claude-sonnet-4-20250514",
+      "context_window": 200000,
+      "input_cost_per_1m": 3.0,
+      "output_cost_per_1m": 15.0,
+      "api_base_url": "https://api.anthropic.com/v1",
+      "supports_thinking": false,
+      "supports_cache": true,
+      "api_key": ""
     }
   },
   "model_routing": {
-    "planning_primary": "anthropic:claude-sonnet",
-    "patching_primary": "anthropic:claude-sonnet",
-    "repair_primary": "anthropic:claude-sonnet"
-  }
+    "planning_primary": "anthropic:claude-sonnet-4",
+    "planning_mode": "thinking_max",
+    "patching_primary": "anthropic:claude-sonnet-4",
+    "patching_mode": "no_thinking",
+    "repair_primary": "anthropic:claude-sonnet-4",
+    "repair_mode": "no_thinking"
+  },
+  "token_budget": { "hard_cap_usd": 3.0, "context_window_threshold_pct": 0.85 },
+  "persistence": { "db_path": "~/.harness/checkpoints.db", "ttl_days": 30 }
 }
 ```
 
-Every key in `model_routing` references a model registered under `models` (or one of the catalogue entries shipped in `harness/model_prices.json`). The full schema — every field of `sandbox`, `token_budget`, `node_throttle`, `persistence`, `logging`, `lintgate`, `deployment`, `test_generation`, `metrics` — is documented in [docs/SPEC_REQUIREMENTS.md](SPEC_REQUIREMENTS.md).
+The shipped `config/config.json` in the repo is annotated: every section has a sibling `_<section>_comment` string that documents every leaf field. `_*` keys are stripped at load time, so comment fields ship in the file but never reach the validator.
 
-**API key resolution.** Each provider key is resolved at runtime in this order: (1) explicit constructor argument, (2) `{PROVIDER}_API_KEY` env var, (3) `models["<provider>:<model>"].api_key` field in any config layer. `harness doctor` checks the same two locations (env first, then config field) and reports the source per model in its `api keys` line, so an `[ OK ]` row reading `... (config)` confirms a config-only key would be picked up. Set the key in `~/.harness/config.json` for global use or per-workspace in `.harness_config.json`.
+**Mandatory `product_spec_dir`.** The value is a bare folder name (no path separators, no `..`, no absolute paths) that lives at the workspace root. The harness consolidates every `.txt` file in alphabetical order and feeds the result to the planning LLM. `harness doctor` checks the value is well-formed AND the folder exists with ≥1 `.txt` file.
+
+**Model registry vs routing.**
+- `models` is the registry — every LLM the gateway can dispatch to must be declared here with `provider`, `model_id`, `context_window`, `input_cost_per_1m`, `output_cost_per_1m`, `api_base_url`, `supports_thinking`, `supports_cache`, and an empty `api_key` slot. The key (e.g. `anthropic:claude-sonnet-4`) is the routing handle.
+- `model_routing` binds the harness's internal roles (`planning`, `patching`, `repair`, optional `doc_reviewer` / `code_reviewer`) to registry keys. Only routed models need an env-var key; declared-but-unrouted entries are inert.
+- `*_mode` controls extended thinking: `non_thinking`, `thinking`, or `thinking_max`. Only models with `supports_thinking: true` accept thinking modes.
+
+The full schema — every field of `sandbox`, `token_budget`, `node_throttle`, `persistence`, `logging`, `lintgate`, `deployment`, `test_generation`, `metrics`, `web_tools`, `mcp`, `memory`, `repo_index`, `schedule`, `dashboard`, `deployment_defaults` — is documented in [docs/SPEC_REQUIREMENTS.md](SPEC_REQUIREMENTS.md) and in the inline comments of `config/config.json`.
+
+**API key resolution.** Each provider key is resolved at runtime by `harness/gateway.py`: (1) explicit constructor argument, (2) `{PROVIDER}_API_KEY` env var (recommended), (3) the `api_key` field on the model entry as a last-resort dev knob (the shipped schema keeps this empty and discourages live keys). `harness doctor`'s `api keys (live)` check makes a 1-token chat call per routed provider and reports the source per model — `... (env)` or `... (config)` — so you can confirm at a glance where the runtime resolved from. Set `HARNESS_DOCTOR_SKIP_LIVE=true` to skip the live ping (CI / outbound-blocked hosts).
+
+**Legacy per-workspace config files.** A `.harness_config.json` left over from the layered-config era is **ignored** with one INFO log line per run; the harness no longer reads it. Delete it at your leisure — nothing reads or writes it.
 
 **Recent config additions worth knowing**:
-- `persistence.redact_messages` (default `true`) — checkpoint message redaction. Flip to `false` to keep verbatim transcripts at rest.
-- `sandbox.auto_enable_network_for_install` (default `false`) — opt in to auto-enabling network on detected pip / npm install commands. Without this, the heuristic only logs a WARNING.
-- `node_throttle.max_discovery_iterations` (default `10`, clamped `[1, 30]`) — hard cap on the discovery question loop.
-- `logging.max_bytes` / `logging.backup_count` (default `10_000_000` / `5`) — rotation knobs for the per-session JSONL file. Set `max_bytes: 0` to opt out of rotation.
-- `metrics.metrics_dir` (default `~/.harness/metrics`) and `metrics.burn_rate_window_minutes` (default `10`) — output destination and trailing window for `harness metrics`.
+- `patcher.enforce_read_before_edit` (default `false`) — when true, rejects REPLACE_BLOCK / DELETE_BLOCK / INSERT_AT_BLOCK against any file the LLM has not yet been shown this turn. Mirrors Claude Code's Read-before-Edit invariant.
+- `llm_dispatch.continue_on_length` (per-role bool map) — when finish_reason=length, re-prompt the model with the partial reply up to 3 cycles. Default on for `patching` only; raising it on JSON roles (doc_reviewer / code_reviewer) frequently breaks schema parsing — see the inline comment in `config.json`.
+- `llm_dispatch.prompt_cache_enabled` (default `true`) — emits Anthropic `cache_control` markers on the system block and runs prefix-stability drift detection. Flip to false only if a provider API change rejects the payload shape.
+- `compiler.run_prod_import_smoke_check` (default `true`) — compiler_node imports every production module inside the sandbox before running the build, so module-level errors surface as `[prod-import]` diagnostics ahead of any cascade-amplified test failures.
+- `debug.dump_llm_calls` (default `true`) — every LLM dispatch is written to `~/.harness/debug/*.txt`; `debug.dump_max_files` caps the directory (oldest by mtime pruned). Useful for post-mortem; turn off in production-style runs.
+- `sandbox.cache_volumes` (default `false`) — swap each `readonly_cache_mounts` entry for a writable Docker named volume scoped to the session id. Pip / npm / cargo persist downloads across containers in the session. Clean up with `harness cache clear`.
+- `node_throttle.max_patch_repair_iterations` (default `3`, can be raised) — repair loop ceiling. After this many failing rebuilds the run routes to HITL.
 
-**WSL2 only**: put your workspaces and the config under the WSL filesystem (`~/...`), **not** under `/mnt/c/...`. Windows-mount paths have order-of-magnitude slower I/O.
+**WSL2 only**: put your workspaces under the WSL filesystem (`~/...`), **not** `/mnt/c/...`. Windows-mount paths have order-of-magnitude slower I/O.
 
 ### Workspace single-writer lock
 
-Every `harness run` acquires an `fcntl` lock on `<workspace>/.harness_session.lock` (Linux/macOS/WSL2). A second concurrent run on the same workspace exits with `lock held by PID X`. To recover after a hard kill that left the lock stale:
+Every `harness run` and `harness resume` acquires an `fcntl` lock on `<workspace>/.harness_session.lock` (Linux/macOS/WSL2). A second concurrent run on the same workspace exits with `lock held by PID X`. To recover after a hard kill that left the lock stale:
 
 ```bash
-harness run -r <workspace> -p "<prompt>" --force-lock
+harness run -w <workspace> -p "<prompt>" --force-lock
 ```
 
-Windows native skips locking entirely (no portable `fcntl`); single-writer is the operator's responsibility there. See `docs/RUNBOOK.md` § 4 for the full recovery recipe.
+`--force-lock` releases the stale lock and acquires a fresh one, logging a WARNING so the override is visible in the session record. Windows native skips locking entirely (no portable `fcntl`); single-writer is the operator's responsibility there. See `docs/RUNBOOK.md` § 4 for the full recovery recipe.
 
 ## 8.5 Test generation (new)
 
@@ -371,7 +409,7 @@ After every patching round, the harness writes stack-canonical unit tests for th
 
 **What it does.** Detects the workspace stack via `_detect_workspace_stack`, loads the matching `harness/test_guides/<lang>.md` into the LLM prompt, asks for `CREATE_FILE` / `INSERT_AT_BLOCK` patch blocks for the corresponding test files, applies them, then invokes a stack-canonical test command in the sandbox. **The guides instruct the LLM to write tests that exercise the real code — no mocks.** When a side effect can't be invoked directly, the tests use the test runner's built-in fakes (pytest `monkeypatch` / `tmp_path`, Go `httptest.NewServer`, JUnit `@TempDir`, etc.).
 
-**Config defaults.** Shipped in `harness/cli.json` under `test_generation`. Defaults are `enabled: true` and `max_iterations: 2`. To disable, add to `~/.harness/config.json` or `<workspace>/.harness_config.json`:
+**Config defaults.** Shipped in `config/config.json` under `test_generation`. Defaults are `enabled: true` and `max_iterations: 3`. To disable, edit the same file:
 
 ```json
 "test_generation": { "enabled": false }
@@ -379,7 +417,7 @@ After every patching round, the harness writes stack-canonical unit tests for th
 
 **LLM API key is required.** Without a configured gateway the node synthesises an `env_misconfig:llm_api_key` diagnostic and routes the session to HITL. See §6 — provisioning at least one provider key is no longer optional when test generation is on.
 
-**Per-stack test runner.** The deterministic command the sandbox runs per detected stack:
+**Per-stack test runner.** Stack-canonical guides ship at `harness/test_guides/*.md` for `python`, `javascript`, `typescript`, `go`, `java`, `rust`, and `dart`. The deterministic command the sandbox runs per detected stack:
 
 | Stack | Deterministic command |
 |-------|------------------------|
@@ -390,41 +428,44 @@ After every patching round, the harness writes stack-canonical unit tests for th
 | Java | `mvn -q test` |
 | Rust | `cargo test --quiet` |
 | Dart | `dart test` |
-| Flutter | `flutter test` |
 
 `pip install` / `npm install` tokens trigger the harness's existing `_build_command_needs_network` heuristic, so the sandbox auto-enables outbound network for the test run — no manual `allow_network: true` required.
 
 **Sandbox image caveat (read this).** The deterministic test runner re-uses whichever `sandbox.docker_image` the build_command auto-adapter picked. That adapter keys off `build_command` only — if your `build_command` is, say, `make build` but the workspace is Python, the image stays `ubuntu:22.04` and `pip install pytest` will fail with `pip: command not found`. Two workarounds:
 
 1. Include a stack-implying token in `build_command` so the existing adapter picks the right image, e.g. `make build && python3 --version`.
-2. Or set `sandbox.docker_image` explicitly in your `.harness_config.json`:
+2. Or set `sandbox.docker_image` explicitly in `config/config.json`:
    ```json
    "sandbox": { "docker_image": "python:3.12-slim" }
    ```
-   Per-stack images that ship the toolchain: `python:3.12-slim`, `node:20-slim`, `golang:1.22`, `rust:1.79-slim`, `eclipse-temurin:21-jdk` (Java), `dart:stable` (Dart), `ghcr.io/cirruslabs/flutter` (Flutter).
+   Per-stack images that ship the toolchain: `python:3.12-slim`, `node:20-slim`, `golang:1.22`, `rust:1.79-slim`, `eclipse-temurin:21-jdk` (Java), `dart:stable` (Dart).
 
 **Project-level test conventions.** Drop your own files under `<workspace>/test_guides/<lang>.md` with frontmatter `applies_to: [<stack-tag>]`. The loader prefers project files over the shipped defaults, so a workspace can tighten the conventions the LLM is given without forking the harness.
 
 ## 9. Verify the Install (`harness doctor`)
 
-`cd` into any git repo and run:
+`cd` into any workspace whose `product_spec/` folder is populated and run:
 
 ```bash
 harness doctor
 ```
 
-Expected output: six check lines, all green.
+Expected output: a banner with the resolved canonical config path, then a row per check. `config` is the gate — if it fails, every downstream check is marked `skip` and doctor exits non-zero.
 
 | Check | What it verifies | Failure means |
 |-------|------------------|---------------|
-| `git repo` | Workspace is a git repo with at least one commit | `git init` and make a commit |
-| `global config` | `~/.harness/config.json` exists and is valid JSON | Run the setup script or create it manually |
-| `api keys` | Every provider referenced in `model_routing` has a key in EITHER its `*_API_KEY` env var OR its `models["<key>"].api_key` config field, AND each provider passes a one-token "hello" request that confirms the key actually authenticates | Set the missing key, fix an `HTTP 401 — API key rejected`, or set `HARNESS_DOCTOR_SKIP_LIVE=true` to disable the live ping (CI / headless) |
-| `sandbox backend` | Docker or `unshare` is reachable | Re-do §4 for your platform |
-| `checkpoint db` | `~/.harness/checkpoints.db` is writable AND the 5 most recent checkpoints deserialize cleanly | Adjust `persistence.db_path`, or `harness purge --session-id <id>` for a corrupted session |
-| `config parse` | The merged config is valid JSON with known keys | Fix the typo it suggests |
+| `config` | `<repo>/config/config.json` exists, parses as JSON, and passes strict validation | Fix the multi-line error printed under this row; doctor refuses to run downstream checks until config is clean |
+| `git repo` | Workspace is a git repo with at least one commit | `git init` + first commit, or pass `-r <other-workspace>` |
+| `product spec` | `product_spec_dir` is a valid workspace-root folder name AND the folder has ≥1 `.txt` file | Create `<workspace>/<product_spec_dir>/` and drop the spec text in |
+| `api keys (live)` | Every provider referenced in `model_routing` has a key in `{PROVIDER}_API_KEY` (or the `models[].api_key` field), AND each passes a one-token live ping that confirms the key authenticates against the configured model | Set the missing key, fix an `HTTP 401 — API key rejected`, or set `HARNESS_DOCTOR_SKIP_LIVE=true` (CI / outbound-blocked hosts) |
+| `tree-sitter` | The `tree-sitter` import works and at least one bundled grammar parses a sample buffer | `pip install -U tree-sitter tree-sitter-language-pack`; without it, `patcher` and `impact` silently degrade to regex extraction |
+| `sandbox backend` | Resolves `sandbox.backend`: `docker` probes `docker info`; `unshare` probes `unshare --user echo ok`; `auto` tries docker → unshare in order; `bare` warns (no isolation) | Re-do §4 for your platform |
+| `checkpoint db` | `persistence.db_path` is writable AND the 5 most recent checkpoints deserialize cleanly | Adjust `persistence.db_path`, or `harness purge --session-id <id>` for a corrupted session |
+| `patcher mode` | Reports the two patcher behaviour flags: `read-before-edit` (B5) and `native tool-use` (B6) | Informational; never fails |
+| `external tools` | One row per shelled-out tool (formatters, security scanners, `gh`) the operator's config / workspace touches | `warn` for a missing optional tool; `pass` confirms PATH resolution |
+| `mcp:<server>` | Only when `mcp.enabled: true` — starts each declared server subprocess and lists the advertised tools | Fix the `command` / runtime, or remove the server entry |
 
-The `api keys` PASS message includes the source per model — `... (env)` or `... (config)` — so you can confirm at a glance whether the runtime will resolve from your env vars or your config file. The check also makes a 1-token chat call per provider (in parallel) to confirm the key actually authenticates against the configured model. Cost is well under a tenth of a cent across all providers combined. To skip the live ping (e.g. in CI where outbound network is blocked), set `HARNESS_DOCTOR_SKIP_LIVE=true`; the doctor then reports the source per model and notes `(live ping skipped via HARNESS_DOCTOR_SKIP_LIVE)`.
+The `api keys (live)` PASS message includes the source per model — `... (env)` or `... (config)` — and a per-provider tag. Cost is well under a tenth of a cent across all providers combined. To skip the live ping (e.g. CI where outbound network is blocked), set `HARNESS_DOCTOR_SKIP_LIVE=true`; the doctor then reports the source per model and notes `(live ping skipped via HARNESS_DOCTOR_SKIP_LIVE)`.
 
 Common failure modes the live ping surfaces:
 
@@ -443,39 +484,45 @@ Exit code `0` means you are ready to run.
 
 ## 10. First Run (Smoke Test)
 
-Pick a tiny throwaway git repo:
+Pick a throwaway git repo and drop a one-line spec under `product_spec/` (the harness refuses to start without it):
 
 ```bash
 git clone https://github.com/octocat/Hello-World.git sample
-harness run -r ./sample -p "list the top-level files"
+mkdir -p sample/product_spec
+echo "List the top-level files in this repository." > sample/product_spec/SPEC.txt
+harness run -w ./sample -p "list the top-level files" --new-build false
 ```
 
 The harness will:
 
-1. Auto-generate `./sample/.harness_config.json`.
-2. Acquire an `fcntl` lock on `./sample/.harness_session.lock` (Linux/macOS/WSL2).
-3. Create `~/.harness/checkpoints.db` (or `%USERPROFILE%\.harness\checkpoints.db` on Windows native) and `~/.harness/logs/<session-id>.jsonl` (rotated at 10 MB × 5 backups by default).
-4. Run planning → patching → compile loop, checkpointing each step.
+1. Acquire an `fcntl` lock on `./sample/.harness_session.lock` (Linux/macOS/WSL2).
+2. Create `~/.harness/checkpoints.db` (or `%USERPROFILE%\.harness\checkpoints.db` on Windows native) and `~/.harness/logs/<session-id>.jsonl` (rotated at 10 MB × 5 backups by default).
+3. Consolidate every `.txt` file in `product_spec/`, then run the planning → patching → compile → lintgate loop, checkpointing each step.
+4. Append a session note under `~/.harness/memory/<repo_id>.md` if `memory.enabled: true` (the default).
 
 A successful smoke test exits 0. Inspect the run with `harness status --session-id <id>` or by tailing the JSONL log file. After the run, `harness metrics --session-id <id>` shows cost, burn rate, and projected exhaustion against your `token_budget.hard_cap_usd`.
 
-See the [README command reference](../README.md#command-reference) for the full flag list. For diagnostics on a stuck or failed run, start with [`docs/RUNBOOK.md`](RUNBOOK.md).
+**Bare `harness run`** with no flags drops into the interactive wizard described in §0.1 of the "What's new" notes — it walks API keys, workspace, prompt, `--git`, `--new-build`, and `--spec-discovery`, then hands off to `cmd_run` or `cmd_resume`. The wizard never persists anything.
+
+For diagnostics on a stuck or failed run, start with [`docs/RUNBOOK.md`](RUNBOOK.md).
 
 ## 11. Headless / Server Deployment
 
 For unattended runs (CI, scheduled jobs, services):
 
-- Set `CI=true` and `HARNESS_AUTO_APPROVE=true` to bypass interactive HITL prompts.
-- Set `HARNESS_HITL_WEBHOOK_URL` (and `HARNESS_HITL_WEBHOOK_SECRET`) if you want sensitive operations to require approval via a webhook instead of stdin.
+- Set `CI=true` and `HARNESS_AUTO_APPROVE=true` to bypass interactive HITL prompts. The four `--hitl-*` flags (`req`, `arch`, `repair`, `deployment`) default to false anyway; the env vars are belt-and-braces.
+- Set `HARNESS_HITL_WEBHOOK_URL` (and optional `HARNESS_HITL_WEBHOOK_SECRET` for HMAC-SHA256 signing) if you want sensitive operations to require approval via a webhook instead of stdin. The dashboard exports both automatically when it spawns runs, so HITL gates surface in the UI.
 - Ensure NTP is running — clock skew breaks API auth on fresh VMs.
-- With test_generation on (the default — see [§8.5](#85-test-generation-new)), each session spends additional LLM tokens for test authorship and may hit the default `token_budget.hard_cap_usd = 2.00` on larger changes. Raise the cap in your config, or set `test_generation.enabled: false` under CI when budget pressure matters.
+- With test_generation on (the default — see [§8.5](#85-test-generation-new)), each session spends additional LLM tokens for test authorship and may hit the default `token_budget.hard_cap_usd = 3.00` on larger changes. Raise the cap in your config, or set `test_generation.enabled: false` under CI when budget pressure matters.
 - Track aggregate cost with a cron job: `harness metrics --all --prometheus --output /var/lib/node_exporter/textfile/harness.prom`. The atomic-write contract means a scraper never sees a half-written file.
 - For long-running services, leave `logging.max_bytes` / `logging.backup_count` at defaults (10 MB × 5) — that's ~50 MB max per session, dropped oldest-first.
 - If a scheduled job dies hard and leaves the workspace lock stale, the next run will refuse to start. Wrap with a retry that adds `--force-lock` on second attempt only.
 
 ### Linux (systemd)
 
-One-shot run (single session, equivalent to the operator typing `harness run`):
+`harness` ships three persistent processes you might want to systemd-ify: a one-shot `harness run`, the schedule daemon, and the web dashboard. Each runs the venv's `harness` console script. `HOME` must be set on every unit so `~/.harness/` path expansion works.
+
+One-shot run (equivalent to the operator typing `harness run`):
 ```ini
 [Service]
 Environment=HOME=/srv/harness
@@ -483,11 +530,11 @@ Environment=CI=true
 Environment=HARNESS_AUTO_APPROVE=true
 Environment=ANTHROPIC_API_KEY=sk-...
 WorkingDirectory=/srv/harness/workspace
-ExecStart=/srv/harness/.venvs/harness/bin/harness run -r . -p "..."
+ExecStart=/srv/harness/.venvs/harness/bin/harness run -w . -p "..." --new-build false
 ```
 
-Scheduled-job daemon (`harness schedule run` — runs `schedule.jobs` from
-`config.json` on a cron-style timer; restart-on-failure recommended):
+Scheduled-job daemon (`harness schedule run` — fires `schedule.jobs` from
+`config/config.json` on a cron-style timer; restart-on-failure recommended):
 ```ini
 # /etc/systemd/system/harness-schedule.service
 [Unit]
@@ -499,7 +546,7 @@ Type=simple
 User=harness
 Environment=HOME=/srv/harness
 Environment=ANTHROPIC_API_KEY=sk-...
-WorkingDirectory=/srv/harness/workspace
+WorkingDirectory=/srv/harness/myharness
 ExecStart=/srv/harness/.venvs/harness/bin/harness schedule run
 Restart=on-failure
 RestartSec=10
@@ -508,9 +555,11 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-Web dashboard (`harness web` — all features on by default; set
-`dashboard.writes_enabled: false` in `config.json` for a read-only
-deployment):
+Web dashboard (`harness web start` foreground; writes enabled by default — set
+`dashboard.writes_enabled: false` in `config.json` for a read-only deployment).
+The dashboard is single-instance per user, gated by `~/.harness/web.lock`; a
+second `start` while the marker points at a live pid refuses to launch.
+
 ```ini
 # /etc/systemd/system/harness-dashboard.service
 [Unit]
@@ -525,8 +574,9 @@ Environment=HOME=/srv/harness
 Environment=DASH_TOKEN=replace-with-a-long-random-string
 # Optional: persistent CSRF token across restarts:
 Environment=DASH_CSRF=replace-with-another-long-random-string
-WorkingDirectory=/srv/harness/workspace
-ExecStart=/srv/harness/.venvs/harness/bin/harness web
+WorkingDirectory=/srv/harness/myharness
+ExecStart=/srv/harness/.venvs/harness/bin/harness web start --host 127.0.0.1 --port 9000
+ExecStop=/srv/harness/.venvs/harness/bin/harness web stop
 Restart=on-failure
 RestartSec=10
 
@@ -534,21 +584,21 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-Then in `config.json`:
+Then in `config/config.json`:
 ```jsonc
 {
   "dashboard": {
     "enabled": true,
-    "host": "127.0.0.1",         // localhost only by default
-    "port": 8729,
+    "host": "127.0.0.1",          // localhost only by default
+    "port": 9000,
     "token_env": "DASH_TOKEN",
-    "csrf_token_env": "DASH_CSRF"
-    // writes_enabled defaults to true; set to false for a read-only deployment
+    "csrf_token_env": "DASH_CSRF",
+    "writes_enabled": true,       // set false for a read-only deployment
+    "hitl_webhook_secret": "",    // shared secret the harness POSTs with
+    "web_db_path": "~/.harness/web.db"
   }
 }
 ```
-
-`HOME` must be set explicitly on every unit so `~/.harness/` path expansion works.
 
 Enable + start:
 ```bash
@@ -560,9 +610,11 @@ sudo journalctl -fu harness-schedule.service   # follow logs
 
 Run separate units rather than bundling — the dashboard config changes mean only the dashboard restarts, and a stuck dashboard request never affects schedule timing.
 
+For ad-hoc background mode without systemd, `harness web start --background yes` re-spawns the server detached and logs to `~/.harness/web.log`; `harness web stop` reads the marker, SIGTERMs the pid, and escalates to SIGKILL after 5 s.
+
 ### Windows native (Task Scheduler)
 
-- Create a task running `…\.venvs\harness\Scripts\harness.exe` with arguments `run -r C:\path\to\workspace -p "..."`.
+- Create a task running `…\.venvs\harness\Scripts\harness.exe` with arguments `run -w C:\path\to\workspace -p "..." --new-build false`.
 - Set **Start in** to the workspace directory.
 - Add `CI`, `HARNESS_AUTO_APPROVE`, and `ANTHROPIC_API_KEY` as system or user env vars (Task Scheduler inherits the account's env).
 - For a long-lived service, wrap the command with [NSSM](https://nssm.cc/).
@@ -587,13 +639,13 @@ pip uninstall ai-agent-harness
 rm -rf ~/.harness     # Linux/macOS/WSL2
 ```
 
-`~/.harness/` holds the checkpoint DB, per-session JSONL logs, metrics, repo memory files, the repo index (`repo_index/`), schedule history (`schedule.db`), web app state (`web.db`), and the user-skills directory (`skills/`). Remove only what you don't want to keep.
+`~/.harness/` holds the checkpoint DB, per-session JSONL logs, metrics, repo memory files, the repo index (`repo_index/`), schedule history (`schedule.db`), web app state (`web.db`), and the user-skills directory (`user_skills/` — legacy installs may still use `skills/`). Remove only what you don't want to keep.
 
 On Windows native: `pip uninstall ai-agent-harness` then `Remove-Item -Recurse $HOME\.harness` in PowerShell.
 
 ## 13. Troubleshooting
 
-The canonical runtime-failure table lives in the [README → Troubleshooting](../README.md#troubleshooting) section. For the top-five mid-session failure modes (checkpoint corrupted, budget exhausted, sandbox dead, workspace lock refused, persistent LLM silence), see [`docs/RUNBOOK.md`](RUNBOOK.md). This list adds install-specific gotchas neither of those covers.
+The canonical mid-session failure recipes (checkpoint corrupted, budget exhausted, sandbox dead, workspace lock refused, persistent LLM silence, dashboard 401/403, schedule daemon stuck, repo index empty, …) live in [`docs/RUNBOOK.md`](RUNBOOK.md). This list adds install-specific gotchas the runbook doesn't cover.
 
 ### All platforms
 
@@ -612,10 +664,10 @@ These show up in the HITL banner as `Trigger: <name>` and mean the harness short
 | Trigger | Meaning | Fix |
 |---------|---------|-----|
 | `env_misconfig:<symbol>` (e.g. `env_misconfig:pytest`) | Sandbox build exited with "No module named X" / "command not found" / Docker `exec: "X": executable file not found`. The runtime is missing inside the container. | Either prepend an install step to `build_command` (e.g. `pip install <symbol> && <original-cmd>`) or set `sandbox.docker_image` to one that ships `<symbol>`. |
-| `env_misconfig:llm_api_key` | test_generation cannot run because no LLM gateway is configured. | Set the matching `*_API_KEY` env var (see §6), or set `test_generation.enabled: false` in `.harness_config.json`. |
+| `env_misconfig:llm_api_key` | test_generation cannot run because no LLM gateway is configured. | Set the matching `*_API_KEY` env var (see §6), or set `test_generation.enabled: false` in `config/config.json`. |
 | `llm_silent` (HITL fires immediately) | Three consecutive empty responses from the LLM provider (`EmptyLLMResponseError`). | Check the provider's status page; retry, or route the affected node to a different model via `model_routing`. |
 | `Auto-test run fails with "pip: command not found" / "npx: not found"` | The deterministic test runner from §8.5 is executing in a docker image that doesn't carry the stack toolchain. | See the [§8.5 sandbox-image caveat](#85-test-generation-new) — fix by adjusting `build_command` or pinning `sandbox.docker_image` explicitly. |
-| `[FAIL] api keys` despite a key being set | Doctor used to only check env vars. The current build checks env AND `models["<key>"].api_key` config field — if doctor still reports FAIL, neither location has the key. The FAIL message names both. | Set the key in either `{PROVIDER}_API_KEY` env var or `models."<key>".api_key` in `~/.harness/config.json`. |
+| `[FAIL] api keys (live)` despite a key being set | Doctor checks env vars AND the `models["<key>"].api_key` config field. The FAIL detail line names which location is empty and what the live ping returned (`HTTP 401`, `HTTP 404`, …). | Set the key in `{PROVIDER}_API_KEY` env var (preferred) or in `config/config.json` under `models."<key>".api_key`. |
 | `lock held by PID <n>` at startup | A prior `harness run` exited hard and left `<workspace>/.harness_session.lock` stale, or another live session is using the workspace. | Verify the PID is gone (`ps -p <n>`); then `harness run ... --force-lock` to release and reacquire. See `docs/RUNBOOK.md` § 4. |
 
 ### Linux
@@ -634,7 +686,7 @@ These show up in the HITL banner as `Trigger: <name>` and mean the harness short
 | `[Errno 2] No such file or directory: 'C:\\Users\\…\\some\\deeply\\nested\\…'` | Long paths not enabled; re-do the `LongPathsEnabled` step in §3 and reboot |
 | `docker: Error response from daemon: …Linux containers are not enabled` | Switch Docker Desktop to Linux containers mode (tray icon → "Switch to Linux containers") |
 | Outbound to `api.anthropic.com` blocked | Add a Windows Firewall outbound rule for the venv's `python.exe`, or whitelist the provider domains at the corporate firewall |
-| `.harness_config.json` saved with CRLF line endings | Harmless for JSON parsing; if a downstream tool chokes, run `git config --global core.autocrlf input` and re-save with LF |
+| `config/config.json` saved with CRLF line endings | Harmless for JSON parsing; if a downstream tool chokes, run `git config --global core.autocrlf input` and re-save with LF |
 
 ### Windows + WSL2
 
@@ -646,9 +698,10 @@ These show up in the HITL banner as `Trigger: <name>` and mean the harness short
 
 ## 14. Next Steps
 
-- [README → Command reference](../README.md#command-reference) — every flag of `harness run`, `resume`, `status`, `doctor`, `purge`.
-- [docs/SPEC_REQUIREMENTS.md](SPEC_REQUIREMENTS.md) — full `.harness_config.json` schema.
+- `harness <subcommand> --help` — every flag of `harness run`, `resume`, `status`, `doctor`, `purge`, `metrics`, `web start/stop`, `schedule run/list/validate/once/history`, `chat`, `index build/status/clear`, `gh issue/pr-create/pr-comment`, `cache clear`.
+- [docs/SPEC_REQUIREMENTS.md](SPEC_REQUIREMENTS.md) — full `config/config.json` schema.
 - [docs/SPEC_ARCHITECTURE.md](SPEC_ARCHITECTURE.md) — graph topology and module map.
-- [docs/app-deployment.md](app-deployment.md) — what the harness produces for deployment (Dockerfile, docker-compose.yml, Caddyfile), the preview gate, and how to bring the same dev env up on a different host.
-- [CONTRIBUTING.md](../CONTRIBUTING.md) — dev environment, pre-commit, test loop.
+- [docs/RUNBOOK.md](RUNBOOK.md) — mid-session failure recipes for operators.
+- [docs/EDGE_CASE_AUDIT.md](EDGE_CASE_AUDIT.md) — known edge cases and their handling.
 - `harness/style_guides/*.md` and `harness/test_guides/*.md` — shipped per-language guidance the LLM sees during code and test generation. Drop your own overrides under `<workspace>/style_guides/` or `<workspace>/test_guides/` (same filenames win on collision).
+- `harness/skills/*.md` — stack scaffolds the planner uses for greenfield projects (Django, FastAPI, Flutter, React, Vue, Angular, Spring Boot, Express, …).

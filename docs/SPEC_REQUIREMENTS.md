@@ -442,12 +442,13 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given a PR-create call from a branch with no commits ahead of base, the `gh pr create` exit code surfaces verbatim.
 
 ### FR-055: Runtime-Extensible Skills Directory
-- **Description:** `register_builtin_skills(config)` MUST walk `~/.harness/skills/` (or the path named by `skills.user_skills_dir`) at startup and import every non-`_`-prefixed `*.py` file. Each loaded module MAY call `harness.skills.register(MySkill(...))` to add a `ToolSkill`/`PipelineSkill`/`SubAgentSkill` without modifying core code. Failures (syntax error, missing dep, import-time exception) MUST log and continue so one bad file never blocks startup.
+- **Description:** `register_builtin_skills(config)` MUST walk `~/.harness/user_skills/` (or the path named by `skills.user_skills_dir`) at startup and import every non-`_`-prefixed `*.py` file. Each loaded module MAY call `harness.skills.register(MySkill(...))` to add a `ToolSkill`/`PipelineSkill`/`SubAgentSkill`, or `harness.web_tools.register_backend(name, factory)` to plug in an alternative web-search backend, without modifying core code. Failures (syntax error, missing dep, import-time exception) MUST log and continue so one bad file never blocks startup. The loader MUST fall back to the legacy default `~/.harness/skills/` when only the legacy directory exists, and MUST emit a one-time deprecation INFO naming both paths so operators know to migrate.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given a valid `~/.harness/skills/demo.py` that calls `register(...)` at module load, the skill appears in `SkillRegistry.list_all()` after `harness run` starts.
-  - Given a `~/.harness/skills/broken.py` that raises `RuntimeError` at import time, the harness logs the failure and continues without crashing.
-  - Given `~/.harness/skills/` does not exist, the loader silently no-ops.
+  - Given a valid `~/.harness/user_skills/demo.py` that calls `register(...)` at module load, the skill appears in `SkillRegistry.list_all()` after `harness run` starts.
+  - Given a `~/.harness/user_skills/broken.py` that raises `RuntimeError` at import time, the harness logs the failure and continues without crashing.
+  - Given neither `~/.harness/user_skills/` nor `~/.harness/skills/` exists, the loader silently no-ops.
+  - Given only the legacy `~/.harness/skills/` exists (operator has not yet migrated), the loader uses it AND logs one INFO line per process pointing at the new default.
 
 ### FR-056: Repository Semantic Retrieval (`harness index`)
 - **Description:** The harness MUST ship a per-workspace semantic-retrieval index buildable via `harness index build`. Two backends MUST be supported: zero-dep `tfidf` (default, deterministic, pure Python with identifier-aware tokenisation) and opt-in `openai_embeddings` (using `OPENAI_API_KEY`, falling back to TF-IDF when the key is missing). Index storage MUST be SQLite at `~/.harness/repo_index/repo_index.db`. When `repo_index.enabled=true`, `planning_node` MUST query top-K chunks for the user prompt and inject them as a system context block capped at `repo_index.inject_max_bytes`. `harness index {build, status, clear}` MUST be exposed as a CLI subcommand family.

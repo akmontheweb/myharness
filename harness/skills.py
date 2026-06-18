@@ -770,13 +770,16 @@ def register_builtin_skills(config: Optional[dict[str, Any]] = None) -> int:
         logger.warning("[skills] fanout skill registration skipped: %s", exc)
 
     # Opt-in: user skills directory. Operators drop `*.py` files under
-    # ``~/.harness/skills`` (or the directory named by ``skills.user_skills_dir``);
+    # ``~/.harness/user_skills`` (or the directory named by ``skills.user_skills_dir``);
     # each module is imported at startup and can call ``harness.skills.register``
-    # to add its own ToolSkill / PipelineSkill / SubAgentSkill. The contract
-    # is "import side-effect registration" — same pattern Claude Code uses,
-    # same pattern the built-ins above use. Bad files (syntax errors,
-    # missing deps) log and are skipped so one bad file doesn't take down
-    # the harness.
+    # to add its own ToolSkill / PipelineSkill / SubAgentSkill, OR call
+    # ``harness.web_tools.register_backend(name, factory)`` to plug in an
+    # alternative web-search backend (Tavily, Brave, SerpAPI, in-house) without
+    # forking the harness — the operator then flips ``web_tools.search_backend``
+    # to the registered name. The contract is "import side-effect registration"
+    # — same pattern Claude Code uses, same pattern the built-ins above use.
+    # Bad files (syntax errors, missing deps) log and are skipped so one bad
+    # file doesn't take down the harness.
     try:
         user_count = load_user_skills_directory(config)
         count += user_count
@@ -791,14 +794,70 @@ def register_builtin_skills(config: Optional[dict[str, Any]] = None) -> int:
 # 11. User Skills Directory Loader  (#5 — runtime-extensible skills)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_USER_SKILLS_DIR = "~/.harness/skills"
+# New default. Chosen to disambiguate from the BUNDLED markdown directory
+# at ``harness/skills/`` inside the installed package — that one ships
+# stack scaffolds (react.md, python_django.md, …) the planner reads, and
+# is unrelated to operator-supplied Python. Operators kept dropping
+# ``*.py`` files in the wrong place because the names collided.
+_DEFAULT_USER_SKILLS_DIR = "~/.harness/user_skills"
+
+# Legacy default — operators who relied on the implicit default (no
+# ``skills.user_skills_dir`` in their config) still have files at the
+# old path. _resolve_user_skills_dir() falls back to this when the new
+# default doesn't exist but the legacy one does, and logs a one-time
+# deprecation INFO so the operator knows to migrate. Operators who set
+# the config key explicitly are unaffected either way.
+_LEGACY_USER_SKILLS_DIR = "~/.harness/skills"
+
+_legacy_fallback_warned = False
 
 
 def _resolve_user_skills_dir(config: Optional[dict[str, Any]]) -> str:
-    """Resolve the user-skills directory from config or default."""
+    """Resolve the user-skills directory from config, falling back to the
+    new default — or, transitionally, the legacy default — when no
+    explicit value is set.
+
+    Resolution order:
+        1. ``config["skills"]["user_skills_dir"]`` — explicit operator
+           choice; honoured verbatim (no fallback applied).
+        2. ``_DEFAULT_USER_SKILLS_DIR`` (~/.harness/user_skills) — new
+           default; returned as-is even if the directory doesn't yet
+           exist, so a fresh install creates files in the right place.
+        3. ``_LEGACY_USER_SKILLS_DIR`` (~/.harness/skills) — fallback
+           used ONLY when (a) the operator didn't set the key AND (b)
+           the new directory doesn't exist AND (c) the legacy directory
+           does. Logs a one-time deprecation notice naming both paths
+           so operators know to ``mv`` and either accept the new
+           default or pin the legacy path in config.
+    """
+    global _legacy_fallback_warned
     section = ((config or {}).get("skills") or {})
-    raw = section.get("user_skills_dir") or _DEFAULT_USER_SKILLS_DIR
-    return _os.path.expanduser(str(raw))
+    explicit = section.get("user_skills_dir")
+    if explicit:
+        return _os.path.expanduser(str(explicit))
+
+    new_default = _os.path.expanduser(_DEFAULT_USER_SKILLS_DIR)
+    if _os.path.isdir(new_default):
+        return new_default
+
+    legacy = _os.path.expanduser(_LEGACY_USER_SKILLS_DIR)
+    if _os.path.isdir(legacy):
+        if not _legacy_fallback_warned:
+            logger.info(
+                "[skills] Using legacy user-skills directory %s. The default "
+                "moved to %s to disambiguate from the bundled markdown "
+                "scaffolds at harness/skills/. Move your *.py files to the "
+                "new location, or pin the old path explicitly via "
+                "skills.user_skills_dir in config.json to silence this notice.",
+                legacy, new_default,
+            )
+            _legacy_fallback_warned = True
+        return legacy
+
+    # Neither directory exists. Return the NEW default so an operator who
+    # creates the directory afterward gets the modern path without
+    # having to touch config.
+    return new_default
 
 
 def load_user_skills_directory(config: Optional[dict[str, Any]] = None) -> int:
