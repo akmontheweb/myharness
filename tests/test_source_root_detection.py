@@ -271,3 +271,353 @@ class TestAllowlistEndToEndMonorepo:
         assert is_path_allowed("app/handlers.py", str(tmp_path), allowlist)
         assert is_path_allowed("tests/test_handlers.py", str(tmp_path), allowlist)
         assert not is_path_allowed("scratch/notes.py", str(tmp_path), allowlist)
+
+
+def _write_spec(tmp_path, roots_list, *, test_placement="co-located", root_files=None, include_inventory_files=None):
+    """Build a SPEC_ARCHITECTURE.md with the workspace_layout block."""
+    import json
+
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    layout = {
+        "workspace_layout": {
+            "roots": roots_list,
+            "test_placement": test_placement,
+            "root_files": root_files or [],
+        }
+    }
+    parts = [
+        "# SPEC_ARCHITECTURE.md\n\n## Modules\n\nDescribed below.\n\n",
+        f"```json\n{json.dumps(layout, indent=2)}\n```\n",
+    ]
+    if include_inventory_files is not None:
+        inventory = {"files": [{"path": p} for p in include_inventory_files]}
+        parts.append(f"\n```json\n{json.dumps(inventory, indent=2)}\n```\n")
+    (docs_dir / "SPEC_ARCHITECTURE.md").write_text("".join(parts))
+
+
+class TestSpecDrivenAllowlist:
+    """When SPEC_ARCHITECTURE.md has a workspace_layout block, the
+    patcher allowlist is built from it — the filesystem heuristic
+    becomes the fallback for spec-less modes only."""
+
+    def setup_method(self):
+        # Reset the per-session divergence-decision cache so each test
+        # exercises a fresh decision path.
+        from harness.graph import _LAYOUT_DIVERGENCE_CACHE
+        _LAYOUT_DIVERGENCE_CACHE.clear()
+
+    def test_spec_roots_drive_allowlist(self, tmp_path):
+        # Spec says client + server. The filesystem has only server/ on
+        # disk (greenfield first iteration of the frontend). The spec
+        # must still allow client/ patches.
+        from harness.graph import _build_patcher_allowlist
+        from harness.trust import is_path_allowed
+
+        for name in ("server.js", "routes.js"):
+            _touch(tmp_path / "server" / "src" / name)
+        # NOTE: no client/ files on disk yet — the spec is the only
+        # source of truth that client/ is a valid target.
+
+        _write_spec(
+            tmp_path,
+            [
+                {"path": "client", "purpose": "React frontend", "stack": "react"},
+                {"path": "server", "purpose": "Express API", "stack": "express"},
+            ],
+        )
+
+        allowlist = _build_patcher_allowlist(str(tmp_path))
+        assert allowlist is not None
+        # client/ patches should be accepted even though no client files exist.
+        assert is_path_allowed(
+            "client/src/App.jsx", str(tmp_path), allowlist,
+        )
+        assert is_path_allowed(
+            "client/src/components/Login.test.jsx", str(tmp_path), allowlist,
+        )
+        # server/ still works.
+        assert is_path_allowed(
+            "server/src/auth.js", str(tmp_path), allowlist,
+        )
+        # Drifted dirs (not in the spec) are blocked.
+        assert not is_path_allowed(
+            "evil/exfil.js", str(tmp_path), allowlist,
+        )
+
+    def test_spec_overrides_filesystem_when_they_disagree(self, tmp_path):
+        # The filesystem heuristic alone would pick "server" as the
+        # dominant single root and reject client/. The spec must win.
+        from harness.graph import _build_patcher_allowlist
+        from harness.trust import is_path_allowed
+
+        for i in range(8):
+            _touch(tmp_path / "server" / f"f{i}.js")
+        # Just one file in client/ — filesystem alone would not consider
+        # client/ substantial.
+        _touch(tmp_path / "client" / "App.jsx")
+
+        _write_spec(
+            tmp_path,
+            [
+                {"path": "client"},
+                {"path": "server"},
+            ],
+        )
+
+        allowlist = _build_patcher_allowlist(str(tmp_path))
+        assert allowlist is not None
+        # Adding more client tests / components must be accepted.
+        assert is_path_allowed(
+            "client/src/Login.test.jsx", str(tmp_path), allowlist,
+        )
+
+    def test_spec_root_files_added_to_allowlist(self, tmp_path):
+        from harness.graph import _build_patcher_allowlist
+        from harness.trust import is_path_allowed
+
+        _touch(tmp_path / "src" / "main.py")
+        _write_spec(
+            tmp_path,
+            [{"path": "src"}],
+            root_files=["pyproject.toml", "Justfile"],  # Justfile is exotic
+        )
+        allowlist = _build_patcher_allowlist(str(tmp_path))
+        assert is_path_allowed("Justfile", str(tmp_path), allowlist)
+
+    def test_inventory_derivation_fallback_for_legacy_specs(self, tmp_path):
+        # Spec was written before the workspace_layout contract — has
+        # only the file inventory. Roots should be derived from the
+        # inventory's top-level path components.
+        from harness.graph import _build_patcher_allowlist
+        from harness.trust import is_path_allowed
+        import json
+
+        for name in ("App.jsx", "Login.jsx"):
+            _touch(tmp_path / "client" / "src" / name)
+        for name in ("server.js", "routes.js"):
+            _touch(tmp_path / "server" / "src" / name)
+
+        # Spec has ONLY the inventory block, no workspace_layout block.
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        inventory = {"files": [
+            {"path": "client/src/App.jsx"},
+            {"path": "client/src/Login.jsx"},
+            {"path": "server/src/server.js"},
+            {"path": "server/src/routes.js"},
+        ]}
+        (docs_dir / "SPEC_ARCHITECTURE.md").write_text(
+            f"# SPEC_ARCHITECTURE.md\n\n```json\n{json.dumps(inventory)}\n```\n"
+        )
+
+        allowlist = _build_patcher_allowlist(str(tmp_path))
+        assert is_path_allowed(
+            "client/src/components/Search.jsx", str(tmp_path), allowlist,
+        )
+        assert is_path_allowed(
+            "server/src/db.js", str(tmp_path), allowlist,
+        )
+
+    def test_falls_through_to_filesystem_when_spec_absent(self, tmp_path):
+        # No spec file at all — must behave exactly like the
+        # filesystem-only path (tier-2 fallback).
+        from harness.graph import _build_patcher_allowlist
+        from harness.trust import is_path_allowed
+
+        for name in ("a.py", "b.py", "c.py"):
+            _touch(tmp_path / "src" / name)
+
+        allowlist = _build_patcher_allowlist(str(tmp_path))
+        assert is_path_allowed("src/d.py", str(tmp_path), allowlist)
+        assert not is_path_allowed("nowhere/x.py", str(tmp_path), allowlist)
+
+    def test_falls_through_when_spec_is_unparseable(self, tmp_path):
+        # Spec exists but has no fenced JSON blocks at all → tier-2
+        # filesystem fallback fires.
+        from harness.graph import _build_patcher_allowlist
+        from harness.trust import is_path_allowed
+
+        for name in ("a.py", "b.py"):
+            _touch(tmp_path / "src" / name)
+
+        docs = tmp_path / "docs"
+        docs.mkdir()
+        (docs / "SPEC_ARCHITECTURE.md").write_text(
+            "# SPEC_ARCHITECTURE.md\n\nProse-only spec. No fenced blocks.\n"
+        )
+        allowlist = _build_patcher_allowlist(str(tmp_path))
+        assert is_path_allowed("src/c.py", str(tmp_path), allowlist)
+
+
+class TestLayoutDiskDivergence:
+    """The _check_layout_disk_divergence helper detects drift between
+    the spec's declared roots and what's on disk."""
+
+    def setup_method(self):
+        from harness.graph import _LAYOUT_DIVERGENCE_CACHE
+        _LAYOUT_DIVERGENCE_CACHE.clear()
+
+    def test_no_drift_returns_none(self, tmp_path):
+        from harness.graph import _check_layout_disk_divergence
+        from harness.architecture_inventory import LayoutParseResult, LayoutRoot
+
+        for name in ("a.py", "b.py"):
+            _touch(tmp_path / "src" / name)
+        layout = LayoutParseResult(roots=[LayoutRoot(path="src")])
+        assert _check_layout_disk_divergence(str(tmp_path), layout) is None
+
+    def test_minor_drift_classification(self, tmp_path):
+        from harness.graph import _check_layout_disk_divergence
+        from harness.architecture_inventory import LayoutParseResult, LayoutRoot
+
+        for i in range(10):
+            _touch(tmp_path / "src" / f"f{i}.py")
+        # One unspec'd dir with only 1 file → minor.
+        _touch(tmp_path / "scratch" / "note.py")
+        layout = LayoutParseResult(roots=[LayoutRoot(path="src")])
+        diag = _check_layout_disk_divergence(str(tmp_path), layout)
+        assert diag is not None
+        assert diag["severity"] == "minor"
+        assert diag["drifted_dirs"] == [{"path": "scratch", "source_count": 1}]
+
+    def test_major_drift_by_absolute_count(self, tmp_path):
+        from harness.graph import _check_layout_disk_divergence
+        from harness.architecture_inventory import LayoutParseResult, LayoutRoot
+
+        for i in range(20):
+            _touch(tmp_path / "src" / f"f{i}.py")
+        # 3+ files in an unspec'd dir → major regardless of percentage.
+        for name in ("a.py", "b.py", "c.py"):
+            _touch(tmp_path / "extra" / name)
+        layout = LayoutParseResult(roots=[LayoutRoot(path="src")])
+        diag = _check_layout_disk_divergence(str(tmp_path), layout)
+        assert diag is not None
+        assert diag["severity"] == "major"
+        assert diag["drifted_dirs"][0]["path"] == "extra"
+
+    def test_major_drift_by_percentage(self, tmp_path):
+        from harness.graph import _check_layout_disk_divergence
+        from harness.architecture_inventory import LayoutParseResult, LayoutRoot
+
+        # Smaller workspace where 2 files is ≥15% of the total → major.
+        # src has 8 files, drift has 2 files; total 10. 2/10 = 20% ≥ 15%.
+        for i in range(8):
+            _touch(tmp_path / "src" / f"f{i}.py")
+        for name in ("a.py", "b.py"):
+            _touch(tmp_path / "drifted" / name)
+        layout = LayoutParseResult(roots=[LayoutRoot(path="src")])
+        diag = _check_layout_disk_divergence(str(tmp_path), layout)
+        assert diag is not None
+        assert diag["severity"] == "major"
+
+    def test_ignores_never_source_dirs(self, tmp_path):
+        # node_modules / build / dist / docs etc. must never count as drift.
+        from harness.graph import _check_layout_disk_divergence
+        from harness.architecture_inventory import LayoutParseResult, LayoutRoot
+
+        for name in ("a.py", "b.py"):
+            _touch(tmp_path / "src" / name)
+        for i in range(50):
+            _touch(tmp_path / "node_modules" / "pkg" / f"f{i}.js")
+        for i in range(10):
+            _touch(tmp_path / "build" / f"f{i}.js")
+        layout = LayoutParseResult(roots=[LayoutRoot(path="src")])
+        assert _check_layout_disk_divergence(str(tmp_path), layout) is None
+
+    def test_no_layout_returns_none(self, tmp_path):
+        from harness.graph import _check_layout_disk_divergence
+        from harness.architecture_inventory import LayoutParseResult
+
+        _touch(tmp_path / "src" / "a.py")
+        # Empty layout (no roots) — nothing to compare against.
+        empty = LayoutParseResult()
+        assert _check_layout_disk_divergence(str(tmp_path), empty) is None
+
+
+class TestDivergenceCachingAndHITL:
+    """The divergence resolver caches its result per workspace and
+    short-circuits the HITL prompt when the gate is disabled."""
+
+    def setup_method(self):
+        from harness.graph import _LAYOUT_DIVERGENCE_CACHE
+        _LAYOUT_DIVERGENCE_CACHE.clear()
+
+    def test_minor_drift_does_not_prompt(self, tmp_path, monkeypatch):
+        # Even if the HITL gate is on, MINOR drift never prompts.
+        from harness.graph import _resolve_layout_divergence
+        from harness.architecture_inventory import LayoutParseResult, LayoutRoot
+        import harness.cli as cli_mod
+
+        for i in range(20):
+            _touch(tmp_path / "src" / f"f{i}.py")
+        _touch(tmp_path / "scratch" / "x.py")  # 1 file → minor
+
+        monkeypatch.setitem(cli_mod._HITL_FLAGS, "layout_divergence", True)
+
+        # Should NOT call the channel — minor drift returns [] silently.
+        called = []
+        monkeypatch.setattr(
+            "harness.graph._prompt_layout_divergence",
+            lambda diag: called.append(diag) or [],
+        )
+
+        extra = _resolve_layout_divergence(
+            str(tmp_path),
+            LayoutParseResult(roots=[LayoutRoot(path="src")]),
+        )
+        assert extra == []
+        assert called == []
+
+    def test_major_drift_without_gate_returns_empty(self, tmp_path, monkeypatch):
+        from harness.graph import _resolve_layout_divergence
+        from harness.architecture_inventory import LayoutParseResult, LayoutRoot
+        import harness.cli as cli_mod
+
+        for i in range(8):
+            _touch(tmp_path / "src" / f"f{i}.py")
+        for name in ("a.py", "b.py", "c.py"):
+            _touch(tmp_path / "drift" / name)
+
+        monkeypatch.setitem(cli_mod._HITL_FLAGS, "layout_divergence", False)
+
+        called = []
+        monkeypatch.setattr(
+            "harness.graph._prompt_layout_divergence",
+            lambda diag: called.append(diag) or ["drift/"],
+        )
+
+        extra = _resolve_layout_divergence(
+            str(tmp_path),
+            LayoutParseResult(roots=[LayoutRoot(path="src")]),
+        )
+        # Gate is off → no prompt, no allowlist extension.
+        assert extra == []
+        assert called == []
+
+    def test_major_drift_with_gate_consults_operator_once(self, tmp_path, monkeypatch):
+        from harness.graph import _resolve_layout_divergence
+        from harness.architecture_inventory import LayoutParseResult, LayoutRoot
+        import harness.cli as cli_mod
+
+        for i in range(8):
+            _touch(tmp_path / "src" / f"f{i}.py")
+        for name in ("a.py", "b.py", "c.py"):
+            _touch(tmp_path / "drift" / name)
+
+        monkeypatch.setitem(cli_mod._HITL_FLAGS, "layout_divergence", True)
+
+        calls = []
+        monkeypatch.setattr(
+            "harness.graph._prompt_layout_divergence",
+            lambda diag: calls.append(diag) or ["drift/"],
+        )
+
+        layout = LayoutParseResult(roots=[LayoutRoot(path="src")])
+        first = _resolve_layout_divergence(str(tmp_path), layout)
+        second = _resolve_layout_divergence(str(tmp_path), layout)
+
+        assert first == ["drift/"]
+        assert second == ["drift/"]
+        # Cached — prompt fires exactly once.
+        assert len(calls) == 1

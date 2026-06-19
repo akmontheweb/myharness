@@ -1414,13 +1414,21 @@ def resolve_build_command(
 _HITL_FLAGS: dict[str, bool] = {}
 
 
-def _set_hitl_flags(*, req: bool, arch: bool, repair: bool, deployment: bool) -> None:
+def _set_hitl_flags(
+    *,
+    req: bool,
+    arch: bool,
+    repair: bool,
+    deployment: bool,
+    layout_divergence: bool = False,
+) -> None:
     """Pin the operator's --hitl-* choices for this run."""
     _HITL_FLAGS.update({
-        "requirements": req,
-        "architecture": arch,
-        "repair":       repair,
-        "deployment":   deployment,
+        "requirements":      req,
+        "architecture":      arch,
+        "repair":            repair,
+        "deployment":        deployment,
+        "layout_divergence": layout_divergence,
     })
 
 
@@ -3687,6 +3695,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         arch=bool(getattr(args, "hitl_arch", False)),
         repair=bool(getattr(args, "hitl_repair", False)),
         deployment=bool(getattr(args, "hitl_deployment", False)),
+        layout_divergence=bool(getattr(args, "hitl_layout_divergence", False)),
     )
 
     # --yes only makes sense paired with --new-build. Reject the lone
@@ -7127,6 +7136,28 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "When true, prompt the operator at the DEPLOYMENT gatekeeper "
             "before the dev deploy fires. Defaults to false (auto-approve)."
+        ),
+    )
+    # --hitl-layout-divergence true|false. When the spec-driven patcher
+    # allowlist (built from SPEC_ARCHITECTURE.md's workspace_layout block)
+    # finds substantial source files in top-level dirs the spec didn't
+    # declare, the harness can either log-and-continue (default) or pause
+    # for operator reconciliation. Default false matches the rest of the
+    # HITL flags — autonomous runs stay autonomous. Log + observability
+    # event fire either way; only the interactive gate is gated by this
+    # flag.
+    run_parser.add_argument(
+        "--hitl-layout-divergence",
+        type=_bool_choice,
+        default=False,
+        metavar="true|false",
+        dest="hitl_layout_divergence",
+        help=(
+            "When true, prompt the operator when the on-disk top-level "
+            "layout drifts from SPEC_ARCHITECTURE.md's workspace_layout "
+            "block by ≥3 source files (or ≥15%% of workspace source) in "
+            "an unspec'd directory. Defaults to false (log-only). The "
+            "spec_layout_divergence observability event fires regardless."
         ),
     )
 

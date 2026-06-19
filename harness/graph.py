@@ -352,29 +352,226 @@ def _is_node_config_file(name: str) -> bool:
     return False
 
 
+SPEC_ARCHITECTURE_REL_PATH = os.path.join("docs", "SPEC_ARCHITECTURE.md")
+
+
+def _read_spec_layout(workspace_path: str):
+    """Read ``<workspace>/docs/SPEC_ARCHITECTURE.md`` and parse its
+    ``workspace_layout`` block. Returns a :class:`LayoutParseResult`
+    or ``None`` when the spec file is absent / unreadable.
+
+    The patcher allowlist and the system prompt both call this — kept as
+    a single read-and-parse helper so they see byte-identical layout
+    data within one node invocation."""
+    spec_path = os.path.join(workspace_path, SPEC_ARCHITECTURE_REL_PATH)
+    if not os.path.isfile(spec_path):
+        return None
+    try:
+        with open(spec_path, "r", encoding="utf-8", errors="replace") as f:
+            spec_md = f.read()
+    except OSError:
+        return None
+    from harness.architecture_inventory import parse_layout
+    return parse_layout(spec_md)
+
+
 def _build_patcher_allowlist(workspace_path: str) -> Optional[list[str]]:
     """Return the patcher allowed_paths list for ``workspace_path``.
 
-    When a source root is detected, returns the focused allowlist:
-      - the source root itself as a directory prefix (e.g. ``"app/"``),
-      - the conventional test trees,
-      - the conventionally-root files in :data:`_ROOT_ALLOWLIST_FILES`,
-      - any ``requirements*.txt`` actually present at the workspace root.
+    Tiered decision:
 
-    When detection fails (flat / ambiguous workspaces) we used to return
-    ``None`` which the patcher reads as "allow ANY path under the
-    workspace tree". That gave the LLM unconstrained write access to
-    ``.git/`` config, dotfiles, and anywhere else in the tree — well
-    outside the intent of "edit the source." Instead we return a
-    conservative best-guess allowlist covering the common source layouts
-    (``src/``, ``lib/``, ``app/``, ``pkg/``, ``cmd/``) plus the standard
-    test trees and root manifest files. If the LLM genuinely needs to
-    write somewhere outside that, the patcher will reject the write and
-    the operator can either fix the layout heuristic in ``harness.impact``
-    or add a top-level entry to the allowlist explicitly.
+      1. **Spec-driven (tier 1)** — when
+         ``<workspace>/docs/SPEC_ARCHITECTURE.md`` exists and either its
+         ``workspace_layout`` block parses or it carries a parseable
+         ``files`` inventory we can derive roots from, the allowlist is
+         built directly from the spec's declared roots, test directory
+         convention, and root manifest list. This is the authoritative
+         path — SPEC_ARCHITECTURE.md is the layout contract the
+         architecture phase wrote and the human gatekeeper approved.
 
+      2. **Filesystem fallback (tier 2)** — when the spec is absent
+         (reverse-engineer mode, change-request mode against a legacy
+         repo, greenfield iteration 1) or fails to yield any roots, fall
+         back to :func:`harness.impact._detect_source_roots` and the
+         greenfield / permissive fallback already in place. This keeps
+         the harness working in modes where there is no spec yet.
+
+    Returns ``None`` only for the greenfield iteration-1 case (no spec,
+    no source files), preserving the LLM's freedom to pick the layout.
     Mirrors the language used in the system prompt's "Workspace Layout"
     section, so the LLM sees the same rules as the patcher applies.
+    """
+    layout = _read_spec_layout(workspace_path)
+    if layout is not None and layout.has_layout:
+        allowlist = _spec_driven_allowlist(workspace_path, layout)
+        logger.info(
+            "[allowlist] Spec-driven, roots=%s%s%s.",
+            [r.path for r in layout.roots],
+            (" (derived from file inventory)"
+             if layout.derived_from_inventory else ""),
+            (f" test_placement={layout.test_placement}"
+             if layout.test_placement else ""),
+        )
+        return allowlist
+
+    return _filesystem_allowlist(workspace_path)
+
+
+def _spec_driven_allowlist(workspace_path: str, layout) -> list[str]:
+    """Build the tier-1 allowlist from a parsed workspace_layout block.
+
+    The spec's ``roots`` list IS the prefix set. The standard test trees
+    stay in the allowlist regardless of the spec's ``test_placement`` —
+    a project may host its top-level integration tests in ``tests/``
+    even when unit tests are co-located. The spec's ``root_files`` list
+    is layered on top of the static :data:`_ROOT_ALLOWLIST_FILES`, then
+    the runtime root scan (``requirements*.txt``, node configs) adds
+    whatever is actually on disk.
+
+    Spec/disk divergence is surfaced as an observability event and log
+    line every call. When the operator opted into the layout-divergence
+    HITL gate (``--hitl-layout-divergence true``) and the drift is
+    major, an interactive prompt offers to extend the in-memory
+    allowlist with the drifted directories. The choice is cached per
+    workspace so the prompt fires once, not on every node invocation.
+    """
+    allowlist: list[str] = [
+        *[f"{r.path}/" for r in layout.roots],
+        "tests/", "test/", "__tests__/",
+        *_ROOT_ALLOWLIST_FILES,
+        *[f for f in layout.root_files if f not in _ROOT_ALLOWLIST_FILES],
+    ]
+    extra = _resolve_layout_divergence(workspace_path, layout)
+    for entry in extra:
+        if entry not in allowlist:
+            allowlist.append(entry)
+    _append_runtime_root_entries(workspace_path, allowlist)
+    return allowlist
+
+
+# Caches the operator's per-workspace decision when the layout-divergence
+# HITL gate fires, so subsequent calls in the same session reuse the
+# answer instead of re-prompting. Keyed by workspace_path. Values:
+#   - []         → "trust spec" (or no drift / minor drift / HITL off)
+#   - [paths]    → "trust disk" — append these dir prefixes to allowlist
+_LAYOUT_DIVERGENCE_CACHE: dict[str, list[str]] = {}
+
+
+def _resolve_layout_divergence(workspace_path: str, layout) -> list[str]:
+    """Detect spec/disk divergence; emit telemetry; consult the operator
+    when the HITL gate is enabled. Returns extra allowlist prefixes to
+    add to the spec-driven base.
+    """
+    if workspace_path in _LAYOUT_DIVERGENCE_CACHE:
+        return _LAYOUT_DIVERGENCE_CACHE[workspace_path]
+
+    diagnostic = _check_layout_disk_divergence(workspace_path, layout)
+    if diagnostic is None:
+        _LAYOUT_DIVERGENCE_CACHE[workspace_path] = []
+        return []
+
+    # Always emit the observability event so divergence is visible even
+    # when the HITL gate is off (the default).
+    try:
+        from harness.observability import emit_event
+        emit_event(
+            "spec_layout_divergence",
+            severity=diagnostic["severity"],
+            spec_roots=diagnostic["spec_roots"],
+            drifted_dirs=diagnostic["drifted_dirs"],
+            total_workspace_source=diagnostic["total_workspace_source"],
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never block the build
+        pass
+
+    drifted_summary = ", ".join(
+        f"{d['path']}/ ({d['source_count']} files)"
+        for d in diagnostic["drifted_dirs"]
+    )
+
+    if diagnostic["severity"] == "minor":
+        logger.info(
+            "[allowlist] Minor layout drift: %s. Spec roots: %s. "
+            "Spec wins — drifted dirs stay off the allowlist.",
+            drifted_summary, diagnostic["spec_roots"],
+        )
+        _LAYOUT_DIVERGENCE_CACHE[workspace_path] = []
+        return []
+
+    logger.warning(
+        "[allowlist] Major layout drift. Spec declares roots %s but "
+        "workspace also has substantial source under: %s. Patches "
+        "targeting drifted dirs will be rejected unless the spec is "
+        "updated.",
+        diagnostic["spec_roots"], drifted_summary,
+    )
+
+    try:
+        from harness.cli import _hitl_gate_enabled
+        gate_on = _hitl_gate_enabled("layout_divergence")
+    except Exception:  # noqa: BLE001
+        gate_on = False
+    if not gate_on:
+        _LAYOUT_DIVERGENCE_CACHE[workspace_path] = []
+        return []
+
+    extra = _prompt_layout_divergence(diagnostic)
+    _LAYOUT_DIVERGENCE_CACHE[workspace_path] = extra
+    return extra
+
+
+def _prompt_layout_divergence(diagnostic: dict[str, Any]) -> list[str]:
+    """Interactive prompt for major layout drift. Returns the list of
+    dir prefixes the operator authorized for this session.
+    """
+    drifted_paths = [d["path"] for d in diagnostic["drifted_dirs"]]
+    options = [
+        ("s", "Trust SPEC — proceed; drifted-dir patches will reject"),
+        ("d", f"Trust DISK — append {drifted_paths} to allowlist this run"),
+    ]
+    print()
+    drifted_render = ", ".join(
+        f"{d['path']}/ ({d['source_count']} files)"
+        for d in diagnostic["drifted_dirs"]
+    )
+    print("=" * 80)
+    print("[HITL] Spec / disk layout divergence")
+    print(f"  Spec roots: {diagnostic['spec_roots']}")
+    print(f"  Drifted:    {drifted_render}")
+    print(f"  Total workspace source files: {diagnostic['total_workspace_source']}")
+    print("=" * 80)
+    print("Options:")
+    for key, label in options:
+        print(f"  [{key}] {label}")
+    print()
+    try:
+        from harness.hitl import get_channel
+        choice = get_channel().prompt(
+            "[HITL] Layout divergence — choose action",
+            [k for k, _ in options],
+            default="s",
+            option_labels={k: lbl for k, lbl in options},
+        )
+    except Exception:  # noqa: BLE001 — non-interactive channel etc.
+        choice = "s"
+    if choice == "d":
+        appended = [f"{p}/" for p in drifted_paths]
+        logger.warning(
+            "[allowlist] Operator chose 'trust disk' — extending allowlist "
+            "with %s for the remainder of this run.", appended,
+        )
+        return appended
+    logger.info("[allowlist] Operator chose 'trust spec' — allowlist unchanged.")
+    return []
+
+
+def _filesystem_allowlist(workspace_path: str) -> Optional[list[str]]:
+    """Tier-2 fallback: derive the allowlist from a filesystem scan.
+
+    Same logic the harness has used since multi-root detection landed —
+    runs when the spec is unavailable. Returns ``None`` for true
+    greenfield workspaces so the LLM can pick its own layout on
+    iteration 1.
     """
     from harness.impact import (
         _detect_source_roots,
@@ -449,22 +646,236 @@ def _build_patcher_allowlist(workspace_path: str) -> Optional[list[str]]:
             *_ROOT_ALLOWLIST_FILES,
         ]
 
-    # Pick up any requirements*.txt actually present so the LLM can amend
-    # them without the patcher rejecting the write. Same scan also catches
-    # Node/JS tool configs (jest.config.cjs, vite.config.ts, .eslintrc.json,
-    # ...) — too many variants to enumerate statically; we allow only the
-    # ones actually in the tree so the LLM can amend what exists without
-    # opening up arbitrary root writes.
+    _append_runtime_root_entries(workspace_path, allowlist)
+    return allowlist
+
+
+def _check_layout_disk_divergence(workspace_path: str, layout) -> Optional[dict[str, Any]]:
+    """Compare the spec's declared roots against the on-disk top-level
+    directories. Detect cases where the workspace has drifted away from
+    SPEC_ARCHITECTURE.md.
+
+    Returns ``None`` when no drift is detected. Otherwise returns a
+    diagnostic dict with shape::
+
+        {
+            "severity": "minor" | "major",
+            "spec_roots": ["client", "server"],
+            "drifted_dirs": [{"path": "web", "source_count": 12}, ...],
+            "total_workspace_source": 47,
+            "test_placement": "co-located",  # from the spec, if present
+        }
+
+    Severity classification:
+      * **minor**: every drifted dir holds ≤2 source files. Treated as
+        scratch / leftover content; allowlist-driven rejection is enough
+        to keep the LLM honest.
+      * **major**: at least one drifted dir holds ≥3 source files OR ≥15%
+        of the workspace's total source. Signals real layout drift — the
+        operator should reconcile spec vs. disk before the run continues.
+
+    The observability event and (when ``--hitl-layout-divergence true``)
+    the HITL gate are raised by the calling node, not here — this
+    function is a pure inspector so it stays testable.
+    """
+    if not layout or not layout.has_layout:
+        return None
+    try:
+        entries = os.listdir(workspace_path)
+    except OSError:
+        return None
+
+    from harness.impact import (
+        _NEVER_SOURCE_DIRS,
+        _SOURCE_FILE_EXTENSIONS,
+        _MAX_FILES_PER_SCAN,
+    )
+
+    spec_root_set = {r.path for r in layout.roots}
+    drifted: list[tuple[str, int]] = []
+    total_source = 0
+    files_scanned = 0
+    spec_root_total = 0
+
+    for entry in entries:
+        full = os.path.join(workspace_path, entry)
+        if not os.path.isdir(full):
+            if os.path.isfile(full):
+                ext = os.path.splitext(entry)[1].lower()
+                if ext in _SOURCE_FILE_EXTENSIONS:
+                    total_source += 1
+            continue
+        if entry.startswith(".") or entry in _NEVER_SOURCE_DIRS:
+            continue
+
+        dir_count = 0
+        for sub_root, sub_dirs, sub_files in os.walk(full):
+            sub_dirs[:] = [
+                d for d in sub_dirs
+                if not d.startswith(".") and d not in _NEVER_SOURCE_DIRS
+            ]
+            for fname in sub_files:
+                if os.path.splitext(fname)[1].lower() in _SOURCE_FILE_EXTENSIONS:
+                    dir_count += 1
+                    files_scanned += 1
+                    if files_scanned >= _MAX_FILES_PER_SCAN:
+                        break
+            if files_scanned >= _MAX_FILES_PER_SCAN:
+                break
+        total_source += dir_count
+        if entry in spec_root_set:
+            spec_root_total += dir_count
+        elif dir_count > 0:
+            drifted.append((entry, dir_count))
+        if files_scanned >= _MAX_FILES_PER_SCAN:
+            break
+
+    if not drifted:
+        return None
+
+    # Threshold: major when any drifted dir has ≥3 files OR ≥15% of total.
+    threshold_count = 3
+    threshold_pct = 0.15
+    is_major = any(
+        cnt >= threshold_count or (total_source > 0 and cnt >= threshold_pct * total_source)
+        for _, cnt in drifted
+    )
+
+    return {
+        "severity": "major" if is_major else "minor",
+        "spec_roots": sorted(spec_root_set),
+        "drifted_dirs": [
+            {"path": p, "source_count": c}
+            for p, c in sorted(drifted, key=lambda kv: kv[1], reverse=True)
+        ],
+        "total_workspace_source": total_source,
+        "spec_root_source_count": spec_root_total,
+        "test_placement": getattr(layout, "test_placement", "") or "",
+    }
+
+
+def _append_runtime_root_entries(workspace_path: str, allowlist: list[str]) -> None:
+    """Append workspace-root files actually present that the LLM may need
+    to amend: ``requirements*.txt`` and the open-ended Node/JS tool
+    config families. Mutates ``allowlist`` in place.
+
+    Used by both the spec-driven tier-1 path and the filesystem
+    fallback. We allow only what's actually on disk so the LLM can amend
+    existing manifests without opening up arbitrary root writes.
+    """
     try:
         for entry in os.listdir(workspace_path):
             if entry.startswith("requirements") and entry.endswith(".txt"):
-                allowlist.append(entry)
+                if entry not in allowlist:
+                    allowlist.append(entry)
             elif _is_node_config_file(entry):
-                allowlist.append(entry)
+                if entry not in allowlist:
+                    allowlist.append(entry)
     except OSError:
         pass
 
-    return allowlist
+
+def _format_spec_layout_block(spec_layout) -> str:
+    """Render the spec's ``workspace_layout`` block as the system-prompt
+    Workspace Layout section.
+
+    The spec gives us purpose strings per root and a test_placement hint,
+    so the guidance to the LLM can be specific ("React frontend SPA"
+    rather than "the client-side root"). Used by ``_build_system_prompt``
+    when the spec is available; the multi-root filesystem-derived block
+    is the fallback.
+    """
+    roots = spec_layout.roots
+    if len(roots) == 1:
+        r = roots[0]
+        purpose_tail = (
+            f" — {r.purpose}" if r.purpose
+            else (f" ({r.stack})" if r.stack else "")
+        )
+        return (
+            f"## Workspace Layout (mandatory — per SPEC_ARCHITECTURE.md)\n"
+            f"The workspace declares one source root: `{r.path}/`"
+            f"{purpose_tail}. **All new source files MUST be created under "
+            f"`{r.path}/`.** Do NOT place new modules at workspace root or "
+            f"in any other top-level directory.\n\n"
+            f"{_format_test_placement_guidance(spec_layout.test_placement, [r.path])}"
+            f"{_format_root_files_guidance(spec_layout.root_files)}"
+        )
+
+    bullets = []
+    for r in roots:
+        parts = [f"`{r.path}/`"]
+        if r.purpose:
+            parts.append(f"— {r.purpose}")
+        if r.stack:
+            parts.append(f"({r.stack})")
+        bullets.append("  * " + " ".join(parts))
+    roots_listing = "\n".join(bullets)
+    primary = roots[0]
+    return (
+        "## Workspace Layout (mandatory — per SPEC_ARCHITECTURE.md)\n"
+        f"This workspace is a multi-root monorepo. The architecture spec "
+        f"declares the following source roots:\n{roots_listing}\n\n"
+        f"**All new source files MUST be created under one of these "
+        f"roots.** Do NOT place new modules at workspace root or in any "
+        f"other top-level directory. When you create a file, choose the "
+        f"root whose `purpose` is the closest semantic match — the "
+        f"purpose strings above were written by the architect for "
+        f"exactly this routing decision. When the choice is genuinely "
+        f"ambiguous, prefer `{primary.path}/` (the first declared root).\n\n"
+        f"{_format_test_placement_guidance(spec_layout.test_placement, [r.path for r in roots])}"
+        f"{_format_root_files_guidance(spec_layout.root_files)}"
+    )
+
+
+def _format_test_placement_guidance(test_placement: str, root_paths: list[str]) -> str:
+    """Render the test_placement line of the Workspace Layout block."""
+    if test_placement == "co-located":
+        return (
+            f"Tests are **co-located** with source per the architecture "
+            f"spec. JS/TS tests sit next to the file they test "
+            f"(`Foo.test.jsx` next to `Foo.jsx`); Python tests sit in a "
+            f"sibling `tests/` subdirectory inside their root "
+            f"(e.g. `{root_paths[0]}/tests/`). A top-level `tests/` is "
+            f"also accepted for cross-root integration tests.\n\n"
+        )
+    if test_placement == "centralized":
+        return (
+            "Tests are **centralized** per the architecture spec: every "
+            "test file lives under a top-level `tests/`, `test/`, or "
+            "`__tests__/` directory. Do NOT co-locate tests next to "
+            "their source files.\n\n"
+        )
+    if test_placement == "mixed":
+        return (
+            "Test placement is **mixed** per the architecture spec — "
+            "either co-located next to source or in a top-level `tests/` "
+            "directory is acceptable. Follow whichever convention an "
+            "existing test in the same root already uses.\n\n"
+        )
+    return (
+        "Test files may live next to their source (co-located) or in a "
+        "top-level `tests/` / `test/` / `__tests__/` directory.\n\n"
+    )
+
+
+def _format_root_files_guidance(root_files: list[str]) -> str:
+    """Render the root_files line of the Workspace Layout block."""
+    if not root_files:
+        return (
+            "Workspace-root files are limited to the standard set: "
+            "`setup.py`, `setup.cfg`, `pyproject.toml`, `package.json`, "
+            "`conftest.py`, `manage.py`, `requirements*.txt`, `tox.ini`, "
+            "`pytest.ini`, `Makefile`, `.gitignore`, plus the standard "
+            "JS tool configs (`*.config.{js,cjs,mjs,ts,json}`, `.eslintrc*`).\n"
+        )
+    listing = ", ".join(f"`{f}`" for f in root_files)
+    return (
+        f"The architecture spec lists these files as workspace-root "
+        f"residents: {listing}. Other root-level files are limited to "
+        f"the standard set (`setup.py`, `pyproject.toml`, `package.json`, "
+        f"`Makefile`, `.gitignore`, etc.).\n"
+    )
 
 
 def _build_system_prompt(workspace_path: str, build_command: str) -> str:
@@ -528,8 +939,18 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
     # `allowed_paths` enforcement in patching_node / repair_node — files
     # outside the allowlist are rejected with a clear error so the LLM
     # tries again with the constraint in mind.
+    #
+    # Preference order for the layout block:
+    #   1. Spec-driven: SPEC_ARCHITECTURE.md's workspace_layout block.
+    #      Uses purpose/stack/test_placement to give precise guidance.
+    #   2. Filesystem-driven multi-root: derived from _detect_source_roots.
+    #      Generic heuristic guidance (UI → client side, handlers → server).
+    #   3. Single-root: legacy single-root message.
     layout_block = ""
-    if len(source_roots) == 1:
+    spec_layout = _read_spec_layout(workspace_path)
+    if spec_layout is not None and spec_layout.has_layout:
+        layout_block = _format_spec_layout_block(spec_layout)
+    elif len(source_roots) == 1:
         root = source_roots[0]
         layout_block = (
             f"## Workspace Layout (mandatory)\n"
