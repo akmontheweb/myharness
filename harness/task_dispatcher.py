@@ -11,6 +11,8 @@ import os
 import subprocess
 from typing import Dict, List, Optional, Union
 
+from harness import _platform
+
 logger = logging.getLogger(__name__)
 
 
@@ -78,10 +80,12 @@ class TaskDispatcher:
         cmd_str = task if isinstance(task, str) else " ".join(task)
 
         # Build the execution arguments: list form avoids shell injection when using list input.
+        # String tasks go through a shell; _platform.shell_argv picks ``sh -c`` on POSIX
+        # and ``sh -c`` (if Git Bash on PATH) or ``cmd /c`` on Windows.
         if isinstance(task, list):
             args = task
         else:
-            args = ["bash", "-c", task]
+            args = _platform.shell_argv(task)
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -106,8 +110,8 @@ class TaskDispatcher:
                 raise TaskError(
                     f"Task failed (exit {proc.returncode}): {cmd_str}",
                     returncode=proc.returncode,
-                    stdout=stdout.decode() if stdout else "",
-                    stderr=stderr.decode() if stderr else "",
+                    stdout=stdout.decode("utf-8", errors="replace") if stdout else "",
+                    stderr=stderr.decode("utf-8", errors="replace") if stderr else "",
                 )
 
             return subprocess.CompletedProcess(

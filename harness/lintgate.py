@@ -161,6 +161,8 @@ def _classify_files_by_git_status(
             ["git", "-C", workspace_path, "status", "--porcelain", "--untracked-files=all"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=False,
         )

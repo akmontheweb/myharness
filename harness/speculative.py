@@ -27,6 +27,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from harness import _platform
 from harness.gateway import NodeRole
 from harness.patcher import process_llm_patch_output, PatchResult
 from harness.sandbox import BUILDER_IMAGE
@@ -187,7 +188,13 @@ class SpeculativeConfig:
     expensive_model: str = ""  # primary model for cheap_first / cheap_parallel
     cheap_model: str = ""      # fallback / cheap variants
     voting: VotingConfig = field(default_factory=VotingConfig)
-    worktree_base_dir: str = "/tmp/.harness/speculative"
+    # Resolved via factory so the platform check happens at instance-creation
+    # time, not import time. POSIX → "/tmp/.harness/speculative" (unchanged);
+    # Windows → "%TEMP%\.harness\speculative" (avoids the FileNotFoundError
+    # that os.makedirs would raise on a literal "/tmp" path).
+    worktree_base_dir: str = field(
+        default_factory=lambda: _platform.harness_temp_dir(".harness/speculative")
+    )
 
     @classmethod
     def from_state(cls, state: dict[str, Any]) -> "SpeculativeConfig":
@@ -1537,6 +1544,8 @@ def _repo_has_resolvable_head(repo_path: str) -> bool:
             ["git", "-C", repo_path, "rev-parse", "--verify", "--quiet", "HEAD"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
     except Exception:
@@ -1557,6 +1566,8 @@ def _create_worktree(repo_path: str, worktree_path: str) -> bool:
             ["git", "-C", repo_path, "worktree", "add", "--detach", worktree_path, "HEAD"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
         )
         if result.returncode != 0:

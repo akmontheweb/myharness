@@ -104,6 +104,8 @@ def repo_identity(workspace_path: str) -> str:
             cwd=workspace_abs,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
             check=False,
         )
@@ -345,18 +347,18 @@ def _atomic_write_text(path: str, content: str) -> None:
 
 @contextmanager
 def _memory_file_lock(path: str):
-    """Hold an exclusive fcntl lock on ``<path>.lock`` for the duration of
+    """Hold an exclusive file lock on ``<path>.lock`` for the duration of
     a read-modify-write on ``path``. The lock file is created next to the
     memory file. Audit §1.14.
 
-    On platforms without fcntl (Windows native), yields without locking —
-    the harness is best-effort here; concurrent appenders on Windows can
-    still race but the harness is primarily run on POSIX.
+    Backed by :mod:`harness._filelock`: ``fcntl.flock`` on POSIX,
+    ``msvcrt.locking`` on Windows. If no backend is available, yields
+    without locking — concurrent appenders can race, but the harness
+    is best-effort here.
     """
+    from harness import _filelock
     lock_path = path + ".lock"
-    try:
-        import fcntl  # type: ignore[import-not-found]
-    except ImportError:
+    if not _filelock.LOCKING_AVAILABLE:
         yield
         return
     try:
@@ -366,7 +368,7 @@ def _memory_file_lock(path: str):
         return
     try:
         try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            _filelock.lock_exclusive_blocking(fh)
         except OSError:
             # Fall through unlocked rather than block the memory write.
             yield
@@ -374,10 +376,7 @@ def _memory_file_lock(path: str):
         yield
     finally:
         try:
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
+            _filelock.unlock(fh)
             fh.close()
         except Exception:  # noqa: BLE001
             pass

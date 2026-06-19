@@ -1447,7 +1447,11 @@ class TestSandboxBackend:
         monkeypatch.setattr(
             "harness.sandbox._execute_subprocess_with_timeout", _fake_exec,
         )
-        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Windows")
+        # OS dispatch lives in harness._platform now; force the Windows
+        # branch and force the "no Git Bash on PATH" fallback so we get
+        # cmd /c rather than ["sh", "-c", ...].
+        monkeypatch.setattr("harness._platform.is_windows", lambda: True)
+        monkeypatch.setattr("harness._platform.posix_shell_path", lambda: None)
 
         import asyncio
         backend = BareBackend()
@@ -1476,7 +1480,8 @@ class TestSandboxBackend:
         monkeypatch.setattr(
             "harness.sandbox._execute_subprocess_with_timeout", _fake_exec,
         )
-        monkeypatch.setattr("harness.sandbox.platform.system", lambda: "Linux")
+        # Force the POSIX branch in harness._platform.shell_argv.
+        monkeypatch.setattr("harness._platform.is_windows", lambda: False)
 
         import asyncio
         backend = BareBackend()

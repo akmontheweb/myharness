@@ -24,6 +24,8 @@ import os
 import re
 from typing import Any, Iterable, Optional
 
+from harness import _platform
+
 
 # ---------------------------------------------------------------------------
 # 1. Path Traversal Guard
@@ -711,6 +713,21 @@ def validate_mcp_server_command(
                 raise ValueError(
                     f"mcp command path under {forbidden!r} rejected: {head!r}"
                 )
+        if _platform.is_windows():
+            # Reject the Windows equivalents of /etc, /proc, /sys, /root.
+            # Compare case-insensitively because NTFS is case-insensitive
+            # and an attacker could otherwise bypass via case variation.
+            head_lc = head.lower().replace("/", "\\")
+            for forbidden in (
+                "c:\\windows\\",
+                "c:\\program files\\",
+                "c:\\program files (x86)\\",
+                "c:\\programdata\\",
+            ):
+                if head_lc.startswith(forbidden):
+                    raise ValueError(
+                        f"mcp command path under {forbidden!r} rejected: {head!r}"
+                    )
 
     # Shell-metacharacter scan over every argv element. We're not going
     # through a shell, but a sloppy server config could still smuggle

@@ -29,6 +29,7 @@ from typing import Any, Iterable, Literal, Optional
 
 from typing_extensions import TypedDict
 
+from harness import _platform
 from harness.sandbox import BUILDER_IMAGE
 
 logger = logging.getLogger(__name__)
@@ -1827,7 +1828,15 @@ def _resolve_read_file_call(
     # Refuse absolute / traversal paths up front. The patcher would
     # reject them on the apply side anyway; doing it here means the
     # model gets a clear error in the same turn.
-    if rel_path.startswith("/") or ".." in rel_path.split("/"):
+    # On Windows, ``split_path_components`` normalises backslashes so
+    # paths like ``..\\foo`` or ``C:\\Windows`` are caught by the same
+    # POSIX-shaped traversal/absolute check. POSIX behaviour is
+    # byte-identical because backslash is a legal filename character there.
+    if (
+        rel_path.startswith("/")
+        or os.path.isabs(rel_path)
+        or ".." in _platform.split_path_components(rel_path)
+    ):
         return f"Error: refused absolute / traversal path {rel_path!r}."
     abs_path = os.path.join(workspace_root, rel_path)
     if not os.path.isfile(abs_path):

@@ -202,6 +202,21 @@ On Windows native the console script lands at `…\.venvs\harness\Scripts\harnes
 
 For an editable install (recompile-free local edits), substitute `pip install -e .`.
 
+#### Make-free workflows (Windows native)
+
+The repo ships a `Makefile` but `make` is not installed by default on Windows. Each target maps to a one-liner you can run from PowerShell or `cmd` — drop the `make` wrapper and invoke the Python directly:
+
+| Makefile target | Windows-native equivalent |
+|---|---|
+| `make setup` | `python scripts\setup.py` |
+| `make build` | `python -m compileall .` |
+| `make test` | `python -m pytest tests\ -q --tb=short` |
+| `make coverage` | `python -m pytest tests\ --cov=harness --cov-report=term-missing:skip-covered --cov-report=html:htmlcov --cov-report=xml:coverage.xml -q --tb=short` |
+| `make hooks-install` | `python -m pre_commit install` |
+| `make release BUMP=patch` | `python scripts\release.py --bump=patch` |
+
+Operators who prefer the `make` ergonomics can install GNU Make via `winget install GnuWin32.Make`, `scoop install make`, or Git Bash (which ships an old but workable `make`). None of those are required — the table above covers every shipped target.
+
 ## 6. Provision API Keys (Required)
 
 > A configured LLM API key is **required** to reach a green build. Strict config validation in `discover_config()` exits with code 2 at startup when any provider referenced by `model_routing` has no key. The auto-test-generation node additionally refuses to run without one and routes to HITL with `env_misconfig:llm_api_key`.
@@ -396,13 +411,13 @@ The full schema — every field of `sandbox`, `token_budget`, `node_throttle`, `
 
 ### Workspace single-writer lock
 
-Every `harness run` and `harness resume` acquires an `fcntl` lock on `<workspace>/.harness_session.lock` (Linux/macOS/WSL2). A second concurrent run on the same workspace exits with `lock held by PID X`. To recover after a hard kill that left the lock stale:
+Every `harness run` and `harness resume` acquires an exclusive lock on `<workspace>/.harness_session.lock`. A second concurrent run on the same workspace exits with `lock held by PID X`. To recover after a hard kill that left the lock stale:
 
 ```bash
 harness run -w <workspace> -p "<prompt>" --force-lock
 ```
 
-`--force-lock` releases the stale lock and acquires a fresh one, logging a WARNING so the override is visible in the session record. Windows native skips locking entirely (no portable `fcntl`); single-writer is the operator's responsibility there. See `docs/RUNBOOK.md` § 4 for the full recovery recipe.
+`--force-lock` releases the stale lock and acquires a fresh one, logging a WARNING so the override is visible in the session record. The lock is implemented via `fcntl.flock` on Linux/macOS/WSL2 (advisory) and `msvcrt.locking` on Windows native (mandatory) — both dispatched through `harness/_filelock.py`. See `docs/RUNBOOK.md` § 4 for the full recovery recipe.
 
 ## 8.5 Test generation (new)
 
@@ -496,7 +511,7 @@ harness run -w ./sample -p "list the top-level files" --new-build false
 
 The harness will:
 
-1. Acquire an `fcntl` lock on `./sample/.harness_session.lock` (Linux/macOS/WSL2).
+1. Acquire an exclusive lock on `./sample/.harness_session.lock` (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows native).
 2. Create `~/.harness/checkpoints.db` (or `%USERPROFILE%\.harness\checkpoints.db` on Windows native) and `~/.harness/logs/<session-id>.jsonl` (rotated at 10 MB × 5 backups by default).
 3. Consolidate every `.txt` file in `product_spec/`, then run the planning → patching → compile → lintgate loop, checkpointing each step.
 4. Append a session note under `~/.harness/memory/<repo_id>.md` if `memory.enabled: true` (the default).

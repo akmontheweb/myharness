@@ -37,6 +37,9 @@ from typing import Any, Callable, Optional, Union
 # subprocess-spawner uses the same allowlist.
 from harness.trust import SCRUBBED_BUILD_ENV_VARS as _SCRUBBED_BUILD_ENV_VARS  # noqa: E402
 
+# OS-dispatch primitives — see harness/_platform.py docstring.
+from harness import _platform
+
 logger = logging.getLogger(__name__)
 
 
@@ -208,7 +211,7 @@ class UnshareBackend(SandboxBackend):
 
     def is_available(self) -> bool:
         """Check if Linux namespaces can be created."""
-        if platform.system() != "Linux":
+        if not _platform.is_linux():
             return False
         try:
             result = subprocess.run(
@@ -493,6 +496,8 @@ class DockerBackend(SandboxBackend):
                 capture_output=True,
                 timeout=10,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
             logger.warning("[sandbox] Docker availability check failed: %s", e)
@@ -603,6 +608,8 @@ class DockerBackend(SandboxBackend):
                     capture_output=True,
                     timeout=15,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                 )
                 if create.returncode != 0:
                     logger.warning(
@@ -823,7 +830,7 @@ class DockerBackend(SandboxBackend):
         ``CAP_CHOWN``), and that's the expected case — the in-container
         trailer is the real defence.
         """
-        if platform.system() != "Linux":
+        if not _platform.is_linux():
             return
         if not workspace_path or not os.path.isdir(workspace_path):
             return
@@ -931,19 +938,11 @@ class BareBackend(SandboxBackend):
         readonly_cache_mounts: Optional[list[str]] = None,
         extra_env: Optional[dict[str, str]] = None,
     ) -> tuple[int, str, bool, bool]:
-        # On Windows there is no ``sh`` on PATH by default. Use ``cmd /c`` with
-        # ``cd /d`` (the ``/d`` switch lets cmd.exe cross drive letters, e.g.
-        # ``C:`` → ``D:``). The ``&&`` separator works in both shells. On
-        # Linux/macOS the ``else`` branch keeps the exact existing line so
-        # the constructed argv is byte-identical to today.
-        if platform.system() == "Windows":
-            cmd = ["cmd", "/c", f'cd /d "{workspace_path}" && {command}']
-        else:
-            # shlex-quote the workspace so apostrophes / spaces in the
-            # operator-supplied path don't escape the quoted context.
-            # Audit §3.11.
-            import shlex as _shlex
-            cmd = ["sh", "-c", f"cd {_shlex.quote(workspace_path)} && {command}"]
+        # OS-specific shell dispatch is centralised in _platform.shell_argv:
+        # POSIX → ``sh -c "cd <quoted> && <cmd>"`` (byte-identical to the
+        # previous inline branch); Windows → ``sh -c`` if Git Bash / WSL
+        # exposed one on PATH, else ``cmd /c "cd /d <path> && <cmd>"``.
+        cmd = _platform.shell_argv(command, workdir=workspace_path)
         logger.info("[sandbox:bare] Running without isolation (bare subprocess).")
         return await _execute_subprocess_with_timeout(cmd, timeout_seconds, extra_env=extra_env)
 
@@ -958,7 +957,7 @@ async def _execute_subprocess_with_timeout(
     extra_env: Optional[dict[str, str]] = None,
     log_buffer_mode: str = "disk",
     max_log_size_mb: int = 500,
-    log_temp_dir: str = "/tmp/.harness",
+    log_temp_dir: Optional[str] = None,
 ) -> tuple[int, str, bool, bool]:
     """
     Execute a command with asyncio subprocess, strict timeout, and PGID
@@ -1210,10 +1209,15 @@ class DiskLogStreamer:
     def __init__(
         self,
         max_size_mb: int = 500,
-        temp_dir: str = "/tmp/.harness",
+        temp_dir: Optional[str] = None,
     ) -> None:
         self.max_size_bytes = max_size_mb * 1024 * 1024
-        self.temp_dir = temp_dir
+        # Default-resolve here (not at the param) so the platform check
+        # happens at call time, not import time. On POSIX this gives
+        # ``/tmp/.harness`` byte-identically to the historical default;
+        # on Windows it gives ``%TEMP%\.harness`` (avoids FileNotFoundError
+        # when os.makedirs would otherwise see a literal ``/tmp`` path).
+        self.temp_dir = temp_dir if temp_dir is not None else _platform.harness_temp_dir()
         self._stdout_file: Optional[Any] = None  # tempfile.NamedTemporaryFile
         self._stderr_file: Optional[Any] = None
         self._stdout_path: str = ""

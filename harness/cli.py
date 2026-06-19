@@ -156,29 +156,29 @@ def _make_git_guardian(workspace_path: str):
 # the OS holds the locks for the lifetime of the process. Keyed by workspace
 # path so a re-entrant acquisition (cmd_chat after cmd_run, or two different
 # workspaces in the same process) doesn't overwrite an earlier handle and
-# silently release its fcntl lock via GC. Audit §1.9 / §5.20.
+# silently release its file lock via GC. Audit §1.9 / §5.20.
 _WORKSPACE_LOCK_HANDLES: dict[str, Any] = {}
 
 
 def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
-    """Acquire an advisory exclusive lock on the workspace.
+    """Acquire an exclusive lock on the workspace.
 
     Returns the locked file handle on success, or ``False`` when another
-    session holds the lock and ``force`` is False. On platforms without
-    ``fcntl`` (Windows native), logs a debug message and returns ``None``
-    — we trade hardening for compatibility there since the alternatives
-    (msvcrt.locking, file deletion handshake) bring their own surprises.
+    session holds the lock and ``force`` is False. POSIX uses
+    ``fcntl.flock`` (advisory); Windows uses ``msvcrt.locking``
+    (mandatory) — both via :mod:`harness._filelock`. Returns ``None``
+    only when no locking backend is available at all (which shouldn't
+    happen on any supported platform).
 
     Stash the handle in a per-workspace slot so:
       - the GC doesn't release the lock when cmd_run's local goes out of scope
       - a second acquisition for a different workspace doesn't accidentally
         evict the first lock's handle (audit §1.9 / §5.20)
     """
-    try:
-        import fcntl  # type: ignore[import-not-found]
-    except ImportError:
+    from harness import _filelock
+    if not _filelock.LOCKING_AVAILABLE:
         logger.debug(
-            "[lock] fcntl unavailable (Windows native?); skipping workspace lock."
+            "[lock] No file-locking backend available; skipping workspace lock."
         )
         return None
 
@@ -198,7 +198,7 @@ def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
         return None
 
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _filelock.lock_exclusive_nonblocking(fh)
     except BlockingIOError:
         if force:
             logger.warning(
@@ -208,7 +208,7 @@ def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
                 lock_path,
             )
             try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                _filelock.lock_exclusive_blocking(fh)
             except OSError as exc:
                 logger.error("[lock] Force-lock failed too: %s", exc)
                 fh.close()
@@ -3479,7 +3479,8 @@ def _list_orphan_patch_branches(workspace_path: str) -> list[str]:
         result = subprocess.run(
             ["git", "-C", workspace_path, "for-each-ref",
              "--format=%(refname:short)", "refs/heads/agent/patch-*"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return []
@@ -3606,7 +3607,8 @@ def _perform_new_build_reset(
     def _git(*args: str) -> "subprocess.CompletedProcess[str]":
         return subprocess.run(
             ["git", "-C", workspace_path, *args],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60,
         )
 
     git_mode = _git_enabled()
@@ -3841,6 +3843,8 @@ def _attempt_git_rollback(workspace_path: str) -> None:
             ["git", "-C", workspace_path, "checkout", "--", "."],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
         )
         if result.returncode == 0:
@@ -5220,6 +5224,8 @@ def _doctor_check_git(workspace_path: str) -> tuple[str, str]:
             ["git", "-C", workspace_path, "rev-parse", "--git-dir"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
     except FileNotFoundError:
@@ -5237,6 +5243,8 @@ def _doctor_check_git(workspace_path: str) -> tuple[str, str]:
             ["git", "-C", workspace_path, "rev-parse", "--verify", "--quiet", "HEAD"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
     except subprocess.TimeoutExpired:
@@ -5603,7 +5611,8 @@ def _has_docker_compose_subcommand() -> bool:
     try:
         result = subprocess.run(
             ["docker", "compose", "version"],
-            capture_output=True, text=True, timeout=3,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=3,
         )
         return result.returncode == 0
     except (subprocess.TimeoutExpired, OSError):
@@ -5623,7 +5632,8 @@ def _doctor_check_sandbox(config: dict[str, Any]) -> tuple[str, str]:
         try:
             result = subprocess.run(
                 ["docker", "info"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=5,
             )
         except subprocess.TimeoutExpired:
             return "fail", "docker info timed out (daemon unreachable?)"
@@ -5638,7 +5648,8 @@ def _doctor_check_sandbox(config: dict[str, Any]) -> tuple[str, str]:
         try:
             result = subprocess.run(
                 ["unshare", "--user", "echo", "ok"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=5,
             )
         except subprocess.TimeoutExpired:
             return "fail", "unshare timed out"
@@ -7044,7 +7055,8 @@ async def cmd_cache_clear(args: argparse.Namespace) -> int:
     try:
         listing = subprocess.run(
             [docker_path, "volume", "ls", "--format", "{{.Name}}"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
         print(f"[harness] `docker volume ls` failed: {exc}", file=sys.stderr)
@@ -7088,7 +7100,8 @@ async def cmd_cache_clear(args: argparse.Namespace) -> int:
     for name in candidates:
         rm = subprocess.run(
             [docker_path, "volume", "rm", name],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
         )
         if rm.returncode == 0:
             removed += 1

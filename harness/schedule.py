@@ -54,7 +54,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from harness import _platform
+
 logger = logging.getLogger(__name__)
+
+# One-shot warning latch — if Windows has no POSIX sh on PATH, we log
+# once at the first hook fire instead of every fire.
+_WARNED_WINDOWS_NO_SH = False
 
 
 _WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
@@ -701,25 +707,45 @@ async def _run_hook(
     job_name: str, exit_code: int,
     duration_sec: float, log_path: str,
 ) -> None:
-    """Invoke the operator-supplied shell hook. Hooks run via ``/bin/sh
-    -c <hook>`` so curl + redirection + pipes Just Work without
-    operators having to argv-tokenise. The harness's
-    :func:`harness.trust.safe_subprocess_env` is intentionally NOT
-    applied — the hook may want to read tokens the harness scrubs
-    (SLACK_WEBHOOK, GH_TOKEN, etc.) directly from the operator's env.
-    Operators who want stricter scrubbing pass env through ``env -i``
-    themselves.
+    """Invoke the operator-supplied shell hook.
+
+    POSIX (Linux/macOS): runs via ``sh -c <hook>`` so curl + redirection
+    + pipes Just Work without operators having to argv-tokenise.
+
+    Windows: prefers ``sh -c <hook>`` if a POSIX shell is on PATH (Git
+    Bash, WSL). If none is available, falls back to ``cmd /c <hook>``
+    and emits a one-shot warning — operators whose hooks rely on POSIX
+    syntax (pipes, ``&&``, redirects) will need to install Git for
+    Windows or rewrite the hook in cmd.exe syntax. We still execute
+    rather than drop, since a malformed hook is more diagnosable than a
+    silently dropped one.
+
+    The harness's :func:`harness.trust.safe_subprocess_env` is
+    intentionally NOT applied — the hook may want to read tokens the
+    harness scrubs (SLACK_WEBHOOK, GH_TOKEN, etc.) directly from the
+    operator's env. Operators who want stricter scrubbing pass env
+    through ``env -i`` themselves.
     """
+    global _WARNED_WINDOWS_NO_SH
     env = dict(os.environ)
     env["HARNESS_JOB_NAME"] = job_name
     env["HARNESS_JOB_EXIT_CODE"] = str(exit_code)
     env["HARNESS_JOB_DURATION_SEC"] = f"{duration_sec:.2f}"
     env["HARNESS_JOB_LOG_PATH"] = log_path
+    if _platform.is_windows() and _platform.posix_shell_path() is None and not _WARNED_WINDOWS_NO_SH:
+        logger.warning(
+            "[schedule:%s] No POSIX sh found on PATH (Git Bash / WSL). "
+            "Hooks will run under cmd.exe; POSIX syntax (pipes, &&, "
+            "redirects) will not work. Install Git for Windows to fix.",
+            job_name,
+        )
+        _WARNED_WINDOWS_NO_SH = True
     proc = None
     pgid: Optional[int] = None
     try:
-        proc = await asyncio.create_subprocess_shell(
-            hook, env=env,
+        argv = _platform.shell_argv(hook)
+        proc = await asyncio.create_subprocess_exec(
+            *argv, env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
@@ -739,7 +765,7 @@ async def _run_hook(
     except asyncio.TimeoutError:
         logger.warning("[schedule:%s] hook timed out after 30s; killing process group.", job_name)
         if proc is not None:
-            # Without this kill the /bin/sh -c tree (curl, wget, etc.)
+            # Without this kill the shell process tree (curl, wget, etc.)
             # keeps running forever — one leak per job fire, every tick.
             # Audit §2.5.
             try:

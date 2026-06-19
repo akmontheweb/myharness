@@ -130,6 +130,8 @@ def gh_auth_status(config: Optional[dict[str, Any]] = None) -> GhAuthStatus:
             [binary, "auth", "status"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_DEFAULT_TIMEOUT_SECONDS,
             check=False,
         )
@@ -206,6 +208,7 @@ def fetch_issue(
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=timeout_seconds, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -339,6 +342,7 @@ def create_pr(
         result = subprocess.run(
             cmd, cwd=workspace_path,
             capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=timeout_seconds, check=False,
             input=(body_text if use_stdin_body else None),
         )
@@ -380,6 +384,7 @@ def post_pr_comment(
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=timeout_seconds, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:

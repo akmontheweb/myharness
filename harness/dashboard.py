@@ -40,6 +40,8 @@ import re
 import socketserver
 import threading
 import urllib.parse
+
+from harness import _platform
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Optional
@@ -327,7 +329,7 @@ def _browse_response(query_path: str) -> tuple[int, str, str]:
         roots.append(os.path.realpath(os.getcwd()))
     except OSError:
         pass
-    roots.append(os.path.realpath("/tmp"))
+    roots.append(os.path.realpath(_platform.harness_temp_dir("")))
     try:
         target_real = os.path.realpath(abs_path)
     except OSError:
@@ -339,7 +341,7 @@ def _browse_response(query_path: str) -> tuple[int, str, str]:
         body = json.dumps({
             "ok": False,
             "error": (
-                "path outside allowed roots (home / cwd / /tmp). "
+                "path outside allowed roots (home / cwd / system temp). "
                 "Set dashboard.docs_dir or use the workspace browser instead."
             ),
             "path": abs_path,
@@ -3764,7 +3766,8 @@ def make_request_handler(
             argv = [harness_bin, "purge", "--session-id", session_id]
             try:
                 proc = _sub.run(
-                    argv, capture_output=True, text=True, timeout=30,
+                    argv, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=30,
                 )
             except _sub.TimeoutExpired:
                 self._send(
