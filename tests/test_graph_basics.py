@@ -345,7 +345,10 @@ class TestRouteAfterSecurityScan:
     def test_clean_scan_ends_when_dev_deployment_false(self, monkeypatch):
         import harness.impact as impact_mod
         monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
-        assert route_after_security_scan(self._clean_state()) == "__end__"
+        # Clean + no --deploy-dev now routes through installation_doc_node;
+        # the node's only outgoing edge is END, so this is still a
+        # terminal path (the doc may be a no-op if install_doc=False).
+        assert route_after_security_scan(self._clean_state()) == "installation_doc_node"
 
     def test_clean_scan_enters_discovery_when_dev_deployment_and_cd_discovery_true(self, monkeypatch):
         import harness.impact as impact_mod
@@ -369,18 +372,22 @@ class TestRouteAfterSecurityScan:
         import harness.impact as impact_mod
         monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         # cd_discovery alone (no dev_deployment) is meaningless — the
-        # security-scan-clean → END path still wins because no deploy
-        # was requested.
+        # security-scan-clean terminal path still wins because no deploy
+        # was requested. After the installation_doc_node insertion the
+        # terminal hop is via the doc node (which then edges to END).
         state = self._clean_state(dev_deployment=False, cd_discovery=True)
-        assert route_after_security_scan(state) == "__end__"
+        assert route_after_security_scan(state) == "installation_doc_node"
 
     def test_flutter_short_circuits_regardless_of_dev_deployment(self, monkeypatch):
         import harness.impact as impact_mod
         monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: True)
         # With dev_deployment=True the Flutter early-return must still win;
-        # Flutter and the opt-in flag are independent skip reasons.
+        # Flutter and the opt-in flag are independent skip reasons. The
+        # terminal hop now goes via installation_doc_node (which edges
+        # to END), not __end__ directly — Flutter projects still get
+        # docs/INSTALLATION.md when --install-doc is on.
         state = self._clean_state(dev_deployment=True)
-        assert route_after_security_scan(state) == "__end__"
+        assert route_after_security_scan(state) == "installation_doc_node"
 
     def test_security_findings_route_to_repair(self, monkeypatch):
         import harness.impact as impact_mod

@@ -176,6 +176,20 @@ class AgentState(TypedDict, total=False):
     # the `--cd-discovery` CLI flag on `harness run`; default False
     # (matches the new operator-autonomous baseline).
     cd_discovery: bool
+    # End-of-run installation-doc synthesis toggle. When True,
+    # installation_doc_node fires at the terminal success edges (Flutter
+    # short-circuit, --deploy-dev=false clean security scan, and after
+    # deployment_node health-check success) and writes
+    # docs/INSTALLATION.md from workspace telemetry + manifests +
+    # SPEC_ARCHITECTURE.md §7 (+ the deployment blueprint when present).
+    # Set by --install-doc on `harness run`; defaults to the value of
+    # --new-build so greenfield generations document themselves while
+    # change-request runs stay quiet.
+    install_doc: bool
+    # Absolute path the installation_doc_node wrote on a successful run.
+    # Empty string when install_doc=False or the node failed; consumers
+    # (tests, log aggregators) read it as telemetry only.
+    installation_doc_path: str
     # Optional org-wide deployment policy loaded from the
     # ``deployment_defaults`` section of config.json. When populated,
     # deployment_discovery_node injects it into the planning LLM's prompt
@@ -222,6 +236,7 @@ def create_initial_state(
     change_requests_config: Optional[dict[str, Any]] = None,
     dev_deployment: bool = False,
     cd_discovery: bool = False,
+    install_doc: bool = False,
 ) -> AgentState:
     """
     Construct the initial graph state with anchored system prompt at messages[0]
@@ -290,6 +305,8 @@ def create_initial_state(
         change_requests_config=dict(change_requests_config or {}),
         dev_deployment=bool(dev_deployment),
         cd_discovery=bool(cd_discovery),
+        install_doc=bool(install_doc),
+        installation_doc_path="",
     )
 
 
@@ -8046,6 +8063,78 @@ first heading. Fences are reserved for code blocks INSIDE the document."""
 
 
 # ---------------------------------------------------------------------------
+# 6cc. Installation Doc Synthesis (end-of-run, greenfield builds)
+# ---------------------------------------------------------------------------
+
+async def installation_doc_node(state: AgentState) -> dict[str, Any]:
+    """End-of-run node that synthesises ``docs/INSTALLATION.md``.
+
+    Best-effort: any failure is logged and the run still terminates
+    cleanly via the END edge — a missing install doc must not roll back
+    a build the operator already approved. Gated on
+    ``state["install_doc"]`` so change-request runs skip the LLM call.
+
+    Inputs read from state:
+        * ``workspace_path`` — the generated project root.
+        * ``spec_architecture_path`` — for the Build & Run section slice.
+        * ``node_state["deployment"]["blueprint"]`` — when --deploy-dev
+          produced one; ``None`` otherwise (the synth helper renders §5
+          conditionally on that signal).
+    """
+    if not state.get("install_doc", False):
+        logger.debug("[installation_doc] --install-doc=false; skipping.")
+        return {}
+
+    workspace_path = state.get("workspace_path", "")
+    if not workspace_path or not os.path.isdir(workspace_path):
+        logger.warning(
+            "[installation_doc] Workspace path missing or not a directory (%r); "
+            "skipping INSTALLATION.md generation.", workspace_path,
+        )
+        return {}
+
+    architecture_path = state.get("spec_architecture_path") or os.path.join(
+        workspace_path, "docs", "SPEC_ARCHITECTURE.md",
+    )
+    blueprint: Optional[dict[str, Any]] = None
+    deployment_state = (state.get("node_state") or {}).get("deployment") or {}
+    if isinstance(deployment_state, dict):
+        candidate = deployment_state.get("blueprint")
+        if isinstance(candidate, dict):
+            blueprint = candidate
+
+    output_dir = os.path.join(workspace_path, "docs")
+    gateway = get_gateway()
+    if gateway is None:
+        logger.warning(
+            "[installation_doc] LLM gateway unavailable; skipping INSTALLATION.md."
+        )
+        return {}
+
+    from harness.cli import synthesize_installation
+
+    try:
+        install_path = await synthesize_installation(
+            workspace_path=workspace_path,
+            architecture_path=architecture_path,
+            output_dir=output_dir,
+            gateway=gateway,
+            blueprint=blueprint,
+        )
+    except Exception as exc:  # noqa: BLE001 — never fail the run on a doc miss
+        logger.warning(
+            "[installation_doc] Synthesis failed; INSTALLATION.md not written: %s",
+            exc,
+        )
+        return {}
+
+    return {
+        "installation_doc_path": install_path,
+        "node_state": {"current_node": "installation_doc"},
+    }
+
+
+# ---------------------------------------------------------------------------
 # 6d. Route After Discovery Interview
 # ---------------------------------------------------------------------------
 
@@ -8160,7 +8249,7 @@ def route_after_gatekeeper(state: AgentState) -> str:
 # 7. Route After HITL: Always Back to Compiler
 # ---------------------------------------------------------------------------
 
-def route_after_security_scan(state: AgentState) -> Literal["repair_node", "human_intervention_node", "deployment_discovery_node", "deployment_node", "__end__"]:
+def route_after_security_scan(state: AgentState) -> Literal["repair_node", "human_intervention_node", "deployment_discovery_node", "deployment_node", "installation_doc_node", "__end__"]:
     """
     Conditional edge router executed after security_scan_node completes.
 
@@ -8213,18 +8302,23 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
         from harness.impact import _is_flutter_project
         workspace_path = state.get("workspace_path", "")
         if workspace_path and _is_flutter_project(workspace_path):
-            logger.info("[router] Flutter project detected. Skipping deploy pipeline (M-1). Routing to END.")
-            return "__end__"
+            logger.info(
+                "[router] Flutter project detected. Skipping deploy pipeline "
+                "(M-1). Routing to installation_doc_node before END."
+            )
+            return "installation_doc_node"
         # Operator opt-in gate (--deploy-dev). When the flag is false the
         # harness stops after a clean security scan; the operator can
         # inspect the generated code, then re-run with --deploy-dev true
-        # to enter the deployment phase.
+        # to enter the deployment phase. Stop via installation_doc_node so
+        # greenfield runs still get their docs/INSTALLATION.md.
         if not state.get("dev_deployment", False):
             logger.info(
                 "[router] Security scan clean. --deploy-dev not set; "
-                "skipping deployment phase. Routing to END."
+                "skipping deployment phase. Routing to installation_doc_node "
+                "before END."
             )
-            return "__end__"
+            return "installation_doc_node"
         # --cd-discovery picks between the LLM-driven blueprint pipeline
         # (deployment_discovery_node → interview → gatekeeper →
         # deployment_node) and the telemetry-only fast path (straight to
@@ -8255,6 +8349,37 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
         len(compiler_errors), sec_attempts, max_sec_attempts,
     )
     return "repair_node"
+
+
+# ---------------------------------------------------------------------------
+# 6e. Route After Deployment: success → installation_doc, else compiler logic
+# ---------------------------------------------------------------------------
+
+def route_after_deployment(state: AgentState) -> Literal[
+    "installation_doc_node",
+    "security_scan_node",
+    "repair_node",
+    "human_intervention_node",
+    "test_generation_node",
+]:
+    """Route after deployment_node terminates.
+
+    Successful health check (``node_state.deployment.success == True``)
+    short-circuits to ``installation_doc_node`` so greenfield runs end at
+    a documented artifact instead of re-entering the compile/scan loop.
+    Anything else delegates to the standard post-build router so failed
+    deploys still route through repair / HITL / test generation just like
+    a normal build failure.
+    """
+    ns = state.get("node_state") or {}
+    deployment = ns.get("deployment") if isinstance(ns, dict) else None
+    if isinstance(deployment, dict) and deployment.get("success") is True:
+        logger.info(
+            "[router] Deployment succeeded. Routing to installation_doc_node "
+            "before END."
+        )
+        return "installation_doc_node"
+    return route_after_compiler(state)
 
 
 # ---------------------------------------------------------------------------
@@ -8579,9 +8704,18 @@ def build_graph() -> Any:
     # Register deployment discovery node
     graph.add_node("deployment_discovery_node", deployment_discovery_node)
 
-    # Route security_scan clean → deployment discovery (or END for Flutter);
-    # findings → repair_node so security fixes go through the same
-    # _format_diagnostics_for_repair + escalation path as compile errors.
+    # Register installation_doc_node — best-effort end-of-run docs that
+    # writes <workspace>/docs/INSTALLATION.md from telemetry + manifests
+    # + the Build & Run section of SPEC_ARCHITECTURE.md (+ the deployment
+    # blueprint when present). Gated on state["install_doc"] so the no-op
+    # path is a single state-pass-through for change-request runs.
+    graph.add_node("installation_doc_node", installation_doc_node)
+    graph.add_edge("installation_doc_node", END)
+
+    # Route security_scan clean → deployment discovery (or installation_doc
+    # for Flutter / --deploy-dev=false success exits); findings → repair_node
+    # so security fixes go through the same _format_diagnostics_for_repair +
+    # escalation path as compile errors.
     graph.add_conditional_edges(
         "security_scan_node",
         route_after_security_scan,
@@ -8595,6 +8729,7 @@ def build_graph() -> Any:
             "deployment_node": "deployment_node",
             "repair_node": "repair_node",
             "human_intervention_node": "human_intervention_node",
+            "installation_doc_node": "installation_doc_node",
             "__end__": END,
         },
     )
@@ -8606,11 +8741,15 @@ def build_graph() -> Any:
     from harness.deploy import deployment_node as _deployment_node
     graph.add_node("deployment_node", _deployment_node)
 
-    # Deployment conditional edges — after deployment, either end (success) or route to repair/HITL
+    # Deployment conditional edges. On success the router below short-
+    # circuits to installation_doc_node (which then routes to END);
+    # otherwise it falls through to the standard route_after_compiler
+    # outcomes (repair / HITL / re-scan).
     graph.add_conditional_edges(
         "deployment_node",
-        route_after_compiler,
+        route_after_deployment,
         {
+            "installation_doc_node": "installation_doc_node",
             "security_scan_node": "security_scan_node",
             "repair_node": "repair_node",
             "human_intervention_node": "human_intervention_node",
@@ -8821,6 +8960,7 @@ async def run_graph(
     change_requests_config: Optional[dict[str, Any]] = None,
     dev_deployment: bool = False,
     cd_discovery: bool = False,
+    install_doc: bool = False,
     repo_memory_config: Optional[dict[str, Any]] = None,
     repo_index_config: Optional[dict[str, Any]] = None,
     llm_dispatch_config: Optional[dict[str, Any]] = None,
@@ -8867,6 +9007,7 @@ async def run_graph(
         change_requests_config=change_requests_config,
         dev_deployment=dev_deployment,
         cd_discovery=cd_discovery,
+        install_doc=install_doc,
     )
 
     # Per-node config sections — read by lintgate_node and deployment_node

@@ -5609,15 +5609,17 @@ class TestSecurityScanRouting:
             assert route_after_security_scan(state) == "deployment_node"
 
     def test_route_after_security_scan_clean_without_dev_deployment(self):
-        # New default: clean scan + no --deploy-dev → END. The whole
-        # deployment phase (discovery, blueprint, gatekeeper, docker
-        # compose up) is skipped.
+        # New default: clean scan + no --deploy-dev → terminal hop via
+        # installation_doc_node (which edges to END). The deployment
+        # phase (discovery, blueprint, gatekeeper, docker compose up) is
+        # still skipped; the doc node is the only thing between the
+        # security scan and END now.
         from harness.graph import route_after_security_scan
         with tempfile.TemporaryDirectory() as tmpdir:
             state = _make_state(tmpdir)
             state["budget_remaining_usd"] = 1.0
             state["compiler_errors"] = []
-            assert route_after_security_scan(state) == "__end__"
+            assert route_after_security_scan(state) == "installation_doc_node"
 
     def test_route_after_security_scan_findings(self):
         # Security findings route to repair_node (not patching_node) so
@@ -5651,7 +5653,9 @@ class TestSecurityScanRouting:
 
     def test_route_after_security_scan_flutter_skips_deploy(self):
         # M-1: Flutter projects with a clean security scan end after the
-        # scan rather than entering the docker-compose pipeline.
+        # scan rather than entering the docker-compose pipeline. The
+        # terminal hop now goes via installation_doc_node (which edges
+        # to END) so Flutter projects can still get docs/INSTALLATION.md.
         import os
         from harness.graph import route_after_security_scan
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5662,7 +5666,7 @@ class TestSecurityScanRouting:
             state = _make_state(tmpdir)
             state["budget_remaining_usd"] = 1.0
             state["compiler_errors"] = []
-            assert route_after_security_scan(state) == "__end__"
+            assert route_after_security_scan(state) == "installation_doc_node"
 
 
 # ===========================================================================

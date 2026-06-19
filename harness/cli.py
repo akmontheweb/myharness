@@ -2631,6 +2631,269 @@ async def synthesize_architecture(
     return spec_path
 
 
+# ---------------------------------------------------------------------------
+# 2c. Installation Doc Synthesis (end-of-run, greenfield builds)
+# ---------------------------------------------------------------------------
+
+_INSTALLATION_SYNTHESIS_PROMPT = """You are a Principal DevOps Engineer producing
+an INSTALLATION.md for a freshly generated application. The document must let a
+new developer clone, install, configure, run locally, and (when applicable)
+deploy the app — using ONLY commands and paths that exist in the inputs below.
+Do NOT invent dependencies, scripts, env vars, or ports.
+
+## Output Sections
+
+### 1. Prerequisites
+- Language runtimes and minimum versions (derive from telemetry / manifests).
+- Required system tools (docker, docker-compose, make, etc.) ONLY if the
+  inputs reference them.
+
+### 2. Clone & Install
+- The exact dependency-install commands implied by the manifests
+  (`pip install -r requirements.txt`, `npm install`, `make install`, etc.).
+- Where to run each command (e.g. `cd backend && ...`).
+
+### 3. Configure
+- Environment variables grouped by purpose (DB, auth, third-party).
+- Default values when shown in `.env.example`; mark required vs. optional.
+- Note: omit this section entirely if no env config is referenced anywhere.
+
+### 4. Run Locally
+- Run commands derived from the Build & Run section of SPEC_ARCHITECTURE.md
+  and from manifests (Makefile targets, `npm run`, `uvicorn ...`).
+- Default ports the app binds on (from telemetry port_hints or blueprint).
+
+### 5. Run with Docker
+- ONLY emit this section when a deployment blueprint is provided in the
+  inputs. Commands: `docker compose up --build`. List the service names
+  exposed and their host ports. Omit otherwise.
+
+### 6. Verify
+- Health endpoints (from blueprint healthchecks, or default `/health`
+  when telemetry says a web framework is present).
+- One smoke-test command per service (e.g. `curl http://localhost:PORT/`).
+
+### 7. Troubleshooting
+- 2–4 short entries for likely failures grounded in the actual stack
+  (e.g. "Port X already in use", "DB connection refused — Postgres not
+  ready", "Module not found — re-run install"). Avoid generic boilerplate.
+
+## Inputs
+
+### Workspace telemetry (JSON)
+{telemetry_json}
+
+### Architecture spec — Build & Run section
+{architecture_build_run}
+
+### Deployment blueprint (or "none" when --deploy-dev was not used)
+{blueprint_json}
+
+### Manifests (truncated to 4 KB each)
+{manifests_block}
+
+## Formatting
+Output clean, well-structured Markdown starting with `# Installation`.
+Use fenced code blocks for every command. Do NOT wrap the whole document
+in an outer ```markdown … ``` fence — emit the body directly. Reference
+files by their workspace-relative path. Do not restate sections the inputs
+don't justify."""
+
+
+_INSTALLATION_MANIFEST_GLOBS: tuple[str, ...] = (
+    "requirements.txt", "requirements-dev.txt", "pyproject.toml",
+    "package.json", "Makefile", "makefile", "GNUmakefile",
+    ".env.example", "docker-compose.yml", "docker-compose.yaml",
+)
+_INSTALLATION_MANIFEST_MAX_BYTES = 4096
+_INSTALLATION_ARCH_SECTION_MAX_BYTES = 6144
+
+
+def _extract_arch_build_run(architecture_text: str) -> str:
+    """Slice the '### 7. Build & Run' (or equivalent) section out of a
+    SPEC_ARCHITECTURE.md body. Falls back to the trailing 6 KB when no
+    section heading matches — the section is required by the synthesis
+    prompt but the LLM may have used a slightly different heading."""
+    if not architecture_text:
+        return "(architecture spec not available)"
+    lines = architecture_text.splitlines()
+    start_idx: int = -1
+    for i, line in enumerate(lines):
+        stripped = line.strip().lower()
+        if stripped.startswith("### ") and (
+            "build & run" in stripped
+            or "build and run" in stripped
+            or "build/run" in stripped
+        ):
+            start_idx = i
+            break
+    if start_idx < 0:
+        tail = architecture_text[-_INSTALLATION_ARCH_SECTION_MAX_BYTES:]
+        return tail
+    end_idx = len(lines)
+    for j in range(start_idx + 1, len(lines)):
+        if lines[j].startswith("### ") or lines[j].startswith("## "):
+            end_idx = j
+            break
+    section = "\n".join(lines[start_idx:end_idx])
+    return section[:_INSTALLATION_ARCH_SECTION_MAX_BYTES]
+
+
+def _collect_installation_manifests(workspace_path: str) -> str:
+    """Read up to ~5 manifest files from the workspace root and return them
+    as a single annotated text block. Each entry is truncated to 4 KB so the
+    prompt stays bounded regardless of repo size."""
+    chunks: list[str] = []
+    for name in _INSTALLATION_MANIFEST_GLOBS:
+        path = os.path.join(workspace_path, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                body = f.read(_INSTALLATION_MANIFEST_MAX_BYTES + 1)
+        except OSError:
+            continue
+        truncated = len(body) > _INSTALLATION_MANIFEST_MAX_BYTES
+        body = body[:_INSTALLATION_MANIFEST_MAX_BYTES]
+        suffix = "\n... (truncated)" if truncated else ""
+        chunks.append(f"#### {name}\n```\n{body}{suffix}\n```")
+        if len(chunks) >= 6:
+            break
+    if not chunks:
+        return "(no manifest files found at workspace root)"
+    return "\n\n".join(chunks)
+
+
+def _slim_blueprint(blueprint: Optional[dict[str, Any]]) -> str:
+    """Reduce a deployment blueprint to the install-doc-relevant fields
+    (services with image/ports/healthchecks/env). Returns the literal
+    string ``"none"`` when no blueprint exists so the prompt knows to
+    skip §5."""
+    if not blueprint or not isinstance(blueprint, dict):
+        return "none"
+    services_in = blueprint.get("services") or {}
+    if not isinstance(services_in, dict) or not services_in:
+        return "none"
+    slim_services: dict[str, dict[str, Any]] = {}
+    for name, svc in services_in.items():
+        if not isinstance(svc, dict):
+            continue
+        slim_services[str(name)] = {
+            k: svc[k] for k in ("image", "base_image", "ports", "healthcheck", "environment", "depends_on")
+            if k in svc
+        }
+    if not slim_services:
+        return "none"
+    return json.dumps({"services": slim_services}, indent=2)[:6144]
+
+
+async def synthesize_installation(
+    workspace_path: str,
+    architecture_path: str,
+    output_dir: str,
+    gateway: Any,
+    *,
+    blueprint: Optional[dict[str, Any]] = None,
+) -> str:
+    """
+    Synthesize ``INSTALLATION.md`` for a freshly generated greenfield app.
+
+    Reads workspace telemetry (deterministic scan), root manifests, the
+    Build & Run section of SPEC_ARCHITECTURE.md, and the deployment
+    blueprint (when --deploy-dev produced one). Routes the assembled
+    inputs through the planning LLM and writes the rendered Markdown to
+    ``<output_dir>/INSTALLATION.md``.
+
+    Args:
+        workspace_path: Absolute path to the generated project root.
+        architecture_path: Absolute path to ``SPEC_ARCHITECTURE.md``.
+        output_dir: Directory to write ``INSTALLATION.md`` (usually
+            ``<workspace>/docs``).
+        gateway: Initialized LLM Gateway instance.
+        blueprint: Optional deployment blueprint dict (services / ports /
+            healthchecks). Set when ``--deploy-dev true`` produced one;
+            ``None`` for greenfield runs that skipped the deploy phase.
+
+    Returns:
+        Absolute path to the generated ``INSTALLATION.md`` file.
+
+    Raises:
+        FileNotFoundError: If ``workspace_path`` does not exist.
+        RuntimeError: If LLM synthesis fails or trust validation rejects.
+    """
+    if not os.path.isdir(workspace_path):
+        raise FileNotFoundError(f"Workspace not found: {workspace_path}")
+
+    from harness.deploy import scan_workspace_telemetry
+    telemetry = scan_workspace_telemetry(workspace_path)
+    telemetry_json = json.dumps(telemetry, indent=2)[:6144]
+
+    architecture_text = ""
+    if architecture_path and os.path.isfile(architecture_path):
+        try:
+            with open(architecture_path, "r", encoding="utf-8", errors="replace") as f:
+                architecture_text = f.read()
+        except OSError:
+            architecture_text = ""
+    architecture_build_run = _extract_arch_build_run(architecture_text)
+
+    manifests_block = _collect_installation_manifests(workspace_path)
+    blueprint_json = _slim_blueprint(blueprint)
+
+    logger.info(
+        "[installation] Synthesizing INSTALLATION.md from telemetry "
+        "(langs=%s, dbs=%s, ports=%s) + %d manifest block(s).",
+        telemetry.get("languages"),
+        telemetry.get("databases_detected"),
+        telemetry.get("port_hints"),
+        manifests_block.count("####"),
+    )
+
+    from harness.gateway import NodeRole
+    prompt = _INSTALLATION_SYNTHESIS_PROMPT.format(
+        telemetry_json=telemetry_json,
+        architecture_build_run=architecture_build_run,
+        blueprint_json=blueprint_json,
+        manifests_block=manifests_block,
+    )
+    messages = [
+        {"role": "system", "content": "You are a technical documentation expert. Output clean, structured Markdown."},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        content_raw, cost_total = await _dispatch_with_continuation(
+            gateway=gateway,
+            messages=messages,
+            role=NodeRole.PLANNING,
+            budget_remaining_usd=1.00,
+            log_label="installation",
+        )
+    except Exception as exc:
+        raise RuntimeError(f"LLM installation synthesis failed: {exc}") from exc
+
+    from harness.trust import validate_synthesized_spec
+    content, trust_errors = validate_synthesized_spec(content_raw.strip())
+    if trust_errors:
+        raise RuntimeError(f"Synthesised installation doc failed trust validation: {trust_errors}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    install_path = os.path.join(output_dir, "INSTALLATION.md")
+    try:
+        import aiofiles
+        async with aiofiles.open(install_path, "w", encoding="utf-8") as f:
+            await f.write(content)
+    except ImportError:
+        with open(install_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    logger.info(
+        "[installation] INSTALLATION.md written to %s (%d chars, cost=$%.6f).",
+        install_path, len(content), cost_total,
+    )
+    return install_path
+
+
 async def _refine_requirements(
     spec_path: str,
     additional_notes: str,
@@ -4277,6 +4540,16 @@ async def cmd_run(args: argparse.Namespace) -> int:
         if getattr(args, "cd_discovery", False)
         else "disabled (deployment skips the LLM interview)",
     )
+    _install_doc_flag = getattr(args, "install_doc", None)
+    _install_doc_effective = (
+        _install_doc_flag if _install_doc_flag is not None
+        else bool(getattr(args, "new_build", False))
+    )
+    logger.info(
+        "  Install doc: %s",
+        "enabled (--install-doc true)" if _install_doc_effective
+        else "skipped (pass --install-doc true or --new-build true)",
+    )
     if spec_override:
         logger.info("  Spec:       SPEC_REQUIREMENTS.md (+SPEC_ARCHITECTURE.md) (%d chars)", len(spec_override))
     logger.info("=" * 60)
@@ -4306,6 +4579,15 @@ async def cmd_run(args: argparse.Namespace) -> int:
             # where present). See route_after_security_scan in
             # harness/graph.py.
             cd_discovery=getattr(args, "cd_discovery", False),
+            # End-of-run INSTALLATION.md synthesis. When --install-doc is
+            # unset on the command line (default), follow --new-build —
+            # greenfield runs get an install doc; incremental change
+            # requests skip it. Explicit --install-doc true|false wins.
+            install_doc=(
+                getattr(args, "install_doc", None)
+                if getattr(args, "install_doc", None) is not None
+                else bool(getattr(args, "new_build", False))
+            ),
             lintgate_config=config.get("lintgate", {}),
             deployment_config=config.get("deployment", {}),
             deployment_defaults=load_deployment_defaults(config),
@@ -7021,6 +7303,25 @@ def build_parser() -> argparse.ArgumentParser:
             "codebase before deploying. When false, the deployment step "
             "skips the LLM interview and synthesises the blueprint from "
             "workspace telemetry alone. Defaults to false."
+        ),
+    )
+    # --install-doc true|false. When true, the harness runs
+    # installation_doc_node at the end of a successful build, synthesising
+    # INSTALLATION.md from workspace telemetry + manifests + the Build & Run
+    # section of SPEC_ARCHITECTURE.md (+ the deployment blueprint when
+    # --deploy-dev was also used). Defaults to the value of --new-build:
+    # on for greenfield app generation, off for incremental change-request
+    # runs where the installation steps don't materially change.
+    run_parser.add_argument(
+        "--install-doc",
+        type=_bool_choice,
+        default=None,
+        metavar="true|false",
+        dest="install_doc",
+        help=(
+            "Synthesise INSTALLATION.md at the end of a successful build. "
+            "Defaults to the value of --new-build (on for greenfield, off "
+            "for change-request runs)."
         ),
     )
     # P1.7: workspace-lock override. When another live `harness run` holds
