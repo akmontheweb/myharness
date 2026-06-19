@@ -313,7 +313,7 @@ def _browse_response(query_path: str) -> tuple[int, str, str]:
     """Build the JSON response for ``GET /api/browse?path=...``.
 
     Restrict the visible filesystem to a handful of operator-friendly
-    roots — the home directory, /tmp, and the current working directory.
+    roots — the home directory, the system temp dir, and the current working directory.
     Without this, the endpoint exposes the entire host filesystem and
     becomes a useful reconnaissance primitive once DNS rebinding /
     no-auth-on-loopback puts a browser inside the same origin. Audit §3.13.
@@ -4600,7 +4600,10 @@ def cancel_session(session_id: str) -> bool:
             return True
         _time.sleep(0.1)
     # Grace expired — escalate. Audit §2.2 (no-SIGKILL-escalation).
-    reg.signal_running(session_id, _signal.SIGKILL)
+    # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM,
+    # which the Win32 runtime maps to TerminateProcess — semantically
+    # a hard kill, same outcome.
+    reg.signal_running(session_id, getattr(_signal, "SIGKILL", _signal.SIGTERM))
     return True
 
 

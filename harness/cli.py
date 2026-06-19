@@ -6382,13 +6382,15 @@ def cmd_web_stop(args: argparse.Namespace) -> int:
             return 0
         _time.sleep(0.1)
 
-    # Stubborn — escalate to SIGKILL.
+    # Stubborn — escalate to SIGKILL. Windows lacks SIGKILL so fall back
+    # to SIGTERM, which Win32 maps to TerminateProcess (a hard kill).
+    kill_sig = getattr(_signal, "SIGKILL", _signal.SIGTERM)
     print(
-        f"warning: pid {pid} didn't exit within 5s; sending SIGKILL.",
+        f"warning: pid {pid} didn't exit within 5s; sending {kill_sig.name}.",
         file=sys.stderr,
     )
     try:
-        os.kill(pid, _signal.SIGKILL)
+        os.kill(pid, kill_sig)
     except OSError:
         pass
     deadline = _time.time() + 2.0
@@ -6399,7 +6401,7 @@ def cmd_web_stop(args: argparse.Namespace) -> int:
         _time.sleep(0.1)
 
     print(
-        f"error: pid {pid} still alive after SIGKILL — manual intervention needed.",
+        f"error: pid {pid} still alive after {kill_sig.name} — manual intervention needed.",
         file=sys.stderr,
     )
     return 1

@@ -1049,15 +1049,18 @@ class ScheduleDaemon:
             signalled = [pid for pid in signalled if _pid_alive_int(pid)]
             if signalled:
                 time.sleep(0.2)
-        # Anything still alive after the grace gets SIGKILL.
+        # Anything still alive after the grace gets the kill signal.
+        # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM,
+        # which Win32 maps to TerminateProcess (semantically a hard kill).
+        kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
         for pid in signalled:
             try:
                 if hasattr(os, "killpg"):
                     try:
-                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                        os.killpg(os.getpgid(pid), kill_sig)
                     except (ProcessLookupError, OSError):
-                        os.kill(pid, signal.SIGKILL)
+                        os.kill(pid, kill_sig)
                 else:
-                    os.kill(pid, signal.SIGKILL)
+                    os.kill(pid, kill_sig)
             except (ProcessLookupError, PermissionError, OSError):
                 pass
