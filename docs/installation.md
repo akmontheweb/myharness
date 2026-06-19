@@ -58,7 +58,47 @@ The biggest operator-facing changes since the layered-config era:
 - **Scheduled-job daemon** — `harness schedule run` fires `harness run` jobs from `config.json` on a cron-style timer. See §11.
 - **Repo-index, per-repo memory, MCP client pool** — opt-in subsystems controlled from `config.json`. See the per-section comments in the shipped file for the contract.
 
+## 2.5 Pre-flight Check (first step on any machine)
+
+Before reading §3 in full, after the harness is installed, run:
+
+```bash
+harness pre-flight
+```
+
+or before install, from inside the cloned repo:
+
+```bash
+python -m harness.cli pre-flight
+```
+
+This auto-detects your OS (Windows / macOS / Linux) and prints a coloured checklist of every tool the harness needs, with an OS-appropriate install command for each missing item. The boundary against `harness doctor`:
+
+- **`pre-flight`**: is this **machine** ready to run the harness at all? No workspace, no config — tool / runtime / system level checks.
+- **`doctor`**: is this **workspace** configured correctly? Needs a `config/config.json` and a workspace path.
+
+`pre-flight` exits `0` when no REQUIRED item failed (warnings on optional tools are fine to defer); it exits `1` only when a REQUIRED tool is missing. Useful flags:
+
+| Flag | Purpose |
+|---|---|
+| `--quick` | Skip the live outbound-HTTPS probe (useful in CI / air-gapped runs) |
+| `--json` | Machine-readable output for CI |
+| `--no-color` | Strip ANSI codes (log capture) |
+| `--platform {windows,linux,macos}` | Force a different OS's check set — useful for verifying Windows install instructions from a Linux dev box |
+
+Sections of the report, in order:
+
+- **REQUIRED** — Python 3.11+, git, home / temp writable, disk space, outbound HTTPS, plus per-OS items (Windows long-paths registry; macOS Xcode CLI tools).
+- **SANDBOX** — Docker Desktop (or `unshare` on Linux; `taskkill` on Windows for the cross-platform tree-kill).
+- **RECOMMENDED** — POSIX `sh` on Windows (Git Bash for schedule hooks), security scanners (gitleaks / bandit / semgrep / trivy), formatters (ruff / prettier / rustfmt / clang-format / shellcheck).
+- **OPTIONAL** — `gh` CLI, language toolchains (Node / Go / Rust / Java / Dart) for stacks the LLM may target.
+- **ENV** — informational; which provider API key env vars are set on this machine.
+
+Once `pre-flight` reports green REQUIRED, follow §5 to install the harness package, then `harness doctor -r <workspace>` for the workspace-bound checks.
+
 ## 3. Prerequisites
+
+> The same checklist below is what `harness pre-flight` (§2.5) probes for you automatically. If you'd rather follow the install commands the tool prints than read the matrix, skip to §5 (install the package), then run `harness pre-flight` and iterate.
 
 ### Linux (Ubuntu 22.04+)
 
@@ -208,6 +248,7 @@ The repo ships a `Makefile` but `make` is not installed by default on Windows. E
 
 | Makefile target | Windows-native equivalent |
 |---|---|
+| (pre-install check) | `python -m harness.cli pre-flight` |
 | `make setup` | `python scripts\setup.py` |
 | `make build` | `python -m compileall .` |
 | `make test` | `python -m pytest tests\ -q --tb=short` |

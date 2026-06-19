@@ -6961,6 +6961,50 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pre_flight(args: argparse.Namespace) -> int:
+    """Execute the `harness pre-flight` subcommand.
+
+    Standalone machine-readiness probe — no workspace, no config required.
+    Auto-detects the host OS and runs an OS-appropriate probe set, then
+    emits a coloured checklist or JSON. Exit 0 if no FAIL rows; exit 1
+    if any required tool is missing.
+
+    Examples:
+        harness pre-flight
+        harness pre-flight --quick           # skip live network probe
+        harness pre-flight --json            # CI-friendly output
+        harness pre-flight --platform windows  # verify Windows install docs from Linux
+    """
+    from harness import preflight as _preflight
+
+    platform_override = (args.platform or "auto").lower()
+    if platform_override == "auto":
+        platform_override = None  # let _platform.is_*() decide
+
+    results = _preflight.run_all(
+        platform_override=platform_override,
+        quick=bool(getattr(args, "quick", False)),
+    )
+
+    # The header should reflect the user's choice even though run_all
+    # restored the real platform predicates after the probe pass.
+    header_platform = platform_override
+
+    if getattr(args, "json", False):
+        sys.stdout.write(
+            _preflight.render_json(results, platform_name=header_platform) + "\n"
+        )
+    else:
+        sys.stdout.write(_preflight.render_tty(
+            results,
+            no_color=bool(getattr(args, "no_color", False)),
+            platform_name=header_platform,
+        ))
+
+    has_fail = any(r.status == _preflight.STATUS_FAIL for r in results)
+    return 1 if has_fail else 0
+
+
 async def cmd_purge(args: argparse.Namespace) -> int:
     """
     Execute the `harness purge` subcommand.
@@ -7671,6 +7715,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable debug-level logging.",
     )
 
+    # --- `harness pre-flight` ---
+    pre_flight_parser = subparsers.add_parser(
+        "pre-flight",
+        help="Probe this machine for tools and runtimes the harness needs.",
+        description=(
+            "Standalone readiness check. Does NOT need a workspace or config. "
+            "Auto-detects your OS (Windows / macOS / Linux) and prints a "
+            "coloured checklist of required and optional tools, with the "
+            "install command for each missing item. Run BEFORE `harness doctor`."
+        ),
+    )
+    pre_flight_parser.add_argument(
+        "--platform",
+        choices=["auto", "windows", "linux", "macos"],
+        default="auto",
+        help="Force a specific OS's check set (default: auto-detect).",
+    )
+    pre_flight_parser.add_argument(
+        "--quick",
+        action="store_true",
+        default=False,
+        help="Skip live network probes (outbound HTTPS reachability).",
+    )
+    pre_flight_parser.add_argument(
+        "--no-color",
+        action="store_true",
+        default=False,
+        help="Plain text output for CI / log capture.",
+    )
+    pre_flight_parser.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Machine-readable JSON output.",
+    )
+
     # --- `harness purge` ---
     purge_parser = subparsers.add_parser("purge", help="Manually wipe checkpoint data")
     purge_parser.add_argument(
@@ -8059,6 +8139,8 @@ def main() -> int:
             return asyncio.run(cmd_status(args))
         elif args.command == "doctor":
             return asyncio.run(cmd_doctor(args))
+        elif args.command == "pre-flight":
+            return cmd_pre_flight(args)
         elif args.command == "purge":
             return asyncio.run(cmd_purge(args))
         elif args.command == "metrics":
