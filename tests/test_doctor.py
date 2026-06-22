@@ -1,4 +1,4 @@
-"""Tests for harness/cli.py — `harness doctor` first-run healthcheck."""
+"""Tests for harness/cli.py — `teane doctor` first-run healthcheck."""
 
 import asyncio
 import os

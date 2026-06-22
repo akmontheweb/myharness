@@ -26,7 +26,7 @@ Both backends share:
 - A SQLite store next to the checkpoint DB (``~/.harness/repo_index.db``).
 - The chunker (line-window with overlap; configurable).
 - The query path (cosine + top-K; filter by minimum score).
-- The CLI surface (``harness index build / status / clear``).
+- The CLI surface (``teane index build / status / clear``).
 
 The planner is unchanged when ``repo_index.enabled=false`` (default).
 When enabled, ``planning_node`` calls :func:`query_top_chunks` once for
@@ -373,7 +373,7 @@ class OpenAIEmbeddingsBackend(IndexBackend):
     dependency for what's a few thousand dot products.
 
     Falls back to TF-IDF at construction time when ``OPENAI_API_KEY``
-    is missing — a missing key must NEVER break ``harness index``.
+    is missing — a missing key must NEVER break ``teane index``.
     Callers check :attr:`available`.
     """
 

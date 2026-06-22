@@ -273,7 +273,7 @@ class DuckDuckGoLiteBackend(SearchBackend):
             timeout=httpx.Timeout(self._timeout, connect=10.0),
             follow_redirects=True,
             headers={
-                "User-Agent": "myharness-research/1.0 (+https://github.com/akmontheweb/myharness)",
+                "User-Agent": "teane-research/1.0 (+https://github.com/akmontheweb/teane)",
             },
         ) as client:
             response = await client.post(self._URL, data=params)
@@ -367,7 +367,7 @@ def unregister_backend(name: str) -> None:
 
 def registered_backends() -> list[str]:
     """Return the sorted list of currently-registered backend names
-    (including aliases). Used by error messages and ``harness doctor``
+    (including aliases). Used by error messages and ``teane doctor``
     so the operator sees what's actually available."""
     return sorted(_BACKEND_REGISTRY.keys())
 
@@ -439,7 +439,7 @@ async def _web_fetch_impl(
     else:
         cap = max(1, min(int(max_bytes), cfg.max_bytes))
     headers = {
-        "User-Agent": "myharness-research/1.0 (+https://github.com/akmontheweb/myharness)",
+        "User-Agent": "teane-research/1.0 (+https://github.com/akmontheweb/teane)",
         "Accept": "text/html,application/json,text/plain,text/markdown;q=0.9,*/*;q=0.1",
     }
     try:

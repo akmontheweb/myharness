@@ -1,6 +1,6 @@
 # Installation Guide
 
-Step-by-step deployment of **myharness** on a fresh machine.
+Step-by-step deployment of **teane** on a fresh machine.
 
 Supported platforms: **Linux**, **macOS**, and **Windows** (WSL2 recommended; native works with Docker Desktop).
 
@@ -9,13 +9,13 @@ Supported platforms: **Linux**, **macOS**, and **Windows** (WSL2 recommended; na
 For most operators, the fastest path is the bootstrap script:
 
 ```bash
-git clone <repo-url> myharness && cd myharness
+git clone <repo-url> teane && cd teane
 python3 scripts/setup.py          # or `make setup`
 ```
 
-It walks 11 phases interactively: platform / Python 3.11+ / git / sandbox-backend probes → venv creation → `pip install -e .` → LLM-provider wizard (writes `<repo>/config/config.json` and persists the API key to your shell rc file with your consent) → `harness doctor` verification → optional install commands for security scanners and formatters. Re-runs are idempotent.
+It walks 11 phases interactively: platform / Python 3.11+ / git / sandbox-backend probes → venv creation → `pip install -e .` → LLM-provider wizard (writes `<repo>/config/config.json` and persists the API key to your shell rc file with your consent) → `teane doctor` verification → optional install commands for security scanners and formatters. Re-runs are idempotent.
 
-Flags worth knowing: `--venv <path>` overrides the default `~/.venvs/harness`, `--dev` adds the `[dev]` extras, `--provider <anthropic|openai|deepseek|ollama>` skips the wizard prompt, `--non-interactive` is for CI, `--no-doctor` skips the final verification. Run `python3 scripts/setup.py --help` for the full list.
+Flags worth knowing: `--venv <path>` overrides the default `~/.venvs/teane`, `--dev` adds the `[dev]` extras, `--provider <anthropic|openai|deepseek|ollama>` skips the wizard prompt, `--non-interactive` is for CI, `--no-doctor` skips the final verification. Run `python3 scripts/setup.py --help` for the full list.
 
 Sections §1–§14 below remain the canonical manual reference and the source of truth for what the script does behind the scenes. Read them when you need to debug a failing phase or tune something the wizard skips (multi-provider routing, sandbox image overrides, headless deployment).
 
@@ -47,15 +47,15 @@ On Windows, **WSL2 is recommended** because the harness was developed Linux-firs
 The biggest operator-facing changes since the layered-config era:
 
 - **Single canonical config** — the harness now reads exactly one file: `<repo>/config/config.json`. There is no `~/.harness/config.json`, no per-workspace `.harness_config.json`, no shipped `harness/cli.json` defaults. Strict validation rejects unknown keys, wrong types, missing required fields, and missing API key env vars at startup — before any LLM call. A legacy `.harness_config.json` left in a workspace logs one INFO line and is otherwise ignored. See §8.
-- **Mandatory `product_spec_dir`** — every run must point at a workspace-root folder of `.txt` files describing the product to build. `harness doctor` and `harness run` both refuse to start when the key is missing, malformed, or the folder is empty.
-- **Greenfield-vs-change-request modes** — `harness run --new-build true` wipes the workspace (except `product_spec/` and `.git/`) and resets to a clean base branch; `--new-build false` (the default) reads `.txt` files from `change_requests/` for steady-state work. Pair with `--yes` for unattended automation.
-- **Interactive wizard on bare `harness run`** — invoking `harness run` with no flags drops the operator into a wizard that resolves API keys, workspace, prompt, and mode. The wizard never writes to disk; each bare run re-asks.
+- **Mandatory `product_spec_dir`** — every run must point at a workspace-root folder of `.txt` files describing the product to build. `teane doctor` and `teane run` both refuse to start when the key is missing, malformed, or the folder is empty.
+- **Greenfield-vs-change-request modes** — `teane run --new-build true` wipes the workspace (except `product_spec/` and `.git/`) and resets to a clean base branch; `--new-build false` (the default) reads `.txt` files from `change_requests/` for steady-state work. Pair with `--yes` for unattended automation.
+- **Interactive wizard on bare `teane run`** — invoking `teane run` with no flags drops the operator into a wizard that resolves API keys, workspace, prompt, and mode. The wizard never writes to disk; each bare run re-asks.
 - **Deterministic autofix** — compiler-suggested fixes (rustc / gcc / clang fixits), missing-import insertion, and a small set of known-safe security autofixes (e.g. Bandit `B201` `debug=True → False`, Trivy version bumps with `FixedVersion`) now land **without** an LLM call. Surfaces in logs as `[autofix]` lines.
 - **Env-misconfig short-circuit** — when the sandbox build fails because a runtime is missing (`pytest` not installed in `python:3.12-slim`, `npm: command not found`), the router now exits to HITL on the **first** compile with a focused message instead of burning 3 LLM repair iterations. See §13 → Troubleshooting → HITL triggers.
 - **Auto test generation** — after every patching round, a node writes stack-canonical unit tests for the modified source files and runs them deterministically in the sandbox before lintgate. Requires a configured LLM API key. See **§8.5 Test generation** below.
 - **End-of-run `INSTALLATION.md`** — on successful greenfield builds, the harness writes `<workspace>/docs/INSTALLATION.md` describing how to install, configure, run locally, and (when `--deploy-dev true` produced a docker-compose blueprint) deploy the generated app. The doc is grounded in the actual artifacts: workspace telemetry, root manifests (`requirements.txt`, `package.json`, `Makefile`, `.env.example`), the Build & Run section of `SPEC_ARCHITECTURE.md`, and the deployment blueprint when present. Controlled by `--install-doc true|false`; defaults to the value of `--new-build` (on for greenfield, off for change-request runs). Best-effort — a synthesis failure logs `[installation_doc] Synthesis failed; INSTALLATION.md not written: …` and does not roll back the build.
-- **Carbon web UI** — `harness web start` / `harness web stop` runs a single-instance dashboard (default bind `127.0.0.1:9000`) for browsing sessions, editing config, viewing memory, scheduling runs, and answering HITL prompts in-browser. See §11.
-- **Scheduled-job daemon** — `harness schedule run` fires `harness run` jobs from `config.json` on a cron-style timer. See §11.
+- **Carbon web UI** — `teane web start` / `teane web stop` runs a single-instance dashboard (default bind `127.0.0.1:9000`) for browsing sessions, editing config, viewing memory, scheduling runs, and answering HITL prompts in-browser. See §11.
+- **Scheduled-job daemon** — `teane schedule run` fires `teane run` jobs from `config.json` on a cron-style timer. See §11.
 - **Repo-index, per-repo memory, MCP client pool** — opt-in subsystems controlled from `config.json`. See the per-section comments in the shipped file for the contract.
 
 ## 2.5 Pre-flight Check (first step on any machine)
@@ -63,7 +63,7 @@ The biggest operator-facing changes since the layered-config era:
 Before reading §3 in full, after the harness is installed, run:
 
 ```bash
-harness pre-flight
+teane pre-flight
 ```
 
 or before install, from inside the cloned repo:
@@ -72,7 +72,7 @@ or before install, from inside the cloned repo:
 python -m harness.cli pre-flight
 ```
 
-This auto-detects your OS (Windows / macOS / Linux) and prints a coloured checklist of every tool the harness needs, with an OS-appropriate install command for each missing item. The boundary against `harness doctor`:
+This auto-detects your OS (Windows / macOS / Linux) and prints a coloured checklist of every tool the harness needs, with an OS-appropriate install command for each missing item. The boundary against `teane doctor`:
 
 - **`pre-flight`**: is this **machine** ready to run the harness at all? No workspace, no config — tool / runtime / system level checks.
 - **`doctor`**: is this **workspace** configured correctly? Needs a `config/config.json` and a workspace path.
@@ -94,11 +94,11 @@ Sections of the report, in order:
 - **OPTIONAL** — `gh` CLI, language toolchains (Node / Go / Rust / Java / Dart) for stacks the LLM may target.
 - **ENV** — informational; which provider API key env vars are set on this machine.
 
-Once `pre-flight` reports green REQUIRED, follow §5 to install the harness package, then `harness doctor -r <workspace>` for the workspace-bound checks.
+Once `pre-flight` reports green REQUIRED, follow §5 to install the harness package, then `teane doctor -r <workspace>` for the workspace-bound checks.
 
 ## 3. Prerequisites
 
-> The same checklist below is what `harness pre-flight` (§2.5) probes for you automatically. If you'd rather follow the install commands the tool prints than read the matrix, skip to §5 (install the package), then run `harness pre-flight` and iterate.
+> The same checklist below is what `teane pre-flight` (§2.5) probes for you automatically. If you'd rather follow the install commands the tool prints than read the matrix, skip to §5 (install the package), then run `teane pre-flight` and iterate.
 
 ### Linux (Ubuntu 22.04+)
 
@@ -190,17 +190,17 @@ Opt-in only — the harness refuses to run with `sandbox.backend = "bare"` unles
 
 ## 5. Clone & Install the Package
 
-The package is currently distributed from source. A future `pip install ai-agent-harness` will work once published to PyPI; for now use source.
+The package is currently distributed from source. A future `pip install teane` will work once published to PyPI; for now use source.
 
 ### Linux / macOS / WSL2
 
 ```bash
-git clone <repo-url> myharness
-cd myharness
-python3.11 -m venv ~/.venvs/harness
-source ~/.venvs/harness/bin/activate
+git clone <repo-url> teane
+cd teane
+python3.11 -m venv ~/.venvs/teane
+source ~/.venvs/teane/bin/activate
 pip install .
-harness --version
+teane --version
 ```
 
 For a **pilot install where you need bit-exact reproducibility**, use the
@@ -217,12 +217,12 @@ Regenerate after a deliberate dependency bump with
 ### Windows native (PowerShell)
 
 ```powershell
-git clone <repo-url> myharness
-cd myharness
-py -3.11 -m venv $HOME\.venvs\harness
-& $HOME\.venvs\harness\Scripts\Activate.ps1
+git clone <repo-url> teane
+cd teane
+py -3.11 -m venv $HOME\.venvs\teane
+& $HOME\.venvs\teane\Scripts\Activate.ps1
 pip install .
-harness --version
+teane --version
 ```
 
 If `Activate.ps1` is blocked: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` (one-time).
@@ -230,15 +230,15 @@ If `Activate.ps1` is blocked: `Set-ExecutionPolicy -Scope CurrentUser RemoteSign
 ### Windows native (cmd)
 
 ```cmd
-git clone <repo-url> myharness
-cd myharness
-py -3.11 -m venv %USERPROFILE%\.venvs\harness
-%USERPROFILE%\.venvs\harness\Scripts\activate.bat
+git clone <repo-url> teane
+cd teane
+py -3.11 -m venv %USERPROFILE%\.venvs\teane
+%USERPROFILE%\.venvs\teane\Scripts\activate.bat
 pip install .
-harness --version
+teane --version
 ```
 
-On Windows native the console script lands at `…\.venvs\harness\Scripts\harness.exe`. If `harness --version` fails after activation, your venv didn't activate — re-check the activation command.
+On Windows native the console script lands at `…\.venvs\teane\Scripts\teane.exe`. If `teane --version` fails after activation, your venv didn't activate — re-check the activation command.
 
 For an editable install (recompile-free local edits), substitute `pip install -e .`.
 
@@ -326,9 +326,9 @@ If `gitleaks` is missing, the harness falls back to a regex-based Python secret 
 | `rustfmt` (Rust) | `rustup component add rustfmt` |
 | `clang-format` (C / C++) | `apt install clang-format`, `brew install clang-format`, or [LLVM Windows installer](https://releases.llvm.org/) |
 
-### GitHub CLI (optional — required for `harness gh` subcommands)
+### GitHub CLI (optional — required for `teane gh` subcommands)
 
-The `harness gh issue` / `pr-create` / `pr-comment` subcommands shell out to the [`gh` CLI](https://cli.github.com/). Install once and authenticate; the harness never stores tokens.
+The `teane gh issue` / `pr-create` / `pr-comment` subcommands shell out to the [`gh` CLI](https://cli.github.com/). Install once and authenticate; the harness never stores tokens.
 
 | Platform | Install |
 |----------|---------|
@@ -341,7 +341,7 @@ Then authenticate once:
 gh auth login
 ```
 
-Skip this section if you only run the harness against your own change-request files; `harness gh` is the only place that needs `gh` on PATH.
+Skip this section if you only run the harness against your own change-request files; `teane gh` is the only place that needs `gh` on PATH.
 
 ### MCP servers (optional — required only if you enable `mcp.enabled=true`)
 
@@ -377,11 +377,11 @@ Filesystem MCP servers (`@modelcontextprotocol/server-filesystem`) bypass the ha
 }
 ```
 
-`harness doctor` adds one row per server when `mcp.enabled=true` showing the tool count or the rejection reason.
+`teane doctor` adds one row per server when `mcp.enabled=true` showing the tool count or the rejection reason.
 
 ## 8. Configure the Harness
 
-The harness reads exactly one config file: `<myharness_root>/config/config.json`. There are no fallbacks, no per-workspace overrides, no auto-generated files. The setup wizard writes this file with sane defaults; thereafter every behaviour change goes here.
+The harness reads exactly one config file: `<teane_root>/config/config.json`. There are no fallbacks, no per-workspace overrides, no auto-generated files. The setup wizard writes this file with sane defaults; thereafter every behaviour change goes here.
 
 Strict validation runs at every CLI entry point before any logging, lock, or LLM-gateway initialisation:
 - Unknown top-level or nested keys → fail (catches typos like `token_budget.hrad_cap_usd` that used to silently no-op).
@@ -389,7 +389,7 @@ Strict validation runs at every CLI entry point before any logging, lock, or LLM
 - Wrong types, malformed model keys, dangling routing references → fail.
 - A provider referenced in `model_routing` with no `{PROVIDER}_API_KEY` env var → fail.
 
-On any failure the harness prints the multi-line ConfigError to stderr and exits with code 2. The dashboard editor (Configure Harness page) and `harness doctor` run the same validator so the same mistakes surface in the same words.
+On any failure the harness prints the multi-line ConfigError to stderr and exits with code 2. The dashboard editor (Configure Harness page) and `teane doctor` run the same validator so the same mistakes surface in the same words.
 
 A minimal `config/config.json` body:
 
@@ -426,7 +426,7 @@ A minimal `config/config.json` body:
 
 The shipped `config/config.json` in the repo is annotated: every section has a sibling `_<section>_comment` string that documents every leaf field. `_*` keys are stripped at load time, so comment fields ship in the file but never reach the validator.
 
-**Mandatory `product_spec_dir`.** The value is a bare folder name (no path separators, no `..`, no absolute paths) that lives at the workspace root. The harness consolidates every `.txt` file in alphabetical order and feeds the result to the planning LLM. `harness doctor` checks the value is well-formed AND the folder exists with ≥1 `.txt` file.
+**Mandatory `product_spec_dir`.** The value is a bare folder name (no path separators, no `..`, no absolute paths) that lives at the workspace root. The harness consolidates every `.txt` file in alphabetical order and feeds the result to the planning LLM. `teane doctor` checks the value is well-formed AND the folder exists with ≥1 `.txt` file.
 
 **Model registry vs routing.**
 - `models` is the registry — every LLM the gateway can dispatch to must be declared here with `provider`, `model_id`, `context_window`, `input_cost_per_1m`, `output_cost_per_1m`, `api_base_url`, `supports_thinking`, `supports_cache`, and an empty `api_key` slot. The key (e.g. `anthropic:claude-sonnet-4`) is the routing handle.
@@ -435,7 +435,7 @@ The shipped `config/config.json` in the repo is annotated: every section has a s
 
 The full schema — every field of `sandbox`, `token_budget`, `node_throttle`, `persistence`, `logging`, `lintgate`, `deployment`, `test_generation`, `metrics`, `web_tools`, `mcp`, `memory`, `repo_index`, `schedule`, `dashboard`, `deployment_defaults` — is documented in [docs/SPEC_REQUIREMENTS.md](SPEC_REQUIREMENTS.md) and in the inline comments of `config/config.json`.
 
-**API key resolution.** Each provider key is resolved at runtime by `harness/gateway.py`: (1) explicit constructor argument, (2) `{PROVIDER}_API_KEY` env var (recommended), (3) the `api_key` field on the model entry as a last-resort dev knob (the shipped schema keeps this empty and discourages live keys). `harness doctor`'s `api keys (live)` check makes a 1-token chat call per routed provider and reports the source per model — `... (env)` or `... (config)` — so you can confirm at a glance where the runtime resolved from. Set `HARNESS_DOCTOR_SKIP_LIVE=true` to skip the live ping (CI / outbound-blocked hosts).
+**API key resolution.** Each provider key is resolved at runtime by `harness/gateway.py`: (1) explicit constructor argument, (2) `{PROVIDER}_API_KEY` env var (recommended), (3) the `api_key` field on the model entry as a last-resort dev knob (the shipped schema keeps this empty and discourages live keys). `teane doctor`'s `api keys (live)` check makes a 1-token chat call per routed provider and reports the source per model — `... (env)` or `... (config)` — so you can confirm at a glance where the runtime resolved from. Set `HARNESS_DOCTOR_SKIP_LIVE=true` to skip the live ping (CI / outbound-blocked hosts).
 
 **Legacy per-workspace config files.** A `.harness_config.json` left over from the layered-config era is **ignored** with one INFO log line per run; the harness no longer reads it. Delete it at your leisure — nothing reads or writes it.
 
@@ -445,17 +445,17 @@ The full schema — every field of `sandbox`, `token_budget`, `node_throttle`, `
 - `llm_dispatch.prompt_cache_enabled` (default `true`) — emits Anthropic `cache_control` markers on the system block and runs prefix-stability drift detection. Flip to false only if a provider API change rejects the payload shape.
 - `compiler.run_prod_import_smoke_check` (default `true`) — compiler_node imports every production module inside the sandbox before running the build, so module-level errors surface as `[prod-import]` diagnostics ahead of any cascade-amplified test failures.
 - `debug.dump_llm_calls` (default `true`) — every LLM dispatch is written to `~/.harness/debug/*.txt`; `debug.dump_max_files` caps the directory (oldest by mtime pruned). Useful for post-mortem; turn off in production-style runs.
-- `sandbox.cache_volumes` (default `false`) — swap each `readonly_cache_mounts` entry for a writable Docker named volume scoped to the session id. Pip / npm / cargo persist downloads across containers in the session. Clean up with `harness cache clear`.
+- `sandbox.cache_volumes` (default `false`) — swap each `readonly_cache_mounts` entry for a writable Docker named volume scoped to the session id. Pip / npm / cargo persist downloads across containers in the session. Clean up with `teane cache clear`.
 - `node_throttle.max_patch_repair_iterations` (default `3`, can be raised) — repair loop ceiling. After this many failing rebuilds the run routes to HITL.
 
 **WSL2 only**: put your workspaces under the WSL filesystem (`~/...`), **not** `/mnt/c/...`. Windows-mount paths have order-of-magnitude slower I/O.
 
 ### Workspace single-writer lock
 
-Every `harness run` and `harness resume` acquires an exclusive lock on `<workspace>/.harness_session.lock`. A second concurrent run on the same workspace exits with `lock held by PID X`. To recover after a hard kill that left the lock stale:
+Every `teane run` and `teane resume` acquires an exclusive lock on `<workspace>/.harness_session.lock`. A second concurrent run on the same workspace exits with `lock held by PID X`. To recover after a hard kill that left the lock stale:
 
 ```bash
-harness run -w <workspace> -p "<prompt>" --force-lock
+teane run -w <workspace> -p "<prompt>" --force-lock
 ```
 
 `--force-lock` releases the stale lock and acquires a fresh one, logging a WARNING so the override is visible in the session record. The lock is implemented via `fcntl.flock` on Linux/macOS/WSL2 (advisory) and `msvcrt.locking` on Windows native (mandatory) — both dispatched through `harness/_filelock.py`. See `docs/RUNBOOK.md` § 4 for the full recovery recipe.
@@ -499,12 +499,12 @@ After every patching round, the harness writes stack-canonical unit tests for th
 
 **Project-level test conventions.** Drop your own files under `<workspace>/test_guides/<lang>.md` with frontmatter `applies_to: [<stack-tag>]`. The loader prefers project files over the shipped defaults, so a workspace can tighten the conventions the LLM is given without forking the harness.
 
-## 9. Verify the Install (`harness doctor`)
+## 9. Verify the Install (`teane doctor`)
 
 `cd` into any workspace whose `product_spec/` folder is populated and run:
 
 ```bash
-harness doctor
+teane doctor
 ```
 
 Expected output: a banner with the resolved canonical config path, then a row per check. `config` is the gate — if it fails, every downstream check is marked `skip` and doctor exits non-zero.
@@ -517,7 +517,7 @@ Expected output: a banner with the resolved canonical config path, then a row pe
 | `api keys (live)` | Every provider referenced in `model_routing` has a key in `{PROVIDER}_API_KEY` (or the `models[].api_key` field), AND each passes a one-token live ping that confirms the key authenticates against the configured model | Set the missing key, fix an `HTTP 401 — API key rejected`, or set `HARNESS_DOCTOR_SKIP_LIVE=true` (CI / outbound-blocked hosts) |
 | `tree-sitter` | The `tree-sitter` import works and at least one bundled grammar parses a sample buffer | `pip install -U tree-sitter tree-sitter-language-pack`; without it, `patcher` and `impact` silently degrade to regex extraction |
 | `sandbox backend` | Resolves `sandbox.backend`: `docker` probes `docker info`; `unshare` probes `unshare --user echo ok`; `auto` tries docker → unshare in order; `bare` warns (no isolation) | Re-do §4 for your platform |
-| `checkpoint db` | `persistence.db_path` is writable AND the 5 most recent checkpoints deserialize cleanly | Adjust `persistence.db_path`, or `harness purge --session-id <id>` for a corrupted session |
+| `checkpoint db` | `persistence.db_path` is writable AND the 5 most recent checkpoints deserialize cleanly | Adjust `persistence.db_path`, or `teane purge --session-id <id>` for a corrupted session |
 | `patcher mode` | Reports the two patcher behaviour flags: `read-before-edit` (B5) and `native tool-use` (B6) | Informational; never fails |
 | `external tools` | One row per shelled-out tool (formatters, security scanners, `gh`) the operator's config / workspace touches | `warn` for a missing optional tool; `pass` confirms PATH resolution |
 | `mcp:<server>` | Only when `mcp.enabled: true` — starts each declared server subprocess and lists the advertised tools | Fix the `command` / runtime, or remove the server entry |
@@ -547,7 +547,7 @@ Pick a throwaway git repo and drop a one-line spec under `product_spec/` (the ha
 git clone https://github.com/octocat/Hello-World.git sample
 mkdir -p sample/product_spec
 echo "List the top-level files in this repository." > sample/product_spec/SPEC.txt
-harness run -w ./sample -p "list the top-level files" --new-build false
+teane run -w ./sample -p "list the top-level files" --new-build false
 ```
 
 The harness will:
@@ -557,9 +557,9 @@ The harness will:
 3. Consolidate every `.txt` file in `product_spec/`, then run the planning → patching → compile → lintgate loop, checkpointing each step.
 4. Append a session note under `~/.harness/memory/<repo_id>.md` if `memory.enabled: true` (the default).
 
-A successful smoke test exits 0. Inspect the run with `harness status --session-id <id>` or by tailing the JSONL log file. After the run, `harness metrics --session-id <id>` shows cost, burn rate, and projected exhaustion against your `token_budget.hard_cap_usd`.
+A successful smoke test exits 0. Inspect the run with `teane status --session-id <id>` or by tailing the JSONL log file. After the run, `teane metrics --session-id <id>` shows cost, burn rate, and projected exhaustion against your `token_budget.hard_cap_usd`.
 
-**Bare `harness run`** with no flags drops into the interactive wizard described in §0.1 of the "What's new" notes — it walks API keys, workspace, prompt, `--git`, `--new-build`, and `--spec-discovery`, then hands off to `cmd_run` or `cmd_resume`. The wizard never persists anything.
+**Bare `teane run`** with no flags drops into the interactive wizard described in §0.1 of the "What's new" notes — it walks API keys, workspace, prompt, `--git`, `--new-build`, and `--spec-discovery`, then hands off to `cmd_run` or `cmd_resume`. The wizard never persists anything.
 
 For diagnostics on a stuck or failed run, start with [`docs/RUNBOOK.md`](RUNBOOK.md).
 
@@ -571,15 +571,15 @@ For unattended runs (CI, scheduled jobs, services):
 - Set `HARNESS_HITL_WEBHOOK_URL` (and optional `HARNESS_HITL_WEBHOOK_SECRET` for HMAC-SHA256 signing) if you want sensitive operations to require approval via a webhook instead of stdin. The dashboard exports both automatically when it spawns runs, so HITL gates surface in the UI.
 - Ensure NTP is running — clock skew breaks API auth on fresh VMs.
 - With test_generation on (the default — see [§8.5](#85-test-generation-new)), each session spends additional LLM tokens for test authorship and may hit the default `token_budget.hard_cap_usd = 3.00` on larger changes. Raise the cap in your config, or set `test_generation.enabled: false` under CI when budget pressure matters.
-- Track aggregate cost with a cron job: `harness metrics --all --prometheus --output /var/lib/node_exporter/textfile/harness.prom`. The atomic-write contract means a scraper never sees a half-written file.
+- Track aggregate cost with a cron job: `teane metrics --all --prometheus --output /var/lib/node_exporter/textfile/harness.prom`. The atomic-write contract means a scraper never sees a half-written file.
 - For long-running services, leave `logging.max_bytes` / `logging.backup_count` at defaults (10 MB × 5) — that's ~50 MB max per session, dropped oldest-first.
 - If a scheduled job dies hard and leaves the workspace lock stale, the next run will refuse to start. Wrap with a retry that adds `--force-lock` on second attempt only.
 
 ### Linux (systemd)
 
-`harness` ships three persistent processes you might want to systemd-ify: a one-shot `harness run`, the schedule daemon, and the web dashboard. Each runs the venv's `harness` console script. `HOME` must be set on every unit so `~/.harness/` path expansion works.
+`harness` ships three persistent processes you might want to systemd-ify: a one-shot `teane run`, the schedule daemon, and the web dashboard. Each runs the venv's `harness` console script. `HOME` must be set on every unit so `~/.harness/` path expansion works.
 
-One-shot run (equivalent to the operator typing `harness run`):
+One-shot run (equivalent to the operator typing `teane run`):
 ```ini
 [Service]
 Environment=HOME=/srv/harness
@@ -587,15 +587,15 @@ Environment=CI=true
 Environment=HARNESS_AUTO_APPROVE=true
 Environment=ANTHROPIC_API_KEY=sk-...
 WorkingDirectory=/srv/harness/workspace
-ExecStart=/srv/harness/.venvs/harness/bin/harness run -w . -p "..." --new-build false
+ExecStart=/srv/harness/.venvs/teane/bin/teane run -w . -p "..." --new-build false
 ```
 
-Scheduled-job daemon (`harness schedule run` — fires `schedule.jobs` from
+Scheduled-job daemon (`teane schedule run` — fires `schedule.jobs` from
 `config/config.json` on a cron-style timer; restart-on-failure recommended):
 ```ini
 # /etc/systemd/system/harness-schedule.service
 [Unit]
-Description=myharness scheduled-job daemon
+Description=teane scheduled-job daemon
 After=network-online.target
 
 [Service]
@@ -603,8 +603,8 @@ Type=simple
 User=harness
 Environment=HOME=/srv/harness
 Environment=ANTHROPIC_API_KEY=sk-...
-WorkingDirectory=/srv/harness/myharness
-ExecStart=/srv/harness/.venvs/harness/bin/harness schedule run
+WorkingDirectory=/srv/harness/teane
+ExecStart=/srv/harness/.venvs/teane/bin/teane schedule run
 Restart=on-failure
 RestartSec=10
 
@@ -612,7 +612,7 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
-Web dashboard (`harness web start` foreground; writes enabled by default — set
+Web dashboard (`teane web start` foreground; writes enabled by default — set
 `dashboard.writes_enabled: false` in `config.json` for a read-only deployment).
 The dashboard is single-instance per user, gated by `~/.harness/web.lock`; a
 second `start` while the marker points at a live pid refuses to launch.
@@ -620,7 +620,7 @@ second `start` while the marker points at a live pid refuses to launch.
 ```ini
 # /etc/systemd/system/harness-dashboard.service
 [Unit]
-Description=myharness web dashboard
+Description=teane web dashboard
 After=network-online.target
 
 [Service]
@@ -631,9 +631,9 @@ Environment=HOME=/srv/harness
 Environment=DASH_TOKEN=replace-with-a-long-random-string
 # Optional: persistent CSRF token across restarts:
 Environment=DASH_CSRF=replace-with-another-long-random-string
-WorkingDirectory=/srv/harness/myharness
-ExecStart=/srv/harness/.venvs/harness/bin/harness web start --host 127.0.0.1 --port 9000
-ExecStop=/srv/harness/.venvs/harness/bin/harness web stop
+WorkingDirectory=/srv/harness/teane
+ExecStart=/srv/harness/.venvs/teane/bin/teane web start --host 127.0.0.1 --port 9000
+ExecStop=/srv/harness/.venvs/teane/bin/teane web stop
 Restart=on-failure
 RestartSec=10
 
@@ -667,11 +667,11 @@ sudo journalctl -fu harness-schedule.service   # follow logs
 
 Run separate units rather than bundling — the dashboard config changes mean only the dashboard restarts, and a stuck dashboard request never affects schedule timing.
 
-For ad-hoc background mode without systemd, `harness web start --background yes` re-spawns the server detached and logs to `~/.harness/web.log`; `harness web stop` reads the marker, SIGTERMs the pid, and escalates to SIGKILL after 5 s.
+For ad-hoc background mode without systemd, `teane web start --background yes` re-spawns the server detached and logs to `~/.harness/web.log`; `teane web stop` reads the marker, SIGTERMs the pid, and escalates to SIGKILL after 5 s.
 
 ### Windows native (Task Scheduler)
 
-- Create a task running `…\.venvs\harness\Scripts\harness.exe` with arguments `run -w C:\path\to\workspace -p "..." --new-build false`.
+- Create a task running `…\.venvs\teane\Scripts\teane.exe` with arguments `run -w C:\path\to\workspace -p "..." --new-build false`.
 - Set **Start in** to the workspace directory.
 - Add `CI`, `HARNESS_AUTO_APPROVE`, and `ANTHROPIC_API_KEY` as system or user env vars (Task Scheduler inherits the account's env).
 - For a long-lived service, wrap the command with [NSSM](https://nssm.cc/).
@@ -681,24 +681,24 @@ For ad-hoc background mode without systemd, `harness web start --background yes`
 ### Upgrade
 
 ```bash
-cd myharness
+cd teane
 git pull
 pip install -U .
-harness doctor
+teane doctor
 ```
 
-(Or `pip install -U ai-agent-harness` once published to PyPI.)
+(Or `pip install -U teane` once published to PyPI.)
 
 ### Uninstall
 
 ```bash
-pip uninstall ai-agent-harness
+pip uninstall teane
 rm -rf ~/.harness     # Linux/macOS/WSL2
 ```
 
 `~/.harness/` holds the checkpoint DB, per-session JSONL logs, metrics, repo memory files, the repo index (`repo_index/`), schedule history (`schedule.db`), web app state (`web.db`), and the user-skills directory (`user_skills/` — legacy installs may still use `skills/`). Remove only what you don't want to keep.
 
-On Windows native: `pip uninstall ai-agent-harness` then `Remove-Item -Recurse $HOME\.harness` in PowerShell.
+On Windows native: `pip uninstall teane` then `Remove-Item -Recurse $HOME\.harness` in PowerShell.
 
 ## 13. Troubleshooting
 
@@ -725,7 +725,7 @@ These show up in the HITL banner as `Trigger: <name>` and mean the harness short
 | `llm_silent` (HITL fires immediately) | Three consecutive empty responses from the LLM provider (`EmptyLLMResponseError`). | Check the provider's status page; retry, or route the affected node to a different model via `model_routing`. |
 | `Auto-test run fails with "pip: command not found" / "npx: not found"` | The deterministic test runner from §8.5 is executing in a docker image that doesn't carry the stack toolchain. | See the [§8.5 sandbox-image caveat](#85-test-generation-new) — fix by adjusting `build_command` or pinning `sandbox.docker_image` explicitly. |
 | `[FAIL] api keys (live)` despite a key being set | Doctor checks env vars AND the `models["<key>"].api_key` config field. The FAIL detail line names which location is empty and what the live ping returned (`HTTP 401`, `HTTP 404`, …). | Set the key in `{PROVIDER}_API_KEY` env var (preferred) or in `config/config.json` under `models."<key>".api_key`. |
-| `lock held by PID <n>` at startup | A prior `harness run` exited hard and left `<workspace>/.harness_session.lock` stale, or another live session is using the workspace. | Verify the PID is gone (`ps -p <n>`); then `harness run ... --force-lock` to release and reacquire. See `docs/RUNBOOK.md` § 4. |
+| `lock held by PID <n>` at startup | A prior `teane run` exited hard and left `<workspace>/.harness_session.lock` stale, or another live session is using the workspace. | Verify the PID is gone (`ps -p <n>`); then `teane run ... --force-lock` to release and reacquire. See `docs/RUNBOOK.md` § 4. |
 
 ### Linux
 
@@ -751,11 +751,11 @@ These show up in the HITL banner as `Trigger: <name>` and mean the harness short
 |---------|-----|
 | Builds run extremely slowly | Workspace is under `/mnt/c/...`; move it to the WSL filesystem (`~/...`) |
 | API auth fails after the laptop sleeps | WSL2 clock drift; `sudo hwclock -s` (or install `chrony` and let it run) |
-| `harness doctor`'s sandbox check fails despite Docker Desktop running | "WSL Integration" toggle is off for your distro — enable it in Docker Desktop → Settings → Resources → WSL Integration |
+| `teane doctor`'s sandbox check fails despite Docker Desktop running | "WSL Integration" toggle is off for your distro — enable it in Docker Desktop → Settings → Resources → WSL Integration |
 
 ## 14. Next Steps
 
-- `harness <subcommand> --help` — every flag of `harness run`, `resume`, `status`, `doctor`, `purge`, `metrics`, `web start/stop`, `schedule run/list/validate/once/history`, `chat`, `index build/status/clear`, `gh issue/pr-create/pr-comment`, `cache clear`.
+- `harness <subcommand> --help` — every flag of `teane run`, `resume`, `status`, `doctor`, `purge`, `metrics`, `web start/stop`, `schedule run/list/validate/once/history`, `chat`, `index build/status/clear`, `gh issue/pr-create/pr-comment`, `cache clear`.
 - [docs/SPEC_REQUIREMENTS.md](SPEC_REQUIREMENTS.md) — full `config/config.json` schema.
 - [docs/SPEC_ARCHITECTURE.md](SPEC_ARCHITECTURE.md) — graph topology and module map.
 - [docs/RUNBOOK.md](RUNBOOK.md) — mid-session failure recipes for operators.

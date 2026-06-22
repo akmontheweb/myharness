@@ -126,9 +126,9 @@ harness/
 │   ├── _archive_consumed_change_requests()  # Move consumed CR-*.txt into applied/<sid>/ + manifest.json (FR-045)
 │   ├── _make_git_guardian()     # Returns no-op stub when --git false (FR-049)
 │   └── interactive_review_loop()# Pre-flight manifest review
-├── wizard.py             # Interactive setup wizard for bare `harness run` (FR-047)
+├── wizard.py             # Interactive setup wizard for bare `teane run` (FR-047)
 │   ├── run_setup_wizard()       # Top-level: new vs resume → workspace → prompt → --git → --new-build → --spec-discovery
-│   ├── _prompt_new_or_resume()  # First fork: greenfield/brownfield or `harness resume <id>`
+│   ├── _prompt_new_or_resume()  # First fork: greenfield/brownfield or `teane resume <id>`
 │   ├── _choose_session()        # Lists checkpointed sessions newest-first for resume
 │   └── _confirm_change_requests_folder()  # Detects change_requests/ and offers brownfield mode
 ├── gateway.py            # Model-agnostic LLM Gateway
@@ -268,7 +268,7 @@ harness/
 │   ├── validate_blueprint_json()# Deploy-LLM output trust gate
 │   ├── validate_synthesized_spec()  # Manifest-synthesis trust gate (Bug 7 closure)
 │   └── safe_subprocess_env()    # Scrub envrionment passed to sandbox subprocess
-├── metrics.py            # Cost-metrics aggregation for `harness metrics` (FR-032)
+├── metrics.py            # Cost-metrics aggregation for `teane metrics` (FR-032)
 │   ├── SessionMetrics    # @dataclass: per-session cost / tokens / errors / burn rate
 │   ├── parse_jsonl_file()        # Tolerant line-by-line JSONL reader
 │   ├── _sorted_session_log_files()  # Live <id>.jsonl + rotated .N backups in chronological order
@@ -303,7 +303,7 @@ harness/
 │   ├── WebFetchSkill / WebSearchSkill   # ToolSkill subclasses
 │   ├── parse_tool_blocks / strip_tool_blocks  # <<<WEB_FETCH>>>/<<<WEB_SEARCH>>>
 │   └── register_web_tool_skills(cfg)
-├── github_integration.py # `harness gh` family (FR-054)
+├── github_integration.py # `teane gh` family (FR-054)
 │   ├── gh_path / gh_available / gh_auth_status
 │   ├── fetch_issue       # gh issue view --json
 │   ├── ingest_issue_to_change_request  # Bridge → change_requests/CR-N-<slug>.txt
@@ -322,7 +322,7 @@ harness/
 │   ├── repo_identity     # SHA-256 of git origin URL or workspace path
 │   ├── read_repo_memory  # Returns trimmed file content for planner
 │   └── append_session_note  # FIFO-trimmed atomic append
-├── chat.py               # harness chat REPL (FR-058)
+├── chat.py               # teane chat REPL (FR-058)
 │   ├── ChatSession       # Dataclass with reader/writer injection points
 │   ├── run_chat          # Top-level loop; handles slash commands
 │   ├── _handle_user_turn # Per-turn LLM dispatch + tool loop
@@ -491,7 +491,7 @@ harness/
         ▼
       [END]
 
-Independent of the graph, `harness doctor` reuses the same config-
+Independent of the graph, `teane doctor` reuses the same config-
 discovery + checkpoint-DB code paths to run five healthchecks (git
 repo, API keys per routed provider, sandbox backend reachable,
 checkpoint DB writable, config parses cleanly) and reports
@@ -683,11 +683,11 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 **Rationale**: The developer needs to see what actually failed before choosing an action ([e] hint, [m] manual fix, [r] retry). Previously, with zero structured diagnostics, the HITL screen gave no actionable information.
 
-### 5.15 First-Run Healthcheck (`harness doctor`)
+### 5.15 First-Run Healthcheck (`teane doctor`)
 
-**Decision**: A dedicated `harness doctor` subcommand surfaces the five environment preconditions that previously turned into silent first-run failures: git repo presence, API keys per routed provider, sandbox backend reachability, checkpoint DB writability, and config parse cleanliness. Each check returns one of PASS / WARN / FAIL with a colored marker; the command exits non-zero on any FAIL.
+**Decision**: A dedicated `teane doctor` subcommand surfaces the five environment preconditions that previously turned into silent first-run failures: git repo presence, API keys per routed provider, sandbox backend reachability, checkpoint DB writability, and config parse cleanliness. Each check returns one of PASS / WARN / FAIL with a colored marker; the command exits non-zero on any FAIL.
 
-**Rationale**: Before doctor, users debugging a broken install had to read error messages buried in `harness run` logs. Surfacing the preconditions explicitly turns "why didn't anything happen?" into "your `OPENAI_API_KEY` is missing." Each check is also a smoke test for the underlying config path, so doctor doubles as a sanity check after editing `.harness_config.json`.
+**Rationale**: Before doctor, users debugging a broken install had to read error messages buried in `teane run` logs. Surfacing the preconditions explicitly turns "why didn't anything happen?" into "your `OPENAI_API_KEY` is missing." Each check is also a smoke test for the underlying config path, so doctor doubles as a sanity check after editing `.harness_config.json`.
 
 **Trade-off**: Adds five subprocess + filesystem probes (~50ms each, parallel where possible) per invocation. Acceptable for a deliberate operator command.
 
@@ -727,7 +727,7 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 **Decision**: Failure sites emit structured events via `harness.observability.log_failure(name, **fields)` — an ERROR-level mirror of the existing `emit_event` helper. Each event carries a snake_case `event` field, so failures are grep-able from the per-session JSONL log by event name instead of by string fragment. The catalogue: `sandbox_start_failed`, `token_budget_exhausted`, `hitl_gate_blocked`, `llm_empty_response`, `llm_circuit_open`.
 
-**Rationale**: Logging was already comprehensive but inconsistent — every module invented its own `logger.error("...")` format, so an operator scanning a failure across modules had to grep multiple substrings. A named event catalogue makes the failure modes a first-class queryable shape: `jq 'select(.event == "token_budget_exhausted")'`. The catalogue also feeds `harness metrics`, which counts each event per session.
+**Rationale**: Logging was already comprehensive but inconsistent — every module invented its own `logger.error("...")` format, so an operator scanning a failure across modules had to grep multiple substrings. A named event catalogue makes the failure modes a first-class queryable shape: `jq 'select(.event == "token_budget_exhausted")'`. The catalogue also feeds `teane metrics`, which counts each event per session.
 
 **Trade-off**: New failure sites need a name. The `log_failure` docstring lists naming conventions (`_failed`, `_exhausted`, `_blocked`) and the canonical catalogue, so authors can extend it without inventing new patterns.
 
@@ -778,7 +778,7 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 **Decision**: `cmd_run` acquires an `fcntl.flock(LOCK_EX | LOCK_NB)` on `<workspace>/.harness_session.lock` at startup. The handle is pinned in a module-level slot so the OS holds it for the process lifetime. `--force-lock` releases a stale lock and acquires fresh, logging a WARNING. Platforms without `fcntl` (Windows native) skip locking with a DEBUG log.
 
-**Rationale**: Two `harness run` sessions on the same workspace were a real footgun — race on patch branches, fight over the build command, write to the same files. An advisory file lock is the cheap correct fix, and `--force-lock` gives the operator an escape hatch for the crashed-prior-session case (see `docs/RUNBOOK.md` § 4).
+**Rationale**: Two `teane run` sessions on the same workspace were a real footgun — race on patch branches, fight over the build command, write to the same files. An advisory file lock is the cheap correct fix, and `--force-lock` gives the operator an escape hatch for the crashed-prior-session case (see `docs/RUNBOOK.md` § 4).
 
 **Trade-off**: Windows native gets no enforcement — single-writer is the operator's responsibility there. We accept this rather than pull in `msvcrt.locking` (different semantics, more surprises).
 
@@ -796,7 +796,7 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 **Rationale**: The plain `FileHandler` had no upper bound — a long pilot session could silently fill the customer's disk over weeks. 10 MB × 5 backups gives ~50 MB per session for post-mortem coverage without unbounded growth.
 
-**Trade-off**: A rotation in the middle of a session means the most-recent file is the *live* one, with older content in `.1`, `.2`, …; tools that read the JSONL (notably `harness metrics`) sort the rotated suffixes chronologically before iterating.
+**Trade-off**: A rotation in the middle of a session means the most-recent file is the *live* one, with older content in `.1`, `.2`, …; tools that read the JSONL (notably `teane metrics`) sort the rotated suffixes chronologically before iterating.
 
 ### 5.29 Process-Wide CommandValidator (P0.2)
 
@@ -808,11 +808,11 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 ### 5.30 Cost-Metrics Aggregation (P2.7)
 
-**Decision**: `harness metrics` (CLI surface) plus `harness/metrics.py` (pure aggregation) reconstruct per-session cost, token, and error metrics by reading `<id>.jsonl` + `<id>.jsonl.*` rotated backups. Outputs: human (stdout), `--json`, `--prometheus`. Machine-readable outputs default to `~/.harness/metrics/` (configurable via `metrics.metrics_dir`) and are written atomically (`<dest>.tmp` → `os.replace`). Burn rate is computed over a trailing window (default 10 minutes); exhaustion is projected against `token_budget.hard_cap_usd`.
+**Decision**: `teane metrics` (CLI surface) plus `harness/metrics.py` (pure aggregation) reconstruct per-session cost, token, and error metrics by reading `<id>.jsonl` + `<id>.jsonl.*` rotated backups. Outputs: human (stdout), `--json`, `--prometheus`. Machine-readable outputs default to `~/.harness/metrics/` (configurable via `metrics.metrics_dir`) and are written atomically (`<dest>.tmp` → `os.replace`). Burn rate is computed over a trailing window (default 10 minutes); exhaustion is projected against `token_budget.hard_cap_usd`.
 
 **Rationale**: Operators running multiple sessions had no way to see aggregate cost or "when will I hit the cap at this rate" without a hand-rolled jq pipeline. Doing it as a read-only CLI (instead of an HTTP daemon) matches the single-tenant pilot scope — a cron job emitting `--prometheus` is enough for node_exporter textfile-collector scrape, with no auth/network surface to harden.
 
-**Trade-off**: Metrics live entirely on disk (the JSONL logs are the source of truth). Purging logs deletes the metrics record too — by design, since `harness purge --session-id` is the GDPR-deletion path. For longer-term retention, operators redirect `logging.log_dir` and `metrics.metrics_dir` to a managed location.
+**Trade-off**: Metrics live entirely on disk (the JSONL logs are the source of truth). Purging logs deletes the metrics record too — by design, since `teane purge --session-id` is the GDPR-deletion path. For longer-term retention, operators redirect `logging.log_dir` and `metrics.metrics_dir` to a managed location.
 
 ### 5.31 Opt-In Deployment Phase (`--deploy-dev`)
 
@@ -838,11 +838,11 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 **Trade-off**: Defaults baked into discovery prompts can drift from policy if both are edited independently; the section's values win because they are loaded at startup and treated as already-resolved by the planner. The `_KNOWN_NESTED_KEYS["deployment_defaults"]` whitelist enumerates the four sub-section keys; leaf fields inside each sub-section are intentionally NOT enumerated so operators can set organisation-specific policies the harness has never heard of.
 
-### 5.34 Setup Wizard for Bare `harness run` (FR-047)
+### 5.34 Setup Wizard for Bare `teane run` (FR-047)
 
-**Decision**: When `harness run` is invoked without `-w` and `-p`, the CLI hands off to `harness/wizard.py:run_setup_wizard`. The wizard first asks new-vs-resume; for new it walks workspace → prompt → `--git` (defaults `false` so non-git workspaces work) → `--new-build` (defaults `false` so the harness does not clobber files in an existing repo) → `--spec-discovery` (defaults `false`). Resume lists checkpointed sessions newest-first and re-enters `cmd_resume`. Direct flags bypass the wizard.
+**Decision**: When `teane run` is invoked without `-w` and `-p`, the CLI hands off to `harness/wizard.py:run_setup_wizard`. The wizard first asks new-vs-resume; for new it walks workspace → prompt → `--git` (defaults `false` so non-git workspaces work) → `--new-build` (defaults `false` so the harness does not clobber files in an existing repo) → `--spec-discovery` (defaults `false`). Resume lists checkpointed sessions newest-first and re-enters `cmd_resume`. Direct flags bypass the wizard.
 
-**Rationale**: The harness used to fail with an argparse error when invoked bare. Operators ran `harness run --help`, hand-built a command, and often missed `--git` or `--new-build`. A wizard turns first-run discovery into a guided dialog without changing the contract for power users — flags still work.
+**Rationale**: The harness used to fail with an argparse error when invoked bare. Operators ran `teane run --help`, hand-built a command, and often missed `--git` or `--new-build`. A wizard turns first-run discovery into a guided dialog without changing the contract for power users — flags still work.
 
 **Trade-off**: Two paths to invoke the same `cmd_run` (wizard vs flags). Tests exercise both; the wizard is kept thin (it just resolves into the same `args` namespace `argparse` would have produced).
 
@@ -880,7 +880,7 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 ### 5.39 GitHub Integration via `gh` CLI (FR-054)
 
-**Decision**: `harness/github_integration.py` shells out to the `gh` CLI for issue read, PR create, PR comment. No new Python dep. The `harness gh issue --repo X --number Y` subcommand writes the issue body into the workspace's `change_requests/CR-<N>-<slug>.txt` so the existing change-request flow (PR-1 → PR-3) handles the planning + patching. Authentication flows through `gh auth status` — we don't store tokens.
+**Decision**: `harness/github_integration.py` shells out to the `gh` CLI for issue read, PR create, PR comment. No new Python dep. The `teane gh issue --repo X --number Y` subcommand writes the issue body into the workspace's `change_requests/CR-<N>-<slug>.txt` so the existing change-request flow (PR-1 → PR-3) handles the planning + patching. Authentication flows through `gh auth status` — we don't store tokens.
 
 **Rationale**: The `gh` CLI is the canonical GitHub interface; it handles auth, rate limits, and API surface evolution. Using it directly means we don't ship our own GitHub client and avoid the maintenance tax of an OAuth flow + token storage. Wiring into the existing CR flow means the harness's change-request machinery (delta-aware planning, CR-N markers in patches, archive on success) just works for issue-driven sessions.
 
@@ -896,7 +896,7 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 ### 5.41 Repository Semantic Retrieval (FR-056)
 
-**Decision**: `harness/repo_index.py` ships two backends behind an `IndexBackend` ABC: `TfidfBackend` (default, zero-dep, deterministic, identifier-aware tokenisation that splits CamelCase / snake_case into sub-tokens) and `OpenAIEmbeddingsBackend` (opt-in via `OPENAI_API_KEY`; falls back to TF-IDF on missing key). Index storage: SQLite at `~/.harness/repo_index/repo_index.db` with `(workspace_id, file_path, chunk_index, file_sha, content, vector_json)`. `planning_node` calls `async_query_top_chunks` once per dispatch and injects the top-K chunks as a system message capped at `inject_max_bytes`. CLI: `harness index {build, status, clear}`.
+**Decision**: `harness/repo_index.py` ships two backends behind an `IndexBackend` ABC: `TfidfBackend` (default, zero-dep, deterministic, identifier-aware tokenisation that splits CamelCase / snake_case into sub-tokens) and `OpenAIEmbeddingsBackend` (opt-in via `OPENAI_API_KEY`; falls back to TF-IDF on missing key). Index storage: SQLite at `~/.harness/repo_index/repo_index.db` with `(workspace_id, file_path, chunk_index, file_sha, content, vector_json)`. `planning_node` calls `async_query_top_chunks` once per dispatch and injects the top-K chunks as a system message capped at `inject_max_bytes`. CLI: `teane index {build, status, clear}`.
 
 **Rationale**: `harness/impact.py` is AST-only ("which symbols reference this function"); semantic retrieval complements it with "which other code chunks are semantically similar to the prompt". TF-IDF is the right default — deterministic, no API cost, no model download, identifier-aware tokenisation works surprisingly well on code. OpenAI embeddings is the upgrade path; both backends share the same storage schema so swapping is config-only.
 
@@ -910,11 +910,11 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 **Trade-off**: The memory file is markdown, not structured data — the planner reads it as opaque context. We could persist structured fields (sectors discussed, files touched, design decisions) but the cost of schematising outweighs the value when the planner can pattern-match on prose.
 
-### 5.43 Interactive Refinement REPL (`harness chat`) (FR-058)
+### 5.43 Interactive Refinement REPL (`teane chat`) (FR-058)
 
 **Decision**: `harness/chat.py` opens an interactive stdin loop that reuses the Gateway, redactor, web/MCP `_run_tool_loop`, repo-memory injection, and (when enabled) repo-index injection. Patches are NEVER applied automatically; the LLM emits SEARCH/REPLACE blocks but they only land when the operator types `/apply` and confirms. Slash commands: `/help`, `/exit`, `/clear`, `/files`, `/apply`, `/build`, `/save`, `/budget`, `/memory`. The REPL accepts dependency-injectable reader/writer hooks so unit tests drive it with scripted input.
 
-**Rationale**: `harness run` is autonomous; `harness chat` is the inverse — conversational back-and-forth where the operator stays in control. Reusing the gateway / redactor / tools means budgeting, secret stripping, and web/MCP all keep working. The dependency-injection on reader/writer is the test-affordance pattern from `harness/hitl.py:HitlChannel`.
+**Rationale**: `teane run` is autonomous; `teane chat` is the inverse — conversational back-and-forth where the operator stays in control. Reusing the gateway / redactor / tools means budgeting, secret stripping, and web/MCP all keep working. The dependency-injection on reader/writer is the test-affordance pattern from `harness/hitl.py:HitlChannel`.
 
 **Trade-off**: In-memory only in v1 — closing the REPL loses the conversation. `--resume` is a clean follow-up; persistence would land in the existing checkpoint store.
 
@@ -936,7 +936,7 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 ### 5.46 Cron-Driven Scheduled Job Daemon (FR-062)
 
-**Decision**: `harness/schedule.py` ships a foreground daemon (`harness schedule run`) that ticks every `tick_seconds` (default 60s), polls config-declared jobs in `schedule.jobs` AND web one-shot jobs in `~/.harness/web.db:web_oneshot_jobs`, and fires due jobs as `harness run` subprocesses with their own per-job log file. History persists to `~/.harness/schedule.db`. The cron syntax subset (`every Nm/h/d`, `hourly :MM`, `daily HH:MM`, `weekly DAY HH:MM`) is hand-rolled, no `croniter` dep. Notifications are generic shell hooks (`on_success` / `on_failure`) with `HARNESS_JOB_*` env vars exported.
+**Decision**: `harness/schedule.py` ships a foreground daemon (`teane schedule run`) that ticks every `tick_seconds` (default 60s), polls config-declared jobs in `schedule.jobs` AND web one-shot jobs in `~/.harness/web.db:web_oneshot_jobs`, and fires due jobs as `teane run` subprocesses with their own per-job log file. History persists to `~/.harness/schedule.db`. The cron syntax subset (`every Nm/h/d`, `hourly :MM`, `daily HH:MM`, `weekly DAY HH:MM`) is hand-rolled, no `croniter` dep. Notifications are generic shell hooks (`on_success` / `on_failure`) with `HARNESS_JOB_*` env vars exported.
 
 **Rationale**: Recurring runs ("regenerate failing tests every night", "open the security review every Monday") are high-value workloads. A foreground daemon under systemd / docker is simpler than reinventing process management. The hand-rolled cron subset covers >90% of real use cases; full POSIX cron is a clean follow-up. Generic shell hooks let operators wire Slack/Discord/PagerDuty/email in one curl line without us shipping per-vendor notifier code.
 
@@ -952,7 +952,7 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 ### 5.48 Interactive Web App — Tier B + C (FR-064)
 
-**Decision**: `harness web` (with the default `dashboard.writes_enabled: true`) extends the read-only dashboard with: form-based config editing (forms derived from `harness/web_forms.py:build_section` which walks `harness/cli.py:_KNOWN_NESTED_KEYS` + `_TYPE_SCHEMA`), memory-file editing, schedule-job CRUD, a "New run" form supporting both "Run now" (`harness/dashboard.py:spawn_harness_run` spawns subprocess + registers PID in `harness/web_state.py:ProcessRegistry`) and "Schedule it" (appends to `~/.harness/web.db:web_oneshot_jobs` which the schedule daemon picks up), SSE event stream at `/api/sessions/<id>/events`, HITL bridge via the existing `harness/hitl.py:HttpChannel` (the dashboard registers as the webhook URL and blocks the harness's POST while the UI displays the prompt, signalling back when the operator answers), and per-session chat notes queued for the next HITL gate. Write paths require a CSRF double-submit cookie + `X-CSRF-Token` header.
+**Decision**: `teane web` (with the default `dashboard.writes_enabled: true`) extends the read-only dashboard with: form-based config editing (forms derived from `harness/web_forms.py:build_section` which walks `harness/cli.py:_KNOWN_NESTED_KEYS` + `_TYPE_SCHEMA`), memory-file editing, schedule-job CRUD, a "New run" form supporting both "Run now" (`harness/dashboard.py:spawn_harness_run` spawns subprocess + registers PID in `harness/web_state.py:ProcessRegistry`) and "Schedule it" (appends to `~/.harness/web.db:web_oneshot_jobs` which the schedule daemon picks up), SSE event stream at `/api/sessions/<id>/events`, HITL bridge via the existing `harness/hitl.py:HttpChannel` (the dashboard registers as the webhook URL and blocks the harness's POST while the UI displays the prompt, signalling back when the operator answers), and per-session chat notes queued for the next HITL gate. Write paths require a CSRF double-submit cookie + `X-CSRF-Token` header.
 
 **Rationale**: Form-based config editing eliminates a class of operator errors (typos, wrong types) without us hand-curating a per-section UI — the forms are *derived* from the strict validator, so new config keys appear in the UI the day they land in `_TYPE_SCHEMA`. The HITL bridge reuses `HttpChannel` rather than reinventing — `HttpChannel` already exists exactly for this scenario; the dashboard is its first consumer. CSRF double-submit cookie is the simplest defence against cross-origin form submission while remaining usable from vanilla JS.
 
@@ -1133,7 +1133,7 @@ repo_index.db
 ### 6.6 Schedule History SQLite Store (`~/.harness/schedule.db`)
 
 Per-job execution history persisted by the schedule daemon so
-`harness schedule list` / `history` survives restarts:
+`teane schedule list` / `history` survives restarts:
 
 ```
 schedule.db
@@ -1225,7 +1225,7 @@ schedule.db
 - `sandbox.auto_enable_network_for_install` (default `false`) — opt in to auto-enabling network on detected pip/npm install.
 - `node_throttle.max_discovery_iterations` (default `10`, clamped `[1, 30]`) — hard cap on discovery loop.
 - `logging.max_bytes`, `logging.backup_count` — rotation knobs for the per-session JSONL file (default 10 MB × 5).
-- `metrics.metrics_dir` (default `~/.harness/metrics`) and `metrics.burn_rate_window_minutes` (default `10`) — `harness metrics` output and window.
+- `metrics.metrics_dir` (default `~/.harness/metrics`) and `metrics.burn_rate_window_minutes` (default `10`) — `teane metrics` output and window.
 
 ### 8.3 Environment Variables
 | Variable | Purpose |
@@ -1236,12 +1236,12 @@ schedule.db
 | `CI` | Detect CI environment (auto-approve HITL gate behavior) |
 | `HARNESS_AUTO_APPROVE` | Force auto-approve for non-interactive runs |
 | `HARNESS_ALLOW_UNSAFE_SANDBOX` | Opt in to the `bare` (zero-isolation) sandbox backend when neither Docker nor `unshare` is available. Never set this outside a disposable VM. |
-| `NO_COLOR` | Suppress ANSI colour markers in `harness doctor` output. |
+| `NO_COLOR` | Suppress ANSI colour markers in `teane doctor` output. |
 | `HARNESS_DOCTOR_SKIP_LIVE` | Truthy value (`1` / `true` / `yes`) skips the live 1-token chat ping the `api keys` check makes against each configured provider. Falls back to key-presence-only validation. Useful for CI runs where outbound HTTPS is blocked. |
 | `LANGCHAIN_API_KEY` | Required when `logging.langsmith=true` to forward traces to LangSmith. |
 | `LANGCHAIN_TRACING_V2`, `LANGSMITH_PROJECT` | Additional LangSmith trace routing knobs honoured by `configure_logging`. |
 
-API keys can also live in `models["<provider>:<model>"].api_key` inside any config layer — the gateway's resolution order is explicit arg → env var → config field, and `harness doctor` reflects the same policy.
+API keys can also live in `models["<provider>:<model>"].api_key` inside any config layer — the gateway's resolution order is explicit arg → env var → config field, and `teane doctor` reflects the same policy.
 
 ### 8.4 Generated Files (during execution)
 - `docs/SPEC_REQUIREMENTS.md` — Requirements specification
@@ -1252,7 +1252,7 @@ API keys can also live in `models["<provider>:<model>"].api_key` inside any conf
 - `Caddyfile` — Reverse proxy routing rules
 - `~/.harness/checkpoints.db` — Session checkpoint database (WAL mode; metadata includes `_harness_schema_version`)
 - `~/.harness/logs/<session-id>.jsonl[.N]` — Per-session structured JSONL log (rotated)
-- `~/.harness/metrics/<session-id>.{json,prom}` — `harness metrics` outputs (configurable via `metrics.metrics_dir`)
+- `~/.harness/metrics/<session-id>.{json,prom}` — `teane metrics` outputs (configurable via `metrics.metrics_dir`)
 - `<workspace>/.harness_session.lock` — fcntl single-writer lock; auto-released when the process exits
 - `<workspace>/change_requests/` — Operator-authored `CR-N-<name>.txt` files; consumed change-request inputs (FR-045)
 - `<workspace>/change_requests/applied/<session-id>/` — Archive of consumed `.txt` files + `manifest.json` recording `status` (`success` / `cancelled` / `failed-build`) and the linked modified files

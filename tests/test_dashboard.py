@@ -204,7 +204,7 @@ def test_list_running_sessions_excludes_logs_without_session_start(tmp_path):
     """Dashboard-boot tombstones — JSONL files that hold only
     ``init_observability`` startup chatter (no ``event`` field
     anywhere) — must NOT appear as running sessions. Without this
-    filter, every ``harness web start`` left behind a phantom row
+    filter, every ``teane web start`` left behind a phantom row
     that piled up across restarts (17 phantoms after a few cycles
     in one operator session)."""
     cfg = _make_cfg(tmp_path)
@@ -230,7 +230,7 @@ def test_list_running_sessions_excludes_logs_without_session_start(tmp_path):
 
 
 def test_list_running_sessions_includes_logs_with_session_start_but_no_session_end(tmp_path):
-    """An in-flight harness run emits ``session_start`` at the top of
+    """An in-flight teane run emits ``session_start`` at the top of
     its log and won't write ``session_end`` until it finishes — the
     only signal that a real run is currently live. That signature
     must keep the row visible."""
@@ -634,7 +634,7 @@ def test_empty_sessions_renders_cta_to_run(tmp_path):
     assert "No sessions yet" in body
     # CTA points at /run (the most common next action).
     assert "href='/run'" in body
-    # Old "harness run -r ..." literal is no longer the only hint.
+    # Old "teane run -r ..." literal is no longer the only hint.
     assert "empty-state__title" in body
 
 
@@ -721,7 +721,7 @@ def test_run_page_resume_panel_shows_session_picker_columns(tmp_path, monkeypatc
     # Seed two sessions: one finished, one running.
     _write_session_log(tmp_path / "logs", "done-abc", [
         {"event": "session_start", "timestamp": "2026-06-15T10:00:00Z",
-         "workspace_path": "/home/op/projects/myharness"},
+         "workspace_path": "/home/op/projects/teane"},
         {"event": "session_end", "timestamp": "2026-06-15T10:30:00Z", "exit_code": 0},
     ])
     _write_session_log(tmp_path / "logs", "live-xyz", [
@@ -741,7 +741,7 @@ def test_run_page_resume_panel_shows_session_picker_columns(tmp_path, monkeypatc
     assert "value='done-abc'" in body
     assert "value='live-xyz'" in body
     # "App" cell uses workspace basename.
-    assert ">myharness<" in body
+    assert ">teane<" in body
     assert ">widget<" in body
     # The radio name is what the server reads on POST.
     assert "name='resume_session_id'" in body
@@ -756,7 +756,7 @@ def test_resume_picker_has_delete_column_per_row(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_CSRF", "tok")
     _write_session_log(tmp_path / "logs", "del-target", [
         {"event": "session_start", "timestamp": "2026-06-15T10:00:00Z",
-         "workspace_path": "/home/op/projects/myharness"},
+         "workspace_path": "/home/op/projects/teane"},
         {"event": "session_end", "timestamp": "2026-06-15T10:01:00Z", "exit_code": 0},
     ])
     cfg = _make_cfg(

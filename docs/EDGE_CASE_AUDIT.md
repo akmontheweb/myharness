@@ -1,4 +1,4 @@
-# myharness — Edge-Case Audit
+# teane — Edge-Case Audit
 
 Read-only audit of the harness for failure-prone paths. Findings are grouped by concern area and ranked by severity (**Critical / High / Medium / Low**). Each entry cites a concrete file:line, the failure scenario, and a recommended guard. **No code has been changed** — these are recommendations only, pending your review.
 
@@ -28,7 +28,7 @@ Severity legend:
 ### 1.1 [Critical] Web one-shot jobs can fire twice — read/mark-consumed TOCTOU
 **Files:** `harness/schedule.py:619-678`; `harness/web_state.py:490-535`
 
-`tick_once()` → `_due_oneshots()` runs a plain `SELECT … WHERE consumed_at IS NULL`. The matching `mark_oneshot_consumed` only runs **after** `execute_job_once` completes (minutes/hours later). A second daemon poll, a `harness schedule once` invocation, or a crash-restart in that window re-reads the same row and re-fires the job.
+`tick_once()` → `_due_oneshots()` runs a plain `SELECT … WHERE consumed_at IS NULL`. The matching `mark_oneshot_consumed` only runs **after** `execute_job_once` completes (minutes/hours later). A second daemon poll, a `teane schedule once` invocation, or a crash-restart in that window re-reads the same row and re-fires the job.
 
 **Recommendation:** Convert the read+claim into a single transactional `UPDATE web_oneshot_jobs SET consumed_at=? WHERE id=? AND consumed_at IS NULL` with `RETURNING`; if `rowcount==0`, another worker won the claim — skip.
 
@@ -151,7 +151,7 @@ PK is `(job_name, started_at)`. Two runs in the same second collapse — the fir
 
 ## 2. Subprocess / Process Lifecycle / Resource Leaks
 
-### 2.1 [Critical] Schedule daemon cancellation orphans in-flight `harness run` subprocess
+### 2.1 [Critical] Schedule daemon cancellation orphans in-flight `teane run` subprocess
 **File:** `harness/schedule.py:681-699`
 
 On SIGTERM, `run_forever`'s `CancelledError` branch returns 0 without killing the child. The harness subprocess (own session) keeps running indefinitely as an orphan. Repeated stop/start cycles accumulate orphans.
@@ -196,7 +196,7 @@ Same pattern. One file × one lint pass × one repair iteration leaks one interp
 ### 2.7 [High] Manifest tempfile never deleted
 **File:** `harness/cli.py:3955-3964`
 
-`tempfile.mkstemp` for the consolidated spec; no `os.unlink` anywhere. Every greenfield `harness run` leaks one `/tmp/harness_spec_*.txt` containing the full product spec (potentially proprietary / secret).
+`tempfile.mkstemp` for the consolidated spec; no `os.unlink` anywhere. Every greenfield `teane run` leaks one `/tmp/harness_spec_*.txt` containing the full product spec (potentially proprietary / secret).
 
 **Recommendation:** Wrap in `try: … finally: os.unlink(manifest_path)`; or use `NamedTemporaryFile(delete=True)` if synthesise_requirements accepts a file object.
 
@@ -231,7 +231,7 @@ Synchronous `subprocess.run(find …, timeout=30)` runs in the async `finally` b
 ### 2.12 [Medium] Web stop deletes marker **before** killing — runaway server becomes unrecoverable
 **File:** `harness/cli.py:5866 vs 5872`
 
-`_delete_web_marker()` runs first. On `OSError` (EPERM — pid alive but not owned by current uid), the marker is gone but the server still runs. Future `harness web stop` reports "no server running".
+`_delete_web_marker()` runs first. On `OSError` (EPERM — pid alive but not owned by current uid), the marker is gone but the server still runs. Future `teane web stop` reports "no server running".
 
 **Recommendation:** Delete the marker **after** confirming exit, or only on `ProcessLookupError`.
 
@@ -528,7 +528,7 @@ A value of `1700000000` (epoch in 2023) is compared with `now` (epoch in 2026); 
 ### 5.1 [High] `cmd_resume` never acquires the workspace lock
 **File:** `harness/cli.py:4351` (vs `cli.py:3649` for `cmd_run`)
 
-Two concurrent `harness resume --session-id X` on the same workspace clobber each other's patches.
+Two concurrent `teane resume --session-id X` on the same workspace clobber each other's patches.
 
 **Recommendation:** Call `_acquire_workspace_lock` at the top of `cmd_resume`.
 
@@ -545,7 +545,7 @@ Flows into log filenames, CR archive directory names, git branch names. `--sessi
 ```python
 is_active=exit_code not in (0, -1) and exit_code != 0,
 ```
-A never-built session (`exit_code = -1` default until `compiler_node` runs) is marked inactive — the dashboard / `harness status` under-reports running sessions.
+A never-built session (`exit_code = -1` default until `compiler_node` runs) is marked inactive — the dashboard / `teane status` under-reports running sessions.
 
 **Recommendation:** Replace with `is_active = (exit_code is None) or (exit_code == -1 and not terminated_at)` — depends on the real intent.
 

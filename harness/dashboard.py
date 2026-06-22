@@ -1,4 +1,4 @@
-"""``harness web`` — read-only web UI (#14).
+"""``teane web`` — read-only web UI (#14).
 
 Surfaces the data the harness already emits: session history (from
 ``~/.harness/logs/*.jsonl``), cost burn-down (the same events),
@@ -93,7 +93,7 @@ class DashboardConfig:
     static_dir: str = _DEFAULT_STATIC_DIR
     chart_js_url: str = "https://cdn.jsdelivr.net/npm/chart.js"
     sessions_max: int = 200        # don't enumerate forever
-    # Tier B/C knobs. Writes-on is the DEFAULT — `harness web` ships
+    # Tier B/C knobs. Writes-on is the DEFAULT — `teane web` ships
     # the full UI without ceremony. Operators who need a read-only
     # deployment can flip ``dashboard.writes_enabled: false`` in
     # config.json; that gate still rejects POSTs and renders the
@@ -726,7 +726,7 @@ def list_running_sessions(cfg: DashboardConfig) -> list[dict[str, Any]]:
             # Walk the log once, looking for a ``session_start`` event.
             # A log without one isn't a harness graph run — it's a
             # bootstrap log from the dashboard server itself (every
-            # ``harness web start`` calls init_observability and gets
+            # ``teane web start`` calls init_observability and gets
             # a per-process JSONL holding gateway model registrations
             # but no event fields). Counting those as "running"
             # sessions caused dashboards to surface 17 phantom rows
@@ -987,7 +987,7 @@ def check_auth(
 # 4. HTTP handler
 # ---------------------------------------------------------------------------
 
-# myharness overrides on top of Carbon. Carbon ships its own type scale,
+# teane overrides on top of Carbon. Carbon ships its own type scale,
 # spacing tokens, table styles, etc. — we only add things Carbon doesn't:
 # the side-nav offset for main content, a couple of status-color helpers,
 # and the legacy .card/.ok/.fail classes some existing renderers still use.
@@ -1262,7 +1262,7 @@ def _layout(title: str, body: str, cfg: DashboardConfig, active: str = "") -> st
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#161616">
-<title>{html.escape(title)} — myharness</title>
+<title>{html.escape(title)} — teane</title>
 <link rel="icon" href="/static/favicon.ico">
 <link rel="stylesheet" href="{html.escape(safe_carbon)}">
 <link rel="stylesheet" href="/static/css/app.css?v={app_css_v}">
@@ -1277,7 +1277,7 @@ def _layout(title: str, body: str, cfg: DashboardConfig, active: str = "") -> st
     {_icon("menu", size=20)}
   </button>
   <a class="bx--header__name" href="/status">
-    <span class="bx--header__name--prefix">myharness</span>
+    <span class="bx--header__name--prefix">teane</span>
   </a>
   <div class="header-actions">
     <button id="auto-refresh-toggle" type="button" class="auto-refresh-btn"
@@ -1316,7 +1316,7 @@ def _render_sessions(cfg: DashboardConfig) -> str:
             title="No sessions yet",
             body=(
                 "Run the harness from the Run Harness page or the "
-                "`harness run` CLI to populate this view."
+                "`teane run` CLI to populate this view."
             ),
             cta_text="Run harness",
             cta_href="/run",
@@ -1423,7 +1423,7 @@ def _render_schedule(cfg: DashboardConfig) -> str:
         return (
             "<p class='muted'>No scheduled-job runs recorded yet. "
             "Configure jobs under <code>schedule.jobs</code> in "
-            "<code>config.json</code> and start <code>harness schedule run</code>.</p>"
+            "<code>config.json</code> and start <code>teane schedule run</code>.</p>"
         )
     rows = []
     for r in runs:
@@ -1458,7 +1458,7 @@ def _render_index(cfg: DashboardConfig) -> str:
     if not rows:
         return (
             "<p class='muted'>No repo index built yet. Run "
-            "<code>harness index build -r WORKSPACE</code> to populate this view.</p>"
+            "<code>teane index build -r WORKSPACE</code> to populate this view.</p>"
         )
     items = []
     for r in rows:
@@ -1960,7 +1960,7 @@ def _render_run_harness(cfg: DashboardConfig) -> str:
     # needed for the tab toggle itself.
     form = f"""
 <div class='card'>
-  <h2>Start a harness run</h2>
+  <h2>Start a teane run</h2>
   <form id='run-form' method='post' action='/run/now' class='run-form'>
     <input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>
     <input type='hidden' id='fire-at-utc' name='fire_at_utc' value=''>
@@ -3194,7 +3194,7 @@ def make_request_handler(
                 self._handle_cancel(m.group("sid"))
                 return
             # /sessions/<sid>/purge — wipe everything: checkpoint rows
-            # + JSONL log. Mirrors `harness purge --session-id`.
+            # + JSONL log. Mirrors `teane purge --session-id`.
             m = re.match(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/purge/?$", path)
             if m:
                 self._handle_session_purge(m.group("sid"))
@@ -3723,7 +3723,7 @@ def make_request_handler(
         def _handle_session_purge(self, session_id: str) -> None:
             """Wipe ``session_id`` completely from harness memory:
             checkpoint rows in the SQLite store + the JSONL log file
-            on disk. Mirrors ``harness purge --session-id <id>``.
+            on disk. Mirrors ``teane purge --session-id <id>``.
 
             If the session is currently running, SIGTERM the process
             first and wait briefly for it to exit before purging — a
@@ -3745,7 +3745,7 @@ def make_request_handler(
                         break
                     _time.sleep(0.1)
 
-            # 2. Spawn `harness purge --session-id <id>` synchronously
+            # 2. Spawn `teane purge --session-id <id>` synchronously
             # and pass --yes so it doesn't try to read from stdin. We
             # block until the subprocess returns so the redirect lands
             # an up-to-date list back at the operator.
@@ -4331,7 +4331,7 @@ def spawn_harness_run(
     extra_args: Optional[list[str]] = None,
     harness_binary: str = "harness",
 ) -> WebProcess:
-    """Spawn a `harness run` subprocess, register it, and return the
+    """Spawn a `teane run` subprocess, register it, and return the
     :class:`WebProcess` handle. Sets ``HARNESS_HITL_WEBHOOK_URL`` so the
     harness's HttpChannel POSTs HITL prompts back to this dashboard.
 
@@ -4459,7 +4459,7 @@ def spawn_harness_resume(
     extra_args: Optional[list[str]] = None,
     harness_binary: str = "harness",
 ) -> WebProcess:
-    """Spawn a ``harness resume --session-id <id>`` subprocess for an
+    """Spawn a ``teane resume --session-id <id>`` subprocess for an
     existing checkpointed session. Mirrors :func:`spawn_harness_run`'s
     registry / log-tail / HITL webhook wiring so the dashboard tracks
     the resumed session the same way it tracks a fresh one.

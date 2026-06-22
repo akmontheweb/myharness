@@ -2048,7 +2048,7 @@ class Gateway:
                 raise RuntimeError(
                     f"[API KEY MISSING]: No API key configured for '{model_key}'.\n"
                     f"  However, {len(keyed_models)} other model(s) already have keys configured: {', '.join(keyed_names)}.\n"
-                    f"  To use '{model_key}', add its API key to <myharness_root>/config/config.json or set the "
+                    f"  To use '{model_key}', add its API key to <teane_root>/config/config.json or set the "
                     f"{provider.spec.provider.upper()}_API_KEY environment variable.\n"
                     f"  To use a different model that already has a key, update 'model_routing' in your config to "
                     f"point to one of: {', '.join(keyed_names)}."
@@ -2064,7 +2064,7 @@ class Gateway:
                     f"\n"
                     f"  To add an API key, either:\n"
                     f"  1. Set the {provider.spec.provider.upper()}_API_KEY environment variable\n"
-                    f"  2. Add \"api_key\" to the model entry in <myharness_root>/config/config.json"
+                    f"  2. Add \"api_key\" to the model entry in <teane_root>/config/config.json"
                 )
             else:
                 # No models have keys at all — standard error
@@ -2078,7 +2078,7 @@ class Gateway:
                     f"  1. Set the {env_var} environment variable:\n"
                     f"     export {env_var}=\"your-api-key-here\"\n"
                     f"\n"
-                    f"  2. Add \"api_key\" to the model entry in <myharness_root>/config/config.json:\n"
+                    f"  2. Add \"api_key\" to the model entry in <teane_root>/config/config.json:\n"
                     f"     {{\n"
                     f"       \"models\": {{\n"
                     f"         \"{model_key}\": {{\n"

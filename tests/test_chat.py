@@ -90,7 +90,7 @@ async def test_chat_exits_cleanly_on_eof(tmp_path):
         writer=write,
     )
     assert rc == 0
-    assert any("harness chat" in line for line in out)
+    assert any("teane chat" in line for line in out)
 
 
 @pytest.mark.asyncio

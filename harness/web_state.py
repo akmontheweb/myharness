@@ -2,7 +2,7 @@
 
 This module is the data layer the web UI sits on top of. It owns:
 
-- The **process registry** — the set of ``harness run`` subprocesses
+- The **process registry** — the set of ``teane run`` subprocesses
   the dashboard has spawned, keyed by session id. The UI's
   "currently running" view, the cancel button, and the live event
   stream all consult this.
@@ -167,7 +167,7 @@ def _pid_alive(pid: int) -> bool:
 
 @dataclass
 class WebProcess:
-    """A single ``harness run`` subprocess spawned by the dashboard.
+    """A single ``teane run`` subprocess spawned by the dashboard.
 
     ``pid`` is the PID inside the registry; ``popen`` carries the
     asyncio / subprocess handle that the cancel handler signals.

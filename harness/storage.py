@@ -4,11 +4,11 @@ Pluggable persistence layer with AsyncSqliteSaver as the canonical backend.
 This module implements:
     - Re-exports the official LangGraph AsyncSqliteSaver from langgraph-checkpoint-sqlite
       so that `isinstance(saver, BaseCheckpointSaver)` passes LangGraph's internal validation.
-    - 30-day TTL automatic garbage collection — fired on every harness run/status init.
+    - 30-day TTL automatic garbage collection — fired on every teane run/status init.
     - Session ID management: accepts user-provided --session-id, falls back to UUIDv4.
-    - `harness status` read-only inspector: queries the SQLite DB and prints a
+    - `teane status` read-only inspector: queries the SQLite DB and prints a
       clean text snapshot of any checkpointed session without executing graph nodes.
-    - `harness purge --all` command integration: wipes all checkpoint data.
+    - `teane purge --all` command integration: wipes all checkpoint data.
 """
 
 from __future__ import annotations
@@ -124,7 +124,7 @@ def _cleansed_messages(messages: Any) -> list[Any]:
 @dataclass
 class CheckpointSummary:
     """
-    Read-only snapshot of a checkpointed session, as returned by `harness status`.
+    Read-only snapshot of a checkpointed session, as returned by `teane status`.
     """
     thread_id: str
     session_id: str = ""
@@ -775,7 +775,7 @@ async def inspect_session(
     Read a checkpoint from the SQLite database and return a human-readable
     summary without triggering any graph execution.
 
-    Used by `harness status --session-id <uuid>`.
+    Used by `teane status --session-id <uuid>`.
 
     Args:
         db_path: Path to the checkpoints SQLite database.
@@ -873,7 +873,7 @@ async def inspect_session(
             # and for sessions that ended without recording a real code. The
             # earlier formula `not in (0, -1) and != 0` excluded both meanings
             # of -1, so a never-built session was reported INACTIVE — which
-            # under-counts running sessions in `harness status` and in the
+            # under-counts running sessions in `teane status` and in the
             # dashboard. Now: active when there's no recorded exit code OR
             # the recorded value is -1 AND we've never built (current_node
             # isn't a terminal node). Audit §5.3 (BREAKING).

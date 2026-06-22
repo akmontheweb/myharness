@@ -1,4 +1,4 @@
-"""Tests for sandbox.cache_volumes + harness cache clear + corruption hint.
+"""Tests for sandbox.cache_volumes + teane cache clear + corruption hint.
 
 These cover the new pieces only (the existing test_harness.py block covers
 the unchanged :ro-bind-mount path and the rest of the docker-cmd builder).
@@ -167,7 +167,7 @@ class TestCacheCorruptionHint:
         from harness.sandbox import _cache_corruption_hint
         hint = _cache_corruption_hint(sample)
         assert hint is not None
-        assert "harness cache clear" in hint
+        assert "teane cache clear" in hint
 
     @pytest.mark.parametrize("sample", [
         "Successfully installed numpy-1.26.0",
@@ -312,7 +312,7 @@ class TestCmdCacheClear:
         monkeypatch.setattr(cli_mod, "discover_config", lambda _: {})
         rc = await cli_mod.cmd_cache_clear(_make_args())
         assert rc == 0
-        assert "No harness cache volumes found" in capsys.readouterr().out
+        assert "No teane cache volumes found" in capsys.readouterr().out
 
     @pytest.mark.asyncio
     async def test_no_docker_binary_returns_zero(self, monkeypatch, capsys):

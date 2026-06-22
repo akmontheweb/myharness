@@ -1574,7 +1574,7 @@ def test_spawn_harness_run_honors_preexisting_timeout_env(tmp_path, monkeypatch)
 # ---------------------------------------------------------------------------
 
 def test_dashboard_cli_parses_without_writes_enabled_flag():
-    # All features ship by default — `harness web` does not need a
+    # All features ship by default — `teane web` does not need a
     # `--writes-enabled` flag any more. Operators flip
     # `dashboard.writes_enabled: false` in config.json to lock down.
     from harness.cli import build_parser

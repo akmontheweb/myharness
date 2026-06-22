@@ -1008,7 +1008,7 @@ _DEFAULT_EXCLUDE_PATHS: tuple[str, ...] = ("docs", "product_spec")
 # loop until something times out and silently shadows the finding.
 _HARD_SECURITY_CEILING_MULTIPLIER: int = 3
 
-# Install hints surfaced by `harness doctor` when a scanner binary is not
+# Install hints surfaced by `teane doctor` when a scanner binary is not
 # on PATH. Kept here (not in cli.py) so the runtime scanner code and the
 # doctor share one source of truth.
 SCANNER_INSTALL_HINTS: dict[str, str] = {

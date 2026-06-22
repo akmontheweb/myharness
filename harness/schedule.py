@@ -1,12 +1,12 @@
-"""``harness schedule`` — cron-driven background daemon (#13).
+"""``teane schedule`` — cron-driven background daemon (#13).
 
 Why this exists
 ===============
-``harness run`` is a workstation tool — operator runs it, watches it,
+``teane run`` is a workstation tool — operator runs it, watches it,
 walks away when it's done. Many of the highest-value harness workloads
 are recurring: "every night, ingest open Renovate PRs and regenerate
 failing tests", "every Monday, run the security review on main".
-Standing those up today means wrapping ``harness run`` in cron or
+Standing those up today means wrapping ``teane run`` in cron or
 systemd timers and reinventing per-job state, retry, and notification
 for each. The schedule daemon turns that into a config-driven
 primitive.
@@ -23,12 +23,12 @@ Scope of v1
   operator wires Slack / Discord / PagerDuty / email via curl in one
   config line. No built-in notifiers in v1 — keeps the daemon small
   and the security review trivial.
-- **Subprocess job execution.** Each job runs as ``harness run`` in
+- **Subprocess job execution.** Each job runs as ``teane run`` in
   its own subprocess so a crash never takes the daemon down. Stdout
   / stderr are streamed to per-job log files under
   ``~/.harness/schedule_logs/<job>/<iso8601>.log``.
-- **SQLite-backed history** so ``harness schedule list`` /
-  ``harness schedule history`` survive restarts.
+- **SQLite-backed history** so ``teane schedule list`` /
+  ``teane schedule history`` survive restarts.
 
 Not in scope
 ============
@@ -231,14 +231,14 @@ def next_run(
 
 @dataclass
 class Job:
-    """One scheduled job. The daemon spawns ``harness run`` in a
+    """One scheduled job. The daemon spawns ``teane run`` in a
     subprocess per fire and shells the hooks afterwards.
 
     ``on_success`` / ``on_failure`` are arbitrary shell commands. Two
     environment variables are exported to the hook:
 
         HARNESS_JOB_NAME          — the job's ``name``.
-        HARNESS_JOB_EXIT_CODE     — the exit code of ``harness run``.
+        HARNESS_JOB_EXIT_CODE     — the exit code of ``teane run``.
         HARNESS_JOB_DURATION_SEC  — wall-clock seconds.
         HARNESS_JOB_LOG_PATH      — path to the run's captured log file.
     """
@@ -260,7 +260,7 @@ class ScheduleConfig:
     history_db: str = _DEFAULT_HISTORY_DB
     log_dir: str = _DEFAULT_LOG_DIR
     tick_seconds: int = _DEFAULT_TICK_SECONDS
-    harness_binary: str = "harness"  # operators using a venv set "/path/to/venv/bin/harness"
+    harness_binary: str = "harness"  # operators using a venv set "/path/to/venv/bin/teane"
     # Path to the dashboard's web.db. When set (default
     # ``~/.harness/web.db``), the daemon polls ``web_oneshot_jobs`` for
     # one-shot runs the dashboard enqueued via ``POST /run/schedule`` and
@@ -420,7 +420,7 @@ def record_run_started(
 
     Audit §1.16: if a row already exists for the (job_name, started_at)
     pair (two runs colliding in the same second — leap-second tick, a
-    manual ``harness schedule once`` racing a daemon tick), bump the
+    manual ``teane schedule once`` racing a daemon tick), bump the
     timestamp by 1 µs until the insert succeeds rather than replacing
     the prior row's log_path / pid.
     """
@@ -624,8 +624,8 @@ def _safe_filename(text: str) -> str:
 
 
 def build_run_command(cfg: ScheduleConfig, job: Job) -> list[str]:
-    """Build the argv for ``harness run`` for this job. Pure function;
-    no I/O. Used by ``harness schedule list`` for transparency too.
+    """Build the argv for ``teane run`` for this job. Pure function;
+    no I/O. Used by ``teane schedule list`` for transparency too.
     """
     cmd = [cfg.harness_binary, "run", "-w", job.workspace]
     if job.prompt:
@@ -639,9 +639,9 @@ async def execute_job_once(
     *,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    """Spawn ``harness run`` for this job, await completion, fire the
+    """Spawn ``teane run`` for this job, await completion, fire the
     success/failure hook. Returns a dict summary so the caller can
-    print or log it (``harness schedule once`` does both).
+    print or log it (``teane schedule once`` does both).
     """
     started_at = now or _utcnow()
     log_path = _log_path_for(cfg, job.name, started_at)
@@ -942,7 +942,7 @@ class ScheduleDaemon:
         tick (operators re-enqueue from the UI if they want a retry).
 
         Claims the row atomically BEFORE firing so a second daemon /
-        manual ``harness schedule once`` invocation can't race ahead
+        manual ``teane schedule once`` invocation can't race ahead
         and run the same job twice. Audit §1.1.
         """
         # Atomic claim: any concurrent firer trying to grab the same
@@ -987,7 +987,7 @@ class ScheduleDaemon:
         (Ctrl-C / SIGTERM).
 
         On cancellation, signals SIGTERM to every still-running
-        ``schedule_runs`` row's pid so the spawned ``harness run``
+        ``schedule_runs`` row's pid so the spawned ``teane run``
         subprocesses don't continue as orphans after the daemon exits
         (audit §2.1). Without this drain, repeated daemon stop/start
         cycles accumulated stray harness processes.
@@ -1013,7 +1013,7 @@ class ScheduleDaemon:
     def _drain_inflight_subprocesses(self) -> None:
         """Send SIGTERM (then SIGKILL after 5 s) to every in-flight pid.
 
-        On a clean daemon shutdown we don't want spawned ``harness run``
+        On a clean daemon shutdown we don't want spawned ``teane run``
         children to continue as orphans (audit §2.1). Best-effort: any
         process we can't signal (gone, EPERM) is just left alone.
         """

@@ -264,7 +264,7 @@ def test_resolver_prefers_new_default_when_both_dirs_exist(monkeypatch, tmp_path
 
 def test_legacy_fallback_warning_fires_only_once(monkeypatch, tmp_path, caplog):
     """The deprecation log must fire ONCE per process — not on every
-    harness run inside a long-lived dashboard. Mirrors the once-per-
+    teane run inside a long-lived dashboard. Mirrors the once-per-
     process discipline used elsewhere in the harness."""
     import logging
     from harness import skills as _skills_module

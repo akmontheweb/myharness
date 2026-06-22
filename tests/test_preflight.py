@@ -416,5 +416,5 @@ class TestCLIIntegration:
             timeout=30, check=False,
         )
         assert result.returncode in (0, 1)
-        assert "harness pre-flight" in result.stdout
+        assert "teane pre-flight" in result.stdout
         assert "REQUIRED" in result.stdout

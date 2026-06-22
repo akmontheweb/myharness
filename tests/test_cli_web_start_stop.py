@@ -1,13 +1,13 @@
-"""Tests for the new ``harness web start`` / ``harness web stop``
+"""Tests for the new ``teane web start`` / ``teane web stop``
 lifecycle commands.
 
 Two flavours of coverage here:
   1. Unit tests on the marker helpers (``_read_web_marker`` /
      ``_write_web_marker`` / ``_delete_web_marker`` / ``_is_pid_alive``) and
      the single-instance gate inside ``cmd_web_start``.
-  2. One end-to-end test that spawns ``harness web start --background yes``
+  2. One end-to-end test that spawns ``teane web start --background yes``
      as a real subprocess, hits ``/status`` over HTTP, and then runs
-     ``harness web stop``. Verifies the marker file lifecycle, the port
+     ``teane web stop``. Verifies the marker file lifecycle, the port
      unbinds, and the subprocess exits cleanly.
 
 The E2E test re-points ``$HOME`` at a tmp dir so the marker file never
@@ -181,7 +181,7 @@ def test_stop_with_stale_marker_cleans_up(tmp_path, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# 3. End-to-end: real CLI subprocess via `harness web start --background yes`
+# 3. End-to-end: real CLI subprocess via `teane web start --background yes`
 # ---------------------------------------------------------------------------
 
 def _free_port() -> int:
@@ -202,8 +202,8 @@ def _wait(predicate, timeout=10.0, interval=0.1, msg="timeout"):
 
 
 def test_e2e_start_background_then_stop(tmp_path):
-    """Spawns `harness web start --background yes`, hits /status,
-    runs `harness web stop`, and checks the full lifecycle: marker
+    """Spawns `teane web start --background yes`, hits /status,
+    runs `teane web stop`, and checks the full lifecycle: marker
     written → server serves → marker removed → port released → child
     process exits."""
     port = _free_port()
@@ -254,7 +254,7 @@ def test_e2e_start_background_then_stop(tmp_path):
     assert second.returncode == 1
     assert "already running" in second.stderr
 
-    # `harness web stop` removes the marker, kills the child cleanly.
+    # `teane web stop` removes the marker, kills the child cleanly.
     stop = subprocess.run(
         [sys.executable, "-m", "harness.cli", "web", "stop"],
         env=env, capture_output=True, text=True, timeout=15,
@@ -276,7 +276,7 @@ def test_e2e_start_background_then_stop(tmp_path):
     finally:
         s.close()
 
-    # `harness web stop` again is a clean no-op (idempotent).
+    # `teane web stop` again is a clean no-op (idempotent).
     second_stop = subprocess.run(
         [sys.executable, "-m", "harness.cli", "web", "stop"],
         env=env, capture_output=True, text=True, timeout=10,
@@ -286,7 +286,7 @@ def test_e2e_start_background_then_stop(tmp_path):
 
 
 def test_web_help_describes_start_and_stop():
-    """`harness web --help` must explain both subcommands and show
+    """`teane web --help` must explain both subcommands and show
     the new defaults (port 9000, host 127.0.0.1, background no)."""
     proc = subprocess.run(
         [sys.executable, "-m", "harness.cli", "web", "--help"],
@@ -297,8 +297,8 @@ def test_web_help_describes_start_and_stop():
     assert "start" in out and "stop" in out
     # Examples section is present.
     assert "Examples:" in out
-    assert "harness web start" in out
-    assert "harness web stop" in out
+    assert "teane web start" in out
+    assert "teane web stop" in out
 
 
 def test_web_start_help_describes_options():

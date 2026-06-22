@@ -278,7 +278,7 @@ def test_all_sections_returns_known_sections():
 # ---------------------------------------------------------------------------
 
 def test_run_flags_covers_run_parser_bools():
-    """The Run page surfaces every bool-choice flag the `harness run`
+    """The Run page surfaces every bool-choice flag the `teane run`
     argparse surface accepts (besides workspace + prompt, which have
     dedicated inputs). Text/integer flags stay on the terminal."""
     from harness.web_forms import run_flags

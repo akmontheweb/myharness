@@ -1,15 +1,15 @@
-"""``harness chat`` — interactive refinement REPL (#8).
+"""``teane chat`` — interactive refinement REPL (#8).
 
 Why this exists
 ===============
-``harness run`` is autonomous. Once started it owns the loop until the
+``teane run`` is autonomous. Once started it owns the loop until the
 build is clean, the budget is gone, or HITL intervenes. That's the
 right contract for "drop a prompt and walk away" workflows — but
 operators routinely want the inverse: a quick conversational
 back-and-forth against a workspace. "Read this file, suggest an
 approach, let me iterate, and *maybe* apply a patch when I say so."
 
-That's what ``harness chat`` is. It:
+That's what ``teane chat`` is. It:
 - Reuses the Gateway, redactor, and tool-loop infrastructure so token
   budgeting, secret stripping, web tools, and MCP all keep working.
 - Reuses the per-repo memory and (when enabled) repo-index injection
@@ -21,9 +21,9 @@ That's what ``harness chat`` is. It:
 
 What this is NOT
 ================
-- Not persistent across invocations (v1). Each ``harness chat`` starts
+- Not persistent across invocations (v1). Each ``teane chat`` starts
   a fresh in-memory conversation. ``--resume`` is a clean follow-up.
-- Not the place to scaffold a new project — that's still ``harness run``.
+- Not the place to scaffold a new project — that's still ``teane run``.
 - Not a wire-protocol IDE client — the ``HttpChannel`` HITL transport
   already covers that use case for editor integrations.
 """
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 _HELP_TEXT = """\
-Interactive harness chat commands:
+Interactive teane chat commands:
 
   /help              show this help
   /exit  /quit       end the session
@@ -148,7 +148,7 @@ async def run_chat(
     # The repo-index injection requires a query — defer until the
     # first user turn.
 
-    writer("harness chat — type /help for commands, /exit to quit.")
+    writer("teane chat — type /help for commands, /exit to quit.")
     writer(f"workspace: {session.workspace_path}")
     writer(f"budget   : ${session.budget_remaining_usd:.2f}")
     writer("")

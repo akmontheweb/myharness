@@ -1,4 +1,4 @@
-"""``harness pre-flight`` — standalone machine-readiness probe.
+"""``teane pre-flight`` — standalone machine-readiness probe.
 
 The boundary against :mod:`harness.cli` ``doctor``:
 
@@ -24,7 +24,7 @@ Outputs:
 Exit codes (set by the caller):
 
 * ``0`` — no FAIL rows. The machine is ready; next step is
-  ``harness doctor -r <workspace>``.
+  ``teane doctor -r <workspace>``.
 * ``1`` — at least one FAIL row. The operator must install the
   flagged required tools before the harness can run.
 """
@@ -694,13 +694,13 @@ def probe_formatters() -> list[CheckResult]:
 
 
 def probe_gh_cli() -> CheckResult:
-    return _probe_optional_binary("gh", "`harness gh` subcommands", "OPTIONAL")
+    return _probe_optional_binary("gh", "`teane gh` subcommands", "OPTIONAL")
 
 
 def probe_llm_api_keys() -> list[CheckResult]:
     """Reports which provider env vars are set. INFO-level — pre-flight
     can't know which providers are routed (that's config-dependent and
-    a `harness doctor` concern). Useful as a 'what does this machine
+    a `teane doctor` concern). Useful as a 'what does this machine
     have wired up?' overview."""
     keys = [
         ("ANTHROPIC_API_KEY", "Anthropic Claude"),
@@ -836,7 +836,7 @@ def render_tty(results: list[CheckResult], *, no_color: bool = False,
         platform_name = _detected_platform_name()
     lines: list[str] = []
     lines.append("")
-    lines.append(f"harness pre-flight — {platform_name}")
+    lines.append(f"teane pre-flight — {platform_name}")
     lines.append("")
 
     by_section: dict[str, list[CheckResult]] = {s: [] for s in _SECTION_ORDER}
@@ -868,11 +868,11 @@ def render_tty(results: list[CheckResult], *, no_color: bool = False,
     )
     lines.append(summary)
     if counts[STATUS_FAIL] == 0:
-        lines.append("  Ready for `harness doctor -r <workspace>`.")
+        lines.append("  Ready for `teane doctor -r <workspace>`.")
     else:
         lines.append(
             "  Install the failed REQUIRED items above, then re-run "
-            "`harness pre-flight`."
+            "`teane pre-flight`."
         )
     lines.append("")
     return "\n".join(lines)

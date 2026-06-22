@@ -37,13 +37,13 @@ class TestRewritePyproject:
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_pyproject = Path(tmpdir) / "pyproject.toml"
             fake_pyproject.write_text(
-                '[project]\nname = "ai-agent-harness"\nversion = "1.1.0"\nrequires-python = ">=3.11"\n'
+                '[project]\nname = "teane"\nversion = "1.1.0"\nrequires-python = ">=3.11"\n'
             )
             monkeypatch.setattr(release, "PYPROJECT", fake_pyproject)
             release.rewrite_pyproject("1.2.0")
             text = fake_pyproject.read_text()
             assert 'version = "1.2.0"' in text
-            assert 'name = "ai-agent-harness"' in text  # unchanged
+            assert 'name = "teane"' in text  # unchanged
 
 
 class TestRewriteChangelog:

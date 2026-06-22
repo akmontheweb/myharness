@@ -336,7 +336,7 @@ def _cache_corruption_hint(raw_output: str) -> Optional[str]:
     return (
         "\n[sandbox-hint] Build output contains a cache-corruption signature "
         "(hash mismatch / integrity failure / corrupt registry index). If you "
-        "have `sandbox.cache_volumes` enabled, try `harness cache clear` "
+        "have `sandbox.cache_volumes` enabled, try `teane cache clear` "
         "(optionally `--session-id <id>`) and rerun. If you don't, your host "
         "cache (~/.cache/pip, ~/.npm, ~/.cargo) may be damaged — clear the "
         "affected tool's cache directory."

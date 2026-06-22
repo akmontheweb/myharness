@@ -163,7 +163,7 @@ class AgentState(TypedDict, total=False):
     repo_index_config: dict[str, Any]
     # Operator-controlled toggle for the entire deployment phase (discovery
     # → DEPLOYMENT_BLUEPRINT → gatekeeper → docker-compose up). Set by the
-    # `--deploy-dev` CLI flag on `harness run`; default False. When False,
+    # `--deploy-dev` CLI flag on `teane run`; default False. When False,
     # route_after_security_scan short-circuits to END after a clean scan
     # instead of routing into deployment_discovery_node. Distinct from
     # `deployment_config["enabled"]`, which only gates the docker step
@@ -174,7 +174,7 @@ class AgentState(TypedDict, total=False):
     # and synthesises DEPLOYMENT_BLUEPRINT.md from the codebase. When
     # False, the deployment step skips the LLM-driven discovery and
     # synthesises the blueprint from workspace telemetry alone. Set by
-    # the `--cd-discovery` CLI flag on `harness run`; default False
+    # the `--cd-discovery` CLI flag on `teane run`; default False
     # (matches the new operator-autonomous baseline).
     cd_discovery: bool
     # End-of-run installation-doc synthesis toggle. When True,
@@ -183,7 +183,7 @@ class AgentState(TypedDict, total=False):
     # deployment_node health-check success) and writes
     # docs/INSTALLATION.md from workspace telemetry + manifests +
     # SPEC_ARCHITECTURE.md §7 (+ the deployment blueprint when present).
-    # Set by --install-doc on `harness run`; defaults to the value of
+    # Set by --install-doc on `teane run`; defaults to the value of
     # --new-build so greenfield generations document themselves while
     # change-request runs stay quiet.
     install_doc: bool
@@ -4369,7 +4369,7 @@ def _apply_toolchain_adaptation(
                 "[sandbox] Build command requires network access for install "
                 "but sandbox.auto_enable_network_for_install is false. "
                 "Build will run offline and likely fail; either pre-install "
-                "deps in the sandbox image, run `harness run --allow-network`, "
+                "deps in the sandbox image, run `teane run --allow-network`, "
                 "or set sandbox.auto_enable_network_for_install=true in "
                 ".harness_config.json. Build command: %s",
                 build_command,
@@ -9151,7 +9151,7 @@ async def run_graph(
         # to __end__, leaving the checkpoint at the terminal pseudo-node with
         # node_state.hitl_suspend=True. A naive ainvoke(None) on that
         # checkpoint returns immediately — LangGraph sees no pending work —
-        # so the user's `harness resume` would no-op (Final exit_code=N,
+        # so the user's `teane resume` would no-op (Final exit_code=N,
         # 0 nodes executed). Rewind the checkpoint as if
         # human_intervention_node just produced a "resume" outcome
         # (hitl_suspend cleared, loop counter rolled back), so the outgoing

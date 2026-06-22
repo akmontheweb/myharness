@@ -350,7 +350,7 @@ def project_exhaustion(metrics: SessionMetrics, hard_cap_usd: float) -> Optional
 # ---------------------------------------------------------------------------
 
 def format_human(metrics: SessionMetrics, hard_cap_usd: float) -> str:
-    """Render a single-session report in the `harness status` style."""
+    """Render a single-session report in the `teane status` style."""
     proj = project_exhaustion(metrics, hard_cap_usd)
     if proj is None:
         proj_label = "n/a (no recent activity)"

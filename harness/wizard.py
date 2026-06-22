@@ -1,7 +1,7 @@
 """
-Interactive setup wizard for bare ``harness run`` invocations.
+Interactive setup wizard for bare ``teane run`` invocations.
 
-When the user types ``harness run`` with no flags, ``cmd_run`` calls
+When the user types ``teane run`` with no flags, ``cmd_run`` calls
 :func:`run_setup_wizard` to walk them through the minimum set of choices
 needed to start a run. The wizard first asks whether this is a new
 session or a resume of an existing checkpointed session:
@@ -14,7 +14,7 @@ session or a resume of an existing checkpointed session:
 so the caller can dispatch correctly. ``args`` is mutated in place either
 way.
 
-The wizard does NOT persist anything. Each bare ``harness run`` re-asks
+The wizard does NOT persist anything. Each bare ``teane run`` re-asks
 every question. Model routing, sandbox backend, lintgate, deployment,
 and budget all stay in ``config/config.json``.
 
@@ -63,7 +63,7 @@ def run_setup_wizard(args: argparse.Namespace) -> str:
     channel = get_channel()
     if not channel.is_interactive():
         print(
-            "\nInteractive setup required: `harness run` was invoked with no\n"
+            "\nInteractive setup required: `teane run` was invoked with no\n"
             "--workspace or --prompt, but stdin is not a terminal (or auto-approve\n"
             "is set). Either run from a TTY, or pass --workspace and --prompt\n"
             "explicitly.",
@@ -73,12 +73,12 @@ def run_setup_wizard(args: argparse.Namespace) -> str:
 
     print()
     print("=" * 72)
-    print("harness run — interactive setup")
+    print("teane run — interactive setup")
     print("=" * 72)
     print(
-        "You ran `harness run` without any flags. The wizard will walk you\n"
+        "You ran `teane run` without any flags. The wizard will walk you\n"
         "through the minimum settings needed to start a run. None of your\n"
-        "answers will be persisted — every bare `harness run` re-asks.\n"
+        "answers will be persisted — every bare `teane run` re-asks.\n"
     )
 
     # Config is loaded once and reused for the API-key check and for the

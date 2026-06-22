@@ -427,7 +427,7 @@ class RunFlag:
 
 # Operator-facing schema of every flag the Run page surfaces. Workspace +
 # prompt have dedicated inputs at the top of the form; the bool-choice
-# flags below mirror the `harness run` argparse surface in cli.py
+# flags below mirror the `teane run` argparse surface in cli.py
 # (build_parser → run_parser). Operators still reach text flags
 # (build-cmd, allow-network, verbose, etc.) from the terminal.
 _RUN_FLAGS: tuple[RunFlag, ...] = (

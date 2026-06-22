@@ -13,12 +13,12 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 ## 2. Functional Requirements (FR)
 
 ### FR-001: CLI Subcommand Routing
-- **Description:** The system MUST provide a `harness` CLI with subcommands `run`, `resume`, `status`, `doctor`, `purge`, and `metrics`, each with their own argument parsers and help text. The root parser MUST also accept a `--version` / `-V` flag that prints the installed package version (resolved via `importlib.metadata.version("ai-agent-harness")`) and exits.
+- **Description:** The system MUST provide a `harness` CLI with subcommands `run`, `resume`, `status`, `doctor`, `purge`, and `metrics`, each with their own argument parsers and help text. The root parser MUST also accept a `--version` / `-V` flag that prints the installed package version (resolved via `importlib.metadata.version("teane")`) and exits.
 - **Priority:** Must Have
 - **Acceptance Criteria:**
-  - Given `harness -h`, the system displays help with all six subcommands listed.
-  - Given `harness run -h`, the system displays run-specific help with all flags documented.
-  - Given `harness --version`, the system prints `harness <X.Y.Z>` and exits 0; the version falls back to `(unknown)` for uninstalled in-tree runs.
+  - Given `teane -h`, the system displays help with all six subcommands listed.
+  - Given `teane run -h`, the system displays run-specific help with all flags documented.
+  - Given `teane --version`, the system prints `teane <X.Y.Z>` and exits 0; the version falls back to `(unknown)` for uninstalled in-tree runs.
 
 ### FR-002: Workspace-Bound Execution
 - **Description:** The system MUST accept a `--workspace` / `-r` flag pointing to an existing directory. All generated code, specs, and deployment artifacts MUST land inside this workspace.
@@ -81,7 +81,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Acceptance Criteria:**
   - Given HITL triggered, a menu with [v/r/e/m/b/s/q] options is displayed.
   - Given user selects [b] (increase budget), `budget_remaining_usd` increases by $2.00 and the menu re-displays.
-  - Given user selects [s] (save & quit), the session is checkpointed and the developer is shown the exact `harness resume --session-id` command.
+  - Given user selects [s] (save & quit), the session is checkpointed and the developer is shown the exact `teane resume --session-id` command.
   - Given user selects [q] and confirms, `git checkout -- .` is executed, the session ends, and a `hitl_gate_blocked` event is emitted.
 
 ### FR-010: Secret Redaction Before API Calls
@@ -131,30 +131,30 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given `product_spec.txt` exists in the workspace root, it is used as the manifest without explicit `--manifest` flag.
 
 ### FR-016: Checkpoint Persistence and Crash Recovery
-- **Description:** The system MUST persist graph state to a SQLite database (WAL mode) at every node transition. `harness resume --session-id` MUST restore and continue from the last checkpoint. Each checkpoint's metadata MUST carry a `_harness_schema_version` stamp (current `CHECKPOINT_SCHEMA_VERSION = 1`); `cmd_resume` MUST pre-flight the most recent blob with strict deserialization and refuse to load on `CheckpointCorruptedError` or `CheckpointSchemaMismatchError`. The `messages` channel MUST be redacted through `harness.redactor` before serialization (opt-out via `persistence.redact_messages: false`, default `true`).
+- **Description:** The system MUST persist graph state to a SQLite database (WAL mode) at every node transition. `teane resume --session-id` MUST restore and continue from the last checkpoint. Each checkpoint's metadata MUST carry a `_harness_schema_version` stamp (current `CHECKPOINT_SCHEMA_VERSION = 1`); `cmd_resume` MUST pre-flight the most recent blob with strict deserialization and refuse to load on `CheckpointCorruptedError` or `CheckpointSchemaMismatchError`. The `messages` channel MUST be redacted through `harness.redactor` before serialization (opt-out via `persistence.redact_messages: false`, default `true`).
 - **Priority:** Must Have
 - **Acceptance Criteria:**
   - Given a running graph, checkpoints are written to `~/.harness/checkpoints.db` with the schema version stamped in metadata.
-  - Given `harness resume --session-id <id>`, the graph resumes from the checkpointed state after the pre-flight check passes.
+  - Given `teane resume --session-id <id>`, the graph resumes from the checkpointed state after the pre-flight check passes.
   - Given a corrupted checkpoint blob, `cmd_resume` exits with an operator-readable message offering fresh-start / restore-backup / purge-session options.
   - Given a checkpoint stamped with a future schema version, `cmd_resume` refuses with an upgrade-or-purge message.
   - Given a non-existent session ID, resume exits with error code 1.
   - Given a prompt containing an API-key-shaped secret, the byte sequence is absent from the on-disk SQLite checkpoint blob.
 
 ### FR-017: Read-Only Status Inspection
-- **Description:** `harness status --all` MUST list all checkpointed sessions with session ID, created time, updated time, and workspace path. `harness status --session-id <id>` MUST display a full state snapshot.
+- **Description:** `teane status --all` MUST list all checkpointed sessions with session ID, created time, updated time, and workspace path. `teane status --session-id <id>` MUST display a full state snapshot.
 - **Priority:** Must Have
 - **Acceptance Criteria:**
-  - Given `harness status --all`, a table with SESSION ID, UPDATED, CREATED, and WORKSPACE columns is printed.
-  - Given `harness status --session-id <id>`, a detailed state dump with all fields is printed.
+  - Given `teane status --all`, a table with SESSION ID, UPDATED, CREATED, and WORKSPACE columns is printed.
+  - Given `teane status --session-id <id>`, a detailed state dump with all fields is printed.
   - Given a non-existent session ID, a "not found" message is printed.
 
 ### FR-018: Session Data Purging
-- **Description:** `harness purge --all` MUST delete all checkpoint data after confirmation. `harness purge --session-id <id>` MUST delete that session's checkpoints AND its per-session JSONL log file (`<id>.jsonl`) plus any rotated backups (`<id>.jsonl.*`). Log-file removal is best-effort: a single OS error MUST log a WARNING and continue rather than abort the purge.
+- **Description:** `teane purge --all` MUST delete all checkpoint data after confirmation. `teane purge --session-id <id>` MUST delete that session's checkpoints AND its per-session JSONL log file (`<id>.jsonl`) plus any rotated backups (`<id>.jsonl.*`). Log-file removal is best-effort: a single OS error MUST log a WARNING and continue rather than abort the purge.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given `harness purge --all` and user confirms "yes", all rows in the checkpoints DB are deleted.
-  - Given `harness purge --session-id <id>`, only that thread's checkpoints are deleted and the count of removed log files is printed.
+  - Given `teane purge --all` and user confirms "yes", all rows in the checkpoints DB are deleted.
+  - Given `teane purge --session-id <id>`, only that thread's checkpoints are deleted and the count of removed log files is printed.
   - Given a session whose log file cannot be removed (permissions, race), the checkpoint deletion still completes and the failure is logged at WARNING.
 
 ### FR-019: Lint Gate (Deterministic Format Verification)
@@ -203,11 +203,11 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given a Python workspace with cross-file imports, the dependency graph is built.
   - Given a patch to a file with 3 downstream dependents, those dependents are listed in the impact result.
 
-### FR-025: First-Run Healthcheck (`harness doctor`)
-- **Description:** The CLI MUST expose `harness doctor`, which runs six healthchecks and reports each as PASS / WARN / FAIL with a colored marker (suppressed when stdout is not a TTY or `NO_COLOR` is set): git repo presence, global config presence, API keys per configured `model_routing` provider, sandbox backend reachability, checkpoint DB writability and corruption scan over the 5 most recent rows, and config parse cleanliness (re-running `discover_config` + `_validate_config_keys`). The api-keys check MUST consider a provider satisfied when EITHER the `{PROVIDER}_API_KEY` env var OR the `models["<provider>:<model>"].api_key` config field is set (matching the runtime resolution in `gateway.BaseProviderClient.__init__`); the PASS message MUST report the source (`(env)` vs `(config)`) per model so operators see which key the runtime would actually use. The api-keys check MUST also issue a one-token chat call against each provider in parallel to confirm the resolved key actually authenticates against the configured model; HTTP-status-specific FAIL messages distinguish key-rejected (401), no-model-access (403), model-not-found (404), rate-limited (429), provider error (5xx), and network failures. Set `HARNESS_DOCTOR_SKIP_LIVE=true` to skip the live ping (CI / headless / outbound-network-blocked environments) — the doctor then reports presence and source only.
+### FR-025: First-Run Healthcheck (`teane doctor`)
+- **Description:** The CLI MUST expose `teane doctor`, which runs six healthchecks and reports each as PASS / WARN / FAIL with a colored marker (suppressed when stdout is not a TTY or `NO_COLOR` is set): git repo presence, global config presence, API keys per configured `model_routing` provider, sandbox backend reachability, checkpoint DB writability and corruption scan over the 5 most recent rows, and config parse cleanliness (re-running `discover_config` + `_validate_config_keys`). The api-keys check MUST consider a provider satisfied when EITHER the `{PROVIDER}_API_KEY` env var OR the `models["<provider>:<model>"].api_key` config field is set (matching the runtime resolution in `gateway.BaseProviderClient.__init__`); the PASS message MUST report the source (`(env)` vs `(config)`) per model so operators see which key the runtime would actually use. The api-keys check MUST also issue a one-token chat call against each provider in parallel to confirm the resolved key actually authenticates against the configured model; HTTP-status-specific FAIL messages distinguish key-rejected (401), no-model-access (403), model-not-found (404), rate-limited (429), provider error (5xx), and network failures. Set `HARNESS_DOCTOR_SKIP_LIVE=true` to skip the live ping (CI / headless / outbound-network-blocked environments) — the doctor then reports presence and source only.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given a healthy install, `harness doctor` exits 0.
+  - Given a healthy install, `teane doctor` exits 0.
   - Given an API key only in the `models["<key>"].api_key` config field (no env var), the `api keys` check reports PASS with `(config)` next to the model id (after a successful live ping).
   - Given an env var AND a config field both set, the PASS message reports `(env)` (env wins precedence, matching the runtime).
   - Given neither env var nor config field set for a routed non-Ollama provider, the `api keys` check reports FAIL with a message naming BOTH the env var to set AND the `models."<key>".api_key` path; the command exits non-zero.
@@ -260,11 +260,11 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given a Linux-only regression that breaks the macOS or Windows run, the `pytest` job for that OS reports failure but merge is NOT blocked (advisory).
   - Given a green pytest + ruff-check run on all blocking targets, the workflow reports `success`.
 
-### FR-032: Cost-Metrics Aggregation (`harness metrics`)
-- **Description:** The CLI MUST expose `harness metrics`, which reads `<id>.jsonl` plus rotated backups (`<id>.jsonl.*`) under `logging.log_dir`, aggregates `llm_call` cost / tokens, counts tracked failure events (`token_budget_exhausted`, `llm_empty_response`, `llm_circuit_open`, `sandbox_start_failed`, `hitl_gate_blocked`), computes a trailing-window burn-rate in USD/min, and projects exhaustion against `token_budget.hard_cap_usd`. Flags: `--session-id`, `--all`, `--json`, `--prometheus`, `--output` (path or `-` for stdout), `--window-minutes`. Human-readable output goes to stdout; machine-readable outputs (`--json` / `--prometheus`) write atomically (`<dest>.tmp` → `os.replace`) into `metrics.metrics_dir` (default `~/.harness/metrics/`).
+### FR-032: Cost-Metrics Aggregation (`teane metrics`)
+- **Description:** The CLI MUST expose `teane metrics`, which reads `<id>.jsonl` plus rotated backups (`<id>.jsonl.*`) under `logging.log_dir`, aggregates `llm_call` cost / tokens, counts tracked failure events (`token_budget_exhausted`, `llm_empty_response`, `llm_circuit_open`, `sandbox_start_failed`, `hitl_gate_blocked`), computes a trailing-window burn-rate in USD/min, and projects exhaustion against `token_budget.hard_cap_usd`. Flags: `--session-id`, `--all`, `--json`, `--prometheus`, `--output` (path or `-` for stdout), `--window-minutes`. Human-readable output goes to stdout; machine-readable outputs (`--json` / `--prometheus`) write atomically (`<dest>.tmp` → `os.replace`) into `metrics.metrics_dir` (default `~/.harness/metrics/`).
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given a session log with three `llm_call` records (cost $0.10, $0.20, $0.05), `harness metrics --session-id <id>` prints `Total cost: $0.3500` and a non-zero burn rate.
+  - Given a session log with three `llm_call` records (cost $0.10, $0.20, $0.05), `teane metrics --session-id <id>` prints `Total cost: $0.3500` and a non-zero burn rate.
   - Given `--prometheus` and no `--output`, the file `~/.harness/metrics/<id>.prom` is written atomically with `# HELP` / `# TYPE` headers for every documented metric.
   - Given `--output -`, the payload is streamed to stdout and no file is written.
   - Given an empty log directory, `--all` exits with code 1.
@@ -310,7 +310,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Description:** `cmd_run` MUST acquire an `fcntl.flock(LOCK_EX | LOCK_NB)` on `<workspace>/.harness_session.lock` at startup. On `BlockingIOError` (another session holds the lock), the CLI MUST exit 1 unless `--force-lock` is passed; with `--force-lock`, a WARNING MUST be logged and the lock acquired. The handle MUST be pinned in a module-level slot so the OS holds the lock for the process lifetime. Platforms without `fcntl` (native Windows) MUST log a DEBUG message and skip locking.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given two `harness run` invocations against the same workspace, the second exits with a clear "lock held by PID X" message.
+  - Given two `teane run` invocations against the same workspace, the second exits with a clear "lock held by PID X" message.
   - Given `--force-lock`, the second invocation proceeds after logging a WARNING.
   - Given a Windows native run, lock acquisition is skipped without error.
 
@@ -352,11 +352,11 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given a value outside `[1, 30]`, it is clamped at load and logged.
 
 ### FR-044: Opt-In Deployment Phase (`--deploy-dev`)
-- **Description:** The deployment phase (optional deployment discovery → `DEPLOYMENT_BLUEPRINT.md` → gatekeeper approval → `docker compose up`) MUST be off by default. `harness run` MUST accept `--deploy-dev true|false` (default `false`) on `run_parser` and thread it through `run_graph(dev_deployment=...)` into `AgentState["dev_deployment"]`. `route_after_security_scan` MUST consult the flag: with a clean scan and `dev_deployment=False`, the router MUST return `"__end__"`; with `dev_deployment=True` it MUST return `"deployment_discovery_node"` (when `--cd-discovery true`) or `"deployment_node"` (when `--cd-discovery false`, reading `deployment.json` directly). The Flutter short-circuit (FR-028) MUST run before the flag check so mobile builds end regardless of the flag. The existing `deployment.enabled` config switch is a NARROWER gate that only short-circuits the docker step inside `deployment_node` once the phase is already running.
+- **Description:** The deployment phase (optional deployment discovery → `DEPLOYMENT_BLUEPRINT.md` → gatekeeper approval → `docker compose up`) MUST be off by default. `teane run` MUST accept `--deploy-dev true|false` (default `false`) on `run_parser` and thread it through `run_graph(dev_deployment=...)` into `AgentState["dev_deployment"]`. `route_after_security_scan` MUST consult the flag: with a clean scan and `dev_deployment=False`, the router MUST return `"__end__"`; with `dev_deployment=True` it MUST return `"deployment_discovery_node"` (when `--cd-discovery true`) or `"deployment_node"` (when `--cd-discovery false`, reading `deployment.json` directly). The Flutter short-circuit (FR-028) MUST run before the flag check so mobile builds end regardless of the flag. The existing `deployment.enabled` config switch is a NARROWER gate that only short-circuits the docker step inside `deployment_node` once the phase is already running.
 - **Priority:** Must Have
 - **Acceptance Criteria:**
-  - Given `harness run` with no `--deploy-dev`, after a clean security scan the run ends with no Dockerfile / compose / containers produced and `[cli] Code generated at <path>. Deployment phase skipped.` is logged.
-  - Given `harness run --deploy-dev true --cd-discovery true` and a clean security scan, the router enters `deployment_discovery_node`.
+  - Given `teane run` with no `--deploy-dev`, after a clean security scan the run ends with no Dockerfile / compose / containers produced and `[cli] Code generated at <path>. Deployment phase skipped.` is logged.
+  - Given `teane run --deploy-dev true --cd-discovery true` and a clean security scan, the router enters `deployment_discovery_node`.
   - Given a Flutter project with `--deploy-dev`, the run still ends at the Flutter short-circuit (mobile build, no docker-compose).
   - Given `--deploy-dev` AND `deployment.enabled: false` in config, the phase enters discovery and writes `DEPLOYMENT_BLUEPRINT.md`, but `deployment_node` skips the docker step with `{"skipped": True, "reason": "disabled"}`.
 
@@ -377,13 +377,13 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given the file already exists, the node skips with a log line and no LLM call is made.
   - Given `budget_remaining_usd < change_requests.reverse_engineer_budget_usd`, the node skips with a budget-gate log line; the delta-mode discovery that follows still runs.
 
-### FR-047: Setup Wizard for Bare `harness run`
-- **Description:** When `harness run` is invoked with no `-w` / `-p` flags, the CLI MUST drop the operator into an interactive setup wizard (`harness/wizard.py:run_setup_wizard`). The wizard MUST first ask "new session or resume?". For a new session it MUST collect workspace path, prompt, `--git true|false` (default `false`), `--new-build true|false` (default `false`), and `--spec-discovery true|false` (default `false`). Resume MUST jump straight to `harness resume` with the chosen session. The wizard's behaviour MUST be skippable via direct flag passing; passing either `-w` or `-p` MUST bypass the wizard entirely.
+### FR-047: Setup Wizard for Bare `teane run`
+- **Description:** When `teane run` is invoked with no `-w` / `-p` flags, the CLI MUST drop the operator into an interactive setup wizard (`harness/wizard.py:run_setup_wizard`). The wizard MUST first ask "new session or resume?". For a new session it MUST collect workspace path, prompt, `--git true|false` (default `false`), `--new-build true|false` (default `false`), and `--spec-discovery true|false` (default `false`). Resume MUST jump straight to `teane resume` with the chosen session. The wizard's behaviour MUST be skippable via direct flag passing; passing either `-w` or `-p` MUST bypass the wizard entirely.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given `harness run` with no flags, the wizard prompts: new vs resume → workspace → prompt → `--git` → `--new-build` → `--spec-discovery`.
-  - Given resume is chosen, the wizard lists checkpointed sessions newest-first and hands off to `harness resume --session-id <chosen>`.
-  - Given `harness run -w /tmp/x -p "fix bug"`, the wizard is skipped.
+  - Given `teane run` with no flags, the wizard prompts: new vs resume → workspace → prompt → `--git` → `--new-build` → `--spec-discovery`.
+  - Given resume is chosen, the wizard lists checkpointed sessions newest-first and hands off to `teane resume --session-id <chosen>`.
+  - Given `teane run -w /tmp/x -p "fix bug"`, the wizard is skipped.
 
 ### FR-048: Per-Question Discovery Defaults + Optional Org-Wide `deployment_defaults` Section
 - **Description:** Each discovery question MUST accept a bare Enter (empty input) as "use the default value baked into the prompt." The harness MUST also load an optional org-wide policy from the `deployment_defaults` section of `config/config.json`; when populated, its already-resolved fields MUST be injected into the deployment-discovery LLM prompt as known answers so the planner does not re-ask. The section is OPTIONAL — when absent or `{}`, the full questionnaire is preserved. `config/config.json` MUST document the section's schema and example values inline via its `_deployment_defaults_comment` field.
@@ -394,7 +394,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given no `deployment_defaults` section is present (or it is `{}`), the full questionnaire runs as before.
 
 ### FR-049: Workspace Git-Awareness Toggle (`--git true|false`)
-- **Description:** `harness run` MUST accept `--git true|false` (default `false`). When `true`, `GitGuardian` performs stash → patch-branch → commit/rollback as today and requires the workspace to be a git repo. When `false`, every git-aware step MUST be skipped (`_make_git_guardian` returns a no-op stub with the same interface) so operators whose target repo isn't under git can still run the harness. File-scanning security tools (gitleaks, bandit, semgrep) MUST still run in either mode — they scan files, not history.
+- **Description:** `teane run` MUST accept `--git true|false` (default `false`). When `true`, `GitGuardian` performs stash → patch-branch → commit/rollback as today and requires the workspace to be a git repo. When `false`, every git-aware step MUST be skipped (`_make_git_guardian` returns a no-op stub with the same interface) so operators whose target repo isn't under git can still run the harness. File-scanning security tools (gitleaks, bandit, semgrep) MUST still run in either mode — they scan files, not history.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
   - Given `--git true` and a non-git workspace, the CLI exits 1 with a "not a git repo" message.
@@ -413,7 +413,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Description:** The harness MUST support connecting to one or more MCP servers declared in `config.mcp.servers` and exposing each server's advertised tools as `mcp__<server>__<tool>` skills in the `SkillRegistry`. The MCP client MUST implement JSON-RPC 2.0 over stdio (newline-delimited frames) without depending on the upstream `mcp` SDK so the core install stays dependency-clean. Server commands MUST be validated through `harness.trust.validate_mcp_server_command` (allowlist of `npx`/`node`/`python*`/`uvx`/`docker`; hard-deny on shells / `sudo` / `rm`; shell-metacharacter scan; `/etc /root /proc /sys` path rejection). Filesystem MCP servers MUST be gated behind `mcp.allow_local_filesystem_servers=true`.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given `mcp.enabled=true` and a valid stdio server, `harness doctor` lists the server with the count of advertised tools.
+  - Given `mcp.enabled=true` and a valid stdio server, `teane doctor` lists the server with the count of advertised tools.
   - Given the planner emits a `<<<MCP_CALL server="x" tool="y" args='{...}'>>>` block, the graph's `_run_tool_loop` intercepts it, dispatches via the MCP client, and feeds the result back as a user message.
   - Given a server command that fails the allowlist, the pool refuses to start and logs the rejection reason; one bad server never blocks the rest of the pool.
 
@@ -433,11 +433,11 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given an LLM-supplied URL targeting `169.254.169.254`, `validate_outbound_url` rejects it before the HTTP call.
   - Given `web_tools.enabled=false`, the skills are not registered and any tool block is left in the response with a "tool not registered" notice.
 
-### FR-054: GitHub Integration (`harness gh`)
-- **Description:** The harness MUST ship a `harness gh` subcommand family wrapping the `gh` CLI (no new Python dep). `harness gh issue --repo X --number Y` MUST pull an issue body and write it to the workspace's `change_requests/CR-<N>-<slug>.txt` so the existing change-request flow processes it. `harness gh pr-create` MUST open a PR from the workspace's current branch; `harness gh pr-comment` MUST post a comment on an existing PR. Authentication MUST defer to whatever `gh auth status` reports.
+### FR-054: GitHub Integration (`teane gh`)
+- **Description:** The harness MUST ship a `teane gh` subcommand family wrapping the `gh` CLI (no new Python dep). `teane gh issue --repo X --number Y` MUST pull an issue body and write it to the workspace's `change_requests/CR-<N>-<slug>.txt` so the existing change-request flow processes it. `teane gh pr-create` MUST open a PR from the workspace's current branch; `teane gh pr-comment` MUST post a comment on an existing PR. Authentication MUST defer to whatever `gh auth status` reports.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given `gh` is on PATH and authenticated, `harness gh issue --repo owner/repo --number 42` creates `change_requests/CR-N-<slug>.txt` with the issue body.
+  - Given `gh` is on PATH and authenticated, `teane gh issue --repo owner/repo --number 42` creates `change_requests/CR-N-<slug>.txt` with the issue body.
   - Given `gh` is NOT on PATH, the subcommand exits non-zero with a clear "install gh CLI from cli.github.com" message.
   - Given a PR-create call from a branch with no commits ahead of base, the `gh pr create` exit code surfaces verbatim.
 
@@ -445,16 +445,16 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Description:** `register_builtin_skills(config)` MUST walk `~/.harness/user_skills/` (or the path named by `skills.user_skills_dir`) at startup and import every non-`_`-prefixed `*.py` file. Each loaded module MAY call `harness.skills.register(MySkill(...))` to add a `ToolSkill`/`PipelineSkill`/`SubAgentSkill`, or `harness.web_tools.register_backend(name, factory)` to plug in an alternative web-search backend, without modifying core code. Failures (syntax error, missing dep, import-time exception) MUST log and continue so one bad file never blocks startup. The loader MUST fall back to the legacy default `~/.harness/skills/` when only the legacy directory exists, and MUST emit a one-time deprecation INFO naming both paths so operators know to migrate.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given a valid `~/.harness/user_skills/demo.py` that calls `register(...)` at module load, the skill appears in `SkillRegistry.list_all()` after `harness run` starts.
+  - Given a valid `~/.harness/user_skills/demo.py` that calls `register(...)` at module load, the skill appears in `SkillRegistry.list_all()` after `teane run` starts.
   - Given a `~/.harness/user_skills/broken.py` that raises `RuntimeError` at import time, the harness logs the failure and continues without crashing.
   - Given neither `~/.harness/user_skills/` nor `~/.harness/skills/` exists, the loader silently no-ops.
   - Given only the legacy `~/.harness/skills/` exists (operator has not yet migrated), the loader uses it AND logs one INFO line per process pointing at the new default.
 
-### FR-056: Repository Semantic Retrieval (`harness index`)
-- **Description:** The harness MUST ship a per-workspace semantic-retrieval index buildable via `harness index build`. Two backends MUST be supported: zero-dep `tfidf` (default, deterministic, pure Python with identifier-aware tokenisation) and opt-in `openai_embeddings` (using `OPENAI_API_KEY`, falling back to TF-IDF when the key is missing). Index storage MUST be SQLite at `~/.harness/repo_index/repo_index.db`. When `repo_index.enabled=true`, `planning_node` MUST query top-K chunks for the user prompt and inject them as a system context block capped at `repo_index.inject_max_bytes`. `harness index {build, status, clear}` MUST be exposed as a CLI subcommand family.
+### FR-056: Repository Semantic Retrieval (`teane index`)
+- **Description:** The harness MUST ship a per-workspace semantic-retrieval index buildable via `teane index build`. Two backends MUST be supported: zero-dep `tfidf` (default, deterministic, pure Python with identifier-aware tokenisation) and opt-in `openai_embeddings` (using `OPENAI_API_KEY`, falling back to TF-IDF when the key is missing). Index storage MUST be SQLite at `~/.harness/repo_index/repo_index.db`. When `repo_index.enabled=true`, `planning_node` MUST query top-K chunks for the user prompt and inject them as a system context block capped at `repo_index.inject_max_bytes`. `teane index {build, status, clear}` MUST be exposed as a CLI subcommand family.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given `harness index build -r /repo`, the SQLite store at `~/.harness/repo_index/repo_index.db` contains one row per chunk with `(workspace_id, file_path, chunk_index, vector_json)`.
+  - Given `teane index build -r /repo`, the SQLite store at `~/.harness/repo_index/repo_index.db` contains one row per chunk with `(workspace_id, file_path, chunk_index, vector_json)`.
   - Given `repo_index.enabled=true`, the planner's system message includes a `### Repository context (semantic retrieval)` block when the index has been built.
   - Given `OPENAI_API_KEY` is unset with `repo_index.backend=openai_embeddings`, the backend falls back to TF-IDF with a one-time warning.
 
@@ -466,11 +466,11 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given `memory.enabled=false`, no read or write happens and the planner context excludes the memory block.
   - Given a memory file exceeds `memory.max_bytes`, the FIFO trim drops the oldest `## Session` sections; the most recent entry is always preserved.
 
-### FR-058: Interactive Refinement REPL (`harness chat`)
-- **Description:** The harness MUST ship a `harness chat` subcommand that opens an interactive REPL reusing the Gateway, redactor, web/MCP tool loop, repo-memory injection, and (when enabled) repo-index injection. The REPL MUST NEVER auto-apply patches — the LLM may emit SEARCH/REPLACE blocks but they only land when the operator types `/apply` and confirms. Slash commands: `/help`, `/exit`, `/clear`, `/files`, `/apply`, `/build`, `/save <path>`, `/budget`, `/memory`. The conversation MUST be in-memory only in v1 (no cross-session persistence).
+### FR-058: Interactive Refinement REPL (`teane chat`)
+- **Description:** The harness MUST ship a `teane chat` subcommand that opens an interactive REPL reusing the Gateway, redactor, web/MCP tool loop, repo-memory injection, and (when enabled) repo-index injection. The REPL MUST NEVER auto-apply patches — the LLM may emit SEARCH/REPLACE blocks but they only land when the operator types `/apply` and confirms. Slash commands: `/help`, `/exit`, `/clear`, `/files`, `/apply`, `/build`, `/save <path>`, `/budget`, `/memory`. The conversation MUST be in-memory only in v1 (no cross-session persistence).
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given a `harness chat -r /repo --budget 1.00` invocation, the REPL accepts a prompt, dispatches through the gateway, and surfaces the response in the terminal.
+  - Given a `teane chat -r /repo --budget 1.00` invocation, the REPL accepts a prompt, dispatches through the gateway, and surfaces the response in the terminal.
   - Given the assistant emits patch blocks, `/apply` invokes `process_llm_patch_output` against the workspace with a per-session HITL confirmation.
   - Given `/build`, the configured `build_command` runs in the sandbox and the first 80 lines of output surface in the REPL.
 
@@ -497,24 +497,24 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
   - Given `cost_strategy=cheap_first_sequential`, variants dispatch one at a time using `cheap_model`; the last variant uses `expensive_model`.
   - Given a legacy config of `{enabled, num_variants, temperature, selection_strategy}`, `_upgrade_legacy_config` populates `diversity_mode=temperature`, `cost_strategy=equal_cost`, `salvage_strategy=merge`, `trigger=first_attempt_only` with a WARNING log.
 
-### FR-062: Cron-Driven Scheduled-Job Daemon (`harness schedule`)
-- **Description:** The harness MUST ship a `harness schedule {run, list, validate, once, history}` subcommand family backed by `harness/schedule.py`. The daemon MUST parse a hand-rolled cron syntax subset: `every Nm/h/d`, `hourly :MM`, `daily HH:MM`, `weekly DAY HH:MM` (DAY ∈ mon..sun); all times UTC. Each job MUST run as a `harness run` subprocess with a per-job log at `~/.harness/schedule_logs/<job>/<iso8601>.log`. History MUST persist to SQLite at `~/.harness/schedule.db`. `on_success` / `on_failure` MUST be generic shell hooks invoked via `/bin/sh -c` with `HARNESS_JOB_NAME` / `HARNESS_JOB_EXIT_CODE` / `HARNESS_JOB_DURATION_SEC` / `HARNESS_JOB_LOG_PATH` exported. In-flight tracking MUST prevent double-firing.
+### FR-062: Cron-Driven Scheduled-Job Daemon (`teane schedule`)
+- **Description:** The harness MUST ship a `teane schedule {run, list, validate, once, history}` subcommand family backed by `harness/schedule.py`. The daemon MUST parse a hand-rolled cron syntax subset: `every Nm/h/d`, `hourly :MM`, `daily HH:MM`, `weekly DAY HH:MM` (DAY ∈ mon..sun); all times UTC. Each job MUST run as a `teane run` subprocess with a per-job log at `~/.harness/schedule_logs/<job>/<iso8601>.log`. History MUST persist to SQLite at `~/.harness/schedule.db`. `on_success` / `on_failure` MUST be generic shell hooks invoked via `/bin/sh -c` with `HARNESS_JOB_NAME` / `HARNESS_JOB_EXIT_CODE` / `HARNESS_JOB_DURATION_SEC` / `HARNESS_JOB_LOG_PATH` exported. In-flight tracking MUST prevent double-firing.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given `schedule.enabled=true` and one due job, one `harness schedule run` tick spawns a subprocess and records the result in `schedule.db`.
+  - Given `schedule.enabled=true` and one due job, one `teane schedule run` tick spawns a subprocess and records the result in `schedule.db`.
   - Given an in-flight job from a prior tick, the next tick does NOT fire a second instance.
-  - Given a malformed schedule string, `harness schedule validate` exits non-zero listing the offending job + the supported forms.
+  - Given a malformed schedule string, `teane schedule validate` exits non-zero listing the offending job + the supported forms.
 
-### FR-063: Read-Only Web Dashboard (`harness web`)
-- **Description:** The harness MUST ship a `harness web` subcommand that runs a localhost-only HTTP server (default bind `127.0.0.1`, port 8729) over the harness's on-disk state. Views MUST include: sessions list, per-session detail, cost burn-down (Chart.js via CDN), scheduled-job history, repo-index status, per-repo memory list. The server MUST support optional bearer-token auth via `dashboard.token_env`; when set but the env var is empty the server MUST refuse to start (fail-closed). Zero new Python dependencies (stdlib `http.server.ThreadingHTTPServer`).
+### FR-063: Read-Only Web Dashboard (`teane web`)
+- **Description:** The harness MUST ship a `teane web` subcommand that runs a localhost-only HTTP server (default bind `127.0.0.1`, port 8729) over the harness's on-disk state. Views MUST include: sessions list, per-session detail, cost burn-down (Chart.js via CDN), scheduled-job history, repo-index status, per-repo memory list. The server MUST support optional bearer-token auth via `dashboard.token_env`; when set but the env var is empty the server MUST refuse to start (fail-closed). Zero new Python dependencies (stdlib `http.server.ThreadingHTTPServer`).
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given `harness web --host 127.0.0.1 --port 8729`, an unauthenticated request without `Authorization` returns 401 when `token_env` is configured.
+  - Given `teane web --host 127.0.0.1 --port 8729`, an unauthenticated request without `Authorization` returns 401 when `token_env` is configured.
   - Given the workspace has session logs and a built repo index, all five views render without error.
   - Given `dashboard.token_env` names an empty env var, `start_server` raises `RuntimeError` and the subcommand exits 2.
 
 ### FR-064: Interactive Web App (Dashboard Tier B + C)
-- **Description:** When `dashboard.writes_enabled` is true (the default), the dashboard MUST add form-based editing of config sections (form schema derived from the live `_KNOWN_NESTED_KEYS` + `_TYPE_SCHEMA` tables), memory-file editing, schedule-job CRUD, and a "New run" form with both "Run now" (spawns `harness run` subprocess) and "Schedule it" (enqueues `web.db:web_oneshot_jobs` row picked up by the schedule daemon). Live event streams MUST flow via Server-Sent Events at `/api/sessions/<id>/events`. HITL prompts MUST surface in the UI via the existing `harness/hitl.py:HttpChannel`: the dashboard registers as the webhook URL, blocks the harness's POST while the UI displays the prompt, and signals back when the operator answers. Chat notes MUST queue per session and ride into the next HITL gate's `extra_notes`. Write paths MUST require a CSRF double-submit cookie + `X-CSRF-Token` header. Config writes MUST be atomic (tempfile + `os.replace`) and re-validated through `validate_config_strict` before landing.
+- **Description:** When `dashboard.writes_enabled` is true (the default), the dashboard MUST add form-based editing of config sections (form schema derived from the live `_KNOWN_NESTED_KEYS` + `_TYPE_SCHEMA` tables), memory-file editing, schedule-job CRUD, and a "New run" form with both "Run now" (spawns `teane run` subprocess) and "Schedule it" (enqueues `web.db:web_oneshot_jobs` row picked up by the schedule daemon). Live event streams MUST flow via Server-Sent Events at `/api/sessions/<id>/events`. HITL prompts MUST surface in the UI via the existing `harness/hitl.py:HttpChannel`: the dashboard registers as the webhook URL, blocks the harness's POST while the UI displays the prompt, and signals back when the operator answers. Chat notes MUST queue per session and ride into the next HITL gate's `extra_notes`. Write paths MUST require a CSRF double-submit cookie + `X-CSRF-Token` header. Config writes MUST be atomic (tempfile + `os.replace`) and re-validated through `validate_config_strict` before landing.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
   - Given the default `dashboard.writes_enabled: true` and a valid CSRF token, `POST /config/<section>` with a valid form body updates `config.json` atomically and re-renders the section with "Saved." flash.
@@ -542,8 +542,8 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - Pre-flight manifest → spec synthesis with interactive review
 - SQLite checkpoint persistence with WAL mode, 30-day TTL GC, schema-version stamping, strict-deserialize pre-flight on resume, and message redaction on every aput / aput_writes
 - Read-only session status inspector with timestamp and workspace display
-- First-run healthcheck (`harness doctor`) covering six environment preconditions, with the api-keys check matching the runtime resolution policy (env var OR `models["<key>"].api_key`)
-- Cost-metrics aggregation (`harness metrics`) with human / JSON / Prometheus output, sliding-window burn rate, and projected exhaustion against `token_budget.hard_cap_usd`
+- First-run healthcheck (`teane doctor`) covering six environment preconditions, with the api-keys check matching the runtime resolution policy (env var OR `models["<key>"].api_key`)
+- Cost-metrics aggregation (`teane metrics`) with human / JSON / Prometheus output, sliding-window burn rate, and projected exhaustion against `token_budget.hard_cap_usd`
 - Per-session JSONL log file with `RotatingFileHandler` (10 MB × 5 backups by default), configurable via `logging.max_bytes` / `logging.backup_count`
 - fcntl-based workspace lock (`.harness_session.lock`) preventing concurrent sessions on the same workspace; `--force-lock` for stale-lock recovery
 - Pre-flight LLM-budget refusal (`BudgetTooLowError`), empty-response retry with `EmptyLLMResponseError` route-to-HITL short-circuit, and a rate-limit circuit breaker that diverts to local Ollama after 3 hits in 5 min
@@ -553,7 +553,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - Container deployment pipeline (telemetry → blueprint → Dockerfile → docker compose v2 → health check); **opt-in via `--deploy-dev`** (off by default — clean security scan ends the run otherwise); short-circuits to END for Flutter / mobile projects regardless of the flag
 - Change-request folder mode (`change_requests/*.txt` → monotonic CR-N IDs → marker propagation through specs / source / tests / commits → `applied/<session-id>/` archive with `manifest.json`) for incremental work against existing repos
 - One-shot reverse-engineer of `SPEC_ARCHITECTURE.md` on first contact with a brownfield repo, gated by `change_requests.reverse_engineer_budget_usd` ($0.50 default)
-- Interactive setup wizard on bare `harness run` (new-vs-resume → workspace → prompt → `--git` → `--new-build` → `--spec-discovery`)
+- Interactive setup wizard on bare `teane run` (new-vs-resume → workspace → prompt → `--git` → `--new-build` → `--spec-discovery`)
 - Per-question Enter-to-accept defaults during discovery + optional org-wide `deployment_defaults` section in `config.json` (schema documented inline in `config/config.json`) that pre-resolves deployment-discovery answers
 - Workspace git-awareness toggle (`--git true|false`, default `false`); when `false`, every git-aware step is a no-op so non-git workspaces still work
 - Single kitchen-sink builder image (`harness/vendor/Dockerfile.builder`, Python + Node + Go + Java + Rust + Dart + Make) shared by compiler / lintgate / test-generation nodes; per-command image dispatch retired
@@ -636,7 +636,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - PGID-based process group termination on timeout (no orphaned child processes)
 - Single-writer workspace lock prevents concurrent sessions from clobbering each other
 - Git rollback on session abandonment (no unrecoverable workspace corruption)
-- `harness purge --session-id` removes both checkpoint rows AND the per-session JSONL transcripts for GDPR-style deletion requests
+- `teane purge --session-id` removes both checkpoint rows AND the per-session JSONL transcripts for GDPR-style deletion requests
 
 ---
 
@@ -666,28 +666,28 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **HITL abandon chosen:** `_attempt_git_rollback()` runs and `hitl_gate_blocked` event is emitted.
 - **gitleaks not installed:** Security scan falls back to Python regex-based secret scanner.
 - **msgpack module missing:** `_deserialize_checkpoint_blob()` falls back to JSON text decoding for legacy rows.
-- **`harness doctor` failure:** Non-zero exit with a one-line summary listing failed checks; warnings (e.g. only-Ollama routing) do not block exit 0.
-- **`harness metrics` with no logs:** `--all` exits 1; `--session-id <id>` against a missing session exits 1 so cron detects regression.
+- **`teane doctor` failure:** Non-zero exit with a one-line summary listing failed checks; warnings (e.g. only-Ollama routing) do not block exit 0.
+- **`teane metrics` with no logs:** `--all` exits 1; `--session-id <id>` against a missing session exits 1 so cron detects regression.
 - **`change_requests/` folder empty under `--new-build false`:** CLI exits 1 with a clear error telling the operator to add at least one `.txt` file; there is no implicit "use the prior product_spec" fallback.
 - **Change-request ID collision with archive:** A filename `CR-<N>-<rest>.txt` whose `N` clashes with an existing `change_requests/applied/**/CR-<N>-*.txt` aborts the session so the operator can rename and retry.
 - **Both `-p "..."` and a populated `change_requests/` folder supplied:** The folder wins and the seed prompt is dropped with a WARNING log line; the folder is the single source of truth.
-- **Bare `harness run` with no flags:** Drops the operator into the setup wizard; supplying any of `-r`, `-p`, or `--manifest` bypasses the wizard.
+- **Bare `teane run` with no flags:** Drops the operator into the setup wizard; supplying any of `-r`, `-p`, or `--manifest` bypasses the wizard.
 - **`--deploy-dev` not set + clean security scan:** Graph ends at the security-scan boundary; no Dockerfile / compose / `docker compose up` is produced. A `[cli] Code generated at <path>. Deployment phase skipped.` line is logged.
 - **`--git false` + HITL abandon:** No git rollback is attempted; the workspace is left as the LLM left it (matches the operator's stated intent of running outside git).
-- **MCP server command rejected by allowlist:** Pool start logs the rejection and skips the server; the rest of the pool continues. The `harness doctor` check for that server reports `fail` with the rejection reason.
+- **MCP server command rejected by allowlist:** Pool start logs the rejection and skips the server; the rest of the pool continues. The `teane doctor` check for that server reports `fail` with the rejection reason.
 - **MCP server start times out:** Server is skipped from the pool; its tools are absent from `SkillRegistry`. The LLM emitting `<<<MCP_CALL server=<name> ...>>>` sees a "server not registered" tool result.
 - **Filesystem MCP server attempted with `allow_local_filesystem_servers=false`:** Pool start raises `ValueError`; the dashboard/doctor surface the gating reason.
 - **Prompt cache prefix drift detected:** Warning logged + `cache_prefix_drift` event emitted; dispatch continues normally with the cache miss.
 - **Anthropic API rejects the cache_control payload shape:** Operator can flip `llm_dispatch.prompt_cache_enabled=false` to revert to the legacy string-form system payload as a single-flag rollback.
 - **Web tool URL fails SSRF guard:** Tool returns `{"error": "url rejected: ..."}` instead of fetching; the LLM sees the error message in its tool-result message.
 - **Web tool content-type not in allowlist:** Tool returns `{"error": "content-type ... not in allowlist"}` without the body.
-- **`gh` CLI not on PATH for `harness gh` subcommands:** Subcommand exits 1 with the install hint pointing at `https://cli.github.com/`.
+- **`gh` CLI not on PATH for `teane gh` subcommands:** Subcommand exits 1 with the install hint pointing at `https://cli.github.com/`.
 - **User skill file raises at import time:** Loader logs the file path + exception and continues with the next file; the registry shows the skills from successful imports only.
 - **Repo index built with one backend, queried with another:** Query loads the backend named in `repo_meta.backend` regardless of the live config; mismatched configs silently use the persisted backend.
 - **Repo index never built but `repo_index.enabled=true`:** Planner injection no-ops cleanly; no warning beyond a debug log.
 - **Per-repo memory file unreadable (permissions):** Read returns empty string; write silently fails with a warning log. Session continues without the memory block.
-- **`harness chat` budget exhausted mid-session:** REPL prints "budget exhausted (use /budget to confirm)" and refuses further dispatches. Operator types `/exit` to leave.
-- **`harness chat` `/apply` against an assistant message with no patch blocks:** Reports "no patch blocks detected in the last reply"; no files touched.
+- **`teane chat` budget exhausted mid-session:** REPL prints "budget exhausted (use /budget to confirm)" and refuses further dispatches. Operator types `/exit` to leave.
+- **`teane chat` `/apply` against an assistant message with no patch blocks:** Reports "no patch blocks detected in the last reply"; no files touched.
 - **Speculative trigger not met:** `speculate_node` logs the reason (`patching_count=X > 1` or `repair_count=X < threshold`) and falls through to the standard flow.
 - **Speculative cost_strategy=cheap_first_sequential with one cheap variant succeeding:** Subsequent variants are NOT dispatched (true cost savings); the registry reports `variant_results` for only the dispatched ones.
 - **Speculative legacy config (no new strategy keys):** `_upgrade_legacy_config` injects the legacy-compatible defaults with a one-time `WARNING: legacy config detected` log line.
@@ -713,7 +713,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Rate-limit circuit breaker threshold:** 3 failures in 5-minute sliding window
 - **Empty-LLM-response retry budget:** 2 extra retries after the transport-retry loop
 - **Pre-flight budget approach WARNING threshold:** within 20% of remaining cap
-- **Burn-rate window for `harness metrics`:** 10 minutes (default; `metrics.burn_rate_window_minutes`, clamped to `[1, 1440]`)
+- **Burn-rate window for `teane metrics`:** 10 minutes (default; `metrics.burn_rate_window_minutes`, clamped to `[1, 1440]`)
 - **Default metrics output dir:** `~/.harness/metrics/` (`metrics.metrics_dir`)
 - **Max files per directory in tree snapshot:** 50
 - **Max directory depth in tree snapshot:** 4
@@ -748,12 +748,12 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - **Speculative voting judges:** 3 (default; `speculative.voting.n_judges`); judge role: `code_reviewer` (default)
 
 ### Recovery Scenarios
-- **Process killed mid-graph:** Next `harness run` loads from latest checkpoint; LangGraph replays from the boundary.
+- **Process killed mid-graph:** Next `teane run` loads from latest checkpoint; LangGraph replays from the boundary.
 - **Network timeout during LLM call:** Gateway retries with exponential backoff + jitter (up to 3 attempts), then the rate-limit circuit breaker may divert to Ollama if the failure pattern persists.
 - **Build timeout in sandbox:** PGID-based `kill(-pgid, SIGKILL)` → `SIGTERM` escalation after 5s.
-- **Single corrupted session:** `harness purge --session-id <id>` removes only that thread's checkpoints AND its JSONL log + rotated backups; other sessions are unaffected.
-- **Corrupted checkpoint DB across the board:** `harness purge --all` wipes and recreates; sessions are lost but the workspace is untouched.
-- **Stale workspace lock from a crashed prior session:** `harness run -r <ws> -p '...' --force-lock` releases the stale lock and acquires a fresh one (operator confirms the prior PID is gone). See `docs/RUNBOOK.md` § 4.
+- **Single corrupted session:** `teane purge --session-id <id>` removes only that thread's checkpoints AND its JSONL log + rotated backups; other sessions are unaffected.
+- **Corrupted checkpoint DB across the board:** `teane purge --all` wipes and recreates; sessions are lost but the workspace is untouched.
+- **Stale workspace lock from a crashed prior session:** `teane run -r <ws> -p '...' --force-lock` releases the stale lock and acquires a fresh one (operator confirms the prior PID is gone). See `docs/RUNBOOK.md` § 4.
 - **Git stash conflict:** `git stash pop` may fail if stash conflicts; harness logs warning and continues (working tree is in the patch branch state).
 - **Self-serve recovery playbooks:** `docs/RUNBOOK.md` covers the top-five operator failure modes (checkpoint corrupted, budget exhausted mid-session, sandbox can't start, workspace lock refused, persistent LLM silence) with symptom / diagnostic / fix recipes.
 
@@ -776,7 +776,7 @@ AI Agent Harness is a production-grade, model-agnostic autonomous coding agent b
 - Structured Python logging with timestamps, levels, and module names
 - All LLM calls logged with token counts and cost
 - All file writes logged with path and byte count
-- Session introspection via `harness status` without graph execution
+- Session introspection via `teane status` without graph execution
 - Build output captured in full (stdout + stderr) via disk log streamer
 
 ### Maintainability

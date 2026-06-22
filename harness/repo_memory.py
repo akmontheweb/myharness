@@ -4,7 +4,7 @@ Persists a short, accumulating markdown file per repository at
 ``~/.harness/memory/<repo_id>.md``. The file accumulates a structured
 log of past sessions on the same repository (prompt summary, modified
 files, exit status, date). The planner reads it at the start of every
-``harness run`` and injects the recent entries as an extra system
+``teane run`` and injects the recent entries as an extra system
 message so subsequent sessions have context from prior work — a
 poor-person's persistent memory, complementing the (single-thread)
 LangGraph checkpoint.
@@ -187,7 +187,7 @@ def read_repo_memory(
 # ---------------------------------------------------------------------------
 
 _HEADER_TEMPLATE = (
-    "# myharness session memory\n"
+    "# teane session memory\n"
     "<!-- Append-only log of past sessions on this repository. -->\n"
     "<!-- Trimmed FIFO at memory.max_bytes; oldest sections drop first. -->\n"
 )
@@ -263,7 +263,7 @@ def append_session_note(
 
     try:
         # Serialise concurrent appenders via an fcntl lock on a sibling
-        # lock file. Without this, two ``harness run`` processes pointing
+        # lock file. Without this, two ``teane run`` processes pointing
         # at the same repo memory file could both read the same ``prior``
         # blob, both write back a tmp + rename, and the second writer
         # would overwrite the first writer's new section (audit §1.14).

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Interactive cross-platform bootstrap for myharness.
+"""Interactive cross-platform bootstrap for teane.
 
 Runs through eleven phases that mirror docs/installation.md, but with
 prompts and probes wired up so the operator types a few answers and
-ends with a green `harness doctor`. Stdlib only — runs anywhere a
+ends with a green `teane doctor`. Stdlib only — runs anywhere a
 Python 3.9+ interpreter is on PATH (we then locate Python 3.11+
 ourselves before creating the venv).
 
@@ -41,7 +41,7 @@ from typing import Optional
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 MODEL_CATALOGUE = REPO_ROOT / "harness" / "model_prices.json"
-DEFAULT_VENV = "~/.venvs/harness"
+DEFAULT_VENV = "~/.venvs/teane"
 CONFIG_DIR = REPO_ROOT / "config"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
@@ -298,7 +298,7 @@ def _venv_pip(venv_path: Path) -> Path:
 
 def _venv_harness(venv_path: Path) -> Path:
     if os.name == "nt":
-        return venv_path / "Scripts" / "harness.exe"
+        return venv_path / "Scripts" / "teane.exe"
     return venv_path / "bin" / "harness"
 
 
@@ -419,11 +419,11 @@ def _detect_shell_rc() -> Optional[Path]:
 
 
 # ---------------------------------------------------------------------------
-# Phase 9 — harness doctor
+# Phase 9 — teane doctor
 # ---------------------------------------------------------------------------
 
 def _run_harness_doctor(venv_path: Path, workspace: Path) -> tuple[int, str]:
-    """Run `harness doctor` from inside the venv. Returns (exit_code, output)."""
+    """Run `teane doctor` from inside the venv. Returns (exit_code, output)."""
     harness = _venv_harness(venv_path)
     if not harness.is_file():
         return 127, f"harness console script not found at {harness}"
@@ -434,9 +434,9 @@ def _run_harness_doctor(venv_path: Path, workspace: Path) -> tuple[int, str]:
         )
         return result.returncode, (result.stdout or "") + (result.stderr or "")
     except subprocess.TimeoutExpired:
-        return -1, "harness doctor timed out after 60s"
+        return -1, "teane doctor timed out after 60s"
     except OSError as exc:
-        return -1, f"harness doctor invocation failed: {exc}"
+        return -1, f"teane doctor invocation failed: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +523,7 @@ def _prompt_secret(message: str, *, interactive: bool) -> str:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Interactive bootstrap for myharness.",
+        description="Interactive bootstrap for teane.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--venv", default=DEFAULT_VENV,
@@ -537,14 +537,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--non-interactive", action="store_true",
                         help="Skip all prompts and use defaults; fail fast on missing required tools")
     parser.add_argument("--no-doctor", action="store_true",
-                        help="Skip the final `harness doctor` invocation")
+                        help="Skip the final `teane doctor` invocation")
     args = parser.parse_args(argv)
 
     interactive = not args.non_interactive
     venv_path = Path(os.path.expanduser(args.venv)).resolve()
 
     print(_bold(_green("=" * 64)))
-    print(_bold(_green("  myharness setup")))
+    print(_bold(_green("  teane setup")))
     print(_bold(_green("=" * 64)))
     print()
 
@@ -714,8 +714,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                                encoding="utf-8")
         _ok(f"Wrote {CONFIG_FILE}")
 
-    # ---- Phase 9: harness doctor -----------------------------------------
-    _banner(9, "Running harness doctor")
+    # ---- Phase 9: teane doctor -----------------------------------------
+    _banner(9, "Running teane doctor")
     if args.no_doctor:
         _ok("Skipped per --no-doctor.")
     else:
@@ -740,13 +740,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                 if proc.stderr.strip():
                     print(proc.stderr)
                 if proc.returncode == 0:
-                    _ok("harness doctor passed.")
+                    _ok("teane doctor passed.")
                 else:
-                    _warn(f"harness doctor exited {proc.returncode}. "
+                    _warn(f"teane doctor exited {proc.returncode}. "
                           "Re-check the failing rows above and consult "
                           "docs/installation.md §13.")
             except (subprocess.TimeoutExpired, OSError) as exc:
-                _warn(f"Could not invoke harness doctor: {exc}")
+                _warn(f"Could not invoke teane doctor: {exc}")
 
     # ---- Phase 10: Optional tools -----------------------------------------
     _banner(10, "Optional tools")
@@ -773,9 +773,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     print()
     print(_bold("Next steps:"))
     print(f"  1. Activate the venv:   {_green(activation)}")
-    smoke_cmd = _green('harness run -r <workspace> -p "<task>"')
+    smoke_cmd = _green('teane run -r <workspace> -p "<task>"')
     print(f"  2. Smoke run:           {smoke_cmd}")
-    print(f"  3. Re-verify:           {_green('harness doctor')}")
+    print(f"  3. Re-verify:           {_green('teane doctor')}")
     print()
     print(_bold("Reference docs:"))
     print("  - docs/installation.md       — full install guide (every step in detail)")

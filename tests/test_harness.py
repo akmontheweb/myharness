@@ -3615,7 +3615,7 @@ class TestAgentState:
     @pytest.mark.asyncio
     async def test_rewind_suspended_checkpoint_re_enters_loop(self):
         # Regression: Save & Quit ([s]) routes the graph to __end__ with
-        # hitl_suspend=True. A naive `harness resume` then ainvoke(None)s on
+        # hitl_suspend=True. A naive `teane resume` then ainvoke(None)s on
         # an already-terminated checkpoint and exits in milliseconds with
         # 0 nodes executed. The rewind helper detects this case and stamps
         # the checkpoint so the outgoing edge from human_intervention_node
@@ -4212,7 +4212,7 @@ class TestToolchainAdaptation:
         _cfg, allow_net, _img, net_adapted, _ro = _apply_toolchain_adaptation(
             "make build",
             {"docker_image": "ubuntu:22.04"},
-            True,  # already on, simulating a `harness run --allow-network` or workspace pin to True
+            True,  # already on, simulating a `teane run --allow-network` or workspace pin to True
         )
         # Idempotency: network already on, so we don't re-flag adaptation.
         assert allow_net is True
@@ -6195,7 +6195,7 @@ class TestCLI:
     def test_build_parser(self):
         from harness.cli import build_parser
         parser = build_parser()
-        assert parser.prog == "harness"
+        assert parser.prog == "teane"
 
     def test_spec_discovery_off_by_default(self):
         # --spec-discovery (renamed from --discover) defaults to false, so

@@ -1,5 +1,5 @@
 """P1.7 regression: workspace-level advisory lock prevents two concurrent
-`harness run` invocations against the same workspace from clobbering each
+`teane run` invocations against the same workspace from clobbering each
 other's patches.
 
 The lock is process-scoped via fcntl. We exercise it across two

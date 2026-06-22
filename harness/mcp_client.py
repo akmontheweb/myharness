@@ -255,7 +255,7 @@ class StdioMcpClient:
             {
                 "protocolVersion": _MCP_PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "myharness", "version": "1.0"},
+                "clientInfo": {"name": "teane", "version": "1.0"},
             },
             timeout=self.timeout_seconds,
         )

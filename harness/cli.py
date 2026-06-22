@@ -2,13 +2,13 @@
 CLI entry point, subcommand routing, HITL interactive menu loop, and configuration discovery.
 
 Provides the following commands:
-    harness run     — Primary execution entry point. Runs the full agent graph.
-    harness resume  — Resume a crashed/interrupted session from its checkpoint.
-    harness status  — Read-only inspection of a checkpointed session.
-    harness doctor  — Run first-run healthchecks (git, API keys, sandbox, DB, config).
-    harness purge   — Manually wipe all checkpoint data.
+    teane run     — Primary execution entry point. Runs the full agent graph.
+    teane resume  — Resume a crashed/interrupted session from its checkpoint.
+    teane status  — Read-only inspection of a checkpointed session.
+    teane doctor  — Run first-run healthchecks (git, API keys, sandbox, DB, config).
+    teane purge   — Manually wipe all checkpoint data.
 
-Use `harness -h` or `harness <command> -h` for detailed help on each subcommand.
+Use `teane -h` or `teane <command> -h` for detailed help on each subcommand.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ def _get_harness_version() -> str:
     """
     try:
         from importlib.metadata import PackageNotFoundError, version
-        return version("ai-agent-harness")
+        return version("teane")
     except (PackageNotFoundError, ImportError, Exception):  # noqa: BLE001
         return "(unknown)"
 
@@ -217,7 +217,7 @@ def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
                 return False
         else:
             logger.error(
-                "[lock] Workspace %s is locked by another live `harness run` "
+                "[lock] Workspace %s is locked by another live `teane run` "
                 "session. Refusing to start so the two don't clobber each "
                 "other's patches.\n"
                 "  Wait for the other session to finish, or pass --force-lock "
@@ -255,7 +255,7 @@ def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
 # 1. Configuration Discovery — single canonical source
 # ---------------------------------------------------------------------------
 #
-# The harness reads ONE config file and only one: <myharness_root>/config/config.json.
+# The harness reads ONE config file and only one: <teane_root>/config/config.json.
 # There are no fallbacks, no per-workspace overrides, no auto-generated files.
 # Per-project differences (build command, docker image, network) are handled
 # by the harness's existing auto-detection (graph._toolchain_image_for,
@@ -287,7 +287,7 @@ class ConfigError(Exception):
 
 def _get_global_config_path() -> str:
     """Resolve the repo-root canonical config path:
-    ``<myharness_root>/config/config.json``.
+    ``<teane_root>/config/config.json``.
 
     The harness package lives at ``<root>/harness/``, so the parent of
     this module's directory is the repo root.
@@ -318,7 +318,7 @@ def load_raw_config() -> dict[str, Any]:
         raise ConfigError(
             f"Canonical config not found at {path}. "
             f"The harness reads exactly one config file and it must exist. "
-            f"Create it (see <myharness_root>/config/config.json in the repo "
+            f"Create it (see <teane_root>/config/config.json in the repo "
             f"for the documented schema) before re-running the harness."
         )
 
@@ -471,18 +471,18 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # `<<<MCP_CALL>>>` blocks. See harness/mcp_client.py.
     "mcp",
     # GitHub integration. Pure config-side knobs (gh_path); subcommands
-    # (`harness gh issue / pr-create / pr-comment`) work without a
+    # (`teane gh issue / pr-create / pr-comment`) work without a
     # config block when `gh` is on PATH.
     "github",
-    # Semantic retrieval index. Built via `harness index build` and
+    # Semantic retrieval index. Built via `teane index build` and
     # injected into the planner context when `repo_index.enabled=true`.
     # Default off — the planner is unchanged when disabled. See
     # harness/repo_index.py.
     "repo_index",
-    # Cron-driven scheduled job daemon. Started with `harness schedule
+    # Cron-driven scheduled job daemon. Started with `teane schedule
     # run`. Default off. See harness/schedule.py.
     "schedule",
-    # Read-only web dashboard. Started with `harness web`. Default
+    # Read-only web dashboard. Started with `teane web`. Default
     # bind 127.0.0.1; optional bearer-token auth. See harness/dashboard.py.
     "dashboard",
     # Optional org-wide deployment policy (reverse proxy, TLS strategy,
@@ -570,7 +570,7 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "test_generation": frozenset({
         "enabled", "max_iterations",
     }),
-    # P2.7: cost-metrics aggregation (harness metrics subcommand).
+    # P2.7: cost-metrics aggregation (teane metrics subcommand).
     "metrics": frozenset({
         "burn_rate_window_minutes", "metrics_dir",
     }),
@@ -1746,9 +1746,9 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
             print("=" * 60)
             print("Session saved to checkpoint.")
             print("Resume later with:")
-            print(f"  harness resume --session-id {session_id}")
+            print(f"  teane resume --session-id {session_id}")
             if workspace and workspace != os.getcwd():
-                print(f"  harness resume --session-id {session_id} -r {workspace}")
+                print(f"  teane resume --session-id {session_id} -r {workspace}")
             print("=" * 60)
             print()
             logger.info("[gatekeeper] %s suspended by developer. Session: %s", gate_label, session_id)
@@ -1769,7 +1769,7 @@ def discovery_interview_loop(state: dict[str, Any]) -> dict[str, Any]:
     Walks the operator through one question at a time. Each question shows the
     LLM's recommended answer (from the discovery node's ``suggested_answer``
     field); pressing Enter accepts it, typing text overrides it. Commands:
-        SUSPEND — save & quit (resumable via ``harness resume``).
+        SUSPEND — save & quit (resumable via ``teane resume``).
         DONE    — finish the round now. If critical questions remain
                   unanswered, the loop refuses to finalize and routes back
                   to the discovery node for a follow-up round.
@@ -2026,9 +2026,9 @@ def _discovery_suspend(
     print("=" * 60)
     print("Session saved to checkpoint.")
     print("Resume later with:")
-    print(f"  harness resume --session-id {session_id}")
+    print(f"  teane resume --session-id {session_id}")
     if workspace and workspace != os.getcwd():
-        print(f"  harness resume --session-id {session_id} -r {workspace}")
+        print(f"  teane resume --session-id {session_id} -r {workspace}")
     print("=" * 60)
     print()
     logger.info(
@@ -2321,9 +2321,9 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
             print("=" * 60)
             print("Session saved to checkpoint.")
             print("Resume later with:")
-            print(f"  harness resume --session-id {session_id}")
+            print(f"  teane resume --session-id {session_id}")
             if workspace_path and workspace_path != os.getcwd():
-                print(f"  harness resume --session-id {session_id} -r {workspace_path}")
+                print(f"  teane resume --session-id {session_id} -r {workspace_path}")
             print("=" * 60)
             print()
             logger.info("[HITL] Session suspended by developer. Session: %s", session_id)
@@ -3723,7 +3723,7 @@ async def _purge_workspace_checkpoints(
     association is indirect (the workspace path lives in the serialized
     LangGraph checkpoint blob under ``channel_values.workspace_path``),
     so we enumerate sessions via :func:`harness.storage.list_all_sessions`
-    — the same canonical path ``harness status`` already uses — and match
+    — the same canonical path ``teane status`` already uses — and match
     by ``os.path.realpath`` to absorb symlink aliases.
 
     Best-effort: failure to enumerate or delete is logged + swallowed so
@@ -3990,7 +3990,7 @@ async def _maybe_start_mcp_pool(config: dict[str, Any]) -> Optional[Any]:
 
 async def cmd_run(args: argparse.Namespace) -> int:
     """
-    Execute the `harness run` subcommand.
+    Execute the `teane run` subcommand.
 
     Steps:
         1. Resolve workspace path.
@@ -4002,10 +4002,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
         7. Handle HITL breakpoints if triggered.
 
     Examples:
-        harness run -w /path/to/repo -p "Add JWT authentication"
-        harness run -w ./myproject -p "Refactor the auth module" --new-build false
+        teane run -w /path/to/repo -p "Add JWT authentication"
+        teane run -w ./myproject -p "Refactor the auth module" --new-build false
     """
-    # Bare invocation: `harness run` with no --workspace and no --prompt.
+    # Bare invocation: `teane run` with no --workspace and no --prompt.
     # Drop into the interactive setup wizard, which fills in args.workspace,
     # args.prompt, args.git, args.new_build, and args.spec_discovery before we
     # continue — OR, when the operator picks "resume existing session",
@@ -4082,7 +4082,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     )
 
     # P1.7: workspace-level advisory lock. Without this, two concurrent
-    # `harness run -r <same workspace>` invocations both read and write
+    # `teane run -r <same workspace>` invocations both read and write
     # source files in interleaved order — silently corrupting each other's
     # patches. The lock holds for the lifetime of this process; the OS
     # releases it on exit. Pass --force-lock to override (e.g. recovering
@@ -4223,7 +4223,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
             "To proceed:\n"
             "  1. Create the folder if it does not exist.\n"
             "  2. Add one or more `.txt` files describing the changes.\n"
-            "  3. Re-run `harness run`.\n\n"
+            "  3. Re-run `teane run`.\n\n"
             "If you are starting a fresh build, pass --new-build true\n"
             "instead — that flow uses `product_spec_dir` and skips this\n"
             "check.\n",
@@ -4710,7 +4710,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         git_guardian.rollback()
         git_guardian.pop_stash()
         # Commit any in-flight checkpoint write before close so that
-        # `harness resume --session-id <id>` can recover the last state
+        # `teane resume --session-id <id>` can recover the last state
         # the user saw on screen. Without the commit, aiosqlite drops
         # everything that wasn't already flushed (audit §5.6).
         try:
@@ -4726,7 +4726,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     total_cost = token_tracker.get("total_cost_usd", 0.0)
 
     # Distinguish HITL Save & Quit (intentional pause; operator will
-    # `harness resume`) from a hard failure. Previously both took the same
+    # `teane resume`) from a hard failure. Previously both took the same
     # exit_code != 0 branch and the rollback wiped the LLM's in-flight
     # work — observed in session d880f762 where pressing [s] deleted 21
     # generated app/ + tests/ + requirements.txt files even though the
@@ -4738,7 +4738,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     if hitl_suspend:
         # Suspend = "I'll come back to this." Leave the workspace EXACTLY
         # as the LLM left it on the agent/patch-<session> branch so a
-        # subsequent `harness resume --session-id <id>` picks up against
+        # subsequent `teane resume --session-id <id>` picks up against
         # the same files. The pre-session stash stays parked (the operator
         # can list it with `git stash list` and pop it manually if they
         # need the prior work); popping it here could merge-conflict with
@@ -4746,7 +4746,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         agent_branch = getattr(git_guardian, "_patch_branch", None) or "agent/patch-<unknown>"
         logger.info(
             "[cli] HITL suspend: leaving %d LLM-modified file(s) on branch "
-            "'%s'. Resume with `harness resume --session-id %s` to continue "
+            "'%s'. Resume with `teane resume --session-id %s` to continue "
             "from the same workspace state.",
             len(modified_files), agent_branch, session_id,
         )
@@ -4815,7 +4815,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     await _drain_mcp_pools()
 
     # Persist a one-line entry to the per-repo memory file so the next
-    # `harness run` against this workspace sees the prior outcome in
+    # `teane run` against this workspace sees the prior outcome in
     # the planner context. Wrapped: failures must not change the
     # exit code.
     _append_repo_memory_safely(
@@ -4832,14 +4832,14 @@ async def cmd_run(args: argparse.Namespace) -> int:
 
 async def cmd_resume(args: argparse.Namespace) -> int:
     """
-    Execute the `harness resume` subcommand.
+    Execute the `teane resume` subcommand.
 
     Restores a previously checkpointed session from SQLite and resumes
     graph execution from the exact checkpoint boundary.
 
     Example:
-        harness resume --session-id my-session-abc123
-        harness resume --session-id my-session -r /path/to/repo
+        teane resume --session-id my-session-abc123
+        teane resume --session-id my-session -r /path/to/repo
     """
     from harness.storage import HarnessAsyncSqliteSaver
 
@@ -4849,7 +4849,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
 
     # Acquire the workspace lock (audit §5.1). cmd_run already takes the
     # lock; resume previously did not, so two concurrent
-    # ``harness resume --session-id X`` invocations against the same
+    # ``teane resume --session-id X`` invocations against the same
     # workspace could clobber each other's patches.
     force = bool(getattr(args, "force_lock", False))
     lock_handle = _acquire_workspace_lock(workspace_path, force=force)
@@ -4957,7 +4957,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         if row is None:
             logger.error(
                 "[resume] No checkpoint found for session '%s'. "
-                "Use `harness status --all` to list available sessions.",
+                "Use `teane status --all` to list available sessions.",
                 args.session_id,
             )
             return 1
@@ -4967,9 +4967,9 @@ async def cmd_resume(args: argparse.Namespace) -> int:
             logger.error(
                 "[resume] Checkpoint for session '%s' is corrupted: %s\n"
                 "  Options:\n"
-                "    - Start a fresh session with `harness run -r %s -p '<prompt>'`.\n"
+                "    - Start a fresh session with `teane run -r %s -p '<prompt>'`.\n"
                 "    - Restore checkpoints.db from a known-good backup.\n"
-                "    - Run `harness purge --session-id %s` to drop only this session.",
+                "    - Run `teane purge --session-id %s` to drop only this session.",
                 args.session_id, exc, workspace_path, args.session_id,
             )
             return 1
@@ -4984,8 +4984,8 @@ async def cmd_resume(args: argparse.Namespace) -> int:
                 "[resume] Checkpoint for session '%s' has an incompatible schema: %s\n"
                 "  Options:\n"
                 "    - Upgrade or downgrade the harness to match the checkpoint's version.\n"
-                "    - Start a fresh session with `harness run -r %s -p '<prompt>'`.\n"
-                "    - Run `harness purge --session-id %s` to drop only this session.",
+                "    - Start a fresh session with `teane run -r %s -p '<prompt>'`.\n"
+                "    - Run `teane purge --session-id %s` to drop only this session.",
                 args.session_id, exc, workspace_path, args.session_id,
             )
             return 1
@@ -4998,7 +4998,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
 
     # One-screen diagnostic: tell the user exactly what we're about to
     # resume so they don't fly blind. Read-only — re-uses the same
-    # inspect_session() helper that powers `harness status`. Failures
+    # inspect_session() helper that powers `teane status`. Failures
     # here must never block resume itself, so wrap in a broad except.
     try:
         from harness.storage import inspect_session as _inspect_session
@@ -5090,7 +5090,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
         agent_branch = getattr(git_guardian, "_patch_branch", None) or "agent/patch-<unknown>"
         logger.info(
             "[cli] HITL suspend: leaving %d LLM-modified file(s) on branch "
-            "'%s'. Resume with `harness resume --session-id %s` to continue "
+            "'%s'. Resume with `teane resume --session-id %s` to continue "
             "from the same workspace state.",
             len(modified_files), agent_branch, args.session_id,
         )
@@ -5122,15 +5122,15 @@ async def cmd_resume(args: argparse.Namespace) -> int:
 
 async def cmd_status(args: argparse.Namespace) -> int:
     """
-    Execute the `harness status` subcommand.
+    Execute the `teane status` subcommand.
 
     Reads the SQLite checkpoint database read-only and prints a clean
     text snapshot of the specified session's state without triggering
     any graph execution.
 
     Examples:
-        harness status --session-id my-session
-        harness status --all
+        teane status --session-id my-session
+        teane status --all
     """
     from harness.storage import HarnessAsyncSqliteSaver, inspect_session, list_all_sessions
 
@@ -5193,7 +5193,7 @@ async def cmd_status(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 3b. `harness doctor` — first-run healthcheck
+# 3b. `teane doctor` — first-run healthcheck
 # ---------------------------------------------------------------------------
 
 # ANSI color codes for the doctor report. Skipped when stdout is not a TTY
@@ -5254,7 +5254,7 @@ def _doctor_check_git(workspace_path: str) -> tuple[str, str]:
     if head_result.returncode != 0:
         return "warn", (
             f"git repo at {workspace_path} has no commits yet (unborn HEAD); "
-            "make an initial commit before 'harness run' to enable speculative repair"
+            "make an initial commit before 'teane run' to enable speculative repair"
         )
     return "pass", f"git repo detected at {workspace_path}"
 
@@ -5722,7 +5722,7 @@ def _doctor_check_checkpoint_db(config: dict[str, Any]) -> tuple[str, str]:
                 "warn",
                 f"writable: {expanded} — but {len(corrupted)} recent checkpoint(s) "
                 f"failed to deserialize (threads: {preview}). Run "
-                f"`harness purge --session-id <id>` to drop them.",
+                f"`teane purge --session-id <id>` to drop them.",
             )
     except sqlite3.OperationalError:
         # `checkpoints` table not yet created — fresh DB, nothing to validate.
@@ -5761,7 +5761,7 @@ def _doctor_check_patcher_mode(config: dict[str, Any]) -> tuple[str, str]:
 
 
 def _doctor_check_global_config() -> tuple[str, str]:
-    """The in-repo global config file at <myharness_root>/config/config.json exists.
+    """The in-repo global config file at <teane_root>/config/config.json exists.
 
     Without it, discover_config falls back to harness/cli.json's empty-routing
     defaults and the first LLM dispatch will fail with no model configured.
@@ -5808,8 +5808,8 @@ def _doctor_check_product_spec(
     absolute paths, no `..`). The harness mandates the spec folder lives
     inside the workspace so the operator's product description is
     versioned alongside the code that implements it. The operator should
-    hear about a misconfiguration in `harness doctor` before they try
-    `harness run`.
+    hear about a misconfiguration in `teane doctor` before they try
+    `teane run`.
     """
     spec_dirname = config.get("product_spec_dir")
     if spec_dirname is None:
@@ -5858,9 +5858,9 @@ def _doctor_check_tree_sitter() -> tuple[str, str]:
     (``harness/impact.py``). When the pip package
     ``tree-sitter-language-pack`` is missing or its bundled grammars stop
     loading on a new Python ABI, both subsystems silently fall back to
-    regex extraction — every harness run continues to work but loses
+    regex extraction — every teane run continues to work but loses
     structural awareness, and no operator-facing signal warns about it.
-    This check surfaces that degradation BEFORE the next harness run.
+    This check surfaces that degradation BEFORE the next teane run.
 
     Returns:
       - ``"pass"`` when every supported grammar loads and parses a tiny
@@ -5939,17 +5939,17 @@ def _doctor_check_tree_sitter() -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# `harness web start` / `harness web stop` — marker-driven lifecycle
+# `teane web start` / `teane web stop` — marker-driven lifecycle
 # ---------------------------------------------------------------------------
 #
 # A single marker file at ~/.harness/web.lock records the live web
 # server's pid, host, port, mode (foreground / background), log path,
-# and start timestamp. It's the single source of truth `harness web
+# and start timestamp. It's the single source of truth `teane web
 # stop` reads to find and stop the process. The marker is written
 # atomically (tmp + os.replace) so a crash mid-write doesn't leave a
 # half-baked file behind, and is removed both during clean shutdown
 # (signal handler / finally block in cmd_web_start) and at the top of
-# `harness web stop`. A stale marker (pid no longer alive) is treated
+# `teane web stop`. A stale marker (pid no longer alive) is treated
 # as no-server-running and silently cleaned up on the next start/stop.
 
 _WEB_MARKER_FILENAME = "web.lock"
@@ -6028,9 +6028,9 @@ def _utc_iso_now() -> str:
 
 
 def cmd_web_start(args: argparse.Namespace) -> int:
-    """``harness web start [--host H] [--port N] [--background yes/no]``
+    """``teane web start [--host H] [--port N] [--background yes/no]``
 
-    Writes ``~/.harness/web.lock`` so ``harness web stop`` can find the
+    Writes ``~/.harness/web.lock`` so ``teane web stop`` can find the
     process later. Refuses to start a second instance when the marker
     points at a live pid — the operator must stop the running one
     first. A stale marker (pid dead) is treated as no-server-running
@@ -6046,11 +6046,11 @@ def cmd_web_start(args: argparse.Namespace) -> int:
             mode = existing.get("mode", "?")
             log_path = existing.get("log_path") or "(none — foreground mode)"
             print(
-                f"error: a harness web instance is already running "
+                f"error: a teane web instance is already running "
                 f"(pid {ex_pid}, http://{host}:{port}, mode={mode}).\n"
                 f"  marker: {_web_marker_path()}\n"
                 f"  log:    {log_path}\n"
-                f"  Run 'harness web stop' first, then start a new instance.",
+                f"  Run 'teane web stop' first, then start a new instance.",
                 file=sys.stderr,
             )
             return 1
@@ -6147,13 +6147,13 @@ def _web_start_foreground(*, host: str, port: int) -> int:
             ).start()
 
         # Catch every signal that's *catchable* and means "please stop":
-        #   SIGTERM — `harness web stop`, `kill <pid>`, init shutdown
+        #   SIGTERM — `teane web stop`, `kill <pid>`, init shutdown
         #   SIGINT  — Ctrl-C in the terminal
         #   SIGHUP  — controlling terminal closed (parent shell exit)
         #   SIGQUIT — Ctrl-\ on most terminals
         # SIGKILL (kill -9) and SIGSTOP cannot be caught by any process —
         # the OS terminates immediately. The stale marker left behind
-        # is auto-cleaned on the next `harness web start`.
+        # is auto-cleaned on the next `teane web start`.
         for sig_name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"):
             sig = getattr(_signal, sig_name, None)
             if sig is None:
@@ -6194,7 +6194,7 @@ def _web_start_foreground(*, host: str, port: int) -> int:
             f"[web] listening on http://{dash_cfg.host}:{dash_cfg.port}/  "
             f"(pid {os.getpid()})\n"
             f"[web] marker: {_web_marker_path()}\n"
-            f"[web] stop with: harness web stop  (or Ctrl-C)",
+            f"[web] stop with: teane web stop  (or Ctrl-C)",
         )
 
         try:
@@ -6329,13 +6329,13 @@ def _web_start_background(*, host: str, port: int) -> int:
         f"[web] started in background (pid {proc.pid}, http://{host}:{port}/).\n"
         f"[web] logs:   {log_path}\n"
         f"[web] marker: {_web_marker_path()}\n"
-        f"[web] stop with: harness web stop",
+        f"[web] stop with: teane web stop",
     )
     return 0
 
 
 def cmd_web_stop(args: argparse.Namespace) -> int:
-    """``harness web stop`` — read the marker, delete it, signal the
+    """``teane web stop`` — read the marker, delete it, signal the
     pid, and confirm the process exited. Idempotent: a missing marker
     is reported as "no server running" with exit code 0 so scripts can
     safely call it twice."""
@@ -6440,7 +6440,7 @@ async def cmd_schedule_run(args: argparse.Namespace) -> int:
         return 1
     from harness.schedule import ScheduleDaemon
     daemon = ScheduleDaemon(cfg)
-    print(f"harness schedule — {len(cfg.jobs)} job(s), tick={cfg.tick_seconds}s. Ctrl-C to stop.")
+    print(f"teane schedule — {len(cfg.jobs)} job(s), tick={cfg.tick_seconds}s. Ctrl-C to stop.")
     return await daemon.run_forever()
 
 
@@ -6565,11 +6565,11 @@ def cmd_schedule_history(args: argparse.Namespace) -> int:
 
 
 async def cmd_chat(args: argparse.Namespace) -> int:
-    """``harness chat`` — interactive refinement REPL (#8).
+    """``teane chat`` — interactive refinement REPL (#8).
 
     Builds the same gateway / redactor / skill registry that ``cmd_run``
     uses, then hands control to :func:`harness.chat.run_chat`. The
-    workspace lock is acquired so a concurrent ``harness run`` against
+    workspace lock is acquired so a concurrent ``teane run`` against
     the same workspace can't corrupt patches.
     """
     workspace_path = (
@@ -6635,7 +6635,7 @@ def _resolve_repo_index_config(workspace_path: str) -> "Any":
 
 
 def cmd_index_build(args: argparse.Namespace) -> int:
-    """``harness index build`` — (re)build the workspace's repo index."""
+    """``teane index build`` — (re)build the workspace's repo index."""
     workspace_path = (
         os.path.abspath(args.workspace) if getattr(args, "workspace", None)
         else os.getcwd()
@@ -6670,7 +6670,7 @@ def cmd_index_status(args: argparse.Namespace) -> int:
     stats = get_stats(workspace_path, cfg)
     if stats is None:
         print(f"No index built yet for {workspace_path}.")
-        print("Run `harness index build` to create one.")
+        print("Run `teane index build` to create one.")
         return 0
     print(f"Workspace: {workspace_path}")
     print(f"Workspace ID: {stats.workspace_id}")
@@ -6698,9 +6698,9 @@ def cmd_gh_issue(args: argparse.Namespace) -> int:
 
     Example::
 
-        harness gh issue --repo akmontheweb/myharness --number 42
+        teane gh issue --repo akmontheweb/teane --number 42
 
-    Subsequent ``harness run`` against the workspace picks up the new
+    Subsequent ``teane run`` against the workspace picks up the new
     CR file via the existing change-request flow.
     """
     workspace_path = (
@@ -6731,7 +6731,7 @@ def cmd_gh_issue(args: argparse.Namespace) -> int:
         return 1
     print(f"Wrote {path}")
     print(
-        "Next: run `harness run -w {} -p \"fix CR\" --new-build false` "
+        "Next: run `teane run -w {} -p \"fix CR\" --new-build false` "
         "to process the new change request.".format(workspace_path)
     )
     return 0
@@ -6861,7 +6861,7 @@ async def _doctor_check_mcp(
 
 async def cmd_doctor(args: argparse.Namespace) -> int:
     """
-    Execute the `harness doctor` subcommand.
+    Execute the `teane doctor` subcommand.
 
     Runs healthchecks and prints a green/yellow/red summary. Under the
     single-source-config contract the very first check is "config" —
@@ -6875,8 +6875,8 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
     rest of the checks from running.
 
     Examples:
-        harness doctor
-        harness doctor -r /path/to/repo
+        teane doctor
+        teane doctor -r /path/to/repo
     """
     workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
     # Silence the chatty INFO logging from discover_config; we surface
@@ -6931,7 +6931,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
 
     print()
     print("=" * 72)
-    print(f"harness doctor — workspace: {workspace_path}")
+    print(f"teane doctor — workspace: {workspace_path}")
     print(f"canonical config: {_get_global_config_path()}")
     print("=" * 72)
     for label, (status, detail) in checks:
@@ -6946,7 +6946,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
         if "config" in failures:
             print(
                 "Fix the config file at the path shown above and re-run "
-                "`harness doctor` — the harness will not proceed with "
+                "`teane doctor` — the harness will not proceed with "
                 "invalid configuration."
             )
         return 1
@@ -6962,7 +6962,7 @@ async def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_pre_flight(args: argparse.Namespace) -> int:
-    """Execute the `harness pre-flight` subcommand.
+    """Execute the `teane pre-flight` subcommand.
 
     Standalone machine-readiness probe — no workspace, no config required.
     Auto-detects the host OS and runs an OS-appropriate probe set, then
@@ -6970,10 +6970,10 @@ def cmd_pre_flight(args: argparse.Namespace) -> int:
     if any required tool is missing.
 
     Examples:
-        harness pre-flight
-        harness pre-flight --quick           # skip live network probe
-        harness pre-flight --json            # CI-friendly output
-        harness pre-flight --platform windows  # verify Windows install docs from Linux
+        teane pre-flight
+        teane pre-flight --quick           # skip live network probe
+        teane pre-flight --json            # CI-friendly output
+        teane pre-flight --platform windows  # verify Windows install docs from Linux
     """
     from harness import preflight as _preflight
 
@@ -7007,13 +7007,13 @@ def cmd_pre_flight(args: argparse.Namespace) -> int:
 
 async def cmd_purge(args: argparse.Namespace) -> int:
     """
-    Execute the `harness purge` subcommand.
+    Execute the `teane purge` subcommand.
 
     Wipes all checkpoint data from the SQLite database.
 
     Examples:
-        harness purge --session-id my-session
-        harness purge --all
+        teane purge --session-id my-session
+        teane purge --all
     """
     workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
     config = discover_config(workspace_path)
@@ -7067,7 +7067,7 @@ async def cmd_purge(args: argparse.Namespace) -> int:
 
 
 async def cmd_cache_clear(args: argparse.Namespace) -> int:
-    """Execute ``harness cache clear``.
+    """Execute ``teane cache clear``.
 
     Enumerates harness-owned Docker volumes (those prefixed with
     ``harness-`` by default; configurable via ``sandbox.cache_volumes_prefix``)
@@ -7078,10 +7078,10 @@ async def cmd_cache_clear(args: argparse.Namespace) -> int:
     is treated as success, not an error.
 
     Examples:
-        harness cache clear
-        harness cache clear --session-id sess-abc123
-        harness cache clear --yes  # skip the confirmation prompt
-        harness cache clear --dry-run
+        teane cache clear
+        teane cache clear --session-id sess-abc123
+        teane cache clear --yes  # skip the confirmation prompt
+        teane cache clear --dry-run
     """
     workspace_path = os.path.abspath(args.workspace) if args.workspace else os.getcwd()
     try:
@@ -7127,10 +7127,10 @@ async def cmd_cache_clear(args: argparse.Namespace) -> int:
 
     if not candidates:
         scope = f"session '{args.session_id}'" if args.session_id else "all sessions"
-        print(f"No harness cache volumes found for {scope}.")
+        print(f"No teane cache volumes found for {scope}.")
         return 0
 
-    print(f"Found {len(candidates)} harness cache volume(s):")
+    print(f"Found {len(candidates)} teane cache volume(s):")
     for name in candidates:
         print(f"  {name}")
     if args.dry_run:
@@ -7179,17 +7179,17 @@ _DEFAULT_METRICS_DIR = "~/.harness/metrics"
 
 
 async def cmd_metrics(args: argparse.Namespace) -> int:
-    """Execute the `harness metrics` subcommand (P2.7).
+    """Execute the `teane metrics` subcommand (P2.7).
 
     Aggregates per-session cost/usage from the JSONL logs and renders it
     as a human report (stdout), JSON dump, Prometheus exposition text,
     or roll-up table across every session in the log directory.
 
     Examples:
-        harness metrics --session-id abc123
-        harness metrics --all
-        harness metrics --session-id abc123 --prometheus
-        harness metrics --all --json --output -
+        teane metrics --session-id abc123
+        teane metrics --all
+        teane metrics --session-id abc123 --prometheus
+        teane metrics --all --json --output -
     """
     from harness.metrics import (
         aggregate_session,
@@ -7313,32 +7313,32 @@ def _emit_output(
 def build_parser() -> argparse.ArgumentParser:
     """Construct the full CLI argument parser with all subcommands."""
     parser = argparse.ArgumentParser(
-        prog="harness",
+        prog="teane",
         description=(
             "AI Agent Harness — Production-grade, model-agnostic LangGraph agent\n"
             "for autonomous code generation, sandboxed builds, and bulletproof persistence.\n\n"
             "Quick Start:\n"
-            "  harness run -r /path/to/repo -p \"Your engineering task description\"\n"
-            "  harness -h                     Show this help\n"
-            "  harness --version              Print the installed harness version\n"
-            "  harness run -h                 Show run subcommand help\n"
-            "  harness status --all           List all checkpointed sessions\n"
+            "  teane run -r /path/to/repo -p \"Your engineering task description\"\n"
+            "  teane -h                       Show this help\n"
+            "  teane --version                Print the installed teane version\n"
+            "  teane run -h                   Show run subcommand help\n"
+            "  teane status --all             List all checkpointed sessions\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  harness run -r ./myproject -p \"Add JWT authentication\"\n"
-            "  harness run -r /path/to/repo -p \"Refactor logging\" --manifest notes.txt\n"
-            "  harness resume --session-id abc123\n"
-            "  harness status --session-id abc123\n"
-            "  harness purge --all\n"
+            "  teane run -r ./myproject -p \"Add JWT authentication\"\n"
+            "  teane run -r /path/to/repo -p \"Refactor logging\" --manifest notes.txt\n"
+            "  teane resume --session-id abc123\n"
+            "  teane status --session-id abc123\n"
+            "  teane purge --all\n"
         ),
     )
     parser.add_argument(
         "--version", "-v",
         action="version",
-        version=f"harness {_get_harness_version()}",
-        help="Print the installed harness version and exit.",
+        version=f"teane {_get_harness_version()}",
+        help="Print the installed teane version and exit.",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
@@ -7359,10 +7359,10 @@ def build_parser() -> argparse.ArgumentParser:
             f"Expected true|false (or yes|no, 1|0), got {value!r}"
         )
 
-    # --- `harness run` ---
+    # --- `teane run` ---
     run_parser = subparsers.add_parser("run", help="Execute the agent graph on a workspace")
     # --workspace and --prompt are NOT required at the argparse level so that
-    # `harness run` with no flags can drop the user into the interactive
+    # `teane run` with no flags can drop the user into the interactive
     # setup wizard (harness.wizard.run_setup_wizard). The handler enforces
     # "both or neither" — passing only one still errors out the same way.
     run_parser.add_argument(
@@ -7482,7 +7482,7 @@ def build_parser() -> argparse.ArgumentParser:
             "for change-request runs)."
         ),
     )
-    # P1.7: workspace-lock override. When another live `harness run` holds
+    # P1.7: workspace-lock override. When another live `teane run` holds
     # the workspace's session lock, the new run normally refuses to start.
     # Pass this flag to take the lock anyway — meant for the recovery case
     # where a previous process crashed without releasing it.
@@ -7493,7 +7493,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="force_lock",
         help=(
             "Bypass the workspace session lock. Use ONLY when the previous "
-            "harness run process crashed and the .harness_session.lock file "
+            "teane run process crashed and the .harness_session.lock file "
             "is stale; running two live sessions concurrently against one "
             "workspace will corrupt each other's patches."
         ),
@@ -7627,7 +7627,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # --- `harness resume` ---
+    # --- `teane resume` ---
     resume_parser = subparsers.add_parser("resume", help="Resume a crashed or interrupted session from its checkpoint")
     resume_parser.add_argument(
         "--session-id",
@@ -7675,11 +7675,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Enable GitGuardian for the resumed session. Should match the "
             "value used when the session was originally started; passing a "
             "different value than the original run may corrupt state. "
-            "Defaults to false (matches `harness run` default)."
+            "Defaults to false (matches `teane run` default)."
         ),
     )
 
-    # --- `harness status` ---
+    # --- `teane status` ---
     status_parser = subparsers.add_parser("status", help="Read-only inspection of a checkpointed session")
     status_parser.add_argument(
         "--session-id",
@@ -7698,7 +7698,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
-    # --- `harness doctor` ---
+    # --- `teane doctor` ---
     doctor_parser = subparsers.add_parser(
         "doctor",
         help="Run first-run healthchecks (git, api keys, sandbox, db, config)",
@@ -7715,7 +7715,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable debug-level logging.",
     )
 
-    # --- `harness pre-flight` ---
+    # --- `teane pre-flight` ---
     pre_flight_parser = subparsers.add_parser(
         "pre-flight",
         help="Probe this machine for tools and runtimes the harness needs.",
@@ -7723,7 +7723,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Standalone readiness check. Does NOT need a workspace or config. "
             "Auto-detects your OS (Windows / macOS / Linux) and prints a "
             "coloured checklist of required and optional tools, with the "
-            "install command for each missing item. Run BEFORE `harness doctor`."
+            "install command for each missing item. Run BEFORE `teane doctor`."
         ),
     )
     pre_flight_parser.add_argument(
@@ -7751,7 +7751,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Machine-readable JSON output.",
     )
 
-    # --- `harness purge` ---
+    # --- `teane purge` ---
     purge_parser = subparsers.add_parser("purge", help="Manually wipe checkpoint data")
     purge_parser.add_argument(
         "--all",
@@ -7770,7 +7770,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
-    # --- `harness metrics` ---
+    # --- `teane metrics` ---
     metrics_parser = subparsers.add_parser(
         "metrics",
         help="Per-session cost / burn-rate / Prometheus aggregation from logs",
@@ -7815,15 +7815,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
-    # --- `harness web` (#14) — start / stop subcommands ---
+    # --- `teane web` (#14) — start / stop subcommands ---
     dashboard_parser = subparsers.add_parser(
         "web",
         help="Carbon-styled web UI over the harness's on-disk state.",
         description=(
-            "Manage the harness web UI.\n\n"
+            "Manage the teane web UI.\n\n"
             "The dashboard is a single-instance server per user — its pid, "
             "host, and port are recorded in a marker file at ~/.harness/web.lock "
-            "so 'harness web stop' can find and stop it cleanly. A second "
+            "so 'teane web stop' can find and stop it cleanly. A second "
             "'web start' refuses to launch while a live instance is already "
             "registered; stop it first.\n\n"
             "Subcommands:\n"
@@ -7832,11 +7832,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Examples:\n"
-            "  harness web start                          # foreground, http://127.0.0.1:9000\n"
-            "  harness web start --port 8080              # foreground on port 8080\n"
-            "  harness web start --host 0.0.0.0           # bind all interfaces\n"
-            "  harness web start --background yes         # detach; logs to ~/.harness/web.log\n"
-            "  harness web stop                           # graceful shutdown\n\n"
+            "  teane web start                          # foreground, http://127.0.0.1:9000\n"
+            "  teane web start --port 8080              # foreground on port 8080\n"
+            "  teane web start --host 0.0.0.0           # bind all interfaces\n"
+            "  teane web start --background yes         # detach; logs to ~/.harness/web.log\n"
+            "  teane web stop                           # graceful shutdown\n\n"
             "Files:\n"
             "  ~/.harness/web.lock     pid + host + port + mode (created at start, removed at stop)\n"
             "  ~/.harness/web.log      stdout/stderr (background mode only)\n"
@@ -7847,14 +7847,14 @@ def build_parser() -> argparse.ArgumentParser:
         dest="web_action", help="Web action (start / stop).",
         metavar="{start,stop}",
     )
-    # `harness web start`
+    # `teane web start`
     web_start_parser = dashboard_subparsers.add_parser(
         "start",
         help="Start the web UI server.",
         description=(
-            "Start the harness web UI.\n\n"
+            "Start the teane web UI.\n\n"
             "Refuses to launch if another instance is already registered "
-            "(via the marker file ~/.harness/web.lock). Run 'harness web stop' "
+            "(via the marker file ~/.harness/web.lock). Run 'teane web stop' "
             "first to free the marker.\n\n"
             "Foreground mode (default): the server runs in this terminal. "
             "Ctrl-C triggers a clean shutdown — the listening socket is "
@@ -7865,13 +7865,13 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Examples:\n"
-            "  harness web start\n"
+            "  teane web start\n"
             "      → http://127.0.0.1:9000 (foreground)\n\n"
-            "  harness web start --port 8080\n"
+            "  teane web start --port 8080\n"
             "      → http://127.0.0.1:8080 (foreground)\n\n"
-            "  harness web start --host 0.0.0.0 --port 8080\n"
+            "  teane web start --host 0.0.0.0 --port 8080\n"
             "      → http://0.0.0.0:8080 (all interfaces, foreground)\n\n"
-            "  harness web start --background yes\n"
+            "  teane web start --background yes\n"
             "      → detached on http://127.0.0.1:9000, logs to ~/.harness/web.log\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -7892,12 +7892,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="yes = detach (logs to ~/.harness/web.log), no = foreground. "
              "Default: no.",
     )
-    # `harness web stop`
+    # `teane web stop`
     dashboard_subparsers.add_parser(
         "stop",
         help="Stop the running web UI cleanly.",
         description=(
-            "Stop the running harness web UI.\n\n"
+            "Stop the running teane web UI.\n\n"
             "Reads ~/.harness/web.lock to find the pid, deletes the marker, "
             "sends SIGTERM, and waits up to 5s for a clean exit. If the "
             "process is still alive after 5s it escalates to SIGKILL.\n\n"
@@ -7906,12 +7906,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Examples:\n"
-            "  harness web stop\n"
+            "  teane web stop\n"
             "      → reads ~/.harness/web.lock, SIGTERMs the pid, confirms\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    # --- `harness schedule` (#13) ---
+    # --- `teane schedule` (#13) ---
     schedule_parser = subparsers.add_parser(
         "schedule",
         help="Cron-driven background daemon — runs configured jobs on a recurring schedule.",
@@ -7969,7 +7969,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path (for config discovery). Defaults to current directory.",
     )
 
-    # --- `harness chat` (#8) ---
+    # --- `teane chat` (#8) ---
     chat_parser = subparsers.add_parser(
         "chat",
         help="Interactive refinement REPL — reuses the gateway, tools, and memory; no auto-apply.",
@@ -7986,7 +7986,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional per-session budget cap in USD. Falls back to token_budget.hard_cap_usd.",
     )
 
-    # --- `harness index <action>` ---
+    # --- `teane index <action>` ---
     index_parser = subparsers.add_parser(
         "index",
         help="Build / inspect / clear the per-workspace semantic retrieval index (repo_index.*).",
@@ -8020,7 +8020,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Workspace path. Defaults to current directory.",
     )
 
-    # --- `harness gh <action>` ---
+    # --- `teane gh <action>` ---
     gh_parser = subparsers.add_parser(
         "gh",
         help="GitHub integration (issue ingest, PR create, PR comment). Requires `gh` CLI on PATH.",
@@ -8061,7 +8061,7 @@ def build_parser() -> argparse.ArgumentParser:
     gh_pr_comment_parser.add_argument("--number", type=int, required=True, help="PR number")
     gh_pr_comment_parser.add_argument("--body", required=True, help="Comment body (markdown)")
 
-    # --- `harness cache <action>` ---
+    # --- `teane cache <action>` ---
     cache_parser = subparsers.add_parser(
         "cache",
         help="Manage harness-owned Docker cache volumes (sandbox.cache_volumes).",

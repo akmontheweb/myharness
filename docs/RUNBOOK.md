@@ -4,16 +4,16 @@ Self-serve recovery for the failure modes operators hit most often. Each
 entry has a one-line symptom, a diagnostic command that confirms the
 cause, and a fix recipe with explicit commands.
 
-When in doubt, **run `harness doctor` first** — it executes a strict-validation
+When in doubt, **run `teane doctor` first** — it executes a strict-validation
 pass on the canonical config plus per-subsystem healthchecks (git repo,
 product spec, live API-key ping, tree-sitter, sandbox backend, checkpoint
 DB, patcher mode, external tools, optional MCP servers) and prints a
 colored summary pointing at the broken subsystem. The harness reads ONE
-config file: `<myharness_root>/config/config.json`. There is no
+config file: `<teane_root>/config/config.json`. There is no
 `~/.harness/config.json` and no per-workspace overrides.
 
 ```bash
-harness doctor -r /path/to/workspace
+teane doctor -r /path/to/workspace
 ```
 
 If `doctor` is green and you're still stuck, the entries below cover the
@@ -22,27 +22,27 @@ ordered by frequency, not severity.
 
 ---
 
-## 1. Checkpoint corrupted — `harness resume` refuses to load
+## 1. Checkpoint corrupted — `teane resume` refuses to load
 
 **Symptom**
 
 ```
 [resume] Checkpoint for session '<id>' is corrupted: ...
   Options:
-    - Start a fresh session with `harness run -w <ws> -p '<prompt>'`.
+    - Start a fresh session with `teane run -w <ws> -p '<prompt>'`.
     - Restore checkpoints.db from a known-good backup.
-    - Run `harness purge --session-id <id>` to drop only this session.
+    - Run `teane purge --session-id <id>` to drop only this session.
 ```
 
 **Diagnose**
 
 ```bash
 # Confirm which session(s) have unreadable blobs without altering them.
-harness doctor
+teane doctor
 # Look for the "checkpoint db" check — it scans the 5 most recent rows.
 
 # Inspect the offending session non-destructively:
-harness status --session-id <id>
+teane status --session-id <id>
 ```
 
 **Fix**
@@ -52,16 +52,16 @@ Choose one of three paths, in order of preference:
 1. **Restore from backup** (preferred when a recent backup exists):
    ```bash
    cp ~/.harness/checkpoints.db.bak ~/.harness/checkpoints.db
-   harness resume --session-id <id>
+   teane resume --session-id <id>
    ```
-2. **Drop only the broken session, keep all others** (`harness purge` also removes the rotated JSONL log files for the session):
+2. **Drop only the broken session, keep all others** (`teane purge` also removes the rotated JSONL log files for the session):
    ```bash
-   harness purge --session-id <id>
-   harness run -w <ws> -p "<original prompt>"   # start fresh
+   teane purge --session-id <id>
+   teane run -w <ws> -p "<original prompt>"   # start fresh
    ```
 3. **Last resort, nuke everything**:
    ```bash
-   harness purge --all
+   teane purge --all
    ```
 
 **Why it happens.** The msgpack blob in the SQLite store didn't decode.
@@ -89,10 +89,10 @@ ERROR  BudgetTooLowError: pre-flight estimate ($0.0123) exceeds remaining ($0.00
 
 ```bash
 # Headline: total cost, burn rate, projected exhaustion at current rate.
-harness metrics --session-id <id>
+teane metrics --session-id <id>
 
 # Roll-up across every session in the log dir:
-harness metrics --all
+teane metrics --all
 
 # Legacy fallback (when the harness binary itself is the problem):
 grep '"event": "llm_call"' ~/.harness/logs/<session-id>.jsonl | \
@@ -101,7 +101,7 @@ grep '"event": "llm_call"' ~/.harness/logs/<session-id>.jsonl | \
          map({model: .[0].model, total_cost: (map(.cost_usd) | add), calls: length})'
 ```
 
-The `harness metrics` output shows total cost, per-window burn rate,
+The `teane metrics` output shows total cost, per-window burn rate,
 and an estimated minutes-until-exhaustion at the current rate. The
 legacy jq recipe still works and is useful when the CLI itself is the
 thing that's broken.
@@ -110,9 +110,9 @@ thing that's broken.
 
 - **Raise the cap and resume** (most common):
   ```bash
-  # Edit <myharness_root>/config/config.json:
+  # Edit <teane_root>/config/config.json:
   #   "token_budget": { "hard_cap_usd": 5.00 }
-  harness resume --session-id <id>
+  teane resume --session-id <id>
   ```
 - **Re-route an expensive node to a cheaper model**: edit `model_routing.*`
   in the same file to point a hot node (e.g. `code_reviewer_primary`)
@@ -146,7 +146,7 @@ ERROR  Sandbox init failed: cannot connect to Docker daemon
 **Diagnose**
 
 ```bash
-harness doctor
+teane doctor
 # Look at the "sandbox backend" check — it prints the backend in use
 # and whether the binary/daemon is reachable.
 
@@ -163,7 +163,7 @@ unshare --user echo ok    # for unshare backend (Linux/WSL2 only)
   sudo usermod -aG docker $USER && newgrp docker
   ```
 - **Wrong backend selected** — edit `sandbox.backend` in
-  `<myharness_root>/config/config.json`. Valid values: `auto` (try docker
+  `<teane_root>/config/config.json`. Valid values: `auto` (try docker
   → unshare), `docker`, `unshare` (Linux user-namespaces), `bare`
   (host execution — requires `HARNESS_ALLOW_UNSAFE_SANDBOX=true` and
   should only ever run in a disposable VM).
@@ -206,11 +206,11 @@ ps -p <PID>          # is the PID still alive?
   ```
 - **Holder dead, lock stale**:
   ```bash
-  harness run -w <ws> -p "<prompt>" --force-lock
+  teane run -w <ws> -p "<prompt>" --force-lock
   ```
   `--force-lock` releases the stale lock and acquires a fresh one. It
   logs a WARNING so the override is visible in the session record.
-  `harness resume` also accepts `--force-lock`.
+  `teane resume` also accepts `--force-lock`.
 
 **Why it happens.** The lock is an `fcntl.flock` exclusive lock — the OS
 releases it when the process dies. A SIGKILL'd process should release
@@ -245,11 +245,11 @@ grep llm_circuit_open ~/.harness/logs/<session-id>.jsonl
 
 - **Provider outage** — wait it out, or switch routes:
   ```bash
-  # In <myharness_root>/config/config.json, point the affected node at a different model:
+  # In <teane_root>/config/config.json, point the affected node at a different model:
   #   "model_routing": { "planning_primary": "anthropic:claude-sonnet-4" }
-  harness resume --session-id <id>
+  teane resume --session-id <id>
   ```
-- **API key revoked, out of credit, or wrong model id** — `harness doctor`
+- **API key revoked, out of credit, or wrong model id** — `teane doctor`
   now makes a 1-token chat call per configured provider and reports the
   specific HTTP code:
   - `HTTP 401 — API key rejected` → key is bad, update it.
@@ -277,18 +277,18 @@ provider's quota is too low for the workload).
 
 ---
 
-## 6. MCP server fails to start (`harness doctor` shows `fail`)
+## 6. MCP server fails to start (`teane doctor` shows `fail`)
 
 ### Symptom
-- `harness doctor` reports `mcp:<server>: command rejected: ...` or
+- `teane doctor` reports `mcp:<server>: command rejected: ...` or
   `mcp:<server>: start failed: ...`.
 - Planner emits `<<<MCP_CALL>>>` blocks; the tool result body is
   `{"error": "mcp server 'X' not registered..."}`.
 
 ### Diagnose
 ```bash
-# `harness doctor` lists every configured server and the start outcome:
-harness doctor 2>&1 | grep '^mcp:'
+# `teane doctor` lists every configured server and the start outcome:
+teane doctor 2>&1 | grep '^mcp:'
 
 # Print the resolved server commands the harness will run:
 python -c "
@@ -360,36 +360,36 @@ grep cache_prefix_drift ~/.harness/logs/<id>.jsonl |
 ## 8. Schedule daemon stuck — jobs not firing
 
 ### Symptom
-- `harness schedule list` shows a job that should have fired hours ago.
+- `teane schedule list` shows a job that should have fired hours ago.
 - `~/.harness/schedule.db` has no `schedule_runs` row for the expected
   fire time.
 
 ### Diagnose
 ```bash
 # Is the daemon actually running?
-ps aux | grep "harness schedule run" | grep -v grep
+ps aux | grep "teane schedule run" | grep -v grep
 systemctl status harness-schedule.service   # under systemd
 
 # What does the daemon think the next fire times are?
-harness schedule list
+teane schedule list
 
 # Validate the cron syntax:
-harness schedule validate
+teane schedule validate
 ```
 
 ### Fix
-- **Daemon not running:** Start it (`harness schedule run`). The daemon
-  does not auto-launch on `harness run`; it's a separate process.
+- **Daemon not running:** Start it (`teane schedule run`). The daemon
+  does not auto-launch on `teane run`; it's a separate process.
 - **`schedule.enabled` is `false`:** Flip to `true` in
   `config/config.json` and restart the daemon.
 - **Job marked `enabled: false`:** Flip to `true` on the per-job entry
   in `schedule.jobs[]` and restart the daemon.
-- **Cron syntax silently fell through:** `harness schedule validate`
+- **Cron syntax silently fell through:** `teane schedule validate`
   surfaces the rejection. Supported subset: `every 15m` / `every 6h` /
   `every 3d` / `hourly :MM` / `daily HH:MM` / `weekly DAY HH:MM` (all
   times UTC; DAY ∈ `mon`–`sun`). Full POSIX cron like `30 2 * * mon` is
   NOT supported — use the subset above.
-- **Run a job out of band:** `harness schedule once <name>` fires it
+- **Run a job out of band:** `teane schedule once <name>` fires it
   immediately, regardless of schedule.
 - **In-flight job stuck:** Check the per-job log under
   `~/.harness/schedule_logs/<job>/` — the daemon won't fire a second
@@ -429,7 +429,7 @@ curl -fsS -H "Authorization: Bearer $DASH_TOKEN" \
   `dashboard.csrf_token_env` pins it. After a restart, the browser's
   cookie is stale — reload the page to get a fresh cookie.
 - **403 "writes disabled":** Writes are on by default. If you see this
-  after starting `harness web start`, something in `config/config.json`
+  after starting `teane web start`, something in `config/config.json`
   set `dashboard.writes_enabled: false` — flip it back to `true`
   (or remove the override entirely).
 - **Browser refuses to set cookies on HTTP:** Default
@@ -467,7 +467,7 @@ curl -fsS http://127.0.0.1:9000/      # adjust host:port
 ## 11. `~/.harness/web.db` corrupt — dashboard crashes on startup
 
 ### Symptom
-- `harness web start` logs `sqlite3.DatabaseError: database disk image
+- `teane web start` logs `sqlite3.DatabaseError: database disk image
   is malformed`.
 - The dashboard UI shows 500 errors on `/run/schedule` or
   `/sessions/<id>/note`.
@@ -484,9 +484,9 @@ sqlite3 ~/.harness/web.db "PRAGMA integrity_check;"
   empty tables. Audit log + saved presets + queued chat notes are
   lost; runs and schedule state are unaffected.
   ```bash
-  harness web stop                                  # or systemctl stop
+  teane web stop                                  # or systemctl stop
   mv ~/.harness/web.db ~/.harness/web.db.broken
-  harness web start                                 # or systemctl start
+  teane web start                                 # or systemctl start
   ```
 - **Schema mismatch after harness upgrade:** Same fix — wipe and
   recreate. The schema is `CREATE TABLE IF NOT EXISTS` at module
@@ -495,10 +495,10 @@ sqlite3 ~/.harness/web.db "PRAGMA integrity_check;"
 
 ---
 
-## 12. Repo index returns nothing — `harness index status` shows zero chunks
+## 12. Repo index returns nothing — `teane index status` shows zero chunks
 
 ### Symptom
-- `harness index status` reports `Chunks: 0` / `No index built yet`.
+- `teane index status` reports `Chunks: 0` / `No index built yet`.
 - Planner doesn't include the "Repository context (semantic
   retrieval)" block even with `repo_index.enabled: true`.
 
@@ -518,7 +518,7 @@ for p in walker.walk('.'):
 ```
 
 ### Fix
-- **Never built:** Run `harness index build -w /path/to/workspace`.
+- **Never built:** Run `teane index build -w /path/to/workspace`.
 - **Built but the workspace path changed:** The index is keyed by
   workspace path SHA. Re-build it after moving the workspace.
 - **`repo_index.enabled: false`:** Flip to `true` in
@@ -576,7 +576,7 @@ print('exists:', os.path.isfile(memory_file_path(ws, cfg)))
 ### Symptom
 
 The web dashboard's status / live page keeps showing a session in the
-"running" state long after the `harness run` subprocess actually exited.
+"running" state long after the `teane run` subprocess actually exited.
 Most common cause: the child was killed with `SIGKILL` (which the
 parent's watcher thread can't trap via `proc.wait`), or the dashboard
 process itself was hard-restarted.
@@ -601,19 +601,19 @@ the child died is enough to flip the badge to terminated.
 
 If a badge persists across multiple refreshes:
 
-1. The dashboard process itself is wedged — `harness web stop` then
-   `harness web start`.
+1. The dashboard process itself is wedged — `teane web stop` then
+   `teane web start`.
 2. Or the PID was *recycled* by the kernel between the kill and the
    check (rare but possible on busy hosts). Restarting the dashboard
    clears the registry.
 
 ---
 
-## 15. Dashboard marker file corrupt — `harness web start` refuses to launch
+## 15. Dashboard marker file corrupt — `teane web start` refuses to launch
 
 ### Symptom
 
-`harness web start` exits with "a harness web instance is already
+`teane web start` exits with "a teane web instance is already
 running (pid X, ...)" even though no process is listening on the
 port. The marker file at `~/.harness/web.lock` may have a malformed
 JSON body, a PID that doesn't exist, or stale ownership from a
@@ -638,14 +638,14 @@ parse as JSON.
 
 ### Fix
 
-`harness web start` is supposed to auto-clean a stale marker (the
+`teane web start` is supposed to auto-clean a stale marker (the
 dashboard checks `os.kill(pid, 0)` and treats `ProcessLookupError` as
 "prior process gone, marker is junk"). If the auto-clean isn't
 happening, remove the marker by hand:
 
 ```bash
 rm ~/.harness/web.lock
-harness web start
+teane web start
 ```
 
 The marker is a freshness hint, not a critical lock — the dashboard
@@ -658,7 +658,7 @@ actually prevent a clean boot once removed.
 
 ### Symptom
 
-Long-lived dashboards that spawn many `harness run` subprocesses
+Long-lived dashboards that spawn many `teane run` subprocesses
 ("Run now" / "Run resume" / scheduled one-shot jobs) eventually start
 hitting `OSError: [Errno 24] Too many open files` from inside the
 spawn path.
@@ -684,7 +684,7 @@ limit before invoking the dashboard:
 
 ```bash
 ulimit -n 8192
-harness web start --background yes
+teane web start --background yes
 ```
 
 For systemd, set `LimitNOFILE=` in the unit file. The Docker base
@@ -697,7 +697,7 @@ image picks the host value at start — bump it on the host or set
 
 ### Symptom
 
-`harness run`, `resume`, `doctor`, `metrics`, `purge`, or any other
+`teane run`, `resume`, `doctor`, `metrics`, `purge`, or any other
 subcommand exits immediately with a multi-line error to stderr that
 ends with `exit code 2`. No log file, no checkpoint, no LLM call —
 the harness refused to start because strict config validation found a
@@ -719,13 +719,13 @@ Common error openings:
 ```bash
 # Run doctor — its `config` row repeats the same error in its first slot
 # and skips every downstream check until config is clean:
-harness doctor
+teane doctor
 
 # Verify the canonical path the harness resolves to:
 python -c "from harness.cli import _get_global_config_path; print(_get_global_config_path())"
 
 # Validate the JSON in isolation:
-python -m json.tool <myharness_root>/config/config.json > /dev/null
+python -m json.tool <teane_root>/config/config.json > /dev/null
 ```
 
 ### Fix
@@ -757,10 +757,10 @@ without leaving the browser.
 
 ```bash
 # List all checkpointed sessions:
-harness status --all
+teane status --all
 
 # Inspect a session without resuming:
-harness status --session-id <id>
+teane status --session-id <id>
 
 # Tail a live session's structured log:
 tail -f ~/.harness/logs/<session-id>.jsonl | jq -c
@@ -794,7 +794,7 @@ sqlite3 -header -column ~/.harness/repo_index/repo_index.db \
   "SELECT workspace_id, backend, chunk_count, built_at FROM repo_meta;"
 
 # List MCP servers' advertised tools (post-doctor):
-harness doctor 2>&1 | grep '^mcp:'
+teane doctor 2>&1 | grep '^mcp:'
 
 # Drift events (prompt cache misses) in the most recent session:
 last_log=$(ls -t ~/.harness/logs/*.jsonl | head -1)
@@ -809,11 +809,11 @@ curl -fsS -N -H "Authorization: Bearer $DASH_TOKEN" \
   http://127.0.0.1:9000/api/sessions/SESSION-ID-HERE/events
 
 # Inspect the canonical config without loading it:
-jq 'del(.. | .api_key?)' <myharness_root>/config/config.json | less
+jq 'del(.. | .api_key?)' <teane_root>/config/config.json | less
 
 # Clear harness-owned Docker cache volumes (sandbox.cache_volumes=true):
-harness cache clear --dry-run        # preview
-harness cache clear --session-id <id>
+teane cache clear --dry-run        # preview
+teane cache clear --session-id <id>
 ```
 
 ## Escalation
@@ -821,6 +821,6 @@ harness cache clear --session-id <id>
 If none of the above resolves the issue:
 
 1. Capture the session log (`~/.harness/logs/<session-id>.jsonl`) and the
-   `harness doctor` output.
-2. Capture the harness version: `harness --version`.
+   `teane doctor` output.
+2. Capture the harness version: `teane --version`.
 3. Open an issue at the project tracker with all three.
