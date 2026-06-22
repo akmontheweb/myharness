@@ -169,37 +169,64 @@ def strip_read_blocks(llm_output: str) -> str:
     return _READ_FILE_PATTERN.sub("", llm_output)
 
 
+# Tempered greedy token: matches any character (DOTALL) UNLESS that
+# character is the start of another block opener. This prevents a
+# non-greedy ``.*?`` body from spanning a forbidden boundary when the
+# expected END marker is missing — e.g. when ``_continue_on_length``
+# fires mid-CREATE_FILE and the LLM re-emits the whole block on the
+# continuation, the concatenated text has two ``<<<CREATE_FILE>>>``
+# openers but only one ``<<<END_CREATE_FILE>>>``. Without this guard
+# the first block's content captures the second block's directive
+# lines (``<<<CREATE_FILE>>>\nfile: …\ncontent:\n…``) verbatim and the
+# patcher writes that DSL to disk as file content — a real bug we hit
+# on the ciod build (server/src/db/seed.ts corruption). With the
+# guard, the malformed first block simply fails to match → the patcher
+# logs "no patches parsed" → repair sees the failure cleanly.
+_TEMPERED_CONTENT = (
+    r'(?:(?!<<<(?:CREATE_FILE|REPLACE_BLOCK|DELETE_BLOCK|INSERT_AT_BLOCK)>>>).)*?'
+)
+
+
+# Header fields (``file:``, ``anchor:``) are always one line. The
+# original ``.+?\s*\n`` capture was too loose: under DOTALL, ``.``
+# matches newlines, so when the END marker was missing the regex engine
+# would backtrack-extend the ``file:`` capture across newlines until it
+# found a valid trailer somewhere downstream. Restricting these to
+# ``[^\n]+?`` confines them to the header line where they belong.
+_FIELD_VALUE = r'[^\n]+?'
+
+
 _BLOCK_PATTERNS = {
     OperationType.REPLACE_BLOCK: re.compile(
         r'<<<REPLACE_BLOCK>>>\s*\n'
-        r'file:\s*(?P<file>.+?)\s*\n'
+        r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
         r'(?:count:\s*(?P<count>unique|all|first)\s*\n)?'
-        r'search:\s*\n(?P<search>.*?)\n'
-        r'replace:\s*\n(?P<replace>.*?)'
+        r'search:\s*\n(?P<search>' + _TEMPERED_CONTENT + r')\n'
+        r'replace:\s*\n(?P<replace>' + _TEMPERED_CONTENT + r')'
         r'<<<END_REPLACE_BLOCK>>>',
         re.DOTALL,
     ),
     OperationType.CREATE_FILE: re.compile(
         r'<<<CREATE_FILE>>>\s*\n'
-        r'file:\s*(?P<file>.+?)\s*\n'
-        r'content:\s*\n(?P<content>.*?)'
+        r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
+        r'content:\s*\n(?P<content>' + _TEMPERED_CONTENT + r')'
         r'<<<END_CREATE_FILE>>>',
         re.DOTALL,
     ),
     OperationType.DELETE_BLOCK: re.compile(
         r'<<<DELETE_BLOCK>>>\s*\n'
-        r'file:\s*(?P<file>.+?)\s*\n'
+        r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
         r'(?:count:\s*(?P<count>unique|all|first)\s*\n)?'
-        r'search:\s*\n(?P<search>.*?)'
+        r'search:\s*\n(?P<search>' + _TEMPERED_CONTENT + r')'
         r'<<<END_DELETE_BLOCK>>>',
         re.DOTALL,
     ),
     OperationType.INSERT_AT_BLOCK: re.compile(
         r'<<<INSERT_AT_BLOCK>>>\s*\n'
-        r'file:\s*(?P<file>.+?)\s*\n'
-        r'anchor:\s*(?P<anchor>.+?)\s*\n'
+        r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
+        r'anchor:\s*(?P<anchor>' + _FIELD_VALUE + r')\s*\n'
         r'placement:\s*(?P<placement>before|after)\s*\n'
-        r'content:\s*\n(?P<content>.*?)'
+        r'content:\s*\n(?P<content>' + _TEMPERED_CONTENT + r')'
         r'<<<END_INSERT_AT_BLOCK>>>',
         re.DOTALL,
     ),

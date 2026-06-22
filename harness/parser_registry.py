@@ -925,7 +925,14 @@ def detect_and_parse(
     Detection order:
         1. By compiler name inferred from build_command (e.g., 'cargo', 'gcc')
         2. By file extension (e.g., '.rs' → rustc, '.py' → python)
-        3. Falls back to GenericParser
+        3. By output signature — every registered parser is run against
+           the raw output and the one extracting the most diagnostics
+           wins. Catches the common case where the build command is a
+           generic wrapper (``npm run build``, ``make``, ``yarn test``)
+           whose name doesn't appear in :data:`_PARSER_REGISTRY` but
+           whose internals call ``tsc`` / ``jest`` / ``cargo`` / etc.
+           and emit recognisable diagnostic formats.
+        4. Falls back to GenericParser.
 
     Args:
         raw_output: The complete stdout+stderr from the build tool.
@@ -958,6 +965,35 @@ def detect_and_parse(
         if ext_parser_cls is not None:
             logger.debug("[parser_registry] Using extension-based parser for '%s'.", ext)
             return ext_parser_cls.parse_diagnostics(raw_output)
+
+    # Output-signature detection — when neither the command nor the file
+    # extension identifies the compiler (e.g. ``npm run build``,
+    # ``make``, ``yarn test``, ``pnpm tsc``), try every registered
+    # parser on the raw output and pick the one with the most matches.
+    # The per-language diagnostic formats are distinctive enough that
+    # cross-matches are rare; ties resolve to the parser registered
+    # first (dict iteration order is insertion order).
+    candidates: list[tuple[type[BaseLanguageParser], list[DiagnosticObject]]] = []
+    seen_classes: set[type[BaseLanguageParser]] = set()
+    for parser_cls in _PARSER_REGISTRY.values():
+        if parser_cls in seen_classes:
+            continue
+        seen_classes.add(parser_cls)
+        try:
+            diags = parser_cls.parse_diagnostics(raw_output)
+        except Exception as exc:  # noqa: BLE001 — one bad parser shouldn't kill detection
+            logger.debug("[parser_registry] %s raised during sniff: %s", parser_cls.__name__, exc)
+            continue
+        if diags:
+            candidates.append((parser_cls, diags))
+    if candidates:
+        candidates.sort(key=lambda c: len(c[1]), reverse=True)
+        winner_cls, winner_diags = candidates[0]
+        logger.debug(
+            "[parser_registry] Output-signature match: %s (%d diag(s)).",
+            winner_cls.__name__, len(winner_diags),
+        )
+        return winner_diags
 
     # Fall back to generic parser
     logger.debug("[parser_registry] No specific parser detected. Using GenericParser.")

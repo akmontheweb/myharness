@@ -222,6 +222,44 @@ class TestParserDispatch:
         assert len(diags) == 1
         assert diags[0].file == "lib/a.dart"
 
+    def test_output_signature_sniff_finds_tsc_under_npm_wrapper(self):
+        """Regression for the ciod build: ``npm install && npm run build``
+        wraps a ``tsc --noEmit`` inside, but the build_command string
+        has no entry in ``_PARSER_REGISTRY``. Before output-signature
+        sniffing, detection fell through to ``GenericParser`` which
+        doesn't recognise tsc's ``path(line,col): error TSXXXX:`` form
+        → ``diagnostics=0`` and the repair LLM saw nothing to fix.
+        """
+        output = (
+            "> server@0.0.0 build\n"
+            "> tsc --noEmit\n\n"
+            "src/db/seed.ts(10,1): error TS1109: Expression expected.\n"
+            "src/db/seed.ts(11,5): error TS1005: ';' expected.\n"
+            "src/db/seed.ts(69,1): error TS1005: '}' expected.\n"
+            "npm error Lifecycle script `build` failed with error:\n"
+            "npm error code 2\n"
+        )
+        diags = detect_and_parse(
+            output, build_command="npm install && npm run build",
+        )
+        assert len(diags) == 3
+        assert all(d.file == "src/db/seed.ts" for d in diags)
+        assert {d.error_code for d in diags} == {"TS1109", "TS1005"}
+
+    def test_output_signature_sniff_finds_go_under_make_wrapper(self):
+        """Same hazard for ``make build`` wrapping ``go build`` — neither
+        ``make`` nor ``build`` is a registry key, but the output carries
+        the unambiguous ``path:line:col: msg`` GoParser signature."""
+        output = (
+            "make[1]: Entering directory '/repo'\n"
+            "cmd/server/main.go:42:13: undefined: foo.Bar\n"
+            "make: *** [build] Error 1\n"
+        )
+        diags = detect_and_parse(output, build_command="make build")
+        assert len(diags) == 1
+        assert diags[0].file.endswith("main.go")
+        assert diags[0].line == 42
+
 
 class TestPythonParserAssertionBody:
     """Verify pytest plain-`assert` failures keep their message body so the

@@ -150,6 +150,87 @@ ok
         assert blocks[1].file == "b.py"
         assert blocks[1].content == "ok"
 
+    def test_truncated_create_file_followed_by_continuation_does_not_corrupt(
+        self,
+    ):
+        """Regression for the ciod ``server/src/db/seed.ts`` corruption.
+
+        When ``_continue_on_length`` fires mid-CREATE_FILE, the LLM
+        re-emits the whole block from scratch on the continuation turn.
+        Concatenation then yields TWO ``<<<CREATE_FILE>>>`` openers but
+        only ONE ``<<<END_CREATE_FILE>>>``. Before the tempered-content
+        + single-line ``file:`` guards, the regex engine would
+        backtrack across newlines and span both openers, returning a
+        block whose ``content`` contained the second block's raw DSL —
+        the patcher then wrote that DSL to disk as file content. After
+        the guards, the malformed first block fails to match and only
+        the well-formed second block is returned.
+        """
+        from harness.patcher import parse_patch_blocks, OperationType
+        # Mirrors the on-disk shape we observed in the ciod failure.
+        output = """<<<CREATE_FILE>>>
+file: server/src/db/seed.ts
+content:
+import { initDB, query } from './index';
+async function seed() {
+  await initDB();
+
+<<<CREATE_FILE>>>
+file: server/src/db/seed.ts
+content:
+import { initDB, query } from './index';
+async function seed() {
+  await initDB();
+  return 0;
+}
+<<<END_CREATE_FILE>>>"""
+        blocks = parse_patch_blocks(output)
+        assert len(blocks) == 1
+        assert blocks[0].operation == OperationType.CREATE_FILE
+        # ``file:`` must NOT have absorbed any newlines or DSL.
+        assert blocks[0].file == "server/src/db/seed.ts"
+        assert "\n" not in blocks[0].file
+        # ``content:`` must be the SECOND attempt only — no DSL leaked in.
+        assert "<<<" not in blocks[0].content
+        assert "return 0;" in blocks[0].content
+
+    def test_truncated_replace_block_does_not_swallow_next_block(self):
+        """Same continuation-truncation hazard but for REPLACE_BLOCK."""
+        from harness.patcher import parse_patch_blocks, OperationType
+        output = """<<<REPLACE_BLOCK>>>
+file: a.py
+search:
+old_code()
+replace:
+new_co
+<<<CREATE_FILE>>>
+file: b.py
+content:
+print('clean')
+<<<END_CREATE_FILE>>>"""
+        blocks = parse_patch_blocks(output)
+        # The truncated REPLACE_BLOCK (no END marker) must not match;
+        # the well-formed CREATE_FILE that follows MUST still match.
+        assert len(blocks) == 1
+        assert blocks[0].operation == OperationType.CREATE_FILE
+        assert blocks[0].file == "b.py"
+        assert blocks[0].content == "print('clean')"
+
+    def test_file_field_rejects_newlines(self):
+        """The ``file:`` capture must stay single-line. A bare
+        ``file:`` (no value) followed by content used to backtrack across
+        newlines under DOTALL until a downstream trailer matched."""
+        from harness.patcher import parse_patch_blocks
+        output = """<<<CREATE_FILE>>>
+file:
+content:
+print('x')
+<<<END_CREATE_FILE>>>"""
+        blocks = parse_patch_blocks(output)
+        # Empty ``file:`` is malformed → no block parsed (better than
+        # silently capturing the first content line as the path).
+        assert blocks == []
+
 
 class TestTextPatcher:
 
