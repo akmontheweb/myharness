@@ -82,6 +82,14 @@ async def test_web_fetch_truncates_at_byte_cap(monkeypatch):
         web_tools_module.httpx, "AsyncClient",
         lambda **_kw: _StreamClient({url: response}),
     )
+    # Pin DNS so validate_outbound_url doesn't do a real getaddrinfo
+    # call. Without this the test depends on live example.com resolution
+    # and any DNS hiccup under suite-wide load surfaces as
+    # KeyError: 'truncated' because the URL gets rejected pre-fetch.
+    monkeypatch.setattr(
+        "harness.trust._resolve_host_addresses",
+        lambda host: ["93.184.216.34"],
+    )
     result = await skill.execute(url=url)
     assert result["truncated"] is True
     # The bytes_returned is bounded by the configured cap (it may be

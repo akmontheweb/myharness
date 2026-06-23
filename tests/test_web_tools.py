@@ -40,7 +40,13 @@ from harness.web_tools import (
 # ---------------------------------------------------------------------------
 
 def test_validate_outbound_url_accepts_https():
-    assert validate_outbound_url("https://docs.python.org/3/") == "https://docs.python.org/3/"
+    # resolve_dns=False keeps this a pure shape/scheme/host check — the
+    # other "real DNS" branches have their own coverage. Without it the
+    # test depends on a live getaddrinfo("docs.python.org") and flakes
+    # whenever the network or DNS hiccups.
+    assert validate_outbound_url(
+        "https://docs.python.org/3/", resolve_dns=False
+    ) == "https://docs.python.org/3/"
 
 
 @pytest.mark.parametrize("url", [
@@ -227,6 +233,12 @@ async def test_web_fetch_skill_truncates_at_max_bytes(monkeypatch):
         web_tools_module.httpx, "AsyncClient",
         lambda **_kw: _MockAsyncClient(fake_response, captured),
     )
+    # Pin DNS so validate_outbound_url doesn't hit the network — the
+    # test is about the byte cap, not example.com resolution.
+    monkeypatch.setattr(
+        "harness.trust._resolve_host_addresses",
+        lambda host: ["93.184.216.34"],
+    )
     result = await skill.execute(url="https://example.com/data")
     assert result["truncated"] is True
     assert result["bytes_returned"] == 64
@@ -247,6 +259,11 @@ async def test_web_fetch_skill_rejects_unwhitelisted_content_type(monkeypatch):
     monkeypatch.setattr(
         web_tools_module.httpx, "AsyncClient",
         lambda **_kw: _MockAsyncClient(fake_response, []),
+    )
+    # Pin DNS so we test the content-type gate, not example.com lookup.
+    monkeypatch.setattr(
+        "harness.trust._resolve_host_addresses",
+        lambda host: ["93.184.216.34"],
     )
     result = await skill.execute(url="https://example.com/blob")
     assert "content-type" in result["error"]
