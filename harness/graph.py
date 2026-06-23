@@ -7209,6 +7209,38 @@ async def deployment_discovery_node(state: AgentState) -> dict[str, Any]:
             + "\n```"
         )
 
+    # Deterministic workspace scan — runs token-free and grounds the LLM's
+    # suggested_answers in actual evidence (detected frameworks, databases,
+    # port hints from .env / compose, presence of Dockerfile / Caddyfile,
+    # …). Without this block the LLM is guessing industry defaults blind,
+    # which is what causes the discovery loop to re-ask the same questions
+    # ("do you want a .env for secrets?" on a project that already has one).
+    telemetry_block = ""
+    try:
+        from harness.deploy import scan_workspace_telemetry
+        workspace = state.get("workspace_path", os.getcwd())
+        telemetry = scan_workspace_telemetry(workspace)
+        telemetry_block = (
+            "\n\n## Detected workspace facts (deterministic scan)\n\n"
+            "The block below is a token-free scan of the actual workspace. "
+            "Treat it as AUTHORITATIVE ground-truth — base every "
+            "``suggested_answer`` on this evidence, not on generic "
+            "industry defaults. Examples: if ``existing_infrastructure.dockerfile`` "
+            "is true, suggest reusing it instead of asking whether to "
+            "create one. If ``port_hints`` are non-empty, suggest those "
+            "ports. If a database is listed under ``databases_detected``, "
+            "the secrets question should presume that database. If a "
+            "sector is fully answered by the evidence below, OMIT its "
+            "questions and reflect the answer in ``summary`` so the "
+            "operator doesn't get asked things the workspace already "
+            "answers.\n\n"
+            "```json\n"
+            + json.dumps(telemetry, indent=2, sort_keys=True, default=str)
+            + "\n```"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[deploy_disc] Workspace telemetry scan failed: %s", exc)
+
     if is_followup:
         prompt = f"""You are a Principal DevSecOps Engineer. FOLLOW-UP round #{question_count + 1}.
 Review the conversation above. Cross-reference deployment answers. Find remaining gaps.
@@ -7234,7 +7266,7 @@ Keep it short (1 line, concrete, actionable). The interview presents it as
 a default the operator can press Enter to accept; a vague placeholder
 defeats the purpose. If you have no signal, use the conservative industry
 default and say so. Return ONLY valid JSON. No markdown, no explanation, no
-code fences.{resolved_block}"""
+code fences.{telemetry_block}{resolved_block}"""
 
     else:
         prompt = """You are a Principal DevSecOps Systems Engineer and Lead SRE. Perform EXHAUSTIVE deployment infrastructure discovery across ALL 4 sectors below.
@@ -7273,7 +7305,7 @@ context, project files, and sector intent. Keep it short (1 line, concrete,
 actionable). The interview presents it as a default the operator can press
 Enter to accept; a vague placeholder defeats the purpose. If you have no
 signal, use the conservative industry default and say so. Return ONLY valid
-JSON. No markdown, no explanation, no code blocks.""" + resolved_block
+JSON. No markdown, no explanation, no code blocks.""" + telemetry_block + resolved_block
 
     # Delta-mode preamble — same shape as the requirements/architecture
     # nodes. In CR mode the LLM returns modules=[] and complete=true when
