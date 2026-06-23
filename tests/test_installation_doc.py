@@ -422,10 +422,13 @@ class TestRouteAfterDeployment:
         }
         assert route_after_deployment(state) == "installation_doc_node"
 
-    def test_falls_through_to_compiler_router_on_failure(self):
-        # Failed deployment → no success flag → router delegates to
-        # route_after_compiler which (with exit_code 0 from the prior
-        # build success that got us here) goes to security_scan.
+    def test_failed_deployment_with_no_errors_routes_to_hitl(self):
+        # F1 — route_after_deployment is now terminal. The historic
+        # fall-through to route_after_compiler (which on exit_code=0 from
+        # the prior compile re-entered security_scan_node) caused the
+        # deployment ↔ security-scan loop in session 951f102f.
+        # ``success=False`` without compiler_errors is the Bug-A trap
+        # state; it now surfaces to HITL instead of looping.
         state = {
             "node_state": {"deployment": {"success": False}},
             "exit_code": 0,
@@ -433,4 +436,23 @@ class TestRouteAfterDeployment:
             "budget_remaining_usd": 1.0,
         }
         out = route_after_deployment(state)
-        assert out == "security_scan_node"
+        assert out == "human_intervention_node"
+
+    def test_failed_deployment_with_errors_routes_to_repair(self):
+        # When deployment_node emits a real DEPLOYMENT_* diagnostic
+        # (build_failed / generation_failed / health_check failures), the
+        # router still hands off to repair_node so the LLM can attempt
+        # a fix.
+        state = {
+            "node_state": {"deployment": {"success": False, "phase": "build_failed"}},
+            "compiler_errors": [{
+                "file": "docker-compose.yml", "line": 0, "column": 0,
+                "severity": "error", "error_code": "DEPLOYMENT_BUILD_FAILED",
+                "message": "compose build failed",
+            }],
+            "exit_code": 0,
+            "loop_counter": {},
+            "budget_remaining_usd": 1.0,
+        }
+        out = route_after_deployment(state)
+        assert out == "repair_node"

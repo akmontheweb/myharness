@@ -1310,6 +1310,9 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
     enabled = deploy_cfg.get("enabled", True)
 
     if not enabled:
+        _emit_deployment_outcome(
+            outcome="skipped", reason="disabled", phase="entry",
+        )
         return {"node_state": {"deployment": {"skipped": True, "reason": "disabled"}}}
 
     workspace_path = state.get("workspace_path", os.getcwd())
@@ -1338,6 +1341,9 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
         telemetry, workspace_path, change_request_files=synth_cr_files,
     )
     if not blueprint or not blueprint.get("services"):
+        _emit_deployment_outcome(
+            outcome="failed", reason="synthesis_failed", phase="synthesis",
+        )
         return {
             "compiler_errors": [{
                 "file": "deployment", "line": 0, "column": 0, "severity": "error",
@@ -1369,6 +1375,10 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
         blueprint, telemetry, workspace_path, cr_attribution=cr_attribution,
     )
     if not gen_result.get("success"):
+        _emit_deployment_outcome(
+            outcome="failed", reason="generation_failed", phase="generation",
+            detail=str(gen_result.get("message", ""))[:200],
+        )
         return {
             "compiler_errors": [{
                 "file": "deployment", "line": 0, "column": 0, "severity": "error",
@@ -1385,6 +1395,10 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
     # --- Phase 4: Build & Health Check ---
     compose_path = os.path.join(workspace_path, compose_file)
     if not os.path.isfile(compose_path):
+        _emit_deployment_outcome(
+            outcome="failed", reason="no_compose_file", phase="post_generation",
+            compose_file=compose_file,
+        )
         return {
             "compiler_errors": [{
                 "file": compose_file, "line": 0, "column": 0, "severity": "error",
@@ -1404,6 +1418,12 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
     approved = await _prompt_deploy_approval(preview)
     if not approved:
         logger.info("[deployment_node] User declined deploy preview; aborting before docker-compose up.")
+        _emit_deployment_outcome(
+            outcome="skipped",
+            reason="user_declined_preview",
+            phase="preview_gate",
+            files_generated=len(gen_result.get("generated", [])),
+        )
         return {
             "node_state": {
                 "deployment": {
@@ -1424,6 +1444,10 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
             cwd=workspace_path,
         )
         if timed_out:
+            _emit_deployment_outcome(
+                outcome="failed", reason="build_timeout", phase="docker_build",
+                timeout_seconds=180,
+            )
             return {
                 "compiler_errors": [{
                     "file": compose_file, "line": 0, "column": 0, "severity": "error",
@@ -1433,6 +1457,10 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
                 "loop_counter": {"deployment": 1},
             }
         if rc != 0:
+            _emit_deployment_outcome(
+                outcome="failed", reason="build_failed", phase="docker_build",
+                exit_code=rc,
+            )
             return {
                 "compiler_errors": [{
                     "file": compose_file, "line": 0, "column": 0, "severity": "error",
@@ -1444,6 +1472,9 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
             }
         logger.info("[deployment_node] Container build successful.")
     except FileNotFoundError:
+        _emit_deployment_outcome(
+            outcome="failed", reason="docker_unavailable", phase="docker_build",
+        )
         return {
             "compiler_errors": [{
                 "file": compose_file, "line": 0, "column": 0, "severity": "error",
@@ -1459,6 +1490,14 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
     if health_result["success"]:
         messages = list(state.get("messages", []))
         messages.append({"role": "system", "content": f"[Deployment] All {len(health_result['healthy'])} container(s) healthy."})
+        _emit_deployment_outcome(
+            outcome="success",
+            reason="health_check_passed",
+            phase="health_check",
+            healthy_count=len(health_result["healthy"]),
+            services=len(blueprint.get("services", {})),
+            files_generated=len(gen_result.get("generated", [])),
+        )
         return {
             "messages": messages,
             "node_state": {"deployment": {"success": True, "healthy": health_result["healthy"], "blueprint": blueprint}},
@@ -1475,12 +1514,37 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
         status_parts.append(f"  - {diag['message']}")
     messages.append({"role": "system", "content": "\n".join(status_parts)})
 
+    _emit_deployment_outcome(
+        outcome="failed",
+        reason="health_check_failed",
+        phase="health_check",
+        failed_count=len(health_result.get("failed", [])),
+        diagnostics_count=len(health_result.get("diagnostics", [])),
+        attempt=loop_counter["deployment"],
+    )
     return {
         "compiler_errors": health_result.get("diagnostics", []),
         "messages": messages,
         "loop_counter": loop_counter,
         "node_state": {"deployment": {"success": False, "failed": health_result.get("failed", []), "attempt": loop_counter["deployment"]}},
     }
+
+
+def _emit_deployment_outcome(**fields: Any) -> None:
+    """Single-line telemetry emit at every ``deployment_node`` terminal
+    return path. Without this, a session log shows the four Phase 1-3
+    lines and then jumps straight to ``route_after_compiler`` logs — no
+    indication of WHY deployment_node exited (success, user-declined,
+    health failure, …), forcing a forensic dive every time.
+
+    Fail-open: telemetry must never break the deploy path. Any import or
+    emit failure is swallowed.
+    """
+    try:
+        from harness.observability import emit_event
+        emit_event("deployment_outcome", **fields)
+    except Exception:  # noqa: BLE001 — telemetry never blocks deploy
+        pass
 
 
 async def teardown_containers(workspace_path: str, compose_file: str = "docker-compose.yml") -> bool:

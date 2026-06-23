@@ -9127,6 +9127,31 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
                 pass
             return "compiler_node"
 
+        # Post-deployment clean scan: do NOT re-enter discovery. The deploy
+        # pipeline is one-shot per session — ``deployment_node`` having
+        # returned at least once means we are PAST that gate. Without this
+        # guard, route_after_security_scan kept rotating clean scans back
+        # into ``deployment_discovery_node → write_spec_node → gatekeeper →
+        # deployment_node``, producing the infinite loop observed in session
+        # 951f102f (three full discovery+deploy passes in 6 minutes before
+        # the repair budget was exhausted). The marker is
+        # ``node_state.deployment`` — set by every terminal return path in
+        # ``deployment_node`` (success / skipped / errored).
+        ns = state.get("node_state") or {}
+        if isinstance(ns, dict) and isinstance(ns.get("deployment"), dict):
+            dep_state = ns["deployment"]
+            logger.info(
+                "[router] Security scan clean AND deployment_node has "
+                "already run this session (deployment=%s). Routing to "
+                "installation_doc_node — NOT re-entering deployment "
+                "discovery.",
+                dep_state.get(
+                    "success",
+                    dep_state.get("skipped", dep_state.get("phase", "unknown")),
+                ),
+            )
+            return "installation_doc_node"
+
         # Mobile short-circuit (M-1): Flutter projects don't fit the
         # docker-compose deployment model. Skip deployment_* and end after
         # the security scan passes. iOS builds need macOS anyway and would
@@ -9207,29 +9232,69 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
 
 def route_after_deployment(state: AgentState) -> Literal[
     "installation_doc_node",
-    "security_scan_node",
     "repair_node",
     "human_intervention_node",
-    "test_generation_node",
 ]:
     """Route after deployment_node terminates.
 
-    Successful health check (``node_state.deployment.success == True``)
-    short-circuits to ``installation_doc_node`` so greenfield runs end at
-    a documented artifact instead of re-entering the compile/scan loop.
-    Anything else delegates to the standard post-build router so failed
-    deploys still route through repair / HITL / test generation just like
-    a normal build failure.
+    Terminal by design — the deploy pipeline is one-shot per session so
+    every post-deploy state ends in either docs, repair, or HITL. NEVER
+    delegates back to ``route_after_compiler`` (the historic fall-through
+    silently re-entered ``security_scan_node`` whenever
+    ``deployment.success`` wasn't True, which made
+    ``deployment_node → security_scan → deployment_discovery → deployment_node``
+    a closed loop — see session 951f102f for the worked example). Each
+    outcome is now explicit:
+
+        deployment.success == True     → installation_doc_node (clean deploy)
+        deployment.skipped == True     → installation_doc_node (user declined
+                                          preview / deployment_config.enabled
+                                          is false — emit the docs we have
+                                          and end the run)
+        compiler_errors populated      → repair_node (deployment_node emitted
+                                          a real DEPLOYMENT_* diagnostic that
+                                          the LLM can attempt to fix)
+        neither set                    → human_intervention_node (the
+                                          missing-success-with-no-errors trap
+                                          that produced the loop above; surface
+                                          to the operator with the deployment
+                                          dict in node_state instead of
+                                          burning more iterations)
     """
     ns = state.get("node_state") or {}
     deployment = ns.get("deployment") if isinstance(ns, dict) else None
+    compiler_errors = state.get("compiler_errors") or []
+
     if isinstance(deployment, dict) and deployment.get("success") is True:
         logger.info(
             "[router] Deployment succeeded. Routing to installation_doc_node "
             "before END."
         )
         return "installation_doc_node"
-    return route_after_compiler(state)
+
+    if isinstance(deployment, dict) and deployment.get("skipped") is True:
+        logger.info(
+            "[router] Deployment skipped (%s). Routing to "
+            "installation_doc_node before END — NOT re-entering security "
+            "scan.",
+            deployment.get("reason", "unknown"),
+        )
+        return "installation_doc_node"
+
+    if compiler_errors:
+        logger.info(
+            "[router] Deployment node emitted %d diagnostic(s). Routing to "
+            "repair_node.", len(compiler_errors),
+        )
+        return "repair_node"
+
+    logger.warning(
+        "[router] Deployment node returned neither success nor errors "
+        "(deployment=%r). Routing to HITL rather than re-entering the "
+        "compile/scan loop.",
+        deployment,
+    )
+    return "human_intervention_node"
 
 
 # ---------------------------------------------------------------------------
@@ -9603,10 +9668,8 @@ def build_graph() -> Any:
         route_after_deployment,
         {
             "installation_doc_node": "installation_doc_node",
-            "security_scan_node": "security_scan_node",
             "repair_node": "repair_node",
             "human_intervention_node": "human_intervention_node",
-            "test_generation_node": "test_generation_node",
         },
     )
 

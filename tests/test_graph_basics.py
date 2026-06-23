@@ -6,6 +6,7 @@ from harness.graph import (
     apply_memory_cleanse,
     _format_diagnostics_for_repair,
     _repair_budget_warning,
+    route_after_deployment,
     route_after_security_scan,
 )
 
@@ -484,6 +485,139 @@ class TestRouteAfterSecurityScan:
             loop_counter={"security": 0, "final_verify": 1},
         )
         assert route_after_security_scan(state) == "installation_doc_node"
+
+    # F2 — post-deployment clean-scan guard. Prevents the
+    # deployment_discovery ↔ deployment_node ↔ security_scan loop observed
+    # in session 951f102f. Once deployment_node has returned (any outcome
+    # — success / skipped / failure), a subsequent clean scan must NOT
+    # re-enter the discovery pipeline.
+    def test_post_deploy_clean_scan_terminates_when_success(self, monkeypatch):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
+        state = self._clean_state(
+            dev_deployment=True, cd_discovery=True,
+            node_state={"deployment": {"success": True}},
+        )
+        # Without the F2 guard this would route to deployment_discovery_node
+        # and start another interview round.
+        assert route_after_security_scan(state) == "installation_doc_node"
+
+    def test_post_deploy_clean_scan_terminates_when_skipped(self, monkeypatch):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
+        state = self._clean_state(
+            dev_deployment=True, cd_discovery=True,
+            node_state={
+                "deployment": {
+                    "skipped": True, "reason": "user_declined_preview",
+                    "phase": "preview_gate",
+                }
+            },
+        )
+        # The exact bug from session 951f102f: skipped deploy used to
+        # fall through into another security_scan → deployment_discovery
+        # cycle. Must terminate via installation_doc_node now.
+        assert route_after_security_scan(state) == "installation_doc_node"
+
+    def test_post_deploy_clean_scan_terminates_when_phase_only(self, monkeypatch):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
+        # ``deployment_node`` failure paths set only ``phase`` (e.g.
+        # synthesis_failed) — the guard must still fire because
+        # node_state.deployment is present as a dict.
+        state = self._clean_state(
+            dev_deployment=True, cd_discovery=True,
+            node_state={"deployment": {"phase": "synthesis_failed"}},
+        )
+        assert route_after_security_scan(state) == "installation_doc_node"
+
+    def test_first_clean_scan_without_deployment_still_enters_discovery(
+        self, monkeypatch,
+    ):
+        import harness.impact as impact_mod
+        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
+        # node_state has no ``deployment`` key — we have NOT been through
+        # deployment_node yet. Existing dev_deployment/cd_discovery
+        # routing must still apply (regression guard).
+        state = self._clean_state(
+            dev_deployment=True, cd_discovery=True,
+            node_state={"other_key": "noise"},
+        )
+        assert route_after_security_scan(state) == "deployment_discovery_node"
+
+
+class TestRouteAfterDeployment:
+    """F1 — make route_after_deployment terminal.
+
+    The historic fall-through to route_after_compiler silently re-entered
+    security_scan_node whenever ``deployment.success`` wasn't strictly
+    True, causing the deployment ↔ security-scan loop in session
+    951f102f. The fixed router has four explicit branches.
+    """
+
+    def _state(self, deployment=None, compiler_errors=None):
+        return {
+            "node_state": (
+                {"deployment": deployment} if deployment is not None else {}
+            ),
+            "compiler_errors": compiler_errors or [],
+        }
+
+    def test_success_routes_to_installation_doc(self):
+        assert route_after_deployment(
+            self._state(deployment={"success": True})
+        ) == "installation_doc_node"
+
+    def test_skipped_routes_to_installation_doc(self):
+        # The exact session-951f102f trap: skipped via user_declined_preview
+        # used to fall through to route_after_compiler and re-enter the
+        # security scan. Must now terminate via installation_doc_node.
+        assert route_after_deployment(self._state(
+            deployment={"skipped": True, "reason": "user_declined_preview"}
+        )) == "installation_doc_node"
+
+    def test_skipped_disabled_also_routes_to_installation_doc(self):
+        assert route_after_deployment(self._state(
+            deployment={"skipped": True, "reason": "disabled"}
+        )) == "installation_doc_node"
+
+    def test_compiler_errors_route_to_repair(self):
+        assert route_after_deployment(self._state(
+            deployment={"phase": "build_failed"},
+            compiler_errors=[{
+                "file": "docker-compose.yml", "line": 0, "column": 0,
+                "severity": "error", "error_code": "DEPLOYMENT_BUILD_FAILED",
+                "message": "compose build failed",
+            }],
+        )) == "repair_node"
+
+    def test_compiler_errors_without_deployment_dict_route_to_repair(self):
+        # The synthesis_failed / docker_unavailable paths set
+        # compiler_errors but no deployment dict on node_state. Repair
+        # must still pick them up.
+        assert route_after_deployment({
+            "node_state": {},
+            "compiler_errors": [{
+                "file": "deployment", "line": 0, "column": 0,
+                "severity": "error", "error_code": "DEPLOYMENT_DOCKER_UNAVAILABLE",
+                "message": "docker-compose not installed",
+            }],
+        }) == "repair_node"
+
+    def test_no_deployment_no_errors_routes_to_hitl(self):
+        # The Bug-A trap: deployment_node returned without setting either
+        # success/skipped or compiler_errors. Previously fell through and
+        # looped; now surfaces to the operator.
+        assert route_after_deployment({
+            "node_state": {}, "compiler_errors": [],
+        }) == "human_intervention_node"
+
+    def test_deployment_dict_without_known_keys_routes_to_hitl(self):
+        # A truthy but uninformative deployment dict still hits the
+        # HITL fallback rather than looping silently.
+        assert route_after_deployment(self._state(
+            deployment={"unknown_field": 42},
+        )) == "human_intervention_node"
 
 
 class _PatchingResponse:
