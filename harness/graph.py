@@ -9009,6 +9009,9 @@ def build_graph() -> Any:
     # Deployment discovery → interview loop
     graph.add_edge("deployment_discovery_node", "discovery_interview_loop")
 
+    # After generating deployment spec, route back to gatekeeper for approval/refine
+    graph.add_edge("generate_deployment_spec_node", "human_gatekeeper_node")
+
     # Register deployment node
     from harness.deploy import deployment_node as _deployment_node
     graph.add_node("deployment_node", _deployment_node)  # type: ignore[type-var]
