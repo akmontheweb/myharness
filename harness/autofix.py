@@ -147,6 +147,10 @@ async def apply_autofixes(
             if candidate is not None:
                 fix_kind = "dep"
         if candidate is None:
+            candidate = _try_missing_npm_dep(diag, workspace_path)
+            if candidate is not None:
+                fix_kind = "npm_dep"
+        if candidate is None:
             candidate = _try_dep_resolution_conflict(diag, workspace_path)
             if candidate is not None:
                 fix_kind = "dep"
@@ -795,6 +799,173 @@ def _try_missing_dep(
         search=last_line,
         replace=f"{last_line}\n{install_name}",
     )
+
+
+# ---------------------------------------------------------------------------
+# R7 — Node/npm missing-dep autofix
+# ---------------------------------------------------------------------------
+
+# tailwind + postcss plugin namespace — these are dev-time tooling, not
+# runtime deps. Anything under @tailwindcss/*, postcss-*, @types/*, eslint-*,
+# vite, vitest, jest etc. is conventionally devDependencies. Everything
+# else goes into dependencies. The list is intentionally short — common
+# cases only. The repair LLM can correct a misclassification later.
+_NPM_DEV_NAMESPACE_PREFIXES: tuple[str, ...] = (
+    "@tailwindcss/",
+    "@types/",
+    "@vitejs/",
+    "@vitest/",
+    "@testing-library/",
+    "@storybook/",
+    "@babel/",
+    "@swc/",
+    "@eslint/",
+    "@playwright/",
+    "@nestjs/cli",
+    "postcss-",
+    "eslint-",
+    "stylelint-",
+    "rollup-plugin-",
+    "vite-plugin-",
+    "webpack-",
+    "babel-",
+)
+_NPM_DEV_EXACT: frozenset[str] = frozenset({
+    "vite", "vitest", "jest", "mocha", "chai", "cypress", "playwright",
+    "tailwindcss", "postcss", "autoprefixer", "typescript", "ts-node",
+    "eslint", "prettier", "stylelint", "rollup", "webpack", "esbuild",
+    "nodemon", "concurrently", "husky", "lint-staged",
+})
+
+
+def _is_npm_dev_package(name: str) -> bool:
+    """Classify ``name`` as devDependencies (True) vs dependencies (False).
+
+    A small heuristic table covering the common JS-tooling namespaces. The
+    autofix doesn't need to be exhaustive — a misplaced dep manifests as
+    a slightly-bigger production bundle, not a build break, and the repair
+    LLM can move it later.
+    """
+    if not name:
+        return False
+    if name in _NPM_DEV_EXACT:
+        return True
+    return any(name.startswith(p) for p in _NPM_DEV_NAMESPACE_PREFIXES)
+
+
+def _try_missing_npm_dep(
+    diag: dict[str, Any],
+    workspace_path: str,
+) -> Optional[PatchBlock]:
+    """Add a missing npm package to ``package.json``.
+
+    Triggered by ``MISSING_DEP`` diagnostics whose ``miss_kind`` is
+    ``"node"`` — emitted by ``compiler_node`` when a Vite/PostCSS/Webpack
+    "Cannot find module 'X'" error fires and the missing module isn't a
+    local source file.
+
+    Locates the nearest ``package.json`` (workspace root first, then
+    common subdirs like ``client/`` and ``frontend/``). Adds the package
+    to ``devDependencies`` if it matches the dev-tooling heuristic
+    (``@tailwindcss/*``, ``postcss-*``, ``vite``, ``eslint``, ...) and
+    ``dependencies`` otherwise, with a ``"*"`` version specifier so npm
+    picks the latest matching release on install.
+
+    Idempotent: if the package is already in either dep section the
+    helper returns None — the repair LLM gets the diagnostic and can
+    investigate (typically: the install step failed for an unrelated
+    reason).
+    """
+    if str(diag.get("error_code", "")) != "MISSING_DEP":
+        return None
+    if str(diag.get("miss_kind", "")) != "node":
+        return None
+    symbol = str(diag.get("missing_symbol", "") or "").strip().strip("'\"")
+    if not symbol:
+        return None
+    # Strip sub-paths: "next/router" → "next", "@scope/pkg/sub" → "@scope/pkg"
+    if symbol.startswith("@"):
+        # Scoped: "@scope/pkg" or "@scope/pkg/sub" — keep first two segments.
+        parts = symbol.split("/", 2)
+        package_name = "/".join(parts[:2]) if len(parts) >= 2 else symbol
+    else:
+        package_name = symbol.split("/", 1)[0]
+
+    pkg_rel = _find_package_json(workspace_path)
+    if pkg_rel is None:
+        # No package.json anywhere — CREATE one with a minimal shape
+        # naming this dep. Vite/postcss configs without a package.json
+        # wouldn't have run in the first place, so this branch is rare.
+        package_section = "devDependencies" if _is_npm_dev_package(package_name) else "dependencies"
+        minimal = (
+            "{\n"
+            '  "name": "workspace",\n'
+            '  "version": "0.0.0",\n'
+            '  "private": true,\n'
+            f'  "{package_section}": {{\n'
+            f'    "{package_name}": "*"\n'
+            "  }\n"
+            "}\n"
+        )
+        return PatchBlock(
+            operation=OperationType.CREATE_FILE,
+            file="package.json",
+            content=minimal,
+        )
+
+    pkg_abs = os.path.join(workspace_path, pkg_rel)
+    try:
+        with open(pkg_abs, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return None
+
+    # Idempotency: skip if the package is already present anywhere.
+    # Look for a "package_name": entry — a substring match is enough
+    # because npm names cannot contain quotes.
+    if f'"{package_name}"' in raw:
+        return None
+
+    try:
+        import json as _json
+        manifest = _json.loads(raw)
+    except (ValueError, TypeError):
+        # Malformed package.json — let the LLM fix it.
+        return None
+    if not isinstance(manifest, dict):
+        return None
+
+    target_section = "devDependencies" if _is_npm_dev_package(package_name) else "dependencies"
+    deps = manifest.get(target_section)
+    if isinstance(deps, dict):
+        deps[package_name] = "*"
+    else:
+        manifest[target_section] = {package_name: "*"}
+
+    # Preserve 2-space indentation matching npm-init's default; if the
+    # original used different indent, the result is still valid JSON.
+    import json as _json
+    new_body = _json.dumps(manifest, indent=2) + "\n"
+    return PatchBlock(
+        operation=OperationType.REPLACE_BLOCK,
+        file=pkg_rel,
+        search=raw,
+        replace=new_body,
+    )
+
+
+def _find_package_json(workspace_path: str) -> Optional[str]:
+    """Return a workspace-relative path to the first package.json found,
+    searching workspace root then common frontend subdirs. ``None`` when
+    no package.json exists anywhere reasonable.
+    """
+    candidates = ["package.json"]
+    for sub in ("client", "frontend", "web", "app", "ui"):
+        candidates.append(os.path.join(sub, "package.json"))
+    for rel in candidates:
+        if os.path.isfile(os.path.join(workspace_path, rel)):
+            return rel
+    return None
 
 
 # ---------------------------------------------------------------------------

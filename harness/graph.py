@@ -3626,10 +3626,44 @@ _SHELL_COMMAND_MISS_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?m)^(?P<sym>node|npm|yarn|pnpm): not found\s*$"),
 )
 
+# Node/npm-side missing dependency. Distinct from _PYTHON_MODULE_MISS_*
+# because the autofix path adds the dep to package.json instead of
+# requirements.txt, and the LLM repair prompt needs to know it's a Node
+# package miss (not a shell-command miss).
+#
+# Real-world coverage:
+#   Plain Node     → "Cannot find module 'X'" (with single OR double quotes)
+#   Vite + PostCSS → "[vite:css] [postcss] Cannot find module 'X'"
+#   Webpack        → "Module not found: Error: Can't resolve 'X'"
+#   Next.js prod   → "Cannot find module 'next/X'" (same pattern works)
+#
+# We deliberately exclude paths that start with "./" or "/" or "."
+# inside the capture — those are user-code relative imports (link-check
+# territory, not missing-package territory). Only bare package names
+# (with optional scopes like @scope/pkg) get tagged as MISSING_DEP.
+_NODE_MODULE_MISS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Bare Node "Cannot find module 'X'" — the canonical shape used by
+    # require()/node_modules resolution. Allows scoped packages (@scope/pkg)
+    # and sub-paths (pkg/sub) but rejects anything that looks like a
+    # relative import (starts with ./ or / or ../).
+    re.compile(
+        r"Cannot find module ['\"]"
+        r"(?P<sym>(?:@[a-zA-Z0-9][\w.\-]*/)?[a-zA-Z][\w.\-]*(?:/[\w.\-]+)*)"
+        r"['\"]"
+    ),
+    # Webpack: "Module not found: Error: Can't resolve 'X'"
+    re.compile(
+        r"Module not found:\s*Error:\s*Can't resolve ['\"]"
+        r"(?P<sym>(?:@[a-zA-Z0-9][\w.\-]*/)?[a-zA-Z][\w.\-]*(?:/[\w.\-]+)*)"
+        r"['\"]"
+    ),
+)
+
 # Composite — preserved for callers that don't care about the source kind.
 _ENV_MISCONFIG_PATTERNS: tuple[re.Pattern[str], ...] = (
     *_PYTHON_MODULE_MISS_PATTERNS,
     *_SHELL_COMMAND_MISS_PATTERNS,
+    *_NODE_MODULE_MISS_PATTERNS,
 )
 
 
@@ -3692,6 +3726,26 @@ def _is_env_misconfig(
                 )
                 return None
             return (sym, "shell")
+    # Node/npm package misses — kind="node" so compiler_node routes to
+    # the package.json autofix path instead of requirements.txt.
+    for pattern in _NODE_MODULE_MISS_PATTERNS:
+        match = pattern.search(tail)
+        if match:
+            sym = match.group("sym").strip("'\"")
+            # Skip relative paths defensively — the regex already excludes
+            # them but a future loosening shouldn't accidentally tag user
+            # code as a missing npm package.
+            if sym.startswith(".") or sym.startswith("/"):
+                continue
+            if workspace_path and _node_module_exists_in_workspace(sym, workspace_path):
+                logger.info(
+                    "[env_misconfig] '%s' looks like a missing npm package "
+                    "but a local file by that name exists in %s — treating "
+                    "as a user-code import bug, not env misconfig.",
+                    sym, workspace_path,
+                )
+                return None
+            return (sym, "node")
     return None
 
 
@@ -3720,6 +3774,45 @@ def _symbol_exists_in_workspace(symbol: str, workspace_path: str) -> bool:
                 return True
             if f"{sym}.py" in sub_files:
                 return True
+    except OSError:
+        return False
+    return False
+
+
+def _node_module_exists_in_workspace(module: str, workspace_path: str) -> bool:
+    """True when ``module`` matches a local JS/TS source path in the
+    workspace tree (not a node_modules package).
+
+    Distinguishes a genuine missing-npm-package failure from a typo'd
+    local import. The Node "Cannot find module 'X'" error fires for
+    both; the autofix path must only modify package.json when X really
+    is a third-party package.
+
+    Treats only single-segment names (the first path component) as
+    candidates — `foo/bar` only matches when a `foo` directory or
+    `foo.{js,jsx,ts,tsx}` file exists somewhere under the workspace.
+    Scoped packages (`@scope/pkg`) never match a local file.
+    """
+    if not module or not workspace_path or not os.path.isdir(workspace_path):
+        return False
+    if module.startswith("@"):
+        return False
+    from harness.impact import _NEVER_SOURCE_DIRS
+    head = module.split("/", 1)[0].strip()
+    if not head:
+        return False
+    try:
+        for sub_root, sub_dirs, sub_files in os.walk(workspace_path):
+            sub_dirs[:] = [
+                d for d in sub_dirs
+                if not d.startswith(".") and d not in _NEVER_SOURCE_DIRS
+                and d != "node_modules"
+            ]
+            if head in sub_dirs:
+                return True
+            for ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+                if f"{head}{ext}" in sub_files:
+                    return True
     except OSError:
         return False
     return False
@@ -5414,6 +5507,45 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             build_cmd,
         )
 
+    # Pre-build link check: every relative import in JS/TS/Python source
+    # must resolve to an existing file. Catches the failure mode where
+    # codegen drops a component import (CIOD's App.jsx importing
+    # './components/Dashboard' when only DashboardPage exists). Short-
+    # circuits the build the same way prod_import_smoke_check does, but
+    # cheaper (pure-Python AST/regex, no sandbox).
+    if state.get("run_link_check", True):
+        try:
+            from harness.link_check import (
+                broken_links_to_diagnostics,
+                scan_workspace_for_broken_imports,
+            )
+            broken = scan_workspace_for_broken_imports(workspace)
+        except Exception as exc:  # noqa: BLE001 — link check is advisory
+            logger.warning("[compiler_node] Link check failed (%s); skipping.", exc)
+            broken = []
+        if broken:
+            link_diags = broken_links_to_diagnostics(broken)
+            logger.info(
+                "[compiler_node] Pre-build link check found %d unresolved "
+                "relative import(s); short-circuiting build.",
+                len(link_diags),
+            )
+            short_circuit_state = dict(state.get("node_state", {}) or {})
+            short_circuit_state["current_node"] = "compiler"
+            short_circuit_state["link_check_failed"] = True
+            short_circuit_state["last_build_output"] = (
+                f"Pre-build link check failed: {len(link_diags)} relative "
+                "import(s) do not resolve to any file on disk. The actual "
+                "build was skipped. Fix the imports (or create the missing "
+                "files) before the build is attempted."
+            )
+            return {
+                "exit_code": 1,
+                "compiler_errors": link_diags,
+                "node_state": short_circuit_state,
+                "loop_counter": loop_counter,
+            }
+
     # Fix #6 / two-phase: prod-import smoke check BEFORE running the
     # actual build. Verifies every production module imports cleanly so
     # the LLM never has to disambiguate "is this a prod bug cascading
@@ -5559,12 +5691,17 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             # Python ModuleNotFoundError is ALWAYS repairable — any
             # single-segment module name is a pip-installable distribution,
             # and the autofix R4 (`_try_missing_dep`) + the repair LLM can
-            # land the requirements.txt edit. Shell `command not found` is
-            # only repairable when the symbol is a pip-installable Python
-            # tool listed in `_PIP_INSTALLABLE_SYMBOLS`; everything else
-            # (npm, cargo, go, docker) needs an operator-side image swap.
+            # land the requirements.txt edit.
+            # Node "Cannot find module 'X'" is ALWAYS repairable too — any
+            # bare-name miss is an npm-installable package and autofix R7
+            # (`_try_missing_npm_dep`) writes it to package.json. Scoped
+            # packages (@scope/pkg) and sub-paths (pkg/sub) included.
+            # Shell `command not found` is only repairable when the symbol
+            # is a pip-installable Python tool listed in
+            # ``_PIP_INSTALLABLE_SYMBOLS``; everything else (cargo, go,
+            # docker, etc.) needs an operator-side image swap.
             env_misconfig_is_repairable = (
-                miss_kind == "python"
+                miss_kind in ("python", "node")
                 or env_misconfig_symbol.lower() in _PIP_INSTALLABLE_SYMBOLS
             )
             if env_misconfig_is_repairable:
@@ -7244,6 +7381,36 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         str(err.get("error_code", "")).upper() in autofixable_codes
         for err in compiler_errors
     )
+
+    # Same-file REPLACE_BLOCK stuck-target tripwire. When any single file
+    # racks up >=3 consecutive REPLACE_BLOCK misses — the LLM emitting
+    # search blocks the patcher can't match against the on-disk content,
+    # round after round — the directive at >=2 (_format_replace_block_miss_
+    # directive) has demonstrably not unstuck the LLM. Burning further
+    # iterations on the same file only piles up identical rejections. Go
+    # to HITL with a specific reason: the operator can manually fix the
+    # one file or accept that codegen of that file should be retried.
+    #
+    # Sized to fire AFTER the >=2 directive has had one full round to
+    # work (LLM saw "use a different operation" prompt + the actual file
+    # bytes, and still missed). Three is the smallest count where giving
+    # up is more useful than retrying.
+    _STUCK_TARGET_LIMIT = 3
+    _rb_per_file = loop_counter.get("replace_block_misses_per_file") or {}
+    if isinstance(_rb_per_file, dict):
+        stuck_files = sorted(
+            f for f, n in _rb_per_file.items()
+            if isinstance(n, int) and n >= _STUCK_TARGET_LIMIT
+        )
+        if stuck_files:
+            logger.warning(
+                "[router] REPLACE_BLOCK stuck on file(s) %s (>=%d misses each). "
+                "The LLM keeps emitting search blocks the patcher rejects against "
+                "the on-disk content. Routing to HITL: the operator can edit the "
+                "file by hand or restart codegen for it.",
+                stuck_files, _STUCK_TARGET_LIMIT,
+            )
+            return _transition("human_intervention_node")
 
     # No-patches-landed tripwire (A6). Two consecutive repair rounds where
     # the patcher applied zero patches means the loop is stuck (LLM keeps
@@ -9577,6 +9744,28 @@ async def installation_doc_node(state: AgentState) -> dict[str, Any]:
             exc,
         )
         install_path = None
+
+    # Requirement-traceability audit: surface any FR-XXX / US-XX-YY /
+    # NFR-XXX-NNN declared in the spec that never appears in the
+    # generated source tree. Advisory: prints a report block but does
+    # not block the run. Operator can use this to spot stories codegen
+    # silently dropped before they cause a prod surprise.
+    try:
+        from harness.traceability import audit_workspace, format_report
+        report = audit_workspace(workspace_path)
+        if report is not None and report.untraced:
+            report_text = format_report(report)
+            if report_text:
+                print()
+                print(report_text)
+                logger.info(
+                    "[traceability] %d/%d requirement IDs traced (%.0f%% "
+                    "coverage); %d untraced — see report above.",
+                    report.traced_ids, report.total_ids,
+                    report.coverage_pct, len(report.untraced),
+                )
+    except Exception as exc:  # noqa: BLE001 — audit must never break the run
+        logger.debug("[traceability] Audit failed (%s); skipping report.", exc)
 
     # End-of-run "application usage guide" — prints a visible paragraph
     # to stdout so the operator doesn't have to open INSTALLATION.md to
