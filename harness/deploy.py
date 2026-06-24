@@ -1045,6 +1045,18 @@ def generate_assets_from_blueprint(
     generated.append("docker-compose.yml")
     logger.info("[deploy:generate] Generated docker-compose.yml (%d services)", len(services))
 
+    # Generate .env from the union of services[*].environment_keys_needed
+    # so docker-compose doesn't warn (and DB images don't refuse to start)
+    # on unset required secrets. Never overwrite an operator-authored file.
+    env_path = workspace / ".env"
+    if not env_path.exists():
+        env_content = _generate_env_file(blueprint)
+        if env_content:
+            env_path.write_text(env_content, encoding="utf-8")
+            generated.append(".env")
+            logger.info("[deploy:generate] Generated .env (%d key(s))",
+                        env_content.count("\n") - 3)
+
     # Generate Caddyfile if proxy service specified
     if blueprint.get("proxy_service") == "caddy" or "caddy" in services:
         caddy_path = workspace / "Caddyfile"
@@ -1351,7 +1363,7 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
                 "message": "[DEPLOYMENT FAULT]: Failed to synthesize architecture blueprint.",
                 "semantic_context": str(blueprint),
             }],
-            "loop_counter": {"deployment": 1},
+            "loop_counter": _bump_deployment_counter(state),
             "node_state": {"deployment": {"phase": "synthesis_failed"}},
         }
 
@@ -1386,7 +1398,7 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
                 "message": f"[DEPLOYMENT FAULT]: Failed to generate assets. {gen_result.get('message', '')}",
                 "semantic_context": str(gen_result),
             }],
-            "loop_counter": {"deployment": 1},
+            "loop_counter": _bump_deployment_counter(state),
             "node_state": {"deployment": {"phase": "generation_failed"}},
         }
 
@@ -1406,7 +1418,7 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
                 "message": f"[DEPLOYMENT FAULT]: {compose_file} not found after generation.",
                 "semantic_context": f"Generated files: {gen_result.get('generated', [])}",
             }],
-            "loop_counter": {"deployment": 1},
+            "loop_counter": _bump_deployment_counter(state),
         }
 
     # --- Phase 3.5: Preview gate ---
@@ -1438,7 +1450,7 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
     # Audit §2.3 / §2.4.
     try:
         from harness.sandbox import run_subprocess_kill_on_timeout
-        rc, _stdout, stderr, timed_out = await run_subprocess_kill_on_timeout(
+        rc, stdout, stderr, timed_out = await run_subprocess_kill_on_timeout(
             [*_compose_argv_for(workspace_path), "-f", compose_path, "up", "--build", "-d"],
             timeout=180.0,
             cwd=workspace_path,
@@ -1454,7 +1466,7 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
                     "error_code": "DEPLOYMENT_BUILD_TIMEOUT",
                     "message": "[DEPLOYMENT FAULT]: Build timed out after 180s.",
                 }],
-                "loop_counter": {"deployment": 1},
+                "loop_counter": _bump_deployment_counter(state),
             }
         if rc != 0:
             _emit_deployment_outcome(
@@ -1466,9 +1478,9 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
                     "file": compose_file, "line": 0, "column": 0, "severity": "error",
                     "error_code": "DEPLOYMENT_BUILD_FAILED",
                     "message": f"[DEPLOYMENT FAULT]: docker-compose build failed (exit={rc}).",
-                    "semantic_context": stderr.decode("utf-8", errors="replace")[:500],
+                    "semantic_context": _summarize_compose_failure(stdout, stderr),
                 }],
-                "loop_counter": {"deployment": 1},
+                "loop_counter": _bump_deployment_counter(state),
             }
         logger.info("[deployment_node] Container build successful.")
     except FileNotFoundError:
@@ -1481,7 +1493,7 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
                 "error_code": "DEPLOYMENT_DOCKER_UNAVAILABLE",
                 "message": "[DEPLOYMENT FAULT]: docker-compose not installed.",
             }],
-            "loop_counter": {"deployment": 1},
+            "loop_counter": _bump_deployment_counter(state),
         }
 
     # Health check
@@ -1504,8 +1516,7 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     # Failure
-    loop_counter = state.get("loop_counter", {})
-    loop_counter = dict(loop_counter)
+    loop_counter = dict(state.get("loop_counter") or {})
     loop_counter["deployment"] = loop_counter.get("deployment", 0) + 1
 
     messages = list(state.get("messages", []))
@@ -1717,6 +1728,80 @@ def _emit_deployment_outcome(**fields: Any) -> None:
         emit_event("deployment_outcome", **fields)
     except Exception:  # noqa: BLE001 — telemetry never blocks deploy
         pass
+
+
+def _bump_deployment_counter(state: dict[str, Any]) -> dict[str, Any]:
+    """Increment ``loop_counter['deployment']`` from current state.
+
+    Why: every early-exit path in ``deployment_node`` used to hardcode
+    ``{"deployment": 1}``, so the counter never grew and no cap could
+    ever fire — a stuck deploy spun until budget exhaustion (session
+    973ddbd2).
+    """
+    bumped = dict(state.get("loop_counter") or {})
+    bumped["deployment"] = int(bumped.get("deployment", 0)) + 1
+    return bumped
+
+
+def _summarize_compose_failure(
+    stdout: bytes, stderr: bytes, *, max_chars: int = 2000,
+) -> str:
+    """Distil ``docker compose up --build`` output into a slice the repair
+    LLM can act on.
+
+    Drops the ``variable is not set`` warnings that compose prints for
+    every unset ``${KEY}`` reference — without this filter, the first KB
+    of stderr is consumed by 5-10 warning lines and the slice handed to
+    the LLM contains zero signal about WHY the build failed
+    (session 973ddbd2). Then takes the tail so the actual error (which
+    compose prints last) survives the cap.
+    """
+    out = stdout.decode("utf-8", errors="replace")
+    err = stderr.decode("utf-8", errors="replace")
+    lines = (out + "\n" + err).splitlines()
+    kept = [
+        ln for ln in lines
+        if "variable is not set" not in ln
+        and "Defaulting to a blank string" not in ln
+    ]
+    text = "\n".join(kept).strip()
+    if len(text) <= max_chars:
+        return text
+    return "...\n" + text[-max_chars:]
+
+
+def _generate_env_file(blueprint: dict[str, Any]) -> str:
+    """Emit a ``.env`` populated with placeholder values for every
+    ``${KEY}`` the compose file references.
+
+    Why: ``_generate_compose_file`` renders ``${KEY}`` for each
+    ``environment_keys_needed`` entry, but nothing writes the matching
+    ``.env``. Compose warns "KEY is not set, defaulting to blank", and
+    images that require a non-empty value (postgres, mariadb) fail to
+    start — the failure looks like an arbitrary build error to the
+    repair LLM. Placeholders keep the sandbox starting; the preview
+    gate shows them to the operator before anything runs.
+    """
+    services = blueprint.get("services", {}) or {}
+    seen: set[str] = set()
+    keys: list[str] = []
+    for svc_spec in services.values():
+        if not isinstance(svc_spec, dict):
+            continue
+        for key in svc_spec.get("environment_keys_needed", []) or []:
+            if isinstance(key, str) and key not in seen:
+                seen.add(key)
+                keys.append(key)
+    if not keys:
+        return ""
+    lines = [
+        "# Auto-generated by deployment_node. Sandbox placeholders only —",
+        "# replace with real values before using this stack anywhere else.",
+        "",
+    ]
+    for key in keys:
+        lines.append(f"{key}=changeme")
+    return "\n".join(lines) + "\n"
 
 
 async def teardown_containers(workspace_path: str, compose_file: str = "docker-compose.yml") -> bool:

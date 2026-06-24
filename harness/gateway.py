@@ -1548,6 +1548,25 @@ class GatewayConfig:
     # speculative path also consumes part of this budget, so 3 leaves no
     # headroom for actual repair when speculative ends up salvaging.
     max_patch_repair_iterations: int = 5
+    # Phase G — end-of-session regression repair cap. Caps the
+    # repair → recompile loop the harness runs after security_scan
+    # passes but before deployment. Read by
+    # ``route_after_end_of_session_regression`` in harness/graph.py.
+    max_end_of_session_regression_cycles: int = 3
+    # Phase J — end-of-session repair authority. The default per-batch
+    # repair shows the LLM up to 12 diagnostic-file slices + 50 inventory
+    # files; at the EoS regression a security-scan repair may have
+    # touched shared utilities so the failing test set can implicate
+    # many more files. Raising the caps gives the senior reasoning model
+    # enough surface to spot a cross-file cascade. Wired by
+    # ``_repair_file_caps`` in harness/graph.py.
+    end_of_session_repair_diagnostic_cap: int = 30
+    end_of_session_repair_inventory_cap: int = 150
+    # Phase J — when True, EoS regression repair jumps straight to the
+    # reasoning model on the first attempt rather than burning
+    # cheap-model rounds first. Off to fall back to the cycle-driven
+    # escalation rule (escalates only on the LAST attempt before HITL).
+    end_of_session_force_reasoning_model: bool = True
     ollama_local_model: str = ""
     ollama_local_backup: str = ""
     force_local_only: bool = False
@@ -2836,6 +2855,26 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         max_patch_repair_iterations=_clamp_repair_iterations(
             node_throttle.get("max_patch_repair_iterations", 5)
         ),
+        # Phase G + Phase J — end-of-session repair / regression knobs.
+        # Clamp the cycle / cap fields to sane ranges so a bogus
+        # operator value (e.g. cycles=0 or cap=999999) doesn't silently
+        # disable the gate or blow up prompt sizes.
+        max_end_of_session_regression_cycles=max(1, min(10, int(
+            node_throttle.get("max_end_of_session_regression_cycles", 3) or 3
+        ))),
+        end_of_session_repair_diagnostic_cap=max(1, min(200, int(
+            node_throttle.get(
+                "end_of_session_repair_diagnostic_cap", 30,
+            ) or 30
+        ))),
+        end_of_session_repair_inventory_cap=max(1, min(1000, int(
+            node_throttle.get(
+                "end_of_session_repair_inventory_cap", 150,
+            ) or 150
+        ))),
+        end_of_session_force_reasoning_model=bool(node_throttle.get(
+            "end_of_session_force_reasoning_model", True,
+        )),
         ollama_local_model=model_routing.get("ollama_local_model", ""),
         ollama_local_backup=model_routing.get("ollama_local_backup", ""),
         force_local_only=model_routing.get("force_local_only", False),

@@ -1,0 +1,1236 @@
+"""SQLite-backed state store for Agile-style story decomposition.
+
+This module owns the data layer for teane's per-story TDD flow:
+
+- The **stories** table is the canonical record of work units the
+  decomposition LLM derived from ``SPEC_REQUIREMENTS.md``. Each row
+  carries acceptance criteria, dependencies, and scope hints.
+- **batches** group stories the planner picked for one execution
+  round; **batch_stories** records sequence within a batch.
+- **defects** capture per-story repair-cap failures (compile / lint /
+  test / review / security) so failed acceptances are queryable
+  rather than buried in log files.
+- **test_runs** record acceptance-test outcomes per story phase
+  (tests_first / repair / final).
+- **file_links** map stories to the files they touched (code / test
+  / doc / infra) — the spine of the traceability matrix.
+- **commits** optionally record git SHAs per story when
+  ``--commit-on-story`` is enabled. The DB is the source of truth;
+  git is a snapshot layer on top.
+
+**Global, multi-workspace DB.** The store lives at a single shared
+location (``~/.harness/state.db`` by default; override with the
+``TEANE_STATE_DB`` env var) and carries rows for every workspace teane
+has touched. Each row is scoped by a ``workspace`` column whose value
+is the workspace folder's basename — that name is treated as the
+**app name** and is assumed unique across the operator's machine.
+Two workspaces sharing the same basename WILL collide.
+
+All graph nodes go through the typed helpers here — the LLM never
+composes SQL. Every helper takes the workspace identifier explicitly
+so the SQL stays scoped to the calling app's rows.
+``regenerate_markdown_views`` rebuilds ``docs/STORIES.md`` and
+``docs/TRACEABILITY.md`` from the DB; teane never edits those
+markdown files directly.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sqlite3
+from datetime import datetime, timezone
+from typing import Any, Iterable, Optional
+
+logger = logging.getLogger(__name__)
+
+
+SCHEMA_VERSION = 3
+"""Bump when adding columns. Add a ``_migrate_to_vN`` function and
+register it in ``_MIGRATIONS`` below. Forward-only.
+
+v3 (multi-workspace global DB + CR tagging):
+- ``stories``, ``batches``, ``defects``, ``test_runs``, ``file_links``,
+  ``commits`` each carry a ``workspace TEXT NOT NULL`` column scoping
+  the row to its owning app.
+- ``stories.story_key`` is no longer globally unique — only unique
+  WITHIN a workspace. The composite ``UNIQUE(workspace, story_key)``
+  replaces the old single-column UNIQUE.
+- ``stories`` and ``batches`` carry ``build_kind`` (``greenfield`` or
+  ``cr``) plus ``cr_ids`` (JSON list of integer CR ids ingested in the
+  run that created the row). Together these mark a row as an
+  incremental change-request layer on top of the original build, so
+  traceability views can show "STORY-7 was added by CR-2" without
+  losing the greenfield history.
+
+v2 (per-batch verification pipeline, historical — applied to a v1 DB):
+- ``file_links.batch_id`` — which batch last touched this file
+  (for batch-level repair attribution).
+- ``batches.committed_sha`` — git SHA of the BATCH-N commit, when
+  git-commit-on-batch is enabled.
+"""
+
+BUILD_KIND_GREENFIELD = "greenfield"
+BUILD_KIND_CR = "cr"
+_VALID_BUILD_KINDS = frozenset({BUILD_KIND_GREENFIELD, BUILD_KIND_CR})
+
+# Default path for the harness-global state.db. Override at runtime
+# with the ``TEANE_STATE_DB`` env var — pytest's autouse fixture
+# (tests/conftest.py) uses that to redirect each test's DB into its
+# own ``tmp_path`` so test runs never touch the operator's real file.
+_DEFAULT_STATE_DB_PATH = "~/.harness/state.db"
+
+_STATE_DIR_NAME = ".teane"  # retained only for legacy file detection
+_STATE_DB_NAME = "state.db"
+
+_INVALID_BASENAME = frozenset({"", ".", ".."})
+
+
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS stories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL,
+    story_key TEXT NOT NULL,
+    epic TEXT,
+    title TEXT NOT NULL,
+    description TEXT,
+    acceptance_criteria TEXT NOT NULL DEFAULT '[]',  -- JSON list[str]
+    depends_on TEXT NOT NULL DEFAULT '[]',           -- JSON list[story_key]
+    scope_files TEXT NOT NULL DEFAULT '[]',          -- JSON list[path]
+    status TEXT NOT NULL DEFAULT 'planned',
+    external_ref TEXT,
+    build_kind TEXT NOT NULL DEFAULT 'greenfield',
+    cr_ids TEXT,                                     -- JSON list[int] | NULL
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    UNIQUE(workspace, story_key)
+);
+CREATE INDEX IF NOT EXISTS idx_stories_workspace ON stories(workspace);
+CREATE INDEX IF NOT EXISTS idx_stories_status ON stories(workspace, status);
+CREATE INDEX IF NOT EXISTS idx_stories_epic ON stories(workspace, epic);
+CREATE INDEX IF NOT EXISTS idx_stories_build_kind
+    ON stories(workspace, build_kind);
+
+CREATE TABLE IF NOT EXISTS batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    committed_sha TEXT,
+    build_kind TEXT NOT NULL DEFAULT 'greenfield',
+    cr_ids TEXT                                       -- JSON list[int] | NULL
+);
+CREATE INDEX IF NOT EXISTS idx_batches_workspace ON batches(workspace);
+CREATE INDEX IF NOT EXISTS idx_batches_build_kind
+    ON batches(workspace, build_kind);
+
+CREATE TABLE IF NOT EXISTS batch_stories (
+    batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, story_id)
+);
+
+CREATE TABLE IF NOT EXISTS defects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL,
+    story_id INTEGER REFERENCES stories(id) ON DELETE SET NULL,
+    session_id TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    diagnostic_json TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_defects_workspace ON defects(workspace);
+CREATE INDEX IF NOT EXISTS idx_defects_story ON defects(story_id);
+CREATE INDEX IF NOT EXISTS idx_defects_status ON defects(workspace, status);
+
+CREATE TABLE IF NOT EXISTS test_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL,
+    story_id INTEGER REFERENCES stories(id) ON DELETE SET NULL,
+    session_id TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    exit_code INTEGER NOT NULL,
+    passed INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    errors INTEGER NOT NULL DEFAULT 0,
+    stdout_tail TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_test_runs_workspace ON test_runs(workspace);
+
+CREATE TABLE IF NOT EXISTS file_links (
+    workspace TEXT NOT NULL,
+    story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    batch_id INTEGER REFERENCES batches(id) ON DELETE SET NULL,
+    PRIMARY KEY (story_id, path, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_file_links_workspace ON file_links(workspace);
+CREATE INDEX IF NOT EXISTS idx_file_links_path ON file_links(path);
+CREATE INDEX IF NOT EXISTS idx_file_links_batch ON file_links(batch_id);
+
+CREATE TABLE IF NOT EXISTS commits (
+    sha TEXT PRIMARY KEY,
+    workspace TEXT NOT NULL,
+    story_id INTEGER REFERENCES stories(id) ON DELETE SET NULL,
+    session_id TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_commits_workspace ON commits(workspace);
+CREATE INDEX IF NOT EXISTS idx_commits_story ON commits(story_id);
+"""
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    # Mirrors harness/web_state.py:99 — WAL + busy-timeout avoids
+    # ``database is locked`` if the dashboard ever reads while the
+    # graph writes from another thread.
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+    except sqlite3.DatabaseError:  # pragma: no cover
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Workspace / path helpers
+# ---------------------------------------------------------------------------
+
+def state_db_path() -> str:
+    """Return the active state.db path.
+
+    Resolution order:
+      1. ``TEANE_STATE_DB`` env var (used by tests to isolate per
+         tmp_path; could also be used by an operator to point at a
+         shared store on a network mount).
+      2. ``_DEFAULT_STATE_DB_PATH`` — ``~/.harness/state.db``.
+    """
+    override = os.environ.get("TEANE_STATE_DB", "").strip()
+    if override:
+        return os.path.expanduser(override)
+    return os.path.expanduser(_DEFAULT_STATE_DB_PATH)
+
+
+def app_name_for_workspace(workspace_path: str) -> str:
+    """Derive the workspace's app-name identifier.
+
+    The app name is the workspace folder's basename. teane assumes
+    these basenames are unique across the operator's machine — two
+    workspaces with the same folder name WILL share rows in state.db.
+    """
+    s = (workspace_path or "").rstrip("/\\")
+    base = os.path.basename(s) if s else ""
+    if base in _INVALID_BASENAME:
+        raise ValueError(
+            f"workspace_path={workspace_path!r} has no usable basename; "
+            "cannot derive an app name for state.db scoping."
+        )
+    return base
+
+
+# Legacy path detector — used by the --new-build preview / log so
+# operators upgrading from the per-workspace layout see that the old
+# file is no longer the source of truth.
+def legacy_state_db_path(workspace_path: str) -> str:
+    """Return the OLD per-workspace state.db path (pre-v3)."""
+    return os.path.join(
+        os.path.expanduser(workspace_path), _STATE_DIR_NAME, _STATE_DB_NAME,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Migrations
+# ---------------------------------------------------------------------------
+
+def _read_schema_version(conn: sqlite3.Connection) -> int:
+    try:
+        row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    if row is None:
+        return 0
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _write_schema_version(conn: sqlite3.Connection, version: int) -> None:
+    conn.execute(
+        "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (str(version),),
+    )
+
+
+_MIGRATIONS: list[tuple[int, Any]] = []
+"""(target_version, callable(conn) -> None). Append-only; never rewrite
+history. v1 → v2 and v2 → v3 only existed for per-workspace DBs that
+v3 explicitly ignores — fresh global DBs land at SCHEMA_VERSION
+straight from ``_SCHEMA_SQL`` with no migration steps."""
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    current = _read_schema_version(conn)
+    for target, fn in _MIGRATIONS:
+        if current < target:
+            fn(conn)
+            current = target
+            _write_schema_version(conn, current)
+    if current < SCHEMA_VERSION:
+        _write_schema_version(conn, SCHEMA_VERSION)
+
+
+# ---------------------------------------------------------------------------
+# Open / purge
+# ---------------------------------------------------------------------------
+
+def purge_state_db(workspace_path: str) -> dict[str, int]:
+    """Delete every row in state.db tied to ``workspace_path``'s app
+    name, leaving rows for other workspaces untouched.
+
+    Used by ``--new-build`` so the next run starts as a fresh thread
+    for THIS workspace while preserving every other app's history.
+    Best-effort: a missing DB or open failure logs and returns zeros.
+
+    Returns a dict ``{table: rows_deleted}`` for stories / batches /
+    defects / test_runs / file_links / commits so the caller can log
+    a clear summary.
+    """
+    counts: dict[str, int] = {
+        "stories": 0, "batches": 0, "defects": 0,
+        "test_runs": 0, "file_links": 0, "commits": 0,
+    }
+    try:
+        app = app_name_for_workspace(workspace_path)
+    except ValueError as exc:
+        logger.warning("[story_state] purge skipped: %s", exc)
+        return counts
+
+    db = state_db_path()
+    if not os.path.isfile(db):
+        return counts
+
+    try:
+        conn = sqlite3.connect(db)
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "[story_state] Could not open %s to purge app %r: %s",
+            db, app, exc,
+        )
+        return counts
+
+    try:
+        _apply_sqlite_pragmas(conn)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # Order matters: file_links and batch_stories reference
+            # stories.id / batches.id; delete the children first so
+            # the parent deletes don't trip a FK warning.
+            for table in (
+                "file_links", "test_runs", "defects", "commits",
+                "batch_stories",  # transitively via batches+stories
+            ):
+                if table == "batch_stories":
+                    cur = conn.execute(
+                        "DELETE FROM batch_stories WHERE batch_id IN "
+                        "(SELECT id FROM batches WHERE workspace = ?) "
+                        "OR story_id IN "
+                        "(SELECT id FROM stories WHERE workspace = ?)",
+                        (app, app),
+                    )
+                else:
+                    cur = conn.execute(
+                        f"DELETE FROM {table} WHERE workspace = ?", (app,),
+                    )
+                # batch_stories isn't in the counts dict (it's a join
+                # table without a workspace column of its own).
+                if table in counts:
+                    counts[table] = cur.rowcount or 0
+            for table in ("batches", "stories"):
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE workspace = ?", (app,),
+                )
+                counts[table] = cur.rowcount or 0
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+    total = sum(counts.values())
+    if total:
+        logger.info(
+            "[story_state] Purged %d row(s) for app %r from %s "
+            "(stories=%d, batches=%d, defects=%d, test_runs=%d, "
+            "file_links=%d, commits=%d).",
+            total, app, db,
+            counts["stories"], counts["batches"], counts["defects"],
+            counts["test_runs"], counts["file_links"], counts["commits"],
+        )
+    return counts
+
+
+def open_story_db(workspace_path: Optional[str] = None) -> sqlite3.Connection:
+    """Open (creating + migrating) the harness-global story DB.
+
+    The ``workspace_path`` argument is accepted for back-compat with
+    call sites that already pass it (and so the same import path keeps
+    working) but is NOT used to derive the DB location any more — the
+    DB is a single file shared across every workspace, scoped per row
+    via the ``workspace`` column.
+
+    Caller closes. Pattern mirrors ``harness/web_state.py:115`` —
+    close the connection if anything in schema setup raises so we
+    don't leak fds on a half-initialised DB.
+    """
+    del workspace_path  # accepted for back-compat; not used
+    path = state_db_path()
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        _apply_sqlite_pragmas(conn)
+        conn.executescript(_SCHEMA_SQL)
+        _apply_migrations(conn)
+        conn.commit()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# Story CRUD
+# ---------------------------------------------------------------------------
+
+def _next_story_key(conn: sqlite3.Connection, workspace: str) -> str:
+    """Allocate the next ``STORY-N`` key within ``workspace``.
+
+    Keys are unique WITHIN a workspace; two workspaces can each have
+    a ``STORY-1`` simultaneously — that's why every join carries the
+    workspace filter.
+    """
+    row = conn.execute(
+        "SELECT story_key FROM stories WHERE workspace = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (workspace,),
+    ).fetchone()
+    if row is None:
+        return "STORY-1"
+    last = row[0]
+    try:
+        n = int(last.rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        n = conn.execute(
+            "SELECT COUNT(*) FROM stories WHERE workspace = ?", (workspace,),
+        ).fetchone()[0]
+    return f"STORY-{n + 1}"
+
+
+def create_stories(
+    conn: sqlite3.Connection,
+    workspace: str,
+    items: Iterable[dict[str, Any]],
+    *,
+    build_kind: str = BUILD_KIND_GREENFIELD,
+    cr_ids: Optional[Iterable[int]] = None,
+) -> list[str]:
+    """Insert decomposition-LLM output. Returns assigned story_keys in order.
+
+    Each item supports: ``title`` (required), ``epic``, ``description``,
+    ``acceptance_criteria`` (list[str]), ``depends_on`` (list[story_key]),
+    ``scope_files`` (list[str]), ``external_ref``. Story keys are
+    assigned sequentially within ``workspace`` — caller does not specify
+    them.
+
+    ``build_kind`` is ``greenfield`` (default — initial build) or ``cr``
+    (a change-request increment on top of an existing build).
+    ``cr_ids`` lists the integer CR ids ingested in the run that
+    created these stories; ignored when ``build_kind='greenfield'``.
+    """
+    build_kind = _validate_build_kind(build_kind)
+    if build_kind == BUILD_KIND_GREENFIELD:
+        cr_ids_json = None
+    else:
+        cr_ids_json = _serialise_cr_ids(cr_ids)
+    created: list[str] = []
+    now = _utcnow_iso()
+    for item in items:
+        if not item.get("title"):
+            raise ValueError("story requires 'title'")
+        key = _next_story_key(conn, workspace)
+        conn.execute(
+            """
+            INSERT INTO stories(
+                workspace, story_key, epic, title, description,
+                acceptance_criteria, depends_on, scope_files,
+                status, external_ref, build_kind, cr_ids, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?)
+            """,
+            (
+                workspace,
+                key,
+                item.get("epic"),
+                item["title"],
+                item.get("description"),
+                json.dumps(list(item.get("acceptance_criteria") or [])),
+                json.dumps(list(item.get("depends_on") or [])),
+                json.dumps(list(item.get("scope_files") or [])),
+                item.get("external_ref"),
+                build_kind,
+                cr_ids_json,
+                now,
+            ),
+        )
+        created.append(key)
+    conn.commit()
+    return created
+
+
+def _row_to_story(row: sqlite3.Row | tuple) -> dict[str, Any]:
+    return {
+        "id": row[0],
+        "story_key": row[1],
+        "epic": row[2],
+        "title": row[3],
+        "description": row[4],
+        "acceptance_criteria": json.loads(row[5] or "[]"),
+        "depends_on": json.loads(row[6] or "[]"),
+        "scope_files": json.loads(row[7] or "[]"),
+        "status": row[8],
+        "external_ref": row[9],
+        "build_kind": row[10] or BUILD_KIND_GREENFIELD,
+        "cr_ids": json.loads(row[11]) if row[11] else [],
+        "created_at": row[12],
+        "started_at": row[13],
+        "completed_at": row[14],
+    }
+
+
+_STORY_COLS = (
+    "id, story_key, epic, title, description, "
+    "acceptance_criteria, depends_on, scope_files, status, external_ref, "
+    "build_kind, cr_ids, "
+    "created_at, started_at, completed_at"
+)
+
+
+def _validate_build_kind(build_kind: str) -> str:
+    if build_kind not in _VALID_BUILD_KINDS:
+        raise ValueError(
+            f"build_kind={build_kind!r} not in {sorted(_VALID_BUILD_KINDS)}"
+        )
+    return build_kind
+
+
+def _serialise_cr_ids(cr_ids: Optional[Iterable[int]]) -> Optional[str]:
+    if cr_ids is None:
+        return None
+    coerced = [int(x) for x in cr_ids]
+    return json.dumps(coerced) if coerced else None
+
+
+def list_stories(
+    conn: sqlite3.Connection,
+    workspace: str,
+    *,
+    status: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    if status is None:
+        rows = conn.execute(
+            f"SELECT {_STORY_COLS} FROM stories WHERE workspace = ? "
+            "ORDER BY id",
+            (workspace,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT {_STORY_COLS} FROM stories "
+            "WHERE workspace = ? AND status = ? ORDER BY id",
+            (workspace, status),
+        ).fetchall()
+    return [_row_to_story(r) for r in rows]
+
+
+def get_story(
+    conn: sqlite3.Connection, workspace: str, story_key: str,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        f"SELECT {_STORY_COLS} FROM stories "
+        "WHERE workspace = ? AND story_key = ?",
+        (workspace, story_key),
+    ).fetchone()
+    return _row_to_story(row) if row else None
+
+
+def get_planned_stories(
+    conn: sqlite3.Connection, workspace: str,
+) -> list[dict[str, Any]]:
+    """Stories ready to be picked. Honors depends_on — a story whose
+    deps are not all 'done' is not returned even if status='planned'."""
+    all_planned = list_stories(conn, workspace, status="planned")
+    done_keys = {
+        s["story_key"] for s in list_stories(conn, workspace, status="done")
+    }
+    ready: list[dict[str, Any]] = []
+    for s in all_planned:
+        deps = s["depends_on"]
+        if all(d in done_keys for d in deps):
+            ready.append(s)
+    return ready
+
+
+def mark_in_progress(
+    conn: sqlite3.Connection, workspace: str, story_key: str,
+) -> int:
+    """Transition a planned/in-progress story into the in_progress state.
+
+    Resumed sessions hit this on a story already in_progress — narrowing
+    the WHERE to status='planned' would silently no-op and leak a stale
+    started_at. Allow both states so the started_at stamp is refreshed
+    deterministically. Returns affected rowcount so callers can detect
+    a vanished story_key (rowcount=0).
+    """
+    cur = conn.execute(
+        "UPDATE stories SET status = 'in_progress', started_at = ? "
+        "WHERE workspace = ? AND story_key = ? "
+        "AND status IN ('planned', 'in_progress')",
+        (_utcnow_iso(), workspace, story_key),
+    )
+    conn.commit()
+    return cur.rowcount or 0
+
+
+def mark_done(
+    conn: sqlite3.Connection, workspace: str, story_key: str,
+) -> None:
+    conn.execute(
+        "UPDATE stories SET status = 'done', completed_at = ? "
+        "WHERE workspace = ? AND story_key = ?",
+        (_utcnow_iso(), workspace, story_key),
+    )
+    conn.commit()
+
+
+def mark_blocked(
+    conn: sqlite3.Connection, workspace: str, story_key: str,
+) -> None:
+    conn.execute(
+        "UPDATE stories SET status = 'blocked' "
+        "WHERE workspace = ? AND story_key = ?",
+        (workspace, story_key),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Batches
+# ---------------------------------------------------------------------------
+
+def start_batch(
+    conn: sqlite3.Connection,
+    workspace: str,
+    session_id: str,
+    story_keys: list[str],
+    *,
+    build_kind: str = BUILD_KIND_GREENFIELD,
+    cr_ids: Optional[Iterable[int]] = None,
+) -> int:
+    """Open a new batch row and seed its ``batch_stories`` membership.
+
+    ``build_kind`` (``greenfield`` or ``cr``) and ``cr_ids`` (JSON list
+    of int CR ids ingested in this run) tag the batch as an
+    incremental change-request layer or as part of the initial build.
+    """
+    build_kind = _validate_build_kind(build_kind)
+    cr_ids_json = (
+        None if build_kind == BUILD_KIND_GREENFIELD
+        else _serialise_cr_ids(cr_ids)
+    )
+    cur = conn.execute(
+        "INSERT INTO batches"
+        "(workspace, session_id, started_at, status, build_kind, cr_ids) "
+        "VALUES(?, ?, ?, 'running', ?, ?)",
+        (workspace, session_id, _utcnow_iso(), build_kind, cr_ids_json),
+    )
+    batch_id = cur.lastrowid
+    if batch_id is None:
+        raise RuntimeError("failed to allocate batch id")
+    for seq, key in enumerate(story_keys, start=1):
+        story_row = conn.execute(
+            "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
+            (workspace, key),
+        ).fetchone()
+        if story_row is None:
+            continue
+        conn.execute(
+            "INSERT INTO batch_stories(batch_id, story_id, sequence) "
+            "VALUES(?, ?, ?)",
+            (batch_id, story_row[0], seq),
+        )
+    conn.commit()
+    return batch_id
+
+
+def list_stories_for_cr(
+    conn: sqlite3.Connection, workspace: str, cr_id: int,
+) -> list[dict[str, Any]]:
+    """All stories in ``workspace`` whose ``cr_ids`` JSON list contains
+    ``cr_id``. Used by traceability views ("show me what CR-2 added").
+
+    Implemented in Python rather than via JSON SQL because SQLite's
+    json1 extension isn't guaranteed available everywhere and the row
+    counts here are small (tens to hundreds per workspace).
+    """
+    out: list[dict[str, Any]] = []
+    target = int(cr_id)
+    for s in list_stories(conn, workspace):
+        if target in (s.get("cr_ids") or []):
+            out.append(s)
+    return out
+
+
+def list_batches_for_cr(
+    conn: sqlite3.Connection, workspace: str, cr_id: int,
+) -> list[dict[str, Any]]:
+    """All batches in ``workspace`` whose ``cr_ids`` JSON list contains
+    ``cr_id``. Same in-Python filter as ``list_stories_for_cr`` for
+    the same json1 availability reason."""
+    target = int(cr_id)
+    rows = conn.execute(
+        "SELECT id, session_id, started_at, completed_at, status, "
+        "committed_sha, build_kind, cr_ids "
+        "FROM batches WHERE workspace = ? ORDER BY id",
+        (workspace,),
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        cr_list = json.loads(r[7]) if r[7] else []
+        if target not in cr_list:
+            continue
+        out.append({
+            "id": r[0],
+            "session_id": r[1],
+            "started_at": r[2],
+            "completed_at": r[3],
+            "status": r[4],
+            "committed_sha": r[5],
+            "build_kind": r[6],
+            "cr_ids": cr_list,
+        })
+    return out
+
+
+def complete_batch(
+    conn: sqlite3.Connection, batch_id: int, status: str = "complete",
+) -> None:
+    conn.execute(
+        "UPDATE batches SET status = ?, completed_at = ? WHERE id = ?",
+        (status, _utcnow_iso(), batch_id),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Defects, test runs, file links, commits
+# ---------------------------------------------------------------------------
+
+def record_defect(
+    conn: sqlite3.Connection,
+    *,
+    workspace: str,
+    story_key: Optional[str],
+    session_id: str,
+    severity: str,
+    summary: str,
+    diagnostic: Optional[Any] = None,
+) -> int:
+    story_id = None
+    if story_key:
+        row = conn.execute(
+            "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
+            (workspace, story_key),
+        ).fetchone()
+        story_id = row[0] if row else None
+    cur = conn.execute(
+        """
+        INSERT INTO defects(workspace, story_id, session_id, severity,
+                            summary, diagnostic_json, status, created_at)
+        VALUES(?, ?, ?, ?, ?, ?, 'open', ?)
+        """,
+        (
+            workspace,
+            story_id,
+            session_id,
+            severity,
+            summary,
+            json.dumps(diagnostic) if diagnostic is not None else None,
+            _utcnow_iso(),
+        ),
+    )
+    conn.commit()
+    if cur.lastrowid is None:
+        raise RuntimeError("failed to allocate defect id")
+    return cur.lastrowid
+
+
+def resolve_defects_for_story(
+    conn: sqlite3.Connection, workspace: str, story_key: str,
+) -> int:
+    row = conn.execute(
+        "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
+        (workspace, story_key),
+    ).fetchone()
+    if row is None:
+        return 0
+    cur = conn.execute(
+        "UPDATE defects SET status = 'resolved', resolved_at = ? "
+        "WHERE story_id = ? AND status = 'open'",
+        (_utcnow_iso(), row[0]),
+    )
+    conn.commit()
+    return cur.rowcount or 0
+
+
+def record_test_run(
+    conn: sqlite3.Connection,
+    *,
+    workspace: str,
+    story_key: Optional[str],
+    session_id: str,
+    phase: str,
+    exit_code: int,
+    passed: int = 0,
+    failed: int = 0,
+    errors: int = 0,
+    stdout_tail: Optional[str] = None,
+) -> None:
+    story_id = None
+    if story_key:
+        row = conn.execute(
+            "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
+            (workspace, story_key),
+        ).fetchone()
+        story_id = row[0] if row else None
+    conn.execute(
+        """
+        INSERT INTO test_runs(workspace, story_id, session_id, phase,
+                              exit_code, passed, failed, errors,
+                              stdout_tail, created_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (workspace, story_id, session_id, phase, exit_code, passed,
+         failed, errors, stdout_tail, _utcnow_iso()),
+    )
+    conn.commit()
+
+
+def link_file(
+    conn: sqlite3.Connection,
+    workspace: str,
+    story_key: str,
+    path: str,
+    kind: str = "code",
+    batch_id: Optional[int] = None,
+) -> None:
+    """Record that ``story_key`` (in ``workspace``) touched ``path``.
+
+    When ``batch_id`` is provided, also stamps which batch did the
+    most recent touch — that's what per-batch repair attribution
+    joins against to map a compile error back to the owning story.
+    A subsequent call with a different (non-None) ``batch_id`` updates
+    the stamp; ``None`` is a no-op against the stored value.
+    """
+    row = conn.execute(
+        "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
+        (workspace, story_key),
+    ).fetchone()
+    if row is None:
+        return
+    if batch_id is None:
+        conn.execute(
+            "INSERT OR IGNORE INTO file_links(workspace, story_id, path, kind) "
+            "VALUES(?, ?, ?, ?)",
+            (workspace, row[0], path, kind),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO file_links(workspace, story_id, path, kind, batch_id) "
+            "VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(story_id, path, kind) DO UPDATE SET "
+            "batch_id = excluded.batch_id, workspace = excluded.workspace",
+            (workspace, row[0], path, kind, batch_id),
+        )
+    conn.commit()
+
+
+def files_for_batch(
+    conn: sqlite3.Connection, batch_id: int,
+) -> list[tuple[str, str, str]]:
+    """Return ``[(story_key, path, kind), ...]`` for all files stamped
+    with this batch_id. Used by code review / test gen / security scan
+    to scope their inputs to "what this batch touched"."""
+    rows = conn.execute(
+        "SELECT stories.story_key, file_links.path, file_links.kind "
+        "FROM file_links "
+        "JOIN stories ON stories.id = file_links.story_id "
+        "WHERE file_links.batch_id = ? "
+        "ORDER BY stories.story_key, file_links.path",
+        (batch_id,),
+    ).fetchall()
+    return [(r[0], r[1], r[2]) for r in rows]
+
+
+def set_batch_committed_sha(
+    conn: sqlite3.Connection, batch_id: int, sha: str,
+) -> None:
+    """Record the git SHA of the BATCH-N commit. No-op when batch_id
+    is unknown."""
+    conn.execute(
+        "UPDATE batches SET committed_sha = ? WHERE id = ?",
+        (sha, batch_id),
+    )
+    conn.commit()
+
+
+def record_commit(
+    conn: sqlite3.Connection,
+    *,
+    workspace: str,
+    sha: str,
+    story_key: Optional[str],
+    session_id: str,
+    message: str,
+) -> None:
+    story_id = None
+    if story_key:
+        row = conn.execute(
+            "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
+            (workspace, story_key),
+        ).fetchone()
+        story_id = row[0] if row else None
+    conn.execute(
+        "INSERT OR REPLACE INTO commits"
+        "(sha, workspace, story_id, session_id, message, created_at) "
+        "VALUES(?, ?, ?, ?, ?, ?)",
+        (sha, workspace, story_id, session_id, message, _utcnow_iso()),
+    )
+    conn.commit()
+
+
+def seal_batch_atomically(
+    conn: sqlite3.Connection,
+    *,
+    workspace: str,
+    batch_id: int,
+    stories_in_batch: list[tuple[str, str, str]],
+    blocked_count: int,
+    committed_sha: Optional[str],
+    batch_commit_message: Optional[str],
+    session_id: str,
+) -> list[str]:
+    """Seal a batch in a single SQLite transaction.
+
+    Crash-mid-commit safety: previously batch_commit_node called
+    mark_done / resolve_defects / complete_batch / set_batch_committed_sha
+    / record_commit in sequence, each with its own ``conn.commit()``. A
+    crash between calls left the batch row ``running`` with some stories
+    marked ``done`` — on resume, ``batch_planner_node`` saw inconsistent
+    state. This helper does all those mutations in one transaction so the
+    seal either lands fully or rolls back.
+
+    The git commit (``_commit_for_batch``) is intentionally OUTSIDE this
+    helper — it can't be rolled back, so it happens first; the resulting
+    SHA is then stamped here together with everything else.
+
+    Returns the list of ``story_key`` values that this call transitioned
+    from a non-terminal status to ``done``.
+    """
+    done_keys: list[str] = []
+    now = _utcnow_iso()
+    batch_status = "complete" if blocked_count == 0 else "complete_with_blocks"
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for key, _title, status in stories_in_batch:
+            if status in ("done", "blocked"):
+                continue
+            row = conn.execute(
+                "SELECT id FROM stories WHERE workspace = ? AND story_key = ?",
+                (workspace, key),
+            ).fetchone()
+            if row is None:
+                continue
+            sid = row[0]
+            conn.execute(
+                "UPDATE stories SET status = 'done', completed_at = ? "
+                "WHERE workspace = ? AND story_key = ?",
+                (now, workspace, key),
+            )
+            conn.execute(
+                "UPDATE defects SET status = 'resolved', resolved_at = ? "
+                "WHERE story_id = ? AND status = 'open'",
+                (now, sid),
+            )
+            done_keys.append(key)
+
+        if committed_sha:
+            conn.execute(
+                "UPDATE batches SET status = ?, completed_at = ?, "
+                "committed_sha = ? WHERE id = ?",
+                (batch_status, now, committed_sha, batch_id),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO commits"
+                "(sha, workspace, story_id, session_id, message, created_at) "
+                "VALUES(?, ?, NULL, ?, ?, ?)",
+                (committed_sha, workspace, session_id,
+                 batch_commit_message or "", now),
+            )
+        else:
+            conn.execute(
+                "UPDATE batches SET status = ?, completed_at = ? WHERE id = ?",
+                (batch_status, now, batch_id),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return done_keys
+
+
+# ---------------------------------------------------------------------------
+# Markdown view regeneration
+# ---------------------------------------------------------------------------
+
+_STATUS_BADGE = {
+    "planned": "⏳ planned",
+    "in_progress": "🔧 in_progress",
+    "done": "✅ done",
+    "blocked": "⛔ blocked",
+}
+
+
+def _status_label(status: str) -> str:
+    return _STATUS_BADGE.get(status, status)
+
+
+def _render_stories_md(stories: list[dict[str, Any]]) -> str:
+    lines = [
+        "# Stories",
+        "",
+        "_Auto-generated from teane's state.db. Do not edit by hand._",
+        "",
+    ]
+    if not stories:
+        lines.append("_No stories yet._")
+        lines.append("")
+        return "\n".join(lines)
+
+    by_epic: dict[str, list[dict[str, Any]]] = {}
+    for s in stories:
+        by_epic.setdefault(s.get("epic") or "(no epic)", []).append(s)
+
+    for epic in sorted(by_epic):
+        lines.append(f"## {epic}")
+        lines.append("")
+        lines.append("| Key | Status | Title | Depends on | External |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for s in by_epic[epic]:
+            deps = ", ".join(s["depends_on"]) or "—"
+            ext = s.get("external_ref") or "—"
+            lines.append(
+                f"| {s['story_key']} | {_status_label(s['status'])} | "
+                f"{s['title']} | {deps} | {ext} |"
+            )
+        lines.append("")
+        for s in by_epic[epic]:
+            lines.append(f"### {s['story_key']} — {s['title']}")
+            lines.append("")
+            if s.get("description"):
+                lines.append(s["description"])
+                lines.append("")
+            ac = s["acceptance_criteria"]
+            if ac:
+                lines.append("**Acceptance criteria:**")
+                lines.append("")
+                for item in ac:
+                    lines.append(f"- {item}")
+                lines.append("")
+    return "\n".join(lines)
+
+
+def _render_traceability_md(
+    stories: list[dict[str, Any]],
+    files_by_story: dict[str, list[tuple[str, str]]],
+    defects_by_story: dict[str, list[dict[str, Any]]],
+    commits_by_story: dict[str, list[dict[str, Any]]],
+) -> str:
+    lines = [
+        "# Traceability matrix",
+        "",
+        "_Auto-generated from teane's state.db. Do not edit by hand._",
+        "",
+        "| Story | Status | Files | Tests | Defects | Commits |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    if not stories:
+        lines.append("| _none_ | | | | | |")
+        return "\n".join(lines) + "\n"
+    for s in stories:
+        files = files_by_story.get(s["story_key"], [])
+        code = sum(1 for _, k in files if k == "code")
+        tests = sum(1 for _, k in files if k == "test")
+        defects = defects_by_story.get(s["story_key"], [])
+        open_defects = sum(1 for d in defects if d["status"] == "open")
+        commits = commits_by_story.get(s["story_key"], [])
+        commit_str = ", ".join(c["sha"][:7] for c in commits) or "—"
+        defect_str = f"{open_defects} open / {len(defects)}" if defects else "—"
+        lines.append(
+            f"| {s['story_key']} | {_status_label(s['status'])} | "
+            f"{code} code | {tests} tests | {defect_str} | {commit_str} |"
+        )
+    lines.append("")
+    for s in stories:
+        files = files_by_story.get(s["story_key"], [])
+        defects = defects_by_story.get(s["story_key"], [])
+        commits = commits_by_story.get(s["story_key"], [])
+        if not (files or defects or commits):
+            continue
+        lines.append(f"## {s['story_key']} — {s['title']}")
+        lines.append("")
+        if files:
+            lines.append("**Files:**")
+            lines.append("")
+            for path, kind in sorted(files):
+                lines.append(f"- `{path}` _({kind})_")
+            lines.append("")
+        if defects:
+            lines.append("**Defects:**")
+            lines.append("")
+            for d in defects:
+                lines.append(
+                    f"- [{d['status']}] {d['severity']}: {d['summary']}"
+                )
+            lines.append("")
+        if commits:
+            lines.append("**Commits:**")
+            lines.append("")
+            for c in commits:
+                lines.append(f"- `{c['sha'][:7]}` — {c['message']}")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def _collect_view_inputs(
+    conn: sqlite3.Connection, workspace: str,
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, list[tuple[str, str]]],
+    dict[str, list[dict[str, Any]]],
+    dict[str, list[dict[str, Any]]],
+]:
+    stories = list_stories(conn, workspace)
+    by_key = {s["story_key"]: s for s in stories}
+    # O(1) story_id → story_key lookup so the FK resolution below is
+    # linear in row count rather than n×m for n rows × m stories.
+    id_to_key: dict[int, str] = {s["id"]: s["story_key"] for s in stories}
+
+    files_by_story: dict[str, list[tuple[str, str]]] = {k: [] for k in by_key}
+    for sid, path, kind in conn.execute(
+        "SELECT story_id, path, kind FROM file_links WHERE workspace = ?",
+        (workspace,),
+    ):
+        key = id_to_key.get(sid)
+        if key is not None:
+            files_by_story[key].append((path, kind))
+
+    defects_by_story: dict[str, list[dict[str, Any]]] = {k: [] for k in by_key}
+    for sid, severity, summary, status in conn.execute(
+        "SELECT story_id, severity, summary, status FROM defects "
+        "WHERE workspace = ? ORDER BY id",
+        (workspace,),
+    ):
+        key = id_to_key.get(sid)
+        if key is not None:
+            defects_by_story[key].append(
+                {"severity": severity, "summary": summary, "status": status}
+            )
+
+    commits_by_story: dict[str, list[dict[str, Any]]] = {k: [] for k in by_key}
+    for sid, sha, message in conn.execute(
+        "SELECT story_id, sha, message FROM commits "
+        "WHERE workspace = ? ORDER BY created_at",
+        (workspace,),
+    ):
+        key = id_to_key.get(sid)
+        if key is not None:
+            commits_by_story[key].append({"sha": sha, "message": message})
+
+    return stories, files_by_story, defects_by_story, commits_by_story
+
+
+def regenerate_markdown_views(
+    conn: sqlite3.Connection, workspace_path: str,
+) -> tuple[str, str]:
+    """Rebuild ``docs/STORIES.md`` and ``docs/TRACEABILITY.md`` from the DB.
+
+    Scoped to the calling workspace's rows only — the global state.db
+    holds every app's rows, but each workspace's docs only reflect its
+    own slice. Returns ``(stories_path, traceability_path)``. The agent
+    calls this after every batch — the markdown files are derived
+    state, never a write surface for the LLM.
+    """
+    workspace = app_name_for_workspace(workspace_path)
+    stories, files_by_story, defects_by_story, commits_by_story = (
+        _collect_view_inputs(conn, workspace)
+    )
+    stories_md = _render_stories_md(stories)
+    trace_md = _render_traceability_md(
+        stories, files_by_story, defects_by_story, commits_by_story
+    )
+
+    docs_dir = os.path.join(os.path.expanduser(workspace_path), "docs")
+    os.makedirs(docs_dir, exist_ok=True)
+    stories_path = os.path.join(docs_dir, "STORIES.md")
+    trace_path = os.path.join(docs_dir, "TRACEABILITY.md")
+    with open(stories_path, "w", encoding="utf-8") as fh:
+        fh.write(stories_md)
+        if not stories_md.endswith("\n"):
+            fh.write("\n")
+    with open(trace_path, "w", encoding="utf-8") as fh:
+        fh.write(trace_md)
+        if not trace_md.endswith("\n"):
+            fh.write("\n")
+    return stories_path, trace_path

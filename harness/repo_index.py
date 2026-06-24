@@ -650,6 +650,57 @@ def get_stats(
         conn.close()
 
 
+def purge_workspace(
+    workspace_path: str, cfg: Optional[RepoIndexConfig] = None,
+) -> tuple[int, int]:
+    """Delete every ``repo_meta`` and ``repo_chunks`` row tied to
+    ``workspace_path``. Used by ``--new-build`` so the next session
+    starts with no stale index left over from prior runs.
+
+    Returns ``(meta_rows_deleted, chunk_rows_deleted)``. Best-effort:
+    a DB open failure logs and returns ``(0, 0)`` so the broader
+    new-build flow isn't aborted by a missing or corrupt index DB.
+    """
+    cfg = cfg or RepoIndexConfig()
+    db_path = _db_path(cfg)
+    if not os.path.isfile(db_path):
+        return 0, 0
+    workspace_id = _workspace_id(workspace_path)
+    try:
+        conn = sqlite3.connect(db_path)
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "[repo_index] Could not open index DB %s to purge workspace %s: %s",
+            db_path, workspace_path, exc,
+        )
+        return 0, 0
+    try:
+        meta_cur = conn.execute(
+            "DELETE FROM repo_meta WHERE workspace_id = ?", (workspace_id,),
+        )
+        chunk_cur = conn.execute(
+            "DELETE FROM repo_chunks WHERE workspace_id = ?", (workspace_id,),
+        )
+        conn.commit()
+        meta_n = meta_cur.rowcount or 0
+        chunk_n = chunk_cur.rowcount or 0
+    except sqlite3.DatabaseError as exc:
+        logger.warning(
+            "[repo_index] Purge failed for workspace %s: %s",
+            workspace_path, exc,
+        )
+        return 0, 0
+    finally:
+        conn.close()
+    if meta_n or chunk_n:
+        logger.info(
+            "[repo_index] Purged index for workspace %s "
+            "(meta=%d, chunks=%d).",
+            workspace_path, meta_n, chunk_n,
+        )
+    return meta_n, chunk_n
+
+
 def update_index_for_files(
     workspace_path: str,
     modified_files: Iterable[str],

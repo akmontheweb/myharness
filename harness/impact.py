@@ -192,9 +192,16 @@ class DependencyGraph:
 
         # Try tree-sitter for structural extraction
         if lang and self._try_tree_sitter_extract(filepath, source, lang, symbols):
-            pass
+            # Phase L fix: tree-sitter populates `symbols` (definitions)
+            # but the existing extract_symbols-style helpers don't pull
+            # imports out of the AST. Always run the text-based import
+            # extractor so the reverse index (and thus high_fanout_files
+            # / immediate_callers_of) is populated for Python/JS/TS
+            # files too. Without this `_dependents` stayed empty for
+            # any file tree-sitter could parse.
+            self._text_extract_imports(filepath, source, imports)
         else:
-            # Fallback: text-based extraction
+            # Fallback: text-based extraction for everything.
             self._text_extract_symbols(filepath, ext, source, symbols)
             self._text_extract_imports(filepath, source, imports)
 
@@ -385,38 +392,61 @@ class DependencyGraph:
                 symbol_files.setdefault(sym, set()).add(filepath)
 
         # For each dependent (file that imports X), if X is a file path
-        # or package name defined by a scanned file, link them
-        module_to_file: dict[str, str] = {}
+        # or package name defined by a scanned file, link them.
+        #
+        # The stem-stripped key can collide across stacks — e.g.
+        # ``app/models/foo.py`` and ``app/models/foo.ts`` both reduce
+        # to ``app.models.foo``. Map every key to the SET of source
+        # files that produced it so symbols from neither candidate
+        # are lost to last-writer-wins.
+        module_to_files: dict[str, set[str]] = {}
         for filepath in self._exports:
             rel = os.path.relpath(filepath, self.workspace_path)
-            # Map module paths to files
-            module_to_file[rel.replace("/", ".").replace(".py", "").replace(".ts", "").replace(".js", "").replace(".rs", "").replace(".go", "")] = filepath
-            module_to_file[rel.replace("/", ".")] = filepath
+            stripped = (
+                rel.replace("/", ".")
+                .replace(".py", "")
+                .replace(".ts", "")
+                .replace(".js", "")
+                .replace(".rs", "")
+                .replace(".go", "")
+            )
+            module_to_files.setdefault(stripped, set()).add(filepath)
+            module_to_files.setdefault(rel.replace("/", "."), set()).add(filepath)
 
         # For each import in each file, try to resolve to a known file
         for imp, files in list(self._dependents.items()):
             for filepath in files:
-                resolved = self._resolve_import_to_file(imp, module_to_file)
-                if resolved:
+                resolved = self._resolve_import_to_files(imp, module_to_files)
+                for resolved_file in resolved:
                     # This file depends on symbols from the resolved file
-                    for symbol in self._exports.get(resolved, set()):
+                    for symbol in self._exports.get(resolved_file, set()):
                         self._dependents.setdefault(symbol, set()).add(filepath)
 
-    def _resolve_import_to_file(self, imp: str, module_to_file: dict[str, str]) -> Optional[str]:
-        """Try to resolve an import string to a known file path."""
+    def _resolve_import_to_files(
+        self, imp: str, module_to_files: dict[str, set[str]]
+    ) -> set[str]:
+        """Resolve an import string to all matching source files.
+
+        Returns a set rather than a single file because the stripped
+        module key can map to more than one source path when two files
+        share a stem across stacks (e.g. ``foo.py`` and ``foo.ts``).
+        """
+        out: set[str] = set()
         # Direct module path match
-        if imp in module_to_file:
-            return module_to_file[imp]
+        if imp in module_to_files:
+            out.update(module_to_files[imp])
 
-        # Try with different prefixes and separators
         imp_normalized = imp.replace("/", ".").replace("\\", ".")
-        for key, val in module_to_file.items():
-            if key.endswith("." + imp_normalized) or key.endswith("/" + imp_normalized.replace(".", "/")):
-                return val
-            if imp_normalized.endswith(os.path.splitext(os.path.basename(val))[0]):
-                return val
+        suffix_path = "/" + imp_normalized.replace(".", "/")
+        for key, vals in module_to_files.items():
+            if key.endswith("." + imp_normalized) or key.endswith(suffix_path):
+                out.update(vals)
+                continue
+            for val in vals:
+                if imp_normalized.endswith(os.path.splitext(os.path.basename(val))[0]):
+                    out.add(val)
 
-        return None
+        return out
 
     def get_impacted_files(self, modified_files: list[str]) -> list[tuple[str, list[str]]]:
         """
@@ -476,6 +506,71 @@ class DependencyGraph:
                 return key
 
         return None
+
+    def high_fanout_files(
+        self, *, top_k: int = 5, min_fanout: int = 2,
+    ) -> list[tuple[str, int]]:
+        """Return the workspace's most-depended-on files (Phase L).
+
+        For each scanned file, count how many DISTINCT other files
+        import at least one of its exported symbols. Returns up to
+        ``top_k`` ``(file_path, fanout_count)`` tuples sorted by
+        fanout descending, ties broken by file path. Files with
+        fanout < ``min_fanout`` are excluded so isolated modules
+        don't pollute the result.
+
+        Used by ``repair_node`` in CR mode to identify likely
+        shared-utility cascade sources when the directly-named
+        failing file doesn't obviously cause the regression. The
+        caller intersects this with the actually-touched files so
+        only utilities touched THIS session show up in the prompt.
+        """
+        self.build()
+        fanout_by_file: dict[str, set[str]] = {}
+        for filepath, symbols in self._exports.items():
+            consumers: set[str] = set()
+            for sym in symbols:
+                consumers.update(self._dependents.get(sym, set()))
+            # Don't count a file as its own consumer.
+            consumers.discard(filepath)
+            if consumers:
+                fanout_by_file[filepath] = consumers
+        ranked = sorted(
+            (
+                (f, len(c)) for f, c in fanout_by_file.items()
+                if len(c) >= min_fanout
+            ),
+            key=lambda fc: (-fc[1], fc[0]),
+        )
+        return ranked[:top_k]
+
+    def immediate_callers_of(
+        self, file_paths: list[str], *, top_k: int = 6,
+    ) -> list[str]:
+        """Return files that import at least one symbol exported by
+        any of ``file_paths`` (Phase L).
+
+        Direct one-hop callers only — does not recurse into callers
+        of callers. Capped at ``top_k`` results so the repair prompt
+        doesn't explode on a workspace-wide utility.
+
+        Used by ``repair_node`` in CR mode: when a CR touches
+        ``utils.py``, the immediate callers are the files most likely
+        to surface a regression in the failing-test set, so showing
+        them to the LLM helps it trace the cascade.
+        """
+        self.build()
+        resolved_inputs: set[str] = set()
+        for fp in file_paths:
+            r = self._resolve_path(fp)
+            if r:
+                resolved_inputs.add(r)
+        callers: set[str] = set()
+        for filepath in resolved_inputs:
+            for sym in self._exports.get(filepath, set()):
+                callers.update(self._dependents.get(sym, set()))
+        callers -= resolved_inputs  # don't return the inputs themselves
+        return sorted(callers)[:top_k]
 
 
 # ---------------------------------------------------------------------------

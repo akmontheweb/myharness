@@ -120,13 +120,24 @@ class HitlChannel(ABC):
 _TRUE_VALUES = {"true", "1", "yes", "on", "y"}
 
 
+def _is_truthy_answer(answer: str) -> bool:
+    """Shared truthy interpretation for confirm() across all channels.
+
+    StdinChannel still loops on bad input rather than calling this
+    (so a misread keystroke can be corrected interactively), but
+    FileChannel and HttpChannel route the recorded/HTTP answer here
+    so the same string yields the same boolean regardless of transport.
+    """
+    return (answer or "").strip().lower() in _TRUE_VALUES
+
+
 def _is_truthy_env(name: str) -> bool:
     """Treat the env var as truthy if its lowered value is in the
     canonical set (audit §5.5). Earlier code compared CI strictly to
     "true" — GitLab/Jenkins/CircleCI/TeamCity commonly set CI=1 or
     CI=yes, leaving those CI runs to hit the interactive input() path
     and hang on non-TTY."""
-    return os.environ.get(name, "").strip().lower() in _TRUE_VALUES
+    return _is_truthy_answer(os.environ.get(name, ""))
 
 
 def _auto_approve() -> bool:
@@ -164,14 +175,25 @@ class StdinChannel(HitlChannel):
             logger.info("[hitl] Auto-approved prompt %r → %r", message[:60], chosen)
             return chosen
 
+        opts_lower = [o.lower() for o in options]
         while True:
             try:
                 answer = input(f"{message} [{opts_str}]: ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print("\n[HITL] Input interrupted.", file=sys.stderr)
                 return default if default is not None else (options[0] if options else "")
-            if not options or answer in [o.lower() for o in options]:
+            if not options or answer in opts_lower:
                 return answer
+            # Explicit invalid-input feedback. The previous behaviour
+            # silently re-prompted, which looked indistinguishable from
+            # an unresponsive terminal — operators kept retrying the
+            # same wrong keystroke and assumed the harness had frozen.
+            shown = answer if answer else "(empty)"
+            print(
+                f"[HITL] '{shown}' is not one of the available options. "
+                f"Please choose one of: [{opts_str}].",
+                file=sys.stderr,
+            )
 
     def confirm(self, message: str, default: bool = False) -> bool:
         if _auto_approve():
@@ -179,14 +201,29 @@ class StdinChannel(HitlChannel):
             return default
 
         hint = "[Y/n]" if default else "[y/N]"
-        try:
-            answer = input(f"{message} {hint}: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n[HITL] Input interrupted.", file=sys.stderr)
-            return default
-        if not answer:
-            return default
-        return answer in ("y", "yes")
+        # Loop with friendly feedback on bad input rather than the
+        # previous "anything other than y/yes silently becomes no"
+        # behaviour, which made typos on a destructive prompt
+        # (e.g. --new-build reset) indistinguishable from a deliberate
+        # decline. ENTER alone still accepts the default.
+        while True:
+            try:
+                answer = input(f"{message} {hint}: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\n[HITL] Input interrupted.", file=sys.stderr)
+                return default
+            if not answer:
+                return default
+            if answer in ("y", "yes"):
+                return True
+            if answer in ("n", "no"):
+                return False
+            shown = answer if answer else "(empty)"
+            print(
+                f"[HITL] '{shown}' is not a valid answer. Please answer "
+                f"'y' or 'n' (press ENTER to accept the default).",
+                file=sys.stderr,
+            )
 
     def notes(self, message: str) -> str:
         if _auto_approve():
@@ -271,7 +308,7 @@ class FileChannel(HitlChannel):
 
     def confirm(self, message: str, default: bool = False) -> bool:
         answer = self._lookup(message)
-        return answer.lower() in ("y", "yes", "true", "1")
+        return _is_truthy_answer(answer)
 
     def notes(self, message: str) -> str:
         return self._lookup(message)
@@ -433,7 +470,21 @@ class HttpChannel(HitlChannel):
                     exc.code, attempt + 1, self.max_retries + 1,
                 )
                 last_err = exc
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            except json.JSONDecodeError as exc:
+                # Protocol-layer error: the server returned 200 but the
+                # body isn't valid JSON. Retrying won't fix this — the
+                # server response format is wrong. Fail-closed
+                # immediately so the operator gets an actionable error
+                # instead of burning the retry budget on a permanent
+                # condition.
+                logger.error(
+                    "[hitl:http] Webhook returned malformed JSON "
+                    "(non-transient): %s. Failing closed.", exc,
+                )
+                raise HitlChannelUnavailable(
+                    f"webhook {self.url!r} returned malformed JSON: {exc}"
+                ) from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 logger.warning(
                     "[hitl:http] Webhook error on attempt %d/%d: %s",
                     attempt + 1, self.max_retries + 1, exc,
@@ -488,7 +539,7 @@ class HttpChannel(HitlChannel):
         default_str = "y" if default else "n"
         payload = self._build_payload("confirm", message, None, default_str)
         answer = self._post(payload, default_str)
-        result = answer.lower() in ("y", "yes", "true", "1")
+        result = _is_truthy_answer(answer)
         logger.info("[hitl:http] confirm %r → %s", message[:60], result)
         return result
 

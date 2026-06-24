@@ -1110,4 +1110,8 @@ class TestRouterHardCeiling:
             attempts=99, max_attempts=2, errors=0,
         )
         state["dev_deployment"] = False  # → installation_doc_node
+        # Phase G: simulate "EoS regression already ran" so the router
+        # skips the EoS intercept and falls through to the
+        # no-deployment installation_doc destination.
+        state["loop_counter"]["end_of_session_regression_repair"] = 1
         assert route_after_security_scan(state) == "installation_doc_node"

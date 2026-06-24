@@ -100,6 +100,106 @@ class TestStdinChannelAutoApprove:
         assert ch.is_interactive() is False
 
 
+class TestStdinChannelInteractiveFeedback:
+    """Interactive paths through StdinChannel — verify the friendly
+    feedback for invalid input, added after operators reported
+    typing wrong keys on confirm prompts and seeing what looked
+    like a frozen terminal (silently re-prompted) or an
+    indistinguishable decline ('u' treated as 'no').
+    """
+
+    def _ensure_no_auto_approve(self, monkeypatch):
+        # Defensive: pytest fixtures occasionally inherit CI=true from
+        # the parent shell; clear both auto-approve triggers AND force
+        # _auto_approve to return False (pytest's captured stdin is not
+        # a TTY, which would otherwise route us through the auto-approve
+        # short-circuit and skip the interactive code entirely).
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("HARNESS_AUTO_APPROVE", raising=False)
+        monkeypatch.setattr("harness.hitl._auto_approve", lambda: False)
+
+    def test_confirm_loops_with_feedback_on_invalid_then_accepts(
+        self, monkeypatch, capsys,
+    ):
+        self._ensure_no_auto_approve(monkeypatch)
+        responses = iter(["u", "maybe", "y"])
+        monkeypatch.setattr(
+            "harness.hitl.input", lambda _prompt: next(responses), raising=False,
+        )
+        # Force is_interactive=True so the auto-approve path doesn't fire.
+        monkeypatch.setattr(StdinChannel, "is_interactive", lambda self: True)
+        ch = StdinChannel()
+        result = ch.confirm("Proceed with destructive reset?", default=False)
+        assert result is True
+        err = capsys.readouterr().err
+        # Both invalid attempts must surface a friendly message —
+        # quoting the exact bad input so the operator sees what was
+        # rejected.
+        assert "'u' is not a valid answer" in err
+        assert "'maybe' is not a valid answer" in err
+        # The hint to press ENTER for the default appears.
+        assert "press ENTER" in err
+
+    def test_confirm_n_returns_false_without_feedback(self, monkeypatch, capsys):
+        self._ensure_no_auto_approve(monkeypatch)
+        monkeypatch.setattr(
+            "harness.hitl.input", lambda _prompt: "n", raising=False,
+        )
+        monkeypatch.setattr(StdinChannel, "is_interactive", lambda self: True)
+        ch = StdinChannel()
+        assert ch.confirm("Proceed?", default=True) is False
+        # Valid 'n' must not emit the invalid-input feedback line.
+        assert "is not a valid answer" not in capsys.readouterr().err
+
+    def test_confirm_blank_returns_default(self, monkeypatch, capsys):
+        self._ensure_no_auto_approve(monkeypatch)
+        monkeypatch.setattr(
+            "harness.hitl.input", lambda _prompt: "", raising=False,
+        )
+        monkeypatch.setattr(StdinChannel, "is_interactive", lambda self: True)
+        ch = StdinChannel()
+        assert ch.confirm("Proceed?", default=True) is True
+        assert ch.confirm("Proceed?", default=False) is False
+        assert "is not a valid answer" not in capsys.readouterr().err
+
+    def test_prompt_loops_with_feedback_on_invalid_choice(
+        self, monkeypatch, capsys,
+    ):
+        self._ensure_no_auto_approve(monkeypatch)
+        responses = iter(["x", "z", "r"])
+        monkeypatch.setattr(
+            "harness.hitl.input", lambda _prompt: next(responses), raising=False,
+        )
+        monkeypatch.setattr(StdinChannel, "is_interactive", lambda self: True)
+        ch = StdinChannel()
+        result = ch.prompt(
+            "[HITL] Select action", ["v", "r", "e", "m", "b", "s", "q"], default="r",
+        )
+        assert result == "r"
+        err = capsys.readouterr().err
+        assert "'x' is not one of the available options" in err
+        assert "'z' is not one of the available options" in err
+        # Echoes the option list so the operator doesn't have to scroll
+        # back up to find it again.
+        assert "[v/r/e/m/b/s/q]" in err
+
+    def test_prompt_empty_input_shown_as_placeholder(self, monkeypatch, capsys):
+        self._ensure_no_auto_approve(monkeypatch)
+        responses = iter(["", "r"])
+        monkeypatch.setattr(
+            "harness.hitl.input", lambda _prompt: next(responses), raising=False,
+        )
+        monkeypatch.setattr(StdinChannel, "is_interactive", lambda self: True)
+        ch = StdinChannel()
+        result = ch.prompt(
+            "[HITL] Select action", ["r", "q"], default="r",
+        )
+        assert result == "r"
+        # Empty input shows as '(empty)' so the operator can tell apart
+        # "I pressed ENTER without typing" from "I typed something weird".
+        assert "'(empty)' is not one of" in capsys.readouterr().err
+
+
 # ---------------------------------------------------------------------------
 # FileChannel
 # ---------------------------------------------------------------------------

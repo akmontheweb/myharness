@@ -576,3 +576,257 @@ class TestNewBuildPreviewPrinting:
         assert "Workspace files to delete: none." in err
         assert "Orphan agent/patch-* branches: none." in err
         assert "Checkpoint sessions for this workspace: none." in err
+        assert "Story state DB for this workspace: none." in err
+        assert "Repo index rows for this workspace: none." in err
+
+
+# ---------------------------------------------------------------------------
+# state.db purge (--new-build true)
+# ---------------------------------------------------------------------------
+
+class TestPurgeStateDb:
+    def test_no_state_db_is_a_no_op(self, tmp_path):
+        from harness.story_state import purge_state_db
+        # Global state.db doesn't exist yet (no open ever happened).
+        out = purge_state_db(str(tmp_path / "ws"))
+        assert all(v == 0 for v in out.values())
+
+    def test_deletes_only_target_app_rows(self, tmp_path):
+        """The purge wipes rows for this workspace's app name but
+        leaves every other app's rows intact."""
+        from harness.story_state import (
+            app_name_for_workspace, create_stories, list_stories,
+            open_story_db, purge_state_db,
+        )
+        ws_target = tmp_path / "target-app"
+        ws_other = tmp_path / "other-app"
+        ws_target.mkdir()
+        ws_other.mkdir()
+        app_target = app_name_for_workspace(str(ws_target))
+        app_other = app_name_for_workspace(str(ws_other))
+
+        conn = open_story_db()
+        try:
+            create_stories(conn, app_target, [{"title": "T1"}, {"title": "T2"}])
+            create_stories(conn, app_other, [{"title": "O1"}])
+        finally:
+            conn.close()
+
+        out = purge_state_db(str(ws_target))
+        assert out["stories"] == 2
+
+        conn = open_story_db()
+        try:
+            assert list_stories(conn, app_target) == []
+            assert [s["title"] for s in list_stories(conn, app_other)] == ["O1"]
+        finally:
+            conn.close()
+
+    def test_purge_followed_by_open_starts_fresh(self, tmp_path):
+        from harness.story_state import (
+            app_name_for_workspace, create_stories, list_stories,
+            open_story_db, purge_state_db,
+        )
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        app = app_name_for_workspace(str(ws))
+        conn = open_story_db()
+        try:
+            create_stories(conn, app, [{"title": "first"}])
+        finally:
+            conn.close()
+
+        purge_state_db(str(ws))
+
+        conn2 = open_story_db()
+        try:
+            assert list_stories(conn2, app) == []
+        finally:
+            conn2.close()
+
+    def test_purge_returns_per_table_counts(self, tmp_path):
+        """The returned dict carries row counts for every workspace
+        table so callers can log a meaningful summary."""
+        from harness.story_state import (
+            app_name_for_workspace, create_stories, link_file,
+            open_story_db, purge_state_db, record_commit, record_defect,
+            start_batch,
+        )
+        ws = tmp_path / "counts-ws"
+        ws.mkdir()
+        app = app_name_for_workspace(str(ws))
+        conn = open_story_db()
+        try:
+            create_stories(conn, app, [{"title": "T"}])
+            bid = start_batch(conn, app, "sess-1", ["STORY-1"])
+            link_file(conn, app, "STORY-1", "a.py", "code", batch_id=bid)
+            record_defect(
+                conn, workspace=app, story_key="STORY-1",
+                session_id="sess-1", severity="x", summary="y",
+            )
+            record_commit(
+                conn, workspace=app, sha="abc", story_key="STORY-1",
+                session_id="sess-1", message="x",
+            )
+        finally:
+            conn.close()
+
+        out = purge_state_db(str(ws))
+        assert out["stories"] == 1
+        assert out["batches"] == 1
+        assert out["file_links"] == 1
+        assert out["defects"] == 1
+        assert out["commits"] == 1
+
+
+# ---------------------------------------------------------------------------
+# repo_index workspace purge (--new-build true)
+# ---------------------------------------------------------------------------
+
+class TestPurgeRepoIndex:
+    def test_no_db_is_a_no_op(self, tmp_path, monkeypatch):
+        from harness.repo_index import RepoIndexConfig, purge_workspace
+        monkeypatch.setattr(
+            "harness.repo_index.RepoIndexConfig",
+            lambda: RepoIndexConfig(index_dir=str(tmp_path / "missing")),
+        )
+        assert purge_workspace(str(tmp_path / "ws")) == (0, 0)
+
+    def test_deletes_only_target_workspace_rows(self, tmp_path):
+        import sqlite3
+        from harness.repo_index import (
+            RepoIndexConfig, _db_path, _workspace_id, purge_workspace,
+        )
+        cfg = RepoIndexConfig(index_dir=str(tmp_path / "idx"))
+        os.makedirs(cfg.index_dir, exist_ok=True)
+        db = _db_path(cfg)
+        ws_target = "/tmp/ws-target"
+        ws_other = "/tmp/ws-other"
+        wid_target = _workspace_id(ws_target)
+        wid_other = _workspace_id(ws_other)
+
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS repo_meta (
+                workspace_id TEXT PRIMARY KEY,
+                backend TEXT NOT NULL,
+                idf_json TEXT,
+                built_at TEXT NOT NULL,
+                chunk_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS repo_chunks (
+                workspace_id TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                file_sha TEXT NOT NULL,
+                content TEXT NOT NULL,
+                vector_json TEXT NOT NULL,
+                PRIMARY KEY (workspace_id, file_path, chunk_index)
+            );
+        """)
+        for wid in (wid_target, wid_other):
+            conn.execute(
+                "INSERT INTO repo_meta(workspace_id, backend, built_at, "
+                "chunk_count) VALUES(?, 'tfidf', '2026-06-24', 2)",
+                (wid,),
+            )
+            for i in range(2):
+                conn.execute(
+                    "INSERT INTO repo_chunks(workspace_id, file_path, "
+                    "chunk_index, file_sha, content, vector_json) "
+                    "VALUES(?, 'f.py', ?, 'sha', 'x', '{}')",
+                    (wid, i),
+                )
+        conn.commit()
+        conn.close()
+
+        meta_n, chunk_n = purge_workspace(ws_target, cfg)
+        assert meta_n == 1
+        assert chunk_n == 2
+
+        conn = sqlite3.connect(db)
+        try:
+            remaining_meta = {
+                row[0] for row in
+                conn.execute("SELECT workspace_id FROM repo_meta")
+            }
+            remaining_chunks = {
+                row[0] for row in
+                conn.execute("SELECT workspace_id FROM repo_chunks")
+            }
+        finally:
+            conn.close()
+        assert remaining_meta == {wid_other}
+        assert remaining_chunks == {wid_other}
+
+
+# ---------------------------------------------------------------------------
+# _perform_new_build_reset calls state.db purge
+# ---------------------------------------------------------------------------
+
+class TestNewBuildResetWipesStateDb:
+    def test_app_rows_gone_after_reset(self, tmp_path):
+        from harness.cli import _perform_new_build_reset
+        from harness.story_state import (
+            app_name_for_workspace, create_stories, list_stories,
+            open_story_db,
+        )
+        ws = tmp_path / "reset-ws"
+        ws.mkdir()
+        _init_repo(str(ws))
+        spec_dir = ws / "product_spec"
+        spec_dir.mkdir()
+        (spec_dir / "main.txt").write_text("spec")
+        subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(ws), "commit", "-q", "-m", "spec"], check=True,
+        )
+
+        # Seed prior-session rows for THIS workspace AND a sibling.
+        app_target = app_name_for_workspace(str(ws))
+        ws_other = tmp_path / "untouched"
+        ws_other.mkdir()
+        app_other = app_name_for_workspace(str(ws_other))
+        conn = open_story_db()
+        try:
+            create_stories(conn, app_target, [{"title": "prior session"}])
+            create_stories(conn, app_other, [{"title": "leave me alone"}])
+        finally:
+            conn.close()
+
+        _perform_new_build_reset(str(ws), "product_spec")
+
+        # Target rows are gone. Sibling app's rows survive.
+        conn = open_story_db()
+        try:
+            assert list_stories(conn, app_target) == []
+            assert [s["title"] for s in list_stories(conn, app_other)] == [
+                "leave me alone"
+            ]
+        finally:
+            conn.close()
+
+    def test_state_db_purge_runs_even_without_git(self, tmp_path):
+        from harness.cli import _perform_new_build_reset
+        from harness.story_state import (
+            app_name_for_workspace, create_stories, list_stories,
+            open_story_db,
+        )
+        ws = tmp_path / "no-git-ws"
+        ws.mkdir()
+        # No `_init_repo` — _perform_new_build_reset's git-mode branch
+        # returns early after the state.db purge step.
+        app = app_name_for_workspace(str(ws))
+        conn = open_story_db()
+        try:
+            create_stories(conn, app, [{"title": "prior"}])
+        finally:
+            conn.close()
+
+        _perform_new_build_reset(str(ws), "product_spec")
+
+        conn = open_story_db()
+        try:
+            assert list_stories(conn, app) == []
+        finally:
+            conn.close()

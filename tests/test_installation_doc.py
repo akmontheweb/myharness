@@ -392,7 +392,14 @@ class TestRouteAfterSecurityScan:
     def _clean_state(self, **overrides) -> dict[str, Any]:
         base: dict[str, Any] = {
             "budget_remaining_usd": 1.50,
-            "loop_counter": {"security": 0},
+            # Phase G: simulate "EoS regression already ran" so these
+            # tests assert the post-EoS deployment destination routing
+            # rather than the EoS intercept (covered separately in
+            # tests/test_end_of_session_regression.py).
+            "loop_counter": {
+                "security": 0,
+                "end_of_session_regression_repair": 1,
+            },
             "compiler_errors": [],
             "dev_deployment": False,
             "cd_discovery": False,

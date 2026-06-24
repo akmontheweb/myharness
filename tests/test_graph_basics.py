@@ -371,10 +371,27 @@ class TestRouteAfterSecurityScan:
             "compiler_errors": [],
             "budget_remaining_usd": 1.0,
             "workspace_path": "/tmp/ws",
-            "loop_counter": {"security": 0},
+            # Phase G: setting end_of_session_regression_repair > 0
+            # simulates "EoS regression already ran this session", so
+            # route_after_security_scan skips the EoS intercept and
+            # the tests below can assert the destination routing
+            # (Flutter / no-deploy / cd_discovery / etc.) directly.
+            # The "first visit → EoS regression" path is covered in
+            # tests/test_end_of_session_regression.py.
+            "loop_counter": {
+                "security": 0,
+                "end_of_session_regression_repair": 1,
+            },
             "dev_deployment": False,
             "cd_discovery": False,
         }
+        # Merge loop_counter from overrides so the post-EoS marker
+        # always survives even when a test wants to override a few
+        # specific keys (e.g. final_verify for pre_exit_verify tests).
+        if "loop_counter" in overrides:
+            merged = dict(state["loop_counter"])
+            merged.update(overrides.pop("loop_counter"))
+            state["loop_counter"] = merged
         state.update(overrides)
         return state
 

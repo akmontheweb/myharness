@@ -369,7 +369,13 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         return {}
 
     workspace_path: str = state.get("workspace_path", os.getcwd())
-    modified_files: list[str] = list(state.get("modified_files", []) or [])
+    # In batch-mode, scope test generation to files this batch touched
+    # rather than the cumulative session set. ``_scope_files_for_consumer``
+    # falls back to cumulative ``modified_files`` outside batch-mode and
+    # for the very first invocation. Lives in harness.graph to keep the
+    # batch-scope helpers in one place.
+    from harness.graph import _scope_files_for_consumer
+    modified_files: list[str] = list(_scope_files_for_consumer(state))
     no_tests_collected: bool = bool(
         state.get("node_state", {}).get("no_tests_collected")
     )
@@ -405,7 +411,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
                 "[test_generation_node] no_tests_collected but workspace scan "
                 "found no source files either. Routing to HITL."
             )
-            loop_counter = dict(state.get("loop_counter", {}))
+            loop_counter = dict(state.get("loop_counter") or {})
             return {
                 "loop_counter": loop_counter,
                 "node_state": {
@@ -453,7 +459,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             "[test_generation_node] No LLM gateway configured. test_generation "
             "requires a valid LLM API key. Routing to HITL."
         )
-        loop_counter = dict(state.get("loop_counter", {}))
+        loop_counter = dict(state.get("loop_counter") or {})
         diagnostic = _synth_diag(
             file="<test_generation>",
             message=(
@@ -481,7 +487,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             },
         }
 
-    loop_counter = dict(state.get("loop_counter", {}))
+    loop_counter = dict(state.get("loop_counter") or {})
     loop_counter["test_generation"] = loop_counter.get("test_generation", 0) + 1
     max_iterations = int(cfg.get("max_iterations", 2))
     if loop_counter["test_generation"] > max_iterations:

@@ -529,6 +529,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         "max_doc_review_cycles",
         "max_code_review_cycles",
         "max_discovery_iterations",
+        # Phase G — end-of-session regression repair cap.
+        "max_end_of_session_regression_cycles",
+        # Phase J — end-of-session repair authority knobs.
+        "end_of_session_repair_diagnostic_cap",
+        "end_of_session_repair_inventory_cap",
+        "end_of_session_force_reasoning_model",
     }),
     "persistence": frozenset({
         "db_path", "ttl_days", "redact_messages",
@@ -769,6 +775,11 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "node_throttle.max_doc_review_cycles": (int,),
     "node_throttle.max_code_review_cycles": (int,),
     "node_throttle.max_discovery_iterations": (int,),
+    # Phase G + Phase J — new end-of-session knobs.
+    "node_throttle.max_end_of_session_regression_cycles": (int,),
+    "node_throttle.end_of_session_repair_diagnostic_cap": (int,),
+    "node_throttle.end_of_session_repair_inventory_cap": (int,),
+    "node_throttle.end_of_session_force_reasoning_model": (bool,),
     "persistence.db_path": (str,),
     "persistence.ttl_days": (int,),
     "persistence.redact_messages": (bool,),
@@ -1590,6 +1601,18 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
         gate_desc = "Deployment Blueprint"
         file_label = "DEPLOYMENT_BLUEPRINT.md"
         next_phase = "Container Deployment"
+    elif gate == "STORIES":
+        # Story decomposition gate. docs/STORIES.md is regenerated from
+        # .teane/state.db; the operator approves the breakdown before the
+        # per-story TDD loop starts. Refine re-runs decomposition with
+        # appended feedback. Manual-edit is best-effort — STORIES.md is
+        # a view, the DB is the source of truth, so the operator who
+        # wants surgical edits should open .teane/state.db directly.
+        spec_path = os.path.join(workspace, "docs", "STORIES.md")
+        gate_label = "STORIES"
+        gate_desc = "Story Decomposition"
+        file_label = "STORIES.md"
+        next_phase = "Per-Story TDD Loop"
     else:
         logger.warning("[gatekeeper] Unknown gate: %s. Proceeding.", gate)
         return {"node_state": {"gatekeeper_action": "approve", "current_gate": gate}}
@@ -1608,6 +1631,7 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
         "REQUIREMENTS": "requirement",
         "ARCHITECTURE": "architecture",
         "DEPLOYMENT":   "deployment",
+        "STORIES":      "stories",
     }
     if _gatekeeper_auto_approves(
         gate_name=_gate_to_hitl_key.get(gate, gate.lower())
@@ -1661,6 +1685,15 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
                 "a": "Approve & begin coding / patching",
                 "e": "Refine layout parameters",
                 "m": "Pause for manual edits",
+                "s": "Save & quit (resume later)",
+            }
+        elif gate == "STORIES":
+            print(f"Story decomposition written to {file_label}. Review the breakdown before TDD begins.")
+            print("Source of truth is `.teane/state.db`; STORIES.md is a regenerated view.")
+            gate_options = {
+                "a": f"Approve & begin {next_phase}",
+                "e": "Refine decomposition (re-run with feedback)",
+                "m": "Pause for manual edits to .teane/state.db",
                 "s": "Save & quit (resume later)",
             }
         else:  # DEPLOYMENT
@@ -3540,6 +3573,67 @@ async def _list_workspace_checkpoint_sessions(
     return matches
 
 
+def _describe_state_db_for_preview(workspace_path: str) -> Optional[str]:
+    """If the global state.db has rows for this workspace's app name,
+    return a short summary string (path + per-table row counts scoped
+    to the app). Returns ``None`` when there's nothing to purge.
+    """
+    try:
+        from harness import story_state as _story_state_mod
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        app_name = _story_state_mod.app_name_for_workspace(workspace_path)
+    except ValueError:
+        return None
+    db_path = _story_state_mod.state_db_path()
+    if not os.path.isfile(db_path):
+        return None
+    import sqlite3 as _sqlite3
+    try:
+        conn = _sqlite3.connect(db_path)
+    except _sqlite3.DatabaseError:
+        # Corrupt or unreadable — still announce that we'll touch it.
+        return f"{db_path} (unreadable; purge will be attempted anyway)"
+    try:
+        counts: dict[str, int] = {}
+        for table in ("stories", "batches", "defects", "commits"):
+            try:
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE workspace = ?",
+                    (app_name,),
+                ).fetchone()
+                counts[table] = int(row[0]) if row else 0
+            except _sqlite3.DatabaseError:
+                counts[table] = 0
+    finally:
+        conn.close()
+    if not any(counts.values()):
+        return None
+    summary = ", ".join(f"{k}={v}" for k, v in counts.items())
+    return f"{db_path} for app {app_name!r} ({summary})"
+
+
+def _describe_repo_index_for_preview(workspace_path: str) -> Optional[str]:
+    """Return a one-line summary of repo_index.db rows tied to this
+    workspace, or ``None`` when the index has nothing for it.
+    """
+    try:
+        from harness.repo_index import get_stats
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        stats = get_stats(workspace_path)
+    except Exception:  # noqa: BLE001
+        return None
+    if stats is None:
+        return None
+    return (
+        f"repo_index.db ({stats.chunk_count} chunks across "
+        f"{stats.file_count} file(s), built {stats.built_at})"
+    )
+
+
 def _print_new_build_preview(
     workspace_path: str,
     spec_dirname: str,
@@ -3597,6 +3691,30 @@ def _print_new_build_preview(
             "Checkpoint sessions for this workspace: none.",
             file=sys.stderr,
         )
+
+    state_db_summary = _describe_state_db_for_preview(workspace_path)
+    if state_db_summary:
+        print(
+            f"\nStory state DB to PURGE: {state_db_summary}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "\nStory state DB for this workspace: none.",
+            file=sys.stderr,
+        )
+
+    repo_index_summary = _describe_repo_index_for_preview(workspace_path)
+    if repo_index_summary:
+        print(
+            f"Repo index rows to PURGE: {repo_index_summary}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "Repo index rows for this workspace: none.",
+            file=sys.stderr,
+        )
     print("=" * 72, file=sys.stderr)
 
 
@@ -3605,13 +3723,19 @@ def _perform_new_build_reset(
 ) -> None:
     """When ``--new-build true`` fires, hard-reset the workspace.
 
-    Three steps:
+    Four steps:
 
-    1. Checkout the base branch (``master`` if it exists, else ``main``).
-    2. Delete every file / directory at the workspace root EXCEPT the
+    1. Delete every row in the global ``~/.harness/state.db`` whose
+       ``workspace`` column matches this workspace's app name
+       (basename). Other apps' history is untouched. Runs FIRST,
+       before any git operation, so a downstream failure can't leave
+       stale stories/batches behind to be picked up by the next
+       session.
+    2. Checkout the base branch (``master`` if it exists, else ``main``).
+    3. Delete every file / directory at the workspace root EXCEPT the
        preserved set (``.git/`` and the configured ``spec_dirname``) and
        commit the deletions on the base branch.
-    3. Delete every orphaned ``agent/patch-*`` branch in the repo.
+    4. Delete every orphaned ``agent/patch-*`` branch in the repo.
 
     Runs BEFORE GitGuardian creates the new session's patch branch, so
     the new branch is forked from a now-clean base. Best-effort: any step
@@ -3619,11 +3743,24 @@ def _perform_new_build_reset(
     will still create the patch branch from whatever the working tree
     looks like after this function returns.
 
-    When ``--git false`` (``_git_enabled()`` is False), steps 1 and 3
-    are skipped and step 2 runs without a commit — the file deletion
+    When ``--git false`` (``_git_enabled()`` is False), steps 2 and 4
+    are skipped and step 3 runs without a commit — the file deletion
     still happens so the workspace is cleaned for a fresh run, but no
-    git subprocess calls are made.
+    git subprocess calls are made. Step 1 (state.db row purge) runs
+    unconditionally.
     """
+    # Step 1: state.db row purge — runs unconditionally and BEFORE
+    # anything else so even a hard failure later doesn't strand the
+    # prior session's stories/batches in the global state.db.
+    try:
+        from harness import story_state as _story_state_mod
+        _story_state_mod.purge_state_db(workspace_path)
+    except Exception as exc:  # noqa: BLE001 — best-effort, log only
+        logger.warning(
+            "[new_build] state.db purge raised: %s — continuing with reset.",
+            exc,
+        )
+
     def _git(*args: str) -> "subprocess.CompletedProcess[str]":
         return subprocess.run(
             ["git", "-C", workspace_path, *args],
@@ -3841,6 +3978,26 @@ async def _purge_workspace_checkpoints(
         "file(s) for workspace %s.",
         deleted_rows, removed_logs, workspace_path,
     )
+
+
+def _purge_workspace_repo_index(workspace_path: str) -> None:
+    """Drop every ``repo_meta`` / ``repo_chunks`` row tied to this
+    workspace from ``~/.harness/repo_index.db``.
+
+    Best-effort: import or open failure logs and returns. The repo
+    index is rebuilt on demand by the planner anyway, so a missed
+    purge here at worst leaves stale chunks that the next index build
+    will overwrite — never a correctness issue, only a "lingering
+    reference" we promised to clean.
+    """
+    try:
+        from harness.repo_index import purge_workspace as _purge_idx
+        _purge_idx(workspace_path)
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning(
+            "[new_build] repo_index purge raised for %s: %s",
+            workspace_path, exc,
+        )
 
 
 def _attempt_git_rollback(workspace_path: str) -> None:
@@ -4351,8 +4508,14 @@ async def cmd_run(args: argparse.Namespace) -> int:
         checkpoint_sessions = await _list_workspace_checkpoint_sessions(
             workspace_path, config,
         )
+        has_state_db = _describe_state_db_for_preview(workspace_path) is not None
+        has_repo_index = _describe_repo_index_for_preview(workspace_path) is not None
         total_destructive = (
-            len(files_to_delete) + len(orphan_branches) + len(checkpoint_sessions)
+            len(files_to_delete)
+            + len(orphan_branches)
+            + len(checkpoint_sessions)
+            + (1 if has_state_db else 0)
+            + (1 if has_repo_index else 0)
         )
         if total_destructive == 0:
             # No destructive work — skip the prompt entirely. The
@@ -4361,8 +4524,9 @@ async def cmd_run(args: argparse.Namespace) -> int:
             logger.info(
                 "[new_build] --new-build true but nothing to clean "
                 "(no extra files at workspace root, no orphan patch "
-                "branches, no prior checkpoints for this workspace). "
-                "Skipping the confirmation prompt."
+                "branches, no prior checkpoints, no state.db, no repo "
+                "index rows for this workspace). Skipping the "
+                "confirmation prompt."
             )
         else:
             _print_new_build_preview(
@@ -4403,6 +4567,11 @@ async def cmd_run(args: argparse.Namespace) -> int:
         # before any checkpoint write for this session, so list_all_sessions
         # can't accidentally match (and delete) the run we're about to start.
         await _purge_workspace_checkpoints(workspace_path, config)
+        # Repo index sits outside the workspace (in ~/.harness) so the
+        # workspace rmtree above can't touch it — wipe its workspace-keyed
+        # rows here so the next run starts with no stale chunks for this
+        # workspace either.
+        _purge_workspace_repo_index(workspace_path)
 
     # Initialize GitGuardian for branch lifecycle management. When
     # --git false, _make_git_guardian returns a no-op stub so the
@@ -4717,6 +4886,13 @@ async def cmd_run(args: argparse.Namespace) -> int:
                 if getattr(args, "install_doc", None) is not None
                 else getattr(args, "new_build", False)
             ),
+            # Story-mode (opt-in via --stories). When false, every
+            # downstream node check on decomposition_enabled / current_story_id
+            # short-circuits, so the byte-for-byte monolithic flow runs.
+            decomposition_enabled=getattr(args, "decomposition_enabled", False),
+            commit_on_story=getattr(args, "commit_on_story", False),
+            story_batch_size=getattr(args, "story_batch_size", 5),
+            story_repair_cap=getattr(args, "story_repair_cap", 3),
             lintgate_config=config.get("lintgate", {}),
             deployment_config=config.get("deployment", {}),
             deployment_defaults=load_deployment_defaults(config),
@@ -7511,6 +7687,63 @@ def build_parser() -> argparse.ArgumentParser:
             "for change-request runs)."
         ),
     )
+    # Story-mode flags (Agile decomposition + per-story TDD). Default OFF
+    # so today's monolithic flow is unchanged for everyone who doesn't
+    # opt in. Set --stories true to have decomposition_node split the
+    # approved SPEC_REQUIREMENTS.md into vertical-slice stories and run
+    # them one-at-a-time through the existing patch / compile / review
+    # chain. Per-story progress lives in <workspace>/.teane/state.db;
+    # docs/STORIES.md + docs/TRACEABILITY.md are regenerated views.
+    run_parser.add_argument(
+        "--stories",
+        type=_bool_choice,
+        default=False,
+        metavar="true|false",
+        dest="decomposition_enabled",
+        help=(
+            "Enable Agile-style story decomposition + per-story TDD. "
+            "When true, the approved SPEC_REQUIREMENTS.md is split into "
+            "vertical-slice stories (acceptance criteria first, then "
+            "code, then optional commit) instead of one monolithic "
+            "patching pass. Defaults to false (today's flow)."
+        ),
+    )
+    run_parser.add_argument(
+        "--story-batch-size",
+        type=int,
+        default=5,
+        metavar="N",
+        dest="story_batch_size",
+        help=(
+            "Max stories the planner picks per dependency-ordered batch. "
+            "Only meaningful when --stories=true. Defaults to 5."
+        ),
+    )
+    run_parser.add_argument(
+        "--commit-on-story",
+        type=_bool_choice,
+        default=False,
+        metavar="true|false",
+        dest="commit_on_story",
+        help=(
+            "When true (and --stories=true), `git commit` after each "
+            "green story with `<STORY-N>: <title>` and record the SHA "
+            "in .teane/state.db. No-op when the workspace isn't a git "
+            "repo. Defaults to false."
+        ),
+    )
+    run_parser.add_argument(
+        "--story-repair-cap",
+        type=int,
+        default=3,
+        metavar="N",
+        dest="story_repair_cap",
+        help=(
+            "Max repair iterations before a story is parked as `blocked` "
+            "(a defect is recorded; the batch continues to the next "
+            "story). Only meaningful when --stories=true. Defaults to 3."
+        ),
+    )
     # P1.7: workspace-lock override. When another live `teane run` holds
     # the workspace's session lock, the new run normally refuses to start.
     # Pass this flag to take the lock anyway — meant for the recovery case
@@ -8132,6 +8365,46 @@ def build_parser() -> argparse.ArgumentParser:
 # 5. Main Entry Point
 # ---------------------------------------------------------------------------
 
+def _install_aiosqlite_shutdown_filter() -> None:
+    """Swallow the aiosqlite background-thread ``Event loop is closed``
+    noise that fires on harness exit.
+
+    aiosqlite runs each connection on a worker thread that talks back
+    to the asyncio event loop via ``call_soon_threadsafe``. When
+    ``asyncio.run()`` returns and tears down the loop while the worker
+    is mid-flight (common on early returns, declined-confirm exits,
+    short subcommands), the worker raises a ``RuntimeError`` that
+    Python's default ``threading.excepthook`` dumps as a multi-line
+    traceback. The race is harmless — the connection is closing
+    anyway — but the traceback looks like a crash to operators.
+
+    The filter is narrowly scoped: it only swallows
+    ``RuntimeError("Event loop is closed")`` whose traceback contains
+    an ``aiosqlite`` frame. All other thread exceptions (including
+    other ``RuntimeError`` instances and any user code raising the
+    same message outside aiosqlite) flow through the prior excepthook
+    unchanged.
+    """
+    import threading
+    prior = threading.excepthook
+
+    def _filter(args: "threading.ExceptHookArgs") -> None:
+        exc_value = args.exc_value
+        if (
+            args.exc_type is RuntimeError
+            and exc_value is not None
+            and exc_value.args == ("Event loop is closed",)
+        ):
+            tb = args.exc_traceback
+            while tb is not None:
+                if "aiosqlite" in tb.tb_frame.f_code.co_filename:
+                    return  # swallow — known harmless shutdown race
+                tb = tb.tb_next
+        prior(args)
+
+    threading.excepthook = _filter
+
+
 def main() -> int:
     """
     Primary CLI entry point. Dispatches to the correct subcommand handler.
@@ -8147,6 +8420,7 @@ def main() -> int:
     Returns:
         0 on success, 1 on subcommand-level failure, 2 on config failure.
     """
+    _install_aiosqlite_shutdown_filter()
     parser = build_parser()
     args = parser.parse_args()
 

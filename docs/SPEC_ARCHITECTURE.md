@@ -966,6 +966,94 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 **Trade-off**: An in-memory registry means the dashboard restart drops the live process tracking; the watcher threads that mark `exit_code` survive only as long as the dashboard. Operators who need persistence run the schedule daemon for everything (cron-style) and use the dashboard purely for observability.
 
+### 5.50 Per-Batch Verification Topology (FR-065 — replaces per-story chain)
+
+**Decision**: Story-mode used to run the entire `patching → speculative → test_gen → lintgate → compiler → code_review` chain once **per story**. The redesign reframes stories as a *coverage mechanism* (ensure every requirement gets implemented) and batches as the *unit of verification*. Stories within a batch patch sequentially via `story_loop_node → patching_node → story_loop_node`; when `_next_story_in_batch` returns `None` the loop sets `batch_complete=True` and `route_after_story_loop` enters the verification chain ONCE for the batch:
+
+```
+batch_planner_node
+  → story_loop_node ⇄ patching_node      (per story, sequential patching)
+                  ↓ (batch exhausted)
+  → speculative_node → test_generation_node → lintgate_node
+                                                ↓
+  → compiler_node → code_review_node → batch_commit_node
+                                            ↓
+  → batch_planner_node (try next batch)
+       ↓ (no more batches)
+  → traceability_node → security_scan_node
+                            ↓ (clean, first visit)
+  → end_of_session_regression_node
+       ↓ (clean)
+  → deployment_discovery_node / deployment_node / installation_doc_node
+```
+
+A new `batch_modified_files: list[str]` state field is populated by `patching_node` / `repair_node` returns. Consumer nodes (`code_review_node`, `test_generation_node`, `lintgate_node`) read their inputs through `_scope_files_for_consumer(state)` which returns `batch_modified_files` when `current_batch_id > 0` and the list is non-empty, else falls back to the cumulative `modified_files`. The session-wide list stays the source of truth for git staging and traceability.
+
+**Rationale**: A 3-story batch dropped from running the verification chain 3 times to running it once. Per-story file scoping eliminates the "batch-2 review re-reads files batch-1 already reviewed" redundancy. The pre-batch monolithic flow (when no batch is active) is preserved bit-for-bit — every helper degrades to the historical behaviour when `current_batch_id == 0`.
+
+**Trade-off**: Failure attribution at compile/review time is now batch-level rather than story-level. The harness compensates by stamping `file_links.batch_id` at apply time (schema v2 migration) so a per-batch repair can still join compile errors back to the owning story via `story_state.files_for_batch(batch_id)`.
+
+### 5.51 Batch Sealing Node (FR-066)
+
+**Decision**: A new `batch_commit_node` in `harness/story_loop.py` fires after `route_after_code_review` (when `current_batch_id > 0`) and after `route_after_story_loop` (when `batch_complete=True` and verification gate markers say everything passed). It marks every constituent story `done` in a single transaction, resolves their open defects, and — when `commit_on_story=True` — runs `_commit_for_batch` to produce one `BATCH-N: STORY-1: title1; STORY-2: title2` git commit. The SHA is persisted to `batches.committed_sha`. The node clears `current_batch_id`, `current_story_id`, `batch_modified_files`, and the per-batch loop counters before returning, so the next batch starts from a clean state.
+
+**Rationale**: Per-story commits produced log noise (1 commit per story × 5 stories per batch = 5 commits for one logical unit of work). Sealing at the batch boundary gives operators a single commit per dependency-layered slice. Resetting counters at the batch boundary also gives the per-batch repair budget the right semantics — a batch has up to N repair attempts, not N attempts × stories-per-batch.
+
+**Trade-off**: The `commits.sha` column is the PRIMARY KEY, so a batch commit produces ONE row with `story_id=None` (the message lists every constituent story). `TRACEABILITY.md` joins through `batches.committed_sha` + `batch_stories` to map a commit back to its stories rather than via `commits.story_id` directly.
+
+### 5.52 End-of-Session Regression Gate (FR-067)
+
+**Decision**: A new `end_of_session_regression_node` in `harness/graph.py` runs the build/test pack one final time after `security_scan_node` exits clean for the first time, before any deployment path. It delegates to `compiler_node` for execution but stamps `node_state.end_of_session_phase = True` and uses its own counter `loop_counter.end_of_session_regression_repair` capped by `gateway.config.max_end_of_session_regression_cycles` (default 3). `route_after_security_scan`'s clean path intercepts on first visit (`end_of_session_regression_repair == 0`) and routes through the EoS node; on second visit (counter > 0) it skips EoS and routes directly to the deployment destination, preventing an infinite `security_scan ↔ EoS_regression ↔ repair_node ↔ compiler ↔ code_review ↔ security_scan` loop.
+
+**Rationale**: The per-batch test pack runs INSIDE each batch's verification chain. After the last batch seals, `security_scan_node` may emit findings, route through `repair_node`, and re-enter `compiler_node` — landing patches AFTER the last green test pass. Without an end-of-session regression those security-repair patches could ship a regression. The gate is also a defensive against any other post-batch mutation (e.g. a future hook that touches code between batches and deploy).
+
+**Trade-off**: Adds one extra full-pack run (~30s–2min depending on stack) on every successful session. Operators who don't want it can set `max_end_of_session_regression_cycles` to a very high value and configure `end_of_session_repair_diagnostic_cap` to bypass — but in practice the single extra run is cheap relative to a botched deploy.
+
+### 5.53 End-of-Session Repair Authority (FR-068)
+
+**Decision**: When `node_state.end_of_session_phase` is True, `repair_node`'s `_repair_file_caps(state)` helper returns `(30, 150)` instead of the default `(12, 50)`, widening both the diagnostic-file slice cap and the workspace-inventory snapshot cap. The escalation gate also forces `use_escalation = True` on the first repair attempt (toggle: `gateway.config.end_of_session_force_reasoning_model`, default True) rather than burning cheap-model rounds. An additional EoS-aware framing block is prepended to the repair prompt explicitly pointing the LLM at shared utilities the security-scan repair may have amended.
+
+**Rationale**: Per-batch repair sees 12+50 files because the failing test is almost always traceable to the batch's own patches. End-of-session repair has a different failure shape: a security fix touched a shared utility, breaking tests in code the LLM didn't directly modify. The cascade source isn't in the diagnostic file list; the LLM needs cross-file visibility. Bigger caps + reasoning model from the start = one-shot diagnosis that lands the fix.
+
+**Trade-off**: Larger prompts cost more tokens per call. The reasoning model is ~5× the price of the cheap model. End-of-session repair runs at most 3 times per session, so the upper-bound cost is bounded. Operators can disable `end_of_session_force_reasoning_model` to fall back to repair-count-driven escalation.
+
+### 5.54 CR-Mode Impact-Aware Repair Context (FR-069)
+
+**Decision**: `harness/impact.py:DependencyGraph` gains two new helpers — `high_fanout_files(top_k, min_fanout)` returns the workspace's most-depended-on files (counted as distinct importers of any exported symbol) and `immediate_callers_of(file_paths)` returns one-hop callers of a set of files. When `state["change_request_mode"]` is True, `repair_node`'s `_cr_impact_augment(state, diag_files)` helper widens the file-pull list by up to +6 entries: the intersection of `high_fanout_files` with `modified_files` (so we only surface utilities THIS CR touched) plus immediate callers of every failing file. A CR-aware framing block tells the LLM that the augmented file list is the primary suspect set.
+
+A pre-existing bug fix landed alongside: `DependencyGraph._scan_file` used to skip text-based import extraction when tree-sitter parsed symbols successfully, leaving `_dependents` empty for Python/JS/TS files. The fix always runs `_text_extract_imports` so the reverse index populates for any tree-sitter-supported stack, restoring `ImpactAnalyzer.analyze_and_warn` for what was the most common failure mode.
+
+**Rationale**: A CR that says "add `--version` flag" might amend `cli.py`'s argument parser, which is imported by 20+ subcommand modules. A failing test in `test_other_subcommand.py` looks unrelated to the CR, and the repair LLM seeing only that test file would propose patches to the test instead of the parser. Augmenting the context with high-fanout files + callers exposes the cascade source.
+
+**Trade-off**: The augmentation is best-effort — any analyzer exception is swallowed and the helper returns `[]`. The +6 cap keeps the prompt bounded.
+
+### 5.55 Mid-Batch Resume via Per-Gate Progress Markers (FR-070)
+
+**Decision**: A new `AgentState.batch_gate_progress: dict[str, dict[str, bool]]` field tracks per-batch verification-gate state, keyed by `str(current_batch_id) → {gate_name → True/False}`. `compiler_node` sets `compile_passed=True` on clean exit when `current_batch_id > 0`; `code_review_node` sets `review_passed=True` when it passes without re-patching. `route_after_story_loop` (when `batch_complete=True`) consults the active batch's markers:
+
+- `compile_passed` False → `speculative_node` (full chain re-runs)
+- `compile_passed` True, `review_passed` False → `code_review_node` (skip ahead)
+- both True → `batch_commit_node` (resume hit batch_commit itself)
+
+`batch_commit_node` pops the sealed batch's entry from `batch_gate_progress` before returning. Two helpers — `_batch_gate_passed(state, gate)` and `_mark_batch_gate(state, gate)` — keep the dict immutable across updates so the LangGraph checkpointer can compare snapshots cleanly.
+
+**Rationale**: The `HarnessAsyncSqliteSaver` checkpointer (`harness/storage.py:221`) snapshots state after every node transition, so LangGraph's standard resume mechanics already restart the graph at the last node. But within a batch's verification chain, the per-node resume doesn't reflect "compile + review passed before crash" — the routers used to always re-enter at `speculative_node`. Markers tell the router which gates can be skipped, turning the resume from "re-run everything in the verification chain" into "re-enter at the gate where the crash actually happened."
+
+**Trade-off**: The markers live only in the checkpointed state, not in a separate `batch_gates` DB table. Cross-session inspection (e.g. dashboard view of "which batch is at which gate") requires reading the most recent checkpoint, not querying the story DB directly. The original Phase K plan called for a v3 schema migration to mirror progress into `batch_gates`; this was deferred as nice-to-have since the checkpointer covers the resume case.
+
+### 5.56 Intra-Batch Story Dependency Ordering (FR-071)
+
+**Decision**: When the batch sizer places multiple stories with a dependency relationship in the same batch, the patcher MUST process them in topological order. Three layered enforcements:
+
+1. **`batch_sizing._topo_sort_within_batch`** runs over each emitted batch's `story_keys`, performing a stable topological sort over intra-batch dep edges. Ties preserve input order so a batch already in topo order is returned unchanged.
+2. **`batch_sizing.build_batch_sizing_prompt`** instructs the LLM that same-batch deps are allowed but the dep must be listed before its dependent in `story_keys`.
+3. **`batch_sizing.validate_batches`** relaxes the prior "deps must be in a strictly earlier batch" rule, allowing same-batch deps when ordered correctly. Out-of-order deps within a batch return a `must come BEFORE its dependent` error so the validator falls back to deterministic batching.
+4. **`story_loop._next_story_in_batch`** defensively skips stories whose intra-batch deps aren't yet `done`, even when the recorded `bs.sequence` order is correct — a corrupted DB row or a resumed session mid-rewind shouldn't be able to surface a story before its dep finished.
+
+**Rationale**: Without ordering, two cohesive stories (e.g. `STORY-1: Add User model` and `STORY-2: Add User auth that uses User model`) had to live in separate batches or the patcher might process STORY-2 first against missing code. With ordering enforced top-to-bottom, operators get the cohesion they want (one logical feature = one batch) without correctness compromises.
+
+**Trade-off**: Validation rejection now triggers a deterministic-batching fallback. The LLM batch proposal is generally better at grouping but the deterministic backup is correct by construction — fall-back is a small quality dip on a rare error path.
+
 ---
 
 ## 6. Data Model Overview

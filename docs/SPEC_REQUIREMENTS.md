@@ -522,6 +522,62 @@ Teane is a production-grade, model-agnostic autonomous coding agent built on Lan
   - Given `POST /run/now` with a workspace + prompt, the dashboard spawns the subprocess, sets `HARNESS_HITL_WEBHOOK_URL=http://<host>:<port>/hitl/webhook?session=<id>`, and registers the PID in the process registry.
   - Given the harness POSTs a HITL prompt to `/hitl/webhook`, the request blocks until the UI POSTs `/sessions/<id>/hitl/answer` with the operator's decision.
 
+### FR-065: Per-Batch Verification Topology
+- **Description:** When `--stories=true`, the harness MUST run the compile / code-review / test pipeline ONCE PER BATCH against the batch's combined patches, not once per story. Stories within a batch are patched sequentially via the `story_loop_node → patching_node → story_loop_node` cursor; when the batch is exhausted (every story has patched), control flows to `speculative_node → test_generation_node → lintgate_node → compiler_node → code_review_node`. Consumer nodes (code-review, test-generation, lintgate) MUST read their input from the new `batch_modified_files` state field via `_scope_files_for_consumer(state)` so each gate only sees the current batch's files, not the cumulative session set. The pre-batch behavior (monolithic mode, when no batch is active) MUST be preserved bit-for-bit.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a 3-story batch, `compiler_node` runs exactly ONCE for the batch, not three times.
+  - Given `current_batch_id > 0`, `code_review_node` reads `batch_modified_files`; given `current_batch_id == 0`, it falls back to `modified_files`.
+  - Given `current_batch_id == 0` (monolithic), the patching → speculative edge fires as before — no behavioural regression for non-story-mode runs.
+
+### FR-066: Per-Batch Sealing with Atomic Status + Optional Commit
+- **Description:** When `current_batch_id > 0` and `code_review_node` passes cleanly, control MUST route to `batch_commit_node` (NOT `story_complete_node`). The commit node MUST mark every constituent story as `done` in a single transaction, resolve any open defects per story, and (when `--commit-on-story=true`) run `_commit_for_batch(workspace, batch_id, story_keys_with_titles)` which writes a single `BATCH-N: STORY-1: ...; STORY-2: ...` git commit and persists the SHA into `batches.committed_sha`. The node MUST reset `current_batch_id`, `current_story_id`, `batch_modified_files`, and the per-batch `loop_counter` keys (`patching`, `repair`, `compiler`, `total_repairs`, `review_code`, `consecutive_zero_patch_rounds`, `missing_dep_consecutive_same`) before returning so the next batch starts clean.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given a 3-story batch that passes review, `batch_commit_node` marks STORY-1, STORY-2, and STORY-3 as `done` in one transaction and the `batches.status` row updates to `complete`.
+  - Given `--commit-on-story=true` and a workspace with `.git/`, the SHA recorded in `batches.committed_sha` matches `HEAD` after sealing and the commit subject begins with `BATCH-N:`.
+  - Given a story was `blocked` mid-batch, `batches.status` is `complete_with_blocks` and the blocked story's status stays `blocked`.
+
+### FR-067: End-of-Session Regression Gate
+- **Description:** After every batch in a session has sealed and `security_scan_node` exits clean for the first time, the router MUST insert one final regression run through `end_of_session_regression_node` before any deployment path. The node delegates to `compiler_node` for the build/test execution but stamps `node_state.end_of_session_phase = True` and uses its own counter (`loop_counter.end_of_session_regression_repair`) with the operator-configurable cap `gateway.config.max_end_of_session_regression_cycles` (default 3). On clean exit it routes to the deployment destination (`deployment_discovery_node` / `deployment_node` / `installation_doc_node`) per the same precedence as `route_after_security_scan`'s clean path. On failure it routes through `repair_node → compiler_node` until the cap is reached, then HITL. The router MUST treat `end_of_session_regression_repair > 0` as a marker that the gate already ran — a re-entry to `security_scan_node` via the repair loop MUST NOT re-enter the EoS regression (prevents an infinite security ↔ EoS loop).
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given `security_scan_node` returns clean and `end_of_session_regression_repair == 0`, `route_after_security_scan` returns `"end_of_session_regression_node"`.
+  - Given `end_of_session_regression_repair >= 1` and `security_scan_node` returns clean again (after a repair round), the router skips EoS and goes directly to the deployment destination.
+  - Given `node_throttle.max_end_of_session_regression_cycles = 3` and the build fails 3 times in EoS, the router routes to `human_intervention_node`.
+
+### FR-068: End-of-Session Repair Authority
+- **Description:** When the repair loop fires while `node_state.end_of_session_phase` is True, `repair_node` MUST surface a wider file-context window to the LLM and skip the cheap-model cycle. Specifically: (1) the diagnostic-file cap raises from 12 to `node_throttle.end_of_session_repair_diagnostic_cap` (default 30); (2) the workspace-inventory snapshot cap raises from 50 to `node_throttle.end_of_session_repair_inventory_cap` (default 150); (3) when `node_throttle.end_of_session_force_reasoning_model` is True (default), `use_escalation` is forced True on the first attempt so the senior reasoning model handles the diagnosis directly. The repair prompt MUST prepend an EoS-aware framing block telling the LLM that the failing tests likely involve shared utilities the security-scan repair touched, with explicit instruction to look at imports / recent modifications / utility files.
+- **Priority:** Must Have
+- **Acceptance Criteria:**
+  - Given `node_state.end_of_session_phase = True`, `_repair_file_caps(state)` returns `(30, 150)` (or operator-configured values).
+  - Given `node_state.end_of_session_phase = True` and `end_of_session_force_reasoning_model = True`, `use_escalation` is True on the first repair attempt (counter 0).
+  - Given `end_of_session_phase` is unset or False, the cap helper returns the default `(12, 50)` and escalation follows the existing repair-count-driven rule (last attempt only).
+
+### FR-069: Change-Request Impact-Aware Repair Context
+- **Description:** When `state["change_request_mode"]` is True and the repair loop fires, the repair LLM MUST receive up to +6 additional file slices beyond the diagnostic-named files, drawn from: (a) the workspace's most-depended-on files (`DependencyGraph.high_fanout_files`) intersected with the session's `modified_files` (so only utilities THIS CR amended appear), and (b) immediate one-hop callers of every diagnostic file (`DependencyGraph.immediate_callers_of`). The augmentation MUST de-duplicate against the existing diagnostic list and the inventory list. The repair prompt MUST prepend a CR-aware framing block telling the LLM that the failing tests may involve features outside the CR's stated scope and that the augmented file list is the primary suspect set. Outside CR mode the augmentation MUST be a no-op.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given `change_request_mode = True` and a workspace where `utils.py` is imported by 4+ files, `_cr_impact_augment(state, [failing_test_file])` returns `utils.py` in its result list when `utils.py` is also in `modified_files`.
+  - Given `change_request_mode = False`, `_cr_impact_augment(state, diag_files)` returns an empty list.
+  - Given 8 consumers of a touched utility, the augmenter caps additions at 6 files (`_CR_EXTRA_FILE_CAP`).
+
+### FR-070: Mid-Batch Resume via Per-Gate Progress Markers
+- **Description:** The harness MUST track per-batch verification-gate progress in `AgentState.batch_gate_progress: dict[str, dict[str, bool]]`. `compiler_node` MUST set the active batch's `compile_passed = True` on clean exit when `current_batch_id > 0`; `code_review_node` MUST set `review_passed = True` when it passes without re-patching. On resume after a crash, `route_after_story_loop` (when `batch_complete == True`) MUST consult the active batch's markers and skip ahead to the next un-passed gate — `compile_passed` False → `speculative_node`; True with `review_passed` False → `code_review_node`; both True → `batch_commit_node`. `batch_commit_node` MUST pop the sealed batch's entry from `batch_gate_progress` before returning.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given a crash mid-test-loop after compile passed but review didn't run, `route_after_story_loop` returns `"code_review_node"` instead of `"speculative_node"`.
+  - Given `batch_gate_progress["3"] = {"compile_passed": True}` and `current_batch_id = 2`, the router does NOT short-circuit (progress is per-batch and key-matched).
+  - Given `batch_commit_node` runs on batch 5, `batch_gate_progress` no longer contains a `"5"` entry after the seal.
+
+### FR-071: Intra-Batch Story Dependency Ordering
+- **Description:** When two stories with a dependency relationship (`STORY-B.depends_on = ["STORY-A"]`) are placed in the same batch, the patcher MUST process STORY-A before STORY-B. (1) `batch_sizing.deterministic_batches` MUST topologically order each emitted batch's `story_keys` via `_topo_sort_within_batch`. (2) The LLM batch-sizing prompt (`build_batch_sizing_prompt`) MUST require dependents to appear after their deps in `story_keys`. (3) `batch_sizing.validate_batches` MUST allow same-batch deps (relaxing the prior "deps must be in earlier batch" rule) but MUST reject any batch where a dep appears AFTER its dependent in `story_keys`. (4) `story_loop._next_story_in_batch` MUST defensively skip stories whose intra-batch deps aren't yet `done` even when the recorded sequence is correct, protecting against corrupted DB rows or resumed sessions that landed mid-rewind.
+- **Priority:** Should Have
+- **Acceptance Criteria:**
+  - Given STORY-B depends on STORY-A and both are in batch 1 with `story_keys = ["STORY-A", "STORY-B"]`, validation passes and STORY-A is picked first.
+  - Given `story_keys = ["STORY-B", "STORY-A"]` with the same dep, `validate_batches` returns an error containing "must come BEFORE its dependent".
+  - Given STORY-A is `planned` and STORY-B (deps `["STORY-A"]`) is also `planned`, `_next_story_in_batch` returns STORY-A; once STORY-A is `done`, the next call returns STORY-B.
+
 ---
 
 ## 3. System Scope

@@ -1939,7 +1939,7 @@ async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
         }
 
     # Findings to block on. Route to patching via compiler_errors.
-    loop_counter = dict(state.get("loop_counter", {}))
+    loop_counter = dict(state.get("loop_counter") or {})
     loop_counter["security"] = loop_counter.get("security", 0) + 1
     max_attempts = int(sec_cfg.get("max_security_fix_attempts", 2))
 

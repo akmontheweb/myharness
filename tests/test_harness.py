@@ -5674,12 +5674,16 @@ class TestSecurityScanRouting:
         # the operator opted into BOTH --deploy-dev AND --cd-discovery.
         # When --cd-discovery is false the router skips discovery and
         # goes straight to deployment_node (separate test below).
+        # Phase G: end_of_session_regression_repair > 0 simulates "EoS
+        # regression already ran" so the router proceeds to the
+        # deployment destination instead of intercepting to EoS.
         from harness.graph import route_after_security_scan
         with tempfile.TemporaryDirectory() as tmpdir:
             state = _make_state(tmpdir, dev_deployment=True)
             state["budget_remaining_usd"] = 1.0
             state["compiler_errors"] = []
             state["cd_discovery"] = True
+            state["loop_counter"] = {"end_of_session_regression_repair": 1}
             assert route_after_security_scan(state) == "deployment_discovery_node"
 
     def test_route_after_security_scan_clean_no_cd_discovery(self):
@@ -5692,6 +5696,7 @@ class TestSecurityScanRouting:
             state["budget_remaining_usd"] = 1.0
             state["compiler_errors"] = []
             state["cd_discovery"] = False
+            state["loop_counter"] = {"end_of_session_regression_repair": 1}
             assert route_after_security_scan(state) == "deployment_node"
 
     def test_route_after_security_scan_clean_without_dev_deployment(self):
@@ -5705,6 +5710,7 @@ class TestSecurityScanRouting:
             state = _make_state(tmpdir)
             state["budget_remaining_usd"] = 1.0
             state["compiler_errors"] = []
+            state["loop_counter"] = {"end_of_session_regression_repair": 1}
             assert route_after_security_scan(state) == "installation_doc_node"
 
     def test_route_after_security_scan_findings(self):
@@ -5752,6 +5758,7 @@ class TestSecurityScanRouting:
             state = _make_state(tmpdir)
             state["budget_remaining_usd"] = 1.0
             state["compiler_errors"] = []
+            state["loop_counter"] = {"end_of_session_regression_repair": 1}
             assert route_after_security_scan(state) == "installation_doc_node"
 
 

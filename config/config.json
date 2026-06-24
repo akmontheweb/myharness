@@ -30,23 +30,28 @@
         "pgid_kill_on_timeout": true,
         "restore_workspace_ownership": true
     },
+    
     "_token_budget_comment": "Spend caps. hard_cap_usd is the per-session dollar ceiling \u2014 the gateway refuses dispatches once spend reaches it. Override per-run via --budget. context_window_threshold_pct triggers context compaction when the message list fills this fraction of the model's window. stages (optional) is a soft per-stage budget split \u2014 maps NodeRole name to a fraction of hard_cap_usd, e.g. {\"planning\":0.2,\"patching\":0.2,\"repair\":0.5,\"doc_reviewer\":0.05,\"code_reviewer\":0.05}. Today this only emits a warning when a stage exceeds its share; hard enforcement is a follow-up.",
     "token_budget": {
         "hard_cap_usd": 3.0,
         "context_window_threshold_pct": 0.85,
         "stages": {}
     },
-    "_node_throttle_comment": "Per-loop iteration ceilings \u2014 prevent runaway loops. max_patch_repair_iterations caps how many times the repair loop can retry a failing build (defaults to 3 \u2192 routes to HITL after the third miss). max_doc_review_cycles / max_code_review_cycles cap the adversarial doc-reviewer / code-reviewer revision rounds. max_discovery_iterations caps the requirements/architecture interview loop.",
+    "_node_throttle_comment": "Per-loop iteration ceilings \u2014 prevent runaway loops. max_patch_repair_iterations caps how many times the repair loop can retry a failing build (defaults to 3 \u2192 routes to HITL after the third miss). max_doc_review_cycles / max_code_review_cycles cap the adversarial doc-reviewer / code-reviewer revision rounds. max_discovery_iterations caps the requirements/architecture interview loop. max_end_of_session_regression_cycles caps the final regression repair loop after security_scan passes but before deployment (Phase G). end_of_session_repair_diagnostic_cap / end_of_session_repair_inventory_cap raise the per-file context limits in repair prompts at the end-of-session regression to give the LLM enough surface to spot shared-utility cascade fixes (Phase J); end_of_session_force_reasoning_model jumps straight to the reasoning model on the first EoS repair attempt instead of burning cheap-model rounds.",
     "node_throttle": {
         "max_code_review_cycles": 2,
-        "max_discovery_iterations": 5,
+        "max_discovery_iterations": 2,
         "max_doc_review_cycles": 2,
-        "max_patch_repair_iterations": 8
+        "max_patch_repair_iterations": 3,
+        "max_end_of_session_regression_cycles": 3,
+        "end_of_session_repair_diagnostic_cap": 30,
+        "end_of_session_repair_inventory_cap": 150,
+        "end_of_session_force_reasoning_model": true
     },
     "_hitl_comment": "Human-in-the-loop gate switches. Each flag controls whether the corresponding gate prompts the operator (true) or auto-approves (false). Resolution precedence at run start: (1) the matching --hitl-* CLI flag when explicitly passed; (2) the value in this block; (3) the harness's last-resort default of true. The third tier means: if neither the CLI nor this file says otherwise, every gate prompts. Auto-approve fallbacks (CI=true, HARNESS_AUTO_APPROVE=true, no TTY) still apply on top — those force auto-approve regardless of how this resolves. requirement = requirements gatekeeper + the pre-graph interactive spec review. architecture = architecture gatekeeper. repair = the repair-loop HITL menu when iteration ceilings trip. deployment = deployment gatekeeper before --deploy-dev fires. layout_divergence = the spec_layout_divergence menu fires when on-disk source drifts from SPEC_ARCHITECTURE.md's workspace_layout block.",
     "hitl": {
-        "requirement": true,
-        "architecture": true,
+        "requirement": false,
+        "architecture": false,
         "repair": true,
         "deployment": true,
         "layout_divergence": true
@@ -116,11 +121,22 @@
         "ollama:qwen2.5-coder:14b": {
             "provider": "ollama",
             "model_id": "qwen2.5-coder:14b",
-            "context_window": 131072,
+            "context_window": 32768,
             "input_cost_per_1m": 0.0,
             "output_cost_per_1m": 0.0,
             "api_base_url": "http://localhost:11434/v1",
             "supports_thinking": false,
+            "api_key": "",
+            "supports_cache": false
+        },
+        "ollama:gemma4:12b": {
+            "provider": "ollama",
+            "model_id": "gemma4:12b",
+            "context_window": 32768,
+            "input_cost_per_1m": 0.0,
+            "output_cost_per_1m": 0.0,
+            "api_base_url": "http://localhost:11434/v1",
+            "supports_thinking": true,
             "api_key": "",
             "supports_cache": false
         }

@@ -409,7 +409,16 @@ async def lintgate_node(state: dict[str, Any]) -> dict[str, Any]:
     """
     logger.info("[lintgate_node] Starting deterministic format verification...")
 
-    modified_files: list[str] = list(state.get("modified_files", []))
+    # Phase E.4: in batch-mode the lintgate scopes to the current batch's
+    # files instead of the session-cumulative set, so a 3-batch run formats
+    # ~1/3 the files per pass instead of re-formatting earlier-batch code.
+    # ``_scope_files_for_consumer`` falls back to ``modified_files`` for
+    # monolithic mode and for the very first invocation before the batch
+    # list has been populated by patching_node. The session-wide
+    # ``modified_files`` is still the git-staging source of truth — only
+    # the formatter/linter input is narrowed.
+    from harness.graph import _scope_files_for_consumer
+    modified_files: list[str] = list(_scope_files_for_consumer(state))
     workspace_path: str = state.get("workspace_path", os.getcwd())
 
     # Config: whether to format pre-existing files (default off — clobbers

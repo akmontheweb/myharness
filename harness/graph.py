@@ -237,6 +237,71 @@ class AgentState(TypedDict, total=False):
     # cover the known cases; this is defence-in-depth for future nodes that
     # forget to set their own re-verify flag.
     pre_exit_verify: bool
+    # Story-mode fields (Agile decomposition + per-story TDD). When
+    # ``decomposition_enabled`` is True, route_after_gatekeeper(ARCHITECTURE)
+    # branches to decomposition_node instead of patching_node; the per-story
+    # loop sets current_story_id / current_batch_id / story_scope_files as it
+    # walks the planned stories table in ``<workspace>/.teane/state.db``. All
+    # default to safe values (False / "" / 0 / []) so today's monolithic flow
+    # is preserved when ``--no-stories`` is passed or no decomposition has
+    # run. MUST be declared here — LangGraph drops unregistered fields on
+    # the channel layer (see the discovery_questions warning above).
+    decomposition_enabled: bool
+    current_story_id: str
+    current_batch_id: int
+    story_defects_open: int
+    stories_db_path: str
+    story_scope_files: list[str]
+    # Snapshot of ``modified_files`` taken when story_loop_node picked the
+    # current story. story_complete_node diffs against this to attribute
+    # only newly-touched files to the active STORY-N row in file_links.
+    # Without the snapshot we'd over-attribute (story 2 inherits story 1's
+    # files) — link_file de-dups via INSERT OR IGNORE so it's harmless to
+    # the schema, but the TRACEABILITY.md view would show false coupling.
+    story_modified_baseline: list[str]
+    # Per-batch scope of touched files. Populated by ``patching_node``
+    # while ``current_batch_id`` is non-zero; cleared by the batch-commit
+    # node when the batch lands. Consumer nodes (code_review,
+    # test_generation, security_scan) read this via
+    # ``_scope_files_for_batch`` so per-batch verification gates only see
+    # files this batch wrote, not the cumulative session set.
+    # ``modified_files`` remains the session-cumulative source of truth
+    # for git staging and traceability.
+    batch_modified_files: list[str]
+    # Phase K — per-batch verification-gate progress markers used for
+    # mid-batch crash resume. Outer key is ``str(current_batch_id)``;
+    # inner dict carries boolean flags like ``compile_passed`` and
+    # ``review_passed``. ``compiler_node`` and ``code_review_node`` set
+    # their respective flags on clean pass; ``route_after_story_loop``
+    # skips already-passed gates when ``batch_complete=True`` so a
+    # resumed session doesn't re-run compile+review just to land in the
+    # gate where the crash actually happened. ``batch_commit_node``
+    # pops the batch's entry as part of its state reset.
+    batch_gate_progress: dict[str, dict[str, bool]]
+    # Opt-in: when True (set by ``--commit-on-story``), story_complete_node
+    # runs `git add . && git commit -m "<STORY-N>: <title>"` after a green
+    # story and records the SHA in the commits table. No-op when the
+    # workspace isn't a git repo. Default False — git commits are a side
+    # effect users should opt into.
+    commit_on_story: bool
+    # Story planner / TDD knobs from the CLI. ``story_batch_size`` caps how
+    # many independent stories the planner pulls into one batch (default
+    # DEFAULT_BATCH_SIZE in harness.story_loop).
+    #
+    # ``story_repair_cap`` (default 3): max total_repairs before
+    # ``story_complete_node`` parks the story as ``blocked`` and records
+    # a defect. Phase E.3 changed the live routing so the per-batch
+    # verification chain runs once after every story has patched, then
+    # routes to ``batch_commit_node`` directly — bypassing
+    # ``story_complete_node`` in batch-mode runs. The cap is therefore
+    # only enforced today when a session runs in legacy non-batch
+    # story-mode (no ``batch_planner_node`` in play, e.g. unit tests
+    # that bypass the planner). The session-level repair budget that
+    # actually governs batch-mode runs is
+    # ``gateway.config.max_patch_repair_iterations`` (consulted inside
+    # ``route_after_compiler``).
+    story_batch_size: int
+    story_repair_cap: int
 
 # ---------------------------------------------------------------------------
 # 2. Default State Factory
@@ -259,6 +324,11 @@ def create_initial_state(
     dev_deployment: bool = False,
     cd_discovery: bool = False,
     install_doc: bool = False,
+    decomposition_enabled: bool = False,
+    stories_db_path: str = "",
+    commit_on_story: bool = False,
+    story_batch_size: int = 5,
+    story_repair_cap: int = 3,
 ) -> AgentState:
     """
     Construct the initial graph state with anchored system prompt at messages[0]
@@ -331,7 +401,113 @@ def create_initial_state(
         installation_doc_path="",
         pending_mutations=[],
         pre_exit_verify=False,
+        decomposition_enabled=bool(decomposition_enabled),
+        current_story_id="",
+        current_batch_id=0,
+        story_defects_open=0,
+        stories_db_path=stories_db_path,
+        story_scope_files=[],
+        story_modified_baseline=[],
+        batch_modified_files=[],
+        batch_gate_progress={},
+        commit_on_story=bool(commit_on_story),
+        story_batch_size=int(story_batch_size),
+        story_repair_cap=int(story_repair_cap),
     )
+
+
+# ---------------------------------------------------------------------------
+# 2a. Batch-scope helpers (per-batch verification pipeline, Phase D)
+# ---------------------------------------------------------------------------
+
+def _extend_batch_scope(
+    state: "AgentState", new_modified_files: list[str]
+) -> list[str]:
+    """Append files newly touched by this node to ``batch_modified_files``.
+
+    Used inside patching_node and repair_node returns. Computes the set
+    of files added by THIS invocation (``new_modified_files`` minus the
+    pre-call ``state["modified_files"]``) and appends them to the
+    existing batch scope, preserving insertion order and de-duplicating.
+
+    When ``current_batch_id`` is 0 (monolithic / non-batch mode) the
+    function still returns a coherent value — the unchanged existing
+    list — so callers can unconditionally pass the result back into the
+    state delta without branching."""
+    existing_batch = list(state.get("batch_modified_files") or [])
+    if not int(state.get("current_batch_id") or 0):
+        return existing_batch
+    pre_call = set(state.get("modified_files") or [])
+    new_in_this_call = [f for f in new_modified_files if f not in pre_call]
+    if not new_in_this_call:
+        return existing_batch
+    seen: set[str] = set(existing_batch)
+    out = list(existing_batch)
+    for f in new_in_this_call:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+def _batch_gate_passed(
+    state: "AgentState", gate: str,
+) -> bool:
+    """Return True when ``current_batch_id``'s ``gate`` flag is set
+    in ``batch_gate_progress`` (Phase K).
+
+    No batch active → False. Used by routers to skip already-passed
+    gates on resume."""
+    bid = int(state.get("current_batch_id") or 0)
+    if bid <= 0:
+        return False
+    bgp = state.get("batch_gate_progress") or {}
+    if not isinstance(bgp, dict):
+        return False
+    entry = bgp.get(str(bid)) or {}
+    return bool(entry.get(gate))
+
+
+def _mark_batch_gate(
+    state: "AgentState", gate: str,
+) -> dict[str, dict[str, bool]]:
+    """Return a NEW ``batch_gate_progress`` dict with the current
+    batch's ``gate`` flag set to True (Phase K).
+
+    The result is the new value to fold back into the state-delta dict
+    returned by a node. No-op (returns the existing dict) when there's
+    no active batch."""
+    bid = int(state.get("current_batch_id") or 0)
+    existing = state.get("batch_gate_progress") or {}
+    if not isinstance(existing, dict):
+        existing = {}
+    if bid <= 0:
+        return dict(existing)
+    out: dict[str, dict[str, bool]] = {
+        k: dict(v) for k, v in existing.items()
+    }
+    entry = dict(out.get(str(bid)) or {})
+    entry[gate] = True
+    out[str(bid)] = entry
+    return out
+
+
+def _scope_files_for_consumer(state: "AgentState") -> list[str]:
+    """Return the file set that per-batch verification gates should read.
+
+    In batch-mode (``current_batch_id`` non-zero) callers consume
+    ``batch_modified_files`` so review / test-gen only see what this
+    batch touched. Outside batch-mode they fall back to the cumulative
+    session ``modified_files`` — preserving pre-batch behavior.
+
+    Empty ``batch_modified_files`` in batch-mode falls back to
+    ``modified_files`` too — the patching phase may not have populated
+    the batch list yet on the very first invocation."""
+    if int(state.get("current_batch_id") or 0):
+        batch = list(state.get("batch_modified_files") or [])
+        if batch:
+            return batch
+    return list(state.get("modified_files") or [])
 
 
 # Files that conventionally live at workspace root and are exempt from the
@@ -2820,9 +2996,14 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
         # string) when change_request_mode is False — greenfield runs see
         # the format reminder unchanged.
         cr_preamble = _build_change_request_preamble(state, "patching")
+        # Story mode: when current_story_id is set, scope this turn to
+        # the named STORY-N's acceptance criteria + file hints, with the
+        # STORY-N marker contract. No-op (empty string) when no story
+        # is active — monolithic flow (--no-stories) is byte-identical.
+        story_preamble = _build_story_preamble(state, "patching")
 
         # Inject a format reminder to ensure the LLM outputs patch blocks
-        _FORMAT_REMINDER = allowlist_preamble + cr_preamble + """[CRITICAL FORMAT INSTRUCTION]
+        _FORMAT_REMINDER = allowlist_preamble + cr_preamble + story_preamble + """[CRITICAL FORMAT INSTRUCTION]
 You MUST respond using ONLY the patch block syntax below. Do NOT include any explanations,
 markdown code fences, or text outside the blocks. Your entire response must be parseable
 as one or more patch blocks.
@@ -2861,6 +3042,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
         _TOOL_USE_REMINDER = (
             allowlist_preamble
             + cr_preamble
+            + story_preamble
             + "[PATCHING — NATIVE TOOL-USE MODE]\n"
             "The harness has exposed the patch operations as native tools "
             "(`read_file`, `edit_file`, `create_file`, `delete_block`, "
@@ -3134,6 +3316,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
         return {
             "messages": messages,
             "modified_files": modified_files,
+            "batch_modified_files": _extend_batch_scope(state, modified_files),
             "token_tracker": token_tracker,
             "budget_remaining_usd": new_budget,
             "loop_counter": loop_counter,
@@ -4370,6 +4553,125 @@ def _resolve_read_blocks(
     return intro + "\n" + "\n".join(sections) + "\n"
 
 
+_DEFAULT_REPAIR_DIAGNOSTIC_CAP = 12
+_DEFAULT_REPAIR_INVENTORY_CAP = 50
+_EOS_REPAIR_DIAGNOSTIC_CAP = 30
+_EOS_REPAIR_INVENTORY_CAP = 150
+
+
+_CR_EXTRA_FILE_CAP = 6
+
+
+def _cr_impact_augment(
+    state: "AgentState", diag_files: list[str],
+) -> list[str]:
+    """Return additional file paths to surface to the repair LLM when
+    in change-request mode (Phase L).
+
+    Augments the existing diagnostic file list with up to
+    :data:`_CR_EXTRA_FILE_CAP` extra files:
+
+    - **Shared utilities the session has touched.** Intersect
+      ``modified_files`` with ``DependencyGraph.high_fanout_files`` so
+      we only surface utilities that THIS CR actually amended.
+    - **Immediate callers** of every diag file via
+      ``DependencyGraph.immediate_callers_of``. When a CR amends a
+      utility's signature, its callers are the most likely places a
+      regression surfaces.
+
+    Empty list outside CR mode, on any analyzer error, or when the
+    workspace has nothing to add. Best-effort: this helper must never
+    block a repair attempt.
+    """
+    if not state.get("change_request_mode"):
+        return []
+    workspace = state.get("workspace_path") or ""
+    if not workspace:
+        return []
+    seen: set[str] = set(diag_files)
+    extras: list[str] = []
+    try:
+        from harness.impact import DependencyGraph
+
+        graph_obj = DependencyGraph(workspace)
+        graph_obj.build()
+
+        # High-fanout files the CR touched.
+        touched = {
+            p for p in (state.get("modified_files") or []) if p
+        }
+        if touched:
+            top = graph_obj.high_fanout_files(top_k=10)
+            for fp, _fanout in top:
+                if len(extras) >= _CR_EXTRA_FILE_CAP:
+                    break
+                # Compare on relpath so absolute/relative variants match.
+                rel = os.path.relpath(fp, workspace)
+                if rel in touched and rel not in seen:
+                    extras.append(rel)
+                    seen.add(rel)
+
+        # Immediate callers of every diagnostic file.
+        if len(extras) < _CR_EXTRA_FILE_CAP:
+            callers = graph_obj.immediate_callers_of(
+                list(diag_files), top_k=_CR_EXTRA_FILE_CAP,
+            )
+            for fp in callers:
+                if len(extras) >= _CR_EXTRA_FILE_CAP:
+                    break
+                rel = os.path.relpath(fp, workspace)
+                if rel in seen:
+                    continue
+                extras.append(rel)
+                seen.add(rel)
+    except Exception as exc:  # noqa: BLE001 — never block repair
+        logger.debug(
+            "[repair_node] CR impact augment skipped: %s", exc,
+        )
+        return []
+    return extras
+
+
+def _repair_file_caps(state: "AgentState") -> tuple[int, int]:
+    """Return ``(diagnostic_cap, inventory_cap)`` for the current repair.
+
+    Phase J — at the end-of-session repair (when
+    ``node_state.end_of_session_phase`` is set by
+    ``end_of_session_regression_node``), security-scan repairs may
+    have touched shared utilities. The failing tests can cascade
+    across many files the LLM didn't directly patch, so the default
+    12+50 caps starve the model of the cross-file context it needs.
+    Bumping to 30+150 gives the senior reasoning model enough surface
+    to catch a shared-utility regression without exploding prompts on
+    a per-batch repair where the smaller caps work well.
+
+    The caps are configurable via the gateway's config:
+    ``end_of_session_repair_diagnostic_cap`` (default
+    :data:`_EOS_REPAIR_DIAGNOSTIC_CAP`) and
+    ``end_of_session_repair_inventory_cap`` (default
+    :data:`_EOS_REPAIR_INVENTORY_CAP`).
+    """
+    ns = state.get("node_state") or {}
+    in_eos = bool(
+        isinstance(ns, dict) and ns.get("end_of_session_phase")
+    )
+    if not in_eos:
+        return _DEFAULT_REPAIR_DIAGNOSTIC_CAP, _DEFAULT_REPAIR_INVENTORY_CAP
+    gw = get_gateway()
+    diag_cap = _EOS_REPAIR_DIAGNOSTIC_CAP
+    inv_cap = _EOS_REPAIR_INVENTORY_CAP
+    if gw is not None:
+        diag_cap = int(getattr(
+            gw.config, "end_of_session_repair_diagnostic_cap",
+            _EOS_REPAIR_DIAGNOSTIC_CAP,
+        ))
+        inv_cap = int(getattr(
+            gw.config, "end_of_session_repair_inventory_cap",
+            _EOS_REPAIR_INVENTORY_CAP,
+        ))
+    return diag_cap, inv_cap
+
+
 def _collect_workspace_file_content(
     workspace_path: str,
     rel_paths: Iterable[str],
@@ -5217,6 +5519,13 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         # Anything appended after this point reflects a real drift between
         # what tests verified and what's on disk.
         return_dict["pending_mutations"] = []
+        # Phase K — mark batch-mode's compile gate as passed so
+        # ``route_after_story_loop`` skips re-running this chain on a
+        # resumed session. No-op outside batch-mode.
+        if int(state.get("current_batch_id") or 0):
+            return_dict["batch_gate_progress"] = _mark_batch_gate(
+                state, "compile_passed",
+            )
 
     return return_dict
 
@@ -5430,6 +5739,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         return {
             "messages": autofix_messages,
             "modified_files": autofix_modified_files,
+            "batch_modified_files": _extend_batch_scope(state, autofix_modified_files),
             "loop_counter": loop_counter,
             "node_state": {
                 "current_node": "repair",
@@ -5480,8 +5790,18 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             if f not in diag_files:
                 diag_files.append(f)
         if diag_files:
+            diag_cap, _ = _repair_file_caps(state)
+            # Phase L — in CR mode, augment the diagnostic file list
+            # with up to +6 likely cascade sources: high-fanout
+            # shared utilities the CR touched + immediate callers of
+            # any failing file. The repair LLM otherwise sees only the
+            # failing test/file and would not realise a shared util
+            # the CR amended is the root cause.
+            cr_extra = _cr_impact_augment(state, diag_files)
+            files_for_preflight = list(diag_files) + cr_extra
             preflight_pairs = _collect_workspace_file_content(
-                workspace_path, diag_files,
+                workspace_path, files_for_preflight,
+                max_files=diag_cap,
                 record_hashes_into=files_seen_by_llm,
             )
             error_summary += _format_preflight_file_content(
@@ -5631,7 +5951,11 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     # kills the guessing.
     inventory_files = sorted({p for p in (state.get("modified_files") or []) if p})
     if inventory_files:
-        SNAPSHOT_CAP = 50
+        # Phase J: in end-of-session repair the SNAPSHOT_CAP doubles
+        # (12→30 diagnostic, 50→150 inventory) so a security-repair
+        # that touched a shared utility doesn't leave the EoS repair
+        # blind to the cascade.
+        _, SNAPSHOT_CAP = _repair_file_caps(state)
         shown = inventory_files[:SNAPSHOT_CAP]
         extra = max(0, len(inventory_files) - SNAPSHOT_CAP)
         error_summary += (
@@ -5710,6 +6034,21 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         total_repairs = loop_counter["total_repairs"]
         max_repair_attempts = int(getattr(gateway.config, "max_patch_repair_iterations", 5))
         use_escalation = total_repairs >= max(1, max_repair_attempts - 1)
+        # Phase J: at end-of-session repair, jump straight to the
+        # reasoning model. The failing tests at this gate ran after
+        # security-scan repairs, so a one-shot diagnosis benefits
+        # from the bigger model on attempt #1 rather than burning
+        # cheap-model rounds first. Toggle via
+        # ``end_of_session_force_reasoning_model`` (default True).
+        _eos_ns = state.get("node_state") or {}
+        _eos_active = bool(
+            isinstance(_eos_ns, dict) and _eos_ns.get("end_of_session_phase")
+        )
+        _eos_force = bool(getattr(
+            gateway.config, "end_of_session_force_reasoning_model", True,
+        ))
+        if _eos_active and _eos_force:
+            use_escalation = True
 
         if use_escalation:
             escalation_model = gateway.config.repair_fallback or gateway.config.planning_fallback
@@ -5754,9 +6093,62 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         #   2. Build failed and the cheap model has already missed twice
         #      → escalate to the reasoning model with reasoning framing.
         #   3. Build failed, first or second attempt → standard framing.
+        # Phase L: when the session is processing change-requests, the
+        # repair LLM should consider cross-cutting cascade sources
+        # (shared utils, immediate callers) the CR may have amended.
+        # _cr_impact_augment has already widened the file content
+        # surfaced into error_summary, but the framing line tells the
+        # LLM why and where to look. Concatenates BEFORE the EoS
+        # preamble so an end-of-session CR repair gets both.
+        cr_preamble = ""
+        if state.get("change_request_mode"):
+            cr_preamble = (
+                "## Change-request session\n\n"
+                "This session is implementing change requests against "
+                "an existing codebase. The failing tests below may "
+                "involve features OUTSIDE the CR's stated scope — when "
+                "that happens, the CR likely amended a shared utility "
+                "(`utils.py`, `models.py`, a base class, a config "
+                "loader, etc.) whose callers regressed. The diagnostic "
+                "file list below has been augmented with the most-"
+                "imported workspace files THIS CR touched plus the "
+                "immediate callers of every failing file — use those "
+                "as the primary suspect set before patching anything "
+                "named only by the test.\n\n---\n\n"
+            )
+
+        # Phase J: prepend an end-of-session framing block when this
+        # repair was triggered by the final regression gate. The
+        # failing tests there ran after security-scan repairs may have
+        # touched shared utilities, so the LLM needs to think about
+        # cross-file cascades, not just the directly-named files.
+        eos_preamble = ""
+        if _eos_active:
+            eos_preamble = (
+                "## End-of-session regression\n\n"
+                "This is the FINAL pre-deployment regression check. "
+                "The failing tests below ran after the security-scan "
+                "repair loop already landed patches in this session, "
+                "so a likely cause is a SHARED UTILITY the security "
+                "fix touched that's imported by code unrelated to the "
+                "security finding itself. Before patching the named "
+                "files, look at:\n"
+                "- imports in the failing-test file and follow them "
+                "into shared modules\n"
+                "- recent modifications listed in the workspace "
+                "inventory below — any of those that look like "
+                "utilities, helpers, or `models.py` are prime suspects\n"
+                "- whether a test expectation changed under your feet "
+                "vs whether the implementation changed\n\n"
+                "Then write the minimum diff that restores green tests "
+                "WITHOUT regressing the security fix that was just "
+                "applied.\n\n---\n\n"
+            )
+
         if is_security_repair:
             repair_prompt = (
-                "The deterministic security gate flagged the following vulnerabilities "
+                cr_preamble + eos_preamble
+                +"The deterministic security gate flagged the following vulnerabilities "
                 "in code that has already passed the build. Generate precise SEARCH/REPLACE "
                 "patches that REMOVE the root cause without regressing existing tests. "
                 "Prefer the minimum diff: do not refactor unrelated code, do not weaken "
@@ -5766,7 +6158,8 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             )
         elif is_test_failure_repair:
             repair_prompt = (
-                "The harness-generated unit tests just failed when executed in the "
+                cr_preamble + eos_preamble
+                +"The harness-generated unit tests just failed when executed in the "
                 "sandbox. These are NOT compile errors — the code builds. For each "
                 "failure, decide whether the implementation is wrong or the test "
                 "expectation is wrong. Default to fixing the implementation when the "
@@ -5779,13 +6172,15 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             )
         elif use_escalation:
             repair_prompt = (
-                f"The build has failed {total_repairs} time(s) despite previous fix attempts. "
+                cr_preamble + eos_preamble
+                +f"The build has failed {total_repairs} time(s) despite previous fix attempts. "
                 f"The simpler model could not resolve these errors. You are a senior reasoning model. "
                 f"Carefully analyze the errors and produce a definitive fix.\n\n{error_summary}"
             )
         else:
             repair_prompt = (
-                f"The build failed with the following errors. Generate precise SEARCH/REPLACE "
+                cr_preamble + eos_preamble
+                +"The build failed with the following errors. Generate precise SEARCH/REPLACE "
                 f"patches to fix them.\n\n{error_summary}"
             )
         # Soft turn-budget warning (audit #19). Injected as a system
@@ -6135,6 +6530,7 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         return {
             "messages": messages,
             "modified_files": modified_files,
+            "batch_modified_files": _extend_batch_scope(state, modified_files),
             "token_tracker": token_tracker,
             "budget_remaining_usd": new_budget,
             "loop_counter": loop_counter,
@@ -6543,13 +6939,34 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     """
     Conditional edge router executed after compiler_node completes.
 
-    Decision matrix:
-        exit_code == 0                     → END (memory cleanse already applied in compiler_node)
-        exit_code != 0 AND repairs < 3     → repair_node
-        exit_code != 0 AND repairs >= 3    → human_intervention_node
-        budget_remaining <= 0              → human_intervention_node
-        no_tests_collected AND has_source  → test_generation_node
-        no_tests_collected AND empty repo  → human_intervention_node
+    Decision matrix (in priority order; the first matching row fires):
+        budget_remaining_usd <= 0                            → HITL
+        exit_code == 0                                       → security_scan / code_review
+                                                               (dict aliases ``security_scan_node`` to ``code_review_node``)
+        env_misconfig flag set                               → HITL
+        llm_silent flag set                                  → HITL
+        no_tests_collected AND has_source                    → test_generation_node
+        no_tests_collected AND empty repo                    → HITL
+        consecutive_zero_patch_rounds >= 2 (non-autofixable) → HITL
+        consecutive_zero_patch_rounds >= 5 (generic)         → HITL
+        total_repairs >= max_iterations (non-autofixable)    → HITL
+        same MISSING_DEP symbol >= 3 in a row                → HITL
+        total_repairs >= max_iterations (autofixable)        → repair_node (autofix bypass)
+        otherwise (build failed, within budget)              → repair_node
+
+    Counter semantics (Phase E.3+):
+        - In batch-mode (``current_batch_id > 0``), ``total_repairs``
+          tallies repair cycles for the CURRENT BATCH's verification
+          chain. ``batch_commit_node`` resets it between batches.
+        - In monolithic mode (no batch), ``total_repairs`` is per-session.
+        - ``consecutive_zero_patch_rounds`` is per-compile-cycle in
+          both modes — it tracks rounds where the patcher landed
+          nothing, regardless of how stories/batches are organized.
+
+    ``max_iterations`` is read from
+    ``gateway.config.max_patch_repair_iterations`` (config-driven,
+    default 5; the historical default of 3 only applies when the router
+    is invoked in a test that bypasses gateway initialization).
     """
     exit_code: int = state.get("exit_code", -1)
     loop_counter: dict[str, Any] = state.get("loop_counter", {})
@@ -7200,6 +7617,73 @@ async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
     else:
         new_messages.append(MessageDict(role="user", content=consolidated))
 
+    # CR → STORY bridge. When ``decomposition_enabled``, every CR becomes
+    # one ``stories`` row with ``external_ref='CR-N'`` so the downstream
+    # planner can treat CRs as first-class stories and the patcher's
+    # marker contract emits BOTH `# STORY-M: …` and `# CR-N: …`. Skipped
+    # silently when story-mode is off — the existing CR-only flow keeps
+    # working byte-for-byte.
+    extra_state: dict[str, Any] = {}
+    if state.get("decomposition_enabled", False) and records:
+        try:
+            from harness import story_state as _sst
+            workspace = state.get("workspace_path", "")
+            app_name = _sst.app_name_for_workspace(workspace)
+            conn = _sst.open_story_db()
+            try:
+                # Skip CRs already mirrored (resume safety — running ingest
+                # twice for the same CR set must not create duplicate rows).
+                # Scope by workspace so two apps with their own CR-1 don't
+                # cross-contaminate.
+                existing_refs = {
+                    r[0] for r in conn.execute(
+                        "SELECT external_ref FROM stories "
+                        "WHERE workspace = ? AND external_ref IS NOT NULL",
+                        (app_name,),
+                    )
+                }
+                # Each bridged story corresponds to one CR — tag it as a
+                # CR-kind row stamped with that CR's id so traceability
+                # can answer "which stories did CR-2 produce?".
+                created_keys: list[str] = []
+                for rec in records:
+                    ref = f"CR-{rec['cr_id']}"
+                    if ref in existing_refs:
+                        continue
+                    keys = _sst.create_stories(
+                        conn, app_name,
+                        [{
+                            "title": rec.get("original_name", ref),
+                            "epic": "change-request",
+                            "description": f"Auto-bridged from {ref}.",
+                            # Acceptance criteria for CR-derived stories is a
+                            # single line — the operator can refine via the
+                            # STORIES gatekeeper before the batch loop fires.
+                            "acceptance_criteria": [
+                                f"All edits demanded by {ref} land cleanly."
+                            ],
+                            "depends_on": [],
+                            "scope_files": [],
+                            "external_ref": ref,
+                        }],
+                        build_kind=_sst.BUILD_KIND_CR,
+                        cr_ids=[int(rec["cr_id"])],
+                    )
+                    created_keys.extend(keys)
+                if created_keys:
+                    _sst.regenerate_markdown_views(conn, workspace)
+                    logger.info(
+                        "[change_requests] bridged %d CR(s) into stories: %s",
+                        len(created_keys), ", ".join(created_keys),
+                    )
+                    extra_state["stories_db_path"] = _sst.state_db_path()
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            # Bridging failure is non-fatal — the CR session still runs
+            # in monolithic mode if story-mode plumbing chokes.
+            logger.exception("[change_requests] CR → STORY bridge failed; proceeding without stories")
+
     return {
         "messages": new_messages,
         "change_request_files": records,
@@ -7209,6 +7693,7 @@ async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
         # so route_after_spec_review honors interview follow-ups instead
         # of short-circuiting to the gatekeeper.
         "skip_discovery": False,
+        **extra_state,
     }
 
 
@@ -7292,6 +7777,97 @@ def _build_change_request_preamble(state: AgentState, phase: str) -> str:
         + "The full text of each request is in the conversation history "
         "(first user message). Each request's intent must be traceable "
         "via the `CR-N` ID through every artifact this session produces.\n\n"
+        f"{rules}\n\n"
+        "---\n\n"
+    )
+
+
+def _build_story_preamble(state: AgentState, phase: str) -> str:
+    """Return the per-story scoping preamble for ``phase`` (one of
+    ``"patching"``, ``"tests"``). Empty string when no story is active.
+
+    The preamble names the current ``STORY-N`` key, reproduces the
+    acceptance criteria the patcher must satisfy, advises the LLM to
+    stay within ``story_scope_files`` (advisory — the allowlist is
+    NOT tightened so cross-story coupling is possible; it just
+    becomes a tracked file-link in ``TRACEABILITY.md``), and lays
+    out the marker contract:
+
+      - Production code: ``# STORY-N: …`` (Python) / ``// STORY-N: …``
+        (JS/TS/Go/Rust/Java) — one terse comment per new function /
+        class / region, naming the originating story.
+      - When the story was derived from a CR
+        (``external_ref="CR-N"``), emit BOTH markers (``# STORY-N: …``
+        AND ``# CR-N: …``) so ``grep`` queries against either ID find
+        the same artifacts.
+    """
+    story_key = state.get("current_story_id", "") or ""
+    if not story_key:
+        return ""
+
+    workspace = state.get("workspace_path") or ""
+    story = None
+    if workspace:
+        try:
+            from harness import story_state as _sst
+            app_name = _sst.app_name_for_workspace(workspace)
+            conn = _sst.open_story_db()
+            try:
+                story = _sst.get_story(conn, app_name, story_key)
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            story = None
+    if story is None:
+        return ""
+
+    ac = story.get("acceptance_criteria") or []
+    scope = state.get("story_scope_files") or story.get("scope_files") or []
+    external = story.get("external_ref") or ""
+
+    ac_block = "\n".join(f"  - {c}" for c in ac) if ac else "  - (none recorded)"
+    scope_block = (
+        "\n".join(f"  - {p}" for p in scope) if scope else
+        "  - (unscoped — touch only what the acceptance criteria require)"
+    )
+
+    marker_lines = [
+        f"Tag the code that satisfies this story with `# {story_key}: …` "
+        "(Python) / `// " + story_key + ": …` (JS/TS/Go/Rust/Java) — "
+        "one terse comment per new function/class/region. New files get "
+        "the marker on the line below the module docstring or imports.",
+    ]
+    if external:
+        marker_lines.append(
+            f"This story was derived from {external}; emit BOTH "
+            f"`# {story_key}: …` AND `# {external}: …` so grep on either ID "
+            "finds the same artifacts."
+        )
+
+    if phase == "tests":
+        marker_lines.append(
+            f"Name new test functions `test_{story_key.lower().replace('-', '_')}"
+            "_<descriptive>` and reference the story in each test docstring "
+            f"(e.g. `\"\"\"Verifies {story_key}: …\"\"\"`)."
+        )
+
+    rules = "\n".join(marker_lines)
+
+    return (
+        f"## Story Scope: {story_key} — {story.get('title', '')}\n\n"
+        "This patching turn is scoped to ONE story. Focus on the "
+        "acceptance criteria below; do not attempt to deliver the "
+        "whole specification in a single pass.\n\n"
+        "### Acceptance criteria\n"
+        f"{ac_block}\n\n"
+        "### File scope (advisory)\n"
+        f"{scope_block}\n\n"
+        "Editing files outside this list is allowed when an "
+        "acceptance criterion demands it (e.g. a shared util that "
+        "needs one extra parameter), but those edits will be recorded "
+        "as cross-story coupling in `TRACEABILITY.md`. Keep the blast "
+        "radius small.\n\n"
+        "### Marker contract\n"
         f"{rules}\n\n"
         "---\n\n"
     )
@@ -8325,7 +8901,7 @@ async def spec_review_node(state: AgentState) -> dict[str, Any]:
     existing path (write_spec_node → human_gatekeeper_node).
     """
     gate = state.get("current_gate", "REQUIREMENTS")
-    loop_counter = dict(state.get("loop_counter", {}))
+    loop_counter = dict(state.get("loop_counter") or {})
     counter = loop_counter.get("review_spec", 0)
 
     gateway = get_gateway()
@@ -8460,9 +9036,15 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
     incorporates the feedback. Activation is purely by configuration: empty
     code_reviewer_primary == no-op, falling through to security_scan_node.
     """
-    loop_counter = dict(state.get("loop_counter", {}))
+    loop_counter = dict(state.get("loop_counter") or {})
     counter = loop_counter.get("review_code", 0)
-    modified_files = list(state.get("modified_files", []))
+    # In batch-mode, scope the reviewer to the current batch's files
+    # rather than the cumulative session set — otherwise batch-N's review
+    # re-reads files batch-(N-1) already reviewed. ``_scope_files_for_consumer``
+    # falls back to ``modified_files`` for non-batch sessions and for the
+    # very first invocation before patching has populated the batch list.
+    modified_files = _scope_files_for_consumer(state)
+    batch_id = int(state.get("current_batch_id") or 0)
     workspace = state.get("workspace_path", os.getcwd())
     budget = state.get("budget_remaining_usd", 0.0)
 
@@ -8487,7 +9069,10 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
         logger.info("[code_review] budget too low ($%.4f) — skipping.", budget)
         return {"node_state": {"current_node": "code_review", "skipped": True, "repatched": False}}
     if not modified_files:
-        logger.info("[code_review] no modified_files — skipping.")
+        scope_label = f"batch {batch_id}" if batch_id else "session"
+        logger.info(
+            "[code_review] no modified_files in %s scope — skipping.", scope_label,
+        )
         return {"node_state": {"current_node": "code_review", "skipped": True, "repatched": False}}
 
     # Snapshot up to 20 files, 2000 lines each, to bound token cost.
@@ -8613,7 +9198,7 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
 
     if not findings:
         logger.info("[code_review] No findings — passing through to security scan.")
-        return {
+        out: dict[str, Any] = {
             "token_tracker": token_tracker,
             "budget_remaining_usd": new_budget,
             "loop_counter": loop_counter,
@@ -8625,6 +9210,12 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
                 "findings_count": 0,
             },
         }
+        # Phase K — mark batch-mode's review gate as passed.
+        if int(state.get("current_batch_id") or 0):
+            out["batch_gate_progress"] = _mark_batch_gate(
+                state, "review_passed",
+            )
+        return out
 
     # Re-patch call. Use the patcher format-reminder so the patcher model
     # returns the same SEARCH/REPLACE block syntax patching_node uses.
@@ -8750,6 +9341,7 @@ Generate the patches that address every finding below. Output only the blocks �
 
     return {
         "modified_files": new_modified_files,
+        "batch_modified_files": _extend_batch_scope(state, new_modified_files),
         "token_tracker": token_tracker,
         "budget_remaining_usd": new_budget,
         "loop_counter": loop_counter,
@@ -9136,7 +9728,7 @@ def route_after_discovery(state: AgentState) -> str:
 def route_after_gatekeeper(state: AgentState) -> str:
     """
     Routes based on current_gate and the gatekeeper's decision in node_state.
-    
+
     The human_gatekeeper_node sets node_state.gatekeeper_action to:
         - "approve" → proceed to next phase
         - "refine"  → loop back to the current phase's generator
@@ -9158,12 +9750,26 @@ def route_after_gatekeeper(state: AgentState) -> str:
             return "architecture_discovery_node"
         elif gate == "DEPLOYMENT":
             return "generate_deployment_spec_node"
+        elif gate == "STORIES":
+            # Refine STORIES by re-running decomposition. The existing
+            # rows stay in the DB (so STORY-N numbering keeps growing
+            # monotonically); the operator can prune via direct DB edit
+            # before the second pass runs.
+            return "decomposition_node"
 
     # approve or manual: proceed forward
     if gate == "REQUIREMENTS":
         return "architecture_discovery_node"
     elif gate == "ARCHITECTURE":
+        # Story-mode opt-in: when ``decomposition_enabled``, the approved
+        # architecture spec hands off to the decomposition LLM instead of
+        # going straight into monolithic patching. The decomposition node
+        # then routes back through the STORIES gatekeeper.
+        if state.get("decomposition_enabled", False):
+            return "decomposition_node"
         return "patching_node"
+    elif gate == "STORIES":
+        return "batch_planner_node"
     elif gate == "DEPLOYMENT":
         return "deployment_node"
 
@@ -9174,7 +9780,11 @@ def route_after_gatekeeper(state: AgentState) -> str:
 # 7. Route After HITL: Always Back to Compiler
 # ---------------------------------------------------------------------------
 
-def route_after_security_scan(state: AgentState) -> Literal["repair_node", "human_intervention_node", "deployment_discovery_node", "deployment_node", "installation_doc_node", "compiler_node", "__end__"]:
+def route_after_security_scan(state: AgentState) -> Literal[
+    "repair_node", "human_intervention_node", "deployment_discovery_node",
+    "deployment_node", "installation_doc_node", "compiler_node",
+    "end_of_session_regression_node", "__end__",
+]:
     """
     Conditional edge router executed after security_scan_node completes.
 
@@ -9263,6 +9873,22 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
             except Exception:  # noqa: BLE001 — telemetry must never block
                 pass
             return "compiler_node"
+
+        # Phase G — explicit end-of-session regression gate. The first
+        # time security_scan exits clean, run the full build/test pack
+        # one more time against the post-security-repair tree to catch
+        # any breakage introduced after the last per-batch test pass.
+        # Skipped on a session marker (the regression counter being
+        # non-zero means we already burned this gate; the repair loop
+        # from a failed EoS regression brings us back via
+        # repair → compiler → code_review → security_scan, and we MUST
+        # NOT re-enter the EoS gate or the loop runs forever).
+        if loop_counter.get("end_of_session_regression_repair", 0) == 0:
+            logger.info(
+                "[router] Security scan clean — entering end-of-session "
+                "regression check before deployment."
+            )
+            return "end_of_session_regression_node"
 
         # Post-deployment clean scan: do NOT re-enter discovery. The deploy
         # pipeline is one-shot per session — ``deployment_node`` having
@@ -9364,6 +9990,153 @@ def route_after_security_scan(state: AgentState) -> Literal["repair_node", "huma
 
 
 # ---------------------------------------------------------------------------
+# 6d.5. End-of-session regression — final test pack run after security_scan
+#       passes, before deployment (Phase G).
+# ---------------------------------------------------------------------------
+
+async def end_of_session_regression_node(state: AgentState) -> dict[str, Any]:
+    """Run the full build/test pack one final time after security_scan
+    passes, before deployment.
+
+    The per-batch pipeline already runs the test pack inside each batch's
+    verification chain. This node fires ONCE at end-of-session to catch
+    breakage introduced by the security-scan repair loop — which patches
+    code AFTER the last per-batch test pass, so without this gate a
+    security fix could deploy a regression. Delegates to ``compiler_node``
+    for the actual build execution; differs only in:
+
+    - Increments ``loop_counter["end_of_session_regression_repair"]``
+      with its own configurable cap
+      (``max_end_of_session_regression_cycles``, default 3).
+    - Stamps ``node_state.current_node = "end_of_session_regression"``
+      and ``node_state.end_of_session_phase = True`` so the router knows
+      we're in the post-security final-verify phase, not a per-batch
+      compile cycle.
+    """
+    loop_counter = dict(state.get("loop_counter", {}) or {})
+    counter = int(
+        loop_counter.get("end_of_session_regression_repair", 0) or 0
+    )
+    loop_counter["end_of_session_regression_repair"] = counter + 1
+
+    logger.info(
+        "[end_of_session_regression] Final regression check (attempt %d) "
+        "after security_scan, before deployment.", counter + 1,
+    )
+
+    result = await compiler_node(state)
+    if not isinstance(result, dict):
+        return result  # type: ignore[return-value]
+
+    ns = dict(result.get("node_state", {}) or {})
+    ns["current_node"] = "end_of_session_regression"
+    ns["end_of_session_phase"] = True
+    result["node_state"] = ns
+
+    # compiler_node returned its own loop_counter; merge our incremented
+    # counter back in so the router's cap check sees the right value.
+    merged_counter = dict(result.get("loop_counter", {}) or {})
+    merged_counter["end_of_session_regression_repair"] = loop_counter[
+        "end_of_session_regression_repair"
+    ]
+    result["loop_counter"] = merged_counter
+    return result
+
+
+def _resolve_post_eos_destination(state: AgentState) -> str:
+    """Where to go when both security_scan AND end-of-session regression
+    pass clean.
+
+    Replicates the clean-path decision tree from
+    ``route_after_security_scan`` so the deployment-vs-doc routing is
+    consistent regardless of which gate cleared last. Same precedence:
+
+    1. Flutter project → ``installation_doc_node`` (M-1 short-circuit).
+    2. ``deployment_node`` has already run this session → ``installation_doc_node``
+       (guard against the 951f102f re-entry loop — kept for parity even
+       though regression-then-deploy ordering makes a second deploy hop
+       very unlikely).
+    3. ``dev_deployment`` is False → ``installation_doc_node``.
+    4. ``cd_discovery`` is False → ``deployment_node`` (telemetry-only blueprint).
+    5. otherwise → ``deployment_discovery_node`` (LLM-driven blueprint).
+    """
+    from harness.impact import _is_flutter_project
+    workspace = state.get("workspace_path", "")
+    if workspace and _is_flutter_project(workspace):
+        return "installation_doc_node"
+    ns = state.get("node_state") or {}
+    if isinstance(ns, dict) and isinstance(ns.get("deployment"), dict):
+        return "installation_doc_node"
+    if not state.get("dev_deployment", False):
+        return "installation_doc_node"
+    if not state.get("cd_discovery", False):
+        return "deployment_node"
+    return "deployment_discovery_node"
+
+
+def route_after_end_of_session_regression(state: AgentState) -> Literal[
+    "deployment_discovery_node",
+    "deployment_node",
+    "installation_doc_node",
+    "repair_node",
+    "human_intervention_node",
+]:
+    """After the end-of-session regression run:
+
+    - budget exhausted → HITL
+    - clean exit → onward to the deployment / installation-doc tail
+      via ``_resolve_post_eos_destination``
+    - exit non-zero AND repair budget remains → repair_node
+    - exit non-zero AND repair cap reached → HITL
+
+    Repair cap is read from
+    ``gateway.config.max_end_of_session_regression_cycles`` (default 3,
+    configurable). When the gateway is unavailable (some tests), the
+    in-code default of 3 applies.
+    """
+    exit_code: int = state.get("exit_code", -1)
+    loop_counter: dict[str, Any] = state.get("loop_counter", {})
+    counter: int = int(
+        loop_counter.get("end_of_session_regression_repair", 0) or 0
+    )
+    budget_remaining: float = state.get("budget_remaining_usd", 0.0)
+
+    gw = get_gateway()
+    max_cycles: int = (
+        int(getattr(gw.config, "max_end_of_session_regression_cycles", 3))
+        if gw is not None else 3
+    )
+
+    if budget_remaining <= 0.0:
+        logger.warning(
+            "[router] Budget exhausted ($%.4f) at end_of_session_regression. "
+            "Routing to HITL.", budget_remaining,
+        )
+        return "human_intervention_node"
+
+    if exit_code == 0:
+        dest = _resolve_post_eos_destination(state)
+        logger.info(
+            "[router] end_of_session_regression clean. Routing to %s.", dest,
+        )
+        return dest  # type: ignore[return-value]
+
+    if counter >= max_cycles:
+        logger.warning(
+            "[router] end_of_session_regression repair cap reached (%d/%d). "
+            "Routing to HITL.", counter, max_cycles,
+        )
+        return "human_intervention_node"
+
+    logger.info(
+        "[router] end_of_session_regression failed (exit %d). "
+        "Routing to repair_node (attempt %d/%d).",
+        exit_code, counter + 1, max_cycles,
+    )
+    return "repair_node"
+
+
+# ---------------------------------------------------------------------------
 # 6e. Route After Deployment: success → installation_doc, else compiler logic
 # ---------------------------------------------------------------------------
 
@@ -9419,9 +10192,21 @@ def route_after_deployment(state: AgentState) -> Literal[
         return "installation_doc_node"
 
     if compiler_errors:
+        loop_counter = state.get("loop_counter") or {}
+        attempts = int(loop_counter.get("deployment", 0))
+        dep_cfg = state.get("deployment_config") or {}
+        max_attempts = int(dep_cfg.get("max_deployment_attempts", 3))
+        if attempts >= max_attempts:
+            logger.warning(
+                "[router] Deployment loop limit reached (%d/%d). %d "
+                "diagnostic(s) survived repair. Routing to HITL.",
+                attempts, max_attempts, len(compiler_errors),
+            )
+            return "human_intervention_node"
         logger.info(
-            "[router] Deployment node emitted %d diagnostic(s). Routing to "
-            "repair_node.", len(compiler_errors),
+            "[router] Deployment node emitted %d diagnostic(s) (attempt %d/%d). "
+            "Routing to repair_node.",
+            len(compiler_errors), attempts, max_attempts,
         )
         return "repair_node"
 
@@ -9557,6 +10342,40 @@ def build_graph() -> Any:
     graph.add_node("spec_review_node", spec_review_node)
     graph.add_node("code_review_node", code_review_node)
 
+    # Story-mode nodes (Agile decomposition + per-story TDD). Inert when
+    # ``decomposition_enabled`` stays False — every router that branches into
+    # them gates on that flag, so today's monolithic flow keeps running
+    # exactly as it does on main.
+    from harness.decomposition import decomposition_node as _decomposition_node
+    from harness.story_loop import (
+        batch_planner_node as _batch_planner_node,
+        story_loop_node as _story_loop_node,
+        story_complete_node as _story_complete_node,
+        batch_commit_node as _batch_commit_node,
+        traceability_node as _traceability_node,
+        route_after_batch_planner as _route_after_batch_planner,
+        route_after_story_loop as _route_after_story_loop,
+        route_after_story_complete as _route_after_story_complete,
+        route_after_batch_commit as _route_after_batch_commit,
+    )
+    graph.add_node("decomposition_node", _decomposition_node)  # type: ignore[type-var]
+    graph.add_node("batch_planner_node", _batch_planner_node)  # type: ignore[type-var]
+    graph.add_node("story_loop_node", _story_loop_node)  # type: ignore[type-var]
+    # Phase F removed ``story_test_first_node``. Its xfail-stub
+    # generation duplicated what the patching LLM already produces from
+    # the story preamble (``_build_story_preamble``), and the per-batch
+    # verification chain (compile → review → test) runs the real test
+    # suite once per batch — strict-xfail markers were never wired into
+    # the routing anyway.
+    graph.add_node("story_complete_node", _story_complete_node)  # type: ignore[type-var]
+    # Phase E: batch_commit_node fires when a batch is fully resolved —
+    # marks every constituent story done, optionally commits the batch
+    # under a ``BATCH-N: …`` message, and resets per-batch state and
+    # loop counters. ``route_after_story_loop`` routes batch-exhausted
+    # transitions through here on the way to ``batch_planner_node``.
+    graph.add_node("batch_commit_node", _batch_commit_node)  # type: ignore[type-var]
+    graph.add_node("traceability_node", _traceability_node)  # type: ignore[type-var]
+
     # Register deployment spec node
     graph.add_node("generate_deployment_spec_node", generate_deployment_spec_node)
 
@@ -9667,18 +10486,117 @@ def build_graph() -> Any:
             "generate_deployment_spec_node": "generate_deployment_spec_node",
             "patching_node": "patching_node",
             "deployment_node": "deployment_node",
+            # Story-mode targets — inert when decomposition_enabled=False.
+            "decomposition_node": "decomposition_node",
+            "batch_planner_node": "batch_planner_node",
             "__end__": END,
         },
     )
+
+    # =====================================================================
+    # Story-mode pipeline (Agile decomposition + per-batch verification).
+    #
+    #   decomposition_node → human_gatekeeper(STORIES)
+    #   gatekeeper STORIES approve → batch_planner_node
+    #   batch_planner_node →┬─ story_loop_node (batch planned)
+    #                       └─ traceability_node (all done / stalled)
+    #   story_loop_node    →┬─ patching_node (next story picked; story
+    #                       │   preamble carries acceptance criteria)
+    #                       └─ speculative_node (batch exhausted → enter
+    #                           per-batch verification chain)
+    #   patching_node      →┬─ story_loop_node (advance to next story)
+    #                       └─ speculative_node (monolithic / batch repair)
+    #   code_review_node   →┬─ batch_commit_node (current_batch_id > 0)
+    #                       │   then batch_planner_node for next batch
+    #                       ├─ story_complete_node (legacy non-batch story-mode)
+    #                       └─ {compiler_node | security_scan_node}
+    #   traceability_node  → security_scan_node (rejoins existing tail)
+    # =====================================================================
+    graph.add_edge("decomposition_node", "human_gatekeeper_node")
+    graph.add_conditional_edges(
+        "batch_planner_node",
+        _route_after_batch_planner,
+        {
+            "story_loop_node": "story_loop_node",
+            "traceability_node": "traceability_node",
+        },
+    )
+    graph.add_conditional_edges(
+        "story_loop_node",
+        _route_after_story_loop,
+        {
+            # Phase F: route directly to patching_node — the story
+            # acceptance criteria are injected into the patching LLM
+            # preamble by _build_story_preamble.
+            "patching_node": "patching_node",
+            # Phase E.3: batch-exhausted (all stories patched) →
+            # speculative_node to kick off the per-batch verification
+            # chain. The chain ends in code_review, which routes to
+            # batch_commit_node via route_after_code_review when
+            # current_batch_id is set.
+            "speculative_node": "speculative_node",
+            # Phase K resume short-circuits: skip to the next un-passed
+            # gate when the crash happened mid-verification.
+            "code_review_node": "code_review_node",
+            "batch_commit_node": "batch_commit_node",
+        },
+    )
+    graph.add_conditional_edges(
+        "story_complete_node",
+        _route_after_story_complete,
+        {
+            "story_loop_node": "story_loop_node",
+        },
+    )
+    graph.add_conditional_edges(
+        "batch_commit_node",
+        _route_after_batch_commit,
+        {
+            "batch_planner_node": "batch_planner_node",
+        },
+    )
+    graph.add_edge("traceability_node", "security_scan_node")
 
     # Architecture discovery loop (entered from gatekeeper approve)
     graph.add_edge("architecture_discovery_node", "discovery_interview_loop")
 
     # =====================================================================
-    # Code generation pipeline (after ARCHITECTURE gate approved):
-    # patching → speculative → lintgate → compiler
+    # Code generation pipeline (after ARCHITECTURE gate approved).
+    #
+    # Phase E.3 — In batch-mode (``current_batch_id > 0``) with an
+    # active story (``current_story_id`` set), patching_node loops back
+    # to story_loop_node so the *next* story in the batch can patch
+    # before the verification chain (speculative → compile → review)
+    # fires *once* against the batch's combined patches. The old
+    # per-story chain ran the whole verification path for every story.
+    # In monolithic mode (no batch active) the edge is the original
+    # patching → speculative.
     # =====================================================================
-    graph.add_edge("patching_node", "speculative_node")
+    def route_after_patching(state: AgentState) -> Literal[
+        "story_loop_node", "speculative_node"
+    ]:
+        """Advance to the next story in the batch, or kick off the
+        per-batch verification chain.
+
+        In monolithic mode (no batch active) or when a story-mode batch
+        has no live story cursor (e.g. a batch-level repair re-enters
+        patching), this falls straight through to ``speculative_node``
+        — the historical behavior.
+        """
+        if int(state.get("current_batch_id") or 0) and (
+            state.get("current_story_id") or ""
+        ):
+            return "story_loop_node"
+        return "speculative_node"
+
+    graph.add_conditional_edges(
+        "patching_node",
+        route_after_patching,
+        {
+            "story_loop_node": "story_loop_node",
+            "speculative_node": "speculative_node",
+        },
+    )
     # speculative_node → test_generation_node → conditional edge:
     #   - tests passed (or skipped) → lintgate_node
     #   - tests failed → repair_node (TEST_FAILURE diagnostics surfaced)
@@ -9719,15 +10637,36 @@ def build_graph() -> Any:
     )
 
     def route_after_code_review(state: AgentState) -> Literal[
-        "compiler_node", "security_scan_node"
+        "compiler_node", "security_scan_node",
+        "story_complete_node", "batch_commit_node"
     ]:
-        """If the reviewer re-patched, re-validate by going back through the
-        compiler. If not (no findings, cycle cap, or unconfigured), proceed
-        straight to security_scan_node — exactly today's behavior."""
+        """Route after the reviewer finishes.
+
+        Decision matrix:
+
+        1. Reviewer re-patched → ``compiler_node`` (re-validate the
+           re-patch against the build).
+        2. Batch-mode (``current_batch_id > 0``) → ``batch_commit_node``
+           (Phase E.3 — the per-batch verification chain just passed,
+           now seal the batch). This fires regardless of whether
+           ``current_story_id`` is set: ``story_loop_node`` clears it
+           when batch_complete triggers verification, but if a node in
+           the chain re-set it we still want batch sealing.
+        3. Legacy per-story story-mode (no batch active but
+           ``current_story_id`` set) → ``story_complete_node`` to keep
+           the older single-story TDD path working for tests that
+           bypass the batch planner.
+        4. Monolithic → ``security_scan_node`` (today's behavior).
+        """
         node_state = state.get("node_state", {}) or {}
         if node_state.get("repatched", False):
             logger.info("[router] code_review re-patched — re-running compiler.")
             return "compiler_node"
+        if int(state.get("current_batch_id") or 0):
+            logger.info("[router] code_review clean in batch-mode — sealing via batch_commit_node.")
+            return "batch_commit_node"
+        if state.get("current_story_id"):
+            return "story_complete_node"
         return "security_scan_node"
 
     graph.add_conditional_edges(
@@ -9736,6 +10675,8 @@ def build_graph() -> Any:
         {
             "compiler_node": "compiler_node",
             "security_scan_node": "security_scan_node",
+            "story_complete_node": "story_complete_node",
+            "batch_commit_node": "batch_commit_node",
         },
     )
 
@@ -9782,7 +10723,30 @@ def build_graph() -> Any:
             "repair_node": "repair_node",
             "human_intervention_node": "human_intervention_node",
             "installation_doc_node": "installation_doc_node",
+            # Audit #18 pre_exit_verify re-compile target (rare opt-in).
+            "compiler_node": "compiler_node",
+            # Phase G: final regression check before deployment.
+            "end_of_session_regression_node": "end_of_session_regression_node",
             "__end__": END,
+        },
+    )
+
+    # Phase G — register the end-of-session regression node + its router.
+    # The node delegates to compiler_node for the actual build run, but
+    # owns its own repair-iteration counter and routes to deployment
+    # destinations on clean instead of code_review.
+    graph.add_node(
+        "end_of_session_regression_node", end_of_session_regression_node,
+    )  # type: ignore[type-var]
+    graph.add_conditional_edges(
+        "end_of_session_regression_node",
+        route_after_end_of_session_regression,
+        {
+            "deployment_discovery_node": "deployment_discovery_node",
+            "deployment_node": "deployment_node",
+            "installation_doc_node": "installation_doc_node",
+            "repair_node": "repair_node",
+            "human_intervention_node": "human_intervention_node",
         },
     )
 
@@ -10014,6 +10978,10 @@ async def run_graph(
     dev_deployment: bool = False,
     cd_discovery: bool = False,
     install_doc: bool = False,
+    decomposition_enabled: bool = False,
+    commit_on_story: bool = False,
+    story_batch_size: int = 5,
+    story_repair_cap: int = 3,
     repo_memory_config: Optional[dict[str, Any]] = None,
     repo_index_config: Optional[dict[str, Any]] = None,
     llm_dispatch_config: Optional[dict[str, Any]] = None,
@@ -10037,6 +11005,7 @@ async def run_graph(
         The final AgentState after graph completion.
     """
     import uuid
+    from harness.story_state import state_db_path as _state_db_path
 
     # Generate session identifiers
     if not session_id:
@@ -10061,6 +11030,13 @@ async def run_graph(
         dev_deployment=dev_deployment,
         cd_discovery=cd_discovery,
         install_doc=install_doc,
+        decomposition_enabled=decomposition_enabled,
+        # Global state.db now — same path regardless of workspace, with
+        # rows scoped by the workspace folder's basename (app name).
+        stories_db_path=_state_db_path() if decomposition_enabled else "",
+        commit_on_story=commit_on_story,
+        story_batch_size=story_batch_size,
+        story_repair_cap=story_repair_cap,
     )
 
     # Per-node config sections — read by lintgate_node and deployment_node
