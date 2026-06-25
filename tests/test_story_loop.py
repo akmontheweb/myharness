@@ -238,6 +238,157 @@ def test_story_loop_reports_blocked_count(workspace: str):
 
 
 # ---------------------------------------------------------------------------
+# Layer 2 — per-story zero-patch auto-advance
+# ---------------------------------------------------------------------------
+
+def test_story_loop_auto_completes_story_at_zero_patch_cap(workspace: str):
+    """After STORY_ZERO_PATCH_CAP consecutive zero-patch rounds against
+    the same story, story_loop_node marks it done and advances to the
+    next story so the batch makes progress."""
+    _seed_stories(workspace, [{"title": "A"}, {"title": "B"}])
+    planned = story_loop.batch_planner_node(_state(workspace))
+    batch_id = planned["current_batch_id"]
+
+    # Simulate STORY-1 in-progress with 3 zero-patch rounds accumulated.
+    app = _app(workspace)
+    conn = story_state.open_story_db()
+    try:
+        story_state.mark_in_progress(conn, app, "STORY-1")
+    finally:
+        conn.close()
+
+    out = story_loop.story_loop_node(_state(
+        workspace,
+        current_batch_id=batch_id,
+        current_story_id="STORY-1",
+        loop_counter={
+            "story_zero_patch_rounds": {"STORY-1": story_loop.STORY_ZERO_PATCH_CAP}
+        },
+    ))
+
+    # Advanced to STORY-2.
+    assert out["current_story_id"] == "STORY-2"
+    assert out["node_state"]["batch_complete"] is False
+    assert out["node_state"]["auto_completed_story"] == "STORY-1"
+    assert out["node_state"]["auto_completed_zero_rounds"] == (
+        story_loop.STORY_ZERO_PATCH_CAP
+    )
+
+    # STORY-1 should now be done in the DB.
+    conn = story_state.open_story_db()
+    try:
+        s = story_state.get_story(conn, app, "STORY-1")
+    finally:
+        conn.close()
+    assert s["status"] == "done"
+
+    # Counter cleared.
+    assert out["loop_counter"]["story_zero_patch_rounds"] == {}
+
+
+def test_story_loop_does_not_auto_complete_below_cap(workspace: str):
+    """Below the cap, the story stays in_progress and is re-selected
+    (the in_progress story always wins the ORDER BY)."""
+    _seed_stories(workspace, [{"title": "A"}, {"title": "B"}])
+    planned = story_loop.batch_planner_node(_state(workspace))
+    batch_id = planned["current_batch_id"]
+
+    app = _app(workspace)
+    conn = story_state.open_story_db()
+    try:
+        story_state.mark_in_progress(conn, app, "STORY-1")
+    finally:
+        conn.close()
+
+    out = story_loop.story_loop_node(_state(
+        workspace,
+        current_batch_id=batch_id,
+        current_story_id="STORY-1",
+        loop_counter={
+            "story_zero_patch_rounds": {
+                "STORY-1": story_loop.STORY_ZERO_PATCH_CAP - 1
+            }
+        },
+    ))
+
+    assert out["current_story_id"] == "STORY-1"
+    assert out["node_state"].get("auto_completed_story") is None
+    # Counter survives unchanged.
+    assert out["loop_counter"]["story_zero_patch_rounds"]["STORY-1"] == (
+        story_loop.STORY_ZERO_PATCH_CAP - 1
+    )
+
+    conn = story_state.open_story_db()
+    try:
+        s = story_state.get_story(conn, app, "STORY-1")
+    finally:
+        conn.close()
+    assert s["status"] == "in_progress"
+
+
+def test_story_loop_auto_complete_respects_cap_override(workspace: str):
+    """state['story_zero_patch_cap'] overrides the default cap."""
+    _seed_stories(workspace, [{"title": "A"}, {"title": "B"}])
+    planned = story_loop.batch_planner_node(_state(workspace))
+    batch_id = planned["current_batch_id"]
+
+    app = _app(workspace)
+    conn = story_state.open_story_db()
+    try:
+        story_state.mark_in_progress(conn, app, "STORY-1")
+    finally:
+        conn.close()
+
+    out = story_loop.story_loop_node(_state(
+        workspace,
+        current_batch_id=batch_id,
+        current_story_id="STORY-1",
+        story_zero_patch_cap=1,
+        loop_counter={"story_zero_patch_rounds": {"STORY-1": 1}},
+    ))
+
+    assert out["node_state"]["auto_completed_story"] == "STORY-1"
+
+
+def test_story_loop_auto_complete_finishes_batch_when_last_story(workspace: str):
+    """Auto-completing the only remaining story flips the batch to
+    complete (not complete_with_blocks — auto-advance is a normal
+    completion, not a defect)."""
+    _seed_stories(workspace, [{"title": "A"}])
+    planned = story_loop.batch_planner_node(_state(workspace))
+    batch_id = planned["current_batch_id"]
+
+    app = _app(workspace)
+    conn = story_state.open_story_db()
+    try:
+        story_state.mark_in_progress(conn, app, "STORY-1")
+    finally:
+        conn.close()
+
+    out = story_loop.story_loop_node(_state(
+        workspace,
+        current_batch_id=batch_id,
+        current_story_id="STORY-1",
+        loop_counter={
+            "story_zero_patch_rounds": {"STORY-1": story_loop.STORY_ZERO_PATCH_CAP}
+        },
+    ))
+
+    assert out["node_state"]["batch_complete"] is True
+    assert out["node_state"]["blocked_count"] == 0
+    assert out["current_story_id"] == ""
+
+    conn = story_state.open_story_db()
+    try:
+        row = conn.execute(
+            "SELECT status FROM batches WHERE id = ?", (batch_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row[0] == "complete"
+
+
+# ---------------------------------------------------------------------------
 # Routing helpers
 # ---------------------------------------------------------------------------
 

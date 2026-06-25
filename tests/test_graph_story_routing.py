@@ -146,10 +146,32 @@ def _route_after_patching_under_test():
     """The router lives inside build_graph(); we re-create the routing
     decision inline rather than introspecting the compiled graph,
     because the langgraph branches table shape varies across versions.
-    The deciding condition is current_batch_id AND current_story_id —
-    pure state → dest."""
+
+    Routing rules (mirrors graph.py:route_after_patching):
+
+    - Layer 3 — ``no_progress.tripped(loop_counter)`` →
+      ``human_intervention_node`` (global no-progress failsafe; runs
+      first so it shorts the other branches when budget has been
+      bleeding without producing patches).
+    - Layer 1 — ``loop_counter['consecutive_zero_patch_rounds'] >= 2``
+      → ``human_intervention_node`` (the monolithic-mode tripwire;
+      story mode never increments this field).
+    - else, ``current_batch_id`` AND ``current_story_id`` set →
+      ``story_loop_node`` (advance to next story or auto-complete via
+      Layer 2's per-story counter).
+    - else → ``speculative_node`` (monolithic / batch verification path).
+    """
+    from harness import no_progress
 
     def emulated(state: dict) -> str:
+        loop_counter = state.get("loop_counter", {}) or {}
+        if no_progress.tripped(loop_counter):
+            return "human_intervention_node"
+        consecutive_zero = int(
+            loop_counter.get("consecutive_zero_patch_rounds", 0) or 0
+        )
+        if consecutive_zero >= 2:
+            return "human_intervention_node"
         if int(state.get("current_batch_id") or 0) and (
             state.get("current_story_id") or ""
         ):
@@ -177,6 +199,59 @@ def test_patching_proceeds_to_speculative_when_no_active_story():
     # detected batch_complete). Verification chain fires next.
     state = {"current_batch_id": 5, "current_story_id": ""}
     assert route(state) == "speculative_node"
+
+
+def test_patching_escalates_to_hitl_after_two_zero_rounds_in_monolithic_mode():
+    """Layer 1: a monolithic run that lands zero patches twice in a row
+    must escalate instead of looping forever. Same threshold as the
+    repair_node tripwire that route_after_compiler consumes."""
+    route = _route_after_patching_under_test()
+    state = {"loop_counter": {"consecutive_zero_patch_rounds": 2}}
+    assert route(state) == "human_intervention_node"
+
+
+def test_patching_does_not_escalate_below_zero_round_threshold():
+    """One bad turn alone is not enough — the LLM gets a second chance."""
+    route = _route_after_patching_under_test()
+    state = {"loop_counter": {"consecutive_zero_patch_rounds": 1}}
+    assert route(state) == "speculative_node"
+
+
+def test_patching_escalates_to_hitl_when_global_failsafe_tripped():
+    """Layer 3: even when neither the per-story (Layer 2) nor the
+    global zero-patch (Layer 1) counters have tripped, a tripped
+    no-progress failsafe must short-circuit to HITL — this is the
+    backstop for novel loops we haven't anticipated yet."""
+    route = _route_after_patching_under_test()
+    state = {
+        "current_batch_id": 1,
+        "current_story_id": "STORY-1",
+        "loop_counter": {
+            "consecutive_zero_patch_rounds": 0,
+            "progress_tracker": {
+                "budget_at_last_progress": 10.0,
+                "tripped": True,
+            },
+        },
+    }
+    assert route(state) == "human_intervention_node"
+
+
+def test_patching_does_not_escalate_in_story_mode_via_global_counter():
+    """In story mode the per-story counter handles auto-advance; the
+    global ``consecutive_zero_patch_rounds`` field is not incremented
+    by patching_node in story mode, so the HITL guard remains dormant
+    for normal story runs. This regression-tests that even if the field
+    leaks in from elsewhere (e.g. a stale repair counter), story_loop
+    still gets to apply its own per-story budget first when no leak
+    has happened — i.e. zero == 0 routes to story_loop, not HITL."""
+    route = _route_after_patching_under_test()
+    state = {
+        "current_batch_id": 1,
+        "current_story_id": "STORY-1",
+        "loop_counter": {"consecutive_zero_patch_rounds": 0},
+    }
+    assert route(state) == "story_loop_node"
 
 
 def test_graph_has_conditional_edge_out_of_patching_node():

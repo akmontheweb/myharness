@@ -33,13 +33,26 @@ from harness.batch_sizing import DETERMINISTIC_BATCH_SIZE as DEFAULT_BATCH_SIZE
 logger = logging.getLogger(__name__)
 
 
-__all__ = ["DEFAULT_BATCH_SIZE"]
+__all__ = ["DEFAULT_BATCH_SIZE", "STORY_ZERO_PATCH_CAP"]
 """Cap on stories selected per batch — aliased to
 ``harness.batch_sizing.DETERMINISTIC_BATCH_SIZE`` so the two modules
 share one source of truth. The dependency-aware planner may return
 fewer when the graph chokes earlier (e.g. only one story is unblocked
 at this moment). The CLI's ``--story-batch-size`` flag overrides
 this via ``state['story_batch_size']``."""
+
+STORY_ZERO_PATCH_CAP = 3
+"""Per-story patching attempts allowed before story_loop_node
+auto-completes the story and advances the cursor.
+
+When the patching turn lands zero successful patches against the same
+``current_story_id`` ``STORY_ZERO_PATCH_CAP`` times in a row, the story
+is considered vacuous / mis-identified (the planner generated a story
+the patcher has nothing to do for, or the LLM cannot find anything to
+emit). Rather than burn the run's budget in a tight patching ↔
+story_loop cycle, story_loop_node marks the story ``done`` and lets
+``_next_story_in_batch`` advance to the next eligible story. Default
+3 — overridable via ``state['story_zero_patch_cap']``."""
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +255,20 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
     is exhausted (every story ``done`` or ``blocked``), returns
     ``batch_complete=True`` and clears ``current_story_id`` so the
     router can hop to ``traceability_node``.
+
+    Per-story zero-patch auto-advance (Layer 2 — added after a session
+    burned ~1h22m and $18 looping story_loop ↔ patching with the same
+    STORY-1 selected every cycle): before picking the next story, this
+    node consults ``loop_counter['story_zero_patch_rounds']`` for the
+    currently-cursored story. If that story has accumulated
+    ``story_zero_patch_cap`` (default 3) consecutive patching turns with
+    success_count=0, it is marked ``done`` and its counter cleared so
+    ``_next_story_in_batch`` advances to the next eligible story. The
+    rationale is that a story the patcher can produce nothing for is
+    most likely vacuous, mis-identified, or already covered by an
+    earlier story — and the batch should carry on rather than stall the
+    run. The decision is logged with the story key and round count so
+    the operator sees exactly what was skipped and why.
     """
     workspace_path = state.get("workspace_path", "")
     workspace = story_state.app_name_for_workspace(workspace_path)
@@ -261,8 +288,47 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
             },
         }
 
+    # Per-story zero-patch auto-advance. Must run BEFORE
+    # `_next_story_in_batch` so the now-done story isn't re-picked.
+    loop_counter = dict(state.get("loop_counter", {}) or {})
+    cur_story_id = state.get("current_story_id") or ""
+    auto_completed_key: Optional[str] = None
+    auto_completed_rounds = 0
+    if cur_story_id:
+        sz_raw = loop_counter.get("story_zero_patch_rounds", {}) or {}
+        sz: dict[str, int] = {
+            k: int(v) for k, v in sz_raw.items()
+        } if isinstance(sz_raw, dict) else {}
+        cap = int(
+            state.get("story_zero_patch_cap")
+            or STORY_ZERO_PATCH_CAP
+        )
+        cur_rounds = int(sz.get(cur_story_id, 0) or 0)
+        if cur_rounds >= cap:
+            auto_completed_key = cur_story_id
+            auto_completed_rounds = cur_rounds
+            sz.pop(cur_story_id, None)
+            loop_counter["story_zero_patch_rounds"] = sz
+
     conn = story_state.open_story_db()
     try:
+        if auto_completed_key is not None:
+            # Mark `done` (not `blocked`) — the user's directive is that
+            # a vacuous story should be considered satisfied so the
+            # batch makes progress. If the story really had work the
+            # downstream verification chain (compile / review) will
+            # catch the gap and route the run through repair_node /
+            # human_intervention_node, where the operator has full
+            # context to intervene.
+            story_state.mark_done(conn, workspace, auto_completed_key)
+            logger.warning(
+                "[story_loop] %s auto-completed after %d zero-patch round(s) "
+                "(cap=%d). Story may be vacuous, already covered by an "
+                "earlier story, or mis-identified by the decomposer. "
+                "Marking done and advancing.",
+                auto_completed_key, auto_completed_rounds,
+                int(state.get("story_zero_patch_cap") or STORY_ZERO_PATCH_CAP),
+            )
         nxt = _next_story_in_batch(conn, workspace, batch_id)
         if nxt is None:
             # Batch fully resolved (every story done or blocked).
@@ -285,11 +351,14 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
             return {
                 "current_story_id": "",
                 "story_scope_files": [],
+                "loop_counter": loop_counter,
                 "node_state": {
                     "current_node": "story_loop",
                     "batch_complete": True,
                     "batch_id": batch_id,
                     "blocked_count": blocked_count,
+                    "auto_completed_story": auto_completed_key,
+                    "auto_completed_zero_rounds": auto_completed_rounds,
                 },
             }
 
@@ -307,12 +376,15 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
             return {
                 "current_story_id": "",
                 "story_scope_files": [],
+                "loop_counter": loop_counter,
                 "node_state": {
                     "current_node": "story_loop",
                     "batch_complete": False,
                     "skipped": True,
                     "reason": "mark_in_progress_no_rows",
                     "story_key": nxt["story_key"],
+                    "auto_completed_story": auto_completed_key,
+                    "auto_completed_zero_rounds": auto_completed_rounds,
                 },
             }
     finally:
@@ -330,12 +402,15 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
         "current_story_id": nxt["story_key"],
         "story_scope_files": list(nxt["scope_files"] or []),
         "story_modified_baseline": baseline,
+        "loop_counter": loop_counter,
         "node_state": {
             "current_node": "story_loop",
             "batch_complete": False,
             "story_key": nxt["story_key"],
             "story_title": nxt["title"],
             "acceptance_criteria": nxt["acceptance_criteria"],
+            "auto_completed_story": auto_completed_key,
+            "auto_completed_zero_rounds": auto_completed_rounds,
         },
     }
 
@@ -761,6 +836,13 @@ def batch_commit_node(state: dict[str, Any]) -> dict[str, Any]:
         "consecutive_zero_patch_rounds", "missing_dep_consecutive_same",
     ):
         loop_counter[key] = 0
+    # Layer 2 / Layer 3 — per-story zero-patch tally and the global
+    # no-progress failsafe are both scoped to the current batch.
+    # ``story_zero_patch_rounds`` carries story_keys that won't exist
+    # in the next batch; ``progress_tracker`` carries a budget marker
+    # that should re-baseline against the next batch's starting budget.
+    loop_counter["story_zero_patch_rounds"] = {}
+    loop_counter.pop("progress_tracker", None)
 
     # Phase K — pop the sealed batch's gate-progress entry so a future
     # batch with the same id (shouldn't happen, IDs are monotonic) or

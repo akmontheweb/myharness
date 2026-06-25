@@ -3486,14 +3486,64 @@ Generate your patches NOW. Only the blocks above. No other text."""
             except Exception as _idx_exc:  # noqa: BLE001
                 logger.debug("[repo_index] incremental update failed: %s", _idx_exc)
 
+        # Layer 3 — global no-progress failsafe. Snapshot the budget at
+        # the last moment patching produced progress; route_after_patching
+        # / route_after_compiler escalate to HITL when spend since that
+        # marker exceeds the threshold.
+        from harness.no_progress import update_and_check as _np_update_and_check
+        _np_update_and_check(
+            loop_counter,
+            budget_remaining_usd=new_budget,
+            progress_made=(success_count > 0),
+            threshold_usd=float(
+                state.get("no_progress_budget_usd") or 1.50
+            ),
+        )
+
+        # Zero-patch tripwires. Two counters, split by mode, so the
+        # story-mode auto-advance (Layer 2) and the monolithic-mode HITL
+        # escalation (Layer 1) don't fight each other.
+        #
+        # - Story mode (``current_story_id`` set): increment a per-story
+        #   counter in ``story_zero_patch_rounds[story_key]``. The
+        #   story_loop_node consults this counter at the start of its
+        #   next visit; at ≥ STORY_ZERO_PATCH_CAP (3) it marks the story
+        #   ``done`` and advances the cursor — vacuous / mis-identified
+        #   stories should not stall the batch. The global counter is
+        #   NOT touched so the batch can carry on past a few bad stories
+        #   without tripping the system-wide HITL guard.
+        # - Monolithic mode: bump the global
+        #   ``consecutive_zero_patch_rounds``. ``route_after_patching``
+        #   reads it and escalates to ``human_intervention_node`` at ≥ 2
+        #   (mirrors the existing repair_node guard threshold).
+        current_story_id = state.get("current_story_id") or ""
+        if current_story_id:
+            sz = dict(loop_counter.get("story_zero_patch_rounds", {}) or {})
+            if success_count == 0:
+                sz[current_story_id] = int(sz.get(current_story_id, 0) or 0) + 1
+            else:
+                sz[current_story_id] = 0
+            loop_counter["story_zero_patch_rounds"] = sz
+            zero_rounds_for_log = sz[current_story_id]
+        else:
+            if success_count == 0:
+                loop_counter["consecutive_zero_patch_rounds"] = (
+                    loop_counter.get("consecutive_zero_patch_rounds", 0) + 1
+                )
+            else:
+                loop_counter["consecutive_zero_patch_rounds"] = 0
+            zero_rounds_for_log = loop_counter["consecutive_zero_patch_rounds"]
+
         logger.info(
             "[patching_node] Patches applied. tokens_in=%d tokens_out=%d cost=$%.6f budget_left=$%.4f "
-            "patches=%d succeed=%d fail=%d",
+            "patches=%d succeed=%d fail=%d zero_rounds=%d%s",
             response.usage.input_tokens,
             response.usage.output_tokens,
             response.usage.cost_usd,
             new_budget,
             len(patch_results), success_count, fail_count,
+            zero_rounds_for_log,
+            f" story={current_story_id}" if current_story_id else "",
         )
 
         return {
@@ -3511,6 +3561,8 @@ Generate your patches NOW. Only the blocks above. No other text."""
                 "allowlist_rejections": allowlist_rejections,
                 "patch_failures": patch_failures,
                 "allowed_paths": allowed_paths,
+                "zero_rounds": zero_rounds_for_log,
+                "current_story_id": current_story_id,
             },
         }
     except RuntimeError as exc:
@@ -6834,6 +6886,21 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             except Exception as exc:  # noqa: BLE001 — never let commit break the loop
                 logger.debug("[repair_node] Per-iteration commit skipped: %s", exc)
 
+        # Layer 3 — global no-progress failsafe. Mirror the patching_node
+        # call so route_after_compiler can escalate to HITL when repair
+        # has been burning budget without landing real patches. Uses
+        # ``real_success_count`` (excludes idempotency no-ops) to match
+        # the existing ``consecutive_zero_patch_rounds`` semantics.
+        from harness.no_progress import update_and_check as _np_update_and_check
+        _np_update_and_check(
+            loop_counter,
+            budget_remaining_usd=new_budget,
+            progress_made=(real_success_count > 0),
+            threshold_usd=float(
+                state.get("no_progress_budget_usd") or 1.50
+            ),
+        )
+
         logger.info(
             "[repair_node] Repair #%d complete. tokens_in=%d tokens_out=%d cost=$%.6f budget_left=$%.4f "
             "patches=%d succeed=%d no_op=%d fail=%d consecutive_zero=%d",
@@ -6998,6 +7065,23 @@ async def human_intervention_node(state: AgentState) -> dict[str, Any]:
     from harness.cli import hitl_menu_loop
 
     updated_state = hitl_menu_loop(state_dict)
+
+    # Layer 3 — reset the no-progress failsafe on every HITL exit. The
+    # operator just inspected the situation and chose to resume / suspend;
+    # post-intervention spend should start with a fresh budget marker
+    # rather than inheriting the pre-pause tally that triggered the
+    # escalation. Without this reset, a single "resume" choice would
+    # immediately re-trip the failsafe on the very next patching turn.
+    try:
+        from harness.no_progress import reset as _np_reset
+        lc = dict(updated_state.get("loop_counter", {}) or {})
+        _np_reset(lc)
+        updated_state["loop_counter"] = lc
+    except Exception as _np_exc:  # noqa: BLE001 — failsafe reset is non-fatal
+        logger.debug(
+            "[human_intervention_node] no-progress reset skipped: %s",
+            _np_exc,
+        )
 
     # Extract the node_state back — hitl_menu_loop returns a full state dict
     return updated_state
@@ -7318,6 +7402,18 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
     # Check budget first — financial guardrail takes priority
     if budget_remaining <= 0.0:
         logger.warning("[router] Budget exhausted ($%.4f remaining). Routing to HITL.", budget_remaining)
+        return _transition("human_intervention_node")
+
+    # Layer 3 — global no-progress failsafe. Comes before the success
+    # path so that a stuck repair loop can't camouflage itself with an
+    # eventual clean compile; but yields to the budget check above which
+    # is the harder financial gate.
+    from harness.no_progress import tripped as _np_tripped
+    if _np_tripped(loop_counter):
+        logger.error(
+            "[router] no-progress failsafe tripped — budget bleeding "
+            "without successful patches. Routing to HITL."
+        )
         return _transition("human_intervention_node")
 
     if exit_code == 0:
@@ -10831,16 +10927,47 @@ def build_graph() -> Any:
     # patching → speculative.
     # =====================================================================
     def route_after_patching(state: AgentState) -> Literal[
-        "story_loop_node", "speculative_node"
+        "story_loop_node", "speculative_node", "human_intervention_node"
     ]:
-        """Advance to the next story in the batch, or kick off the
-        per-batch verification chain.
+        """Advance to the next story in the batch, kick off the per-batch
+        verification chain, or escalate to HITL when the patching turn
+        is stuck producing zero patches.
+
+        HITL guard (added after a story-mode session burned ~1h22m and
+        $18 looping story_loop ↔ patching with patches=0 every iteration):
+        when ``loop_counter['consecutive_zero_patch_rounds'] >= 2`` the
+        LLM has failed to land any patch for two consecutive turns. Same
+        threshold as ``route_after_compiler`` for the repair loop, so
+        the two zero-patch tripwires behave symmetrically.
 
         In monolithic mode (no batch active) or when a story-mode batch
         has no live story cursor (e.g. a batch-level repair re-enters
         patching), this falls straight through to ``speculative_node``
         — the historical behavior.
         """
+        loop_counter = state.get("loop_counter", {}) or {}
+        # Layer 3 — global no-progress failsafe runs first so it can
+        # short-circuit any other route decision when budget has been
+        # bleeding without progress.
+        from harness.no_progress import tripped as _np_tripped
+        if _np_tripped(loop_counter):
+            logger.error(
+                "[route_after_patching] no-progress failsafe tripped — "
+                "budget spent without producing patches exceeded the "
+                "threshold. Escalating to human_intervention_node."
+            )
+            return "human_intervention_node"
+        consecutive_zero = int(
+            loop_counter.get("consecutive_zero_patch_rounds", 0) or 0
+        )
+        if consecutive_zero >= 2:
+            logger.warning(
+                "[route_after_patching] consecutive_zero_patch_rounds=%d ≥ 2; "
+                "escalating to human_intervention_node — patching is stuck "
+                "in a no-progress loop.",
+                consecutive_zero,
+            )
+            return "human_intervention_node"
         if int(state.get("current_batch_id") or 0) and (
             state.get("current_story_id") or ""
         ):
@@ -10853,6 +10980,7 @@ def build_graph() -> Any:
         {
             "story_loop_node": "story_loop_node",
             "speculative_node": "speculative_node",
+            "human_intervention_node": "human_intervention_node",
         },
     )
     # speculative_node → test_generation_node → conditional edge:
