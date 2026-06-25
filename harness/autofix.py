@@ -1355,11 +1355,77 @@ def _package_in_npm_manifest(
     return False
 
 
+def _fix_semgrep(
+    rule_id: str,
+    diag: dict[str, Any],
+    workspace_path: str,
+) -> Optional[PatchBlock]:
+    """Layer 1 of the security autofix: consume the scanner-suggested fix.
+
+    Semgrep's JSON output ships an ``extra.rendered_fix`` (or
+    ``extra.fix``) string for any rule whose author shipped an autofix
+    template. The exact byte range to overwrite lives at
+    ``start.line``/``end.line``. ``harness/security.py`` propagates both
+    into the diagnostic as ``diag["fix"]`` and ``diag["end_line"]``;
+    this helper turns the pair into a REPLACE_LINE_RANGE PatchBlock and
+    pins it to the current file's sha256 so a sibling patch in the same
+    round mutating the file first causes a clean rejection instead of a
+    silent wrong-line overwrite.
+
+    When the diagnostic carries no fix metadata (most absence-based
+    rules — "missing-user", "missing-healthcheck" — historically did not
+    ship autofixes), we return ``None`` and the LLM repair loop sees the
+    diagnostic as before. The hardcoded rule-table extension (Layer 2)
+    that covers those is a separate follow-up.
+
+    ``rule_id`` is unused — kept for parity with the other dispatchers
+    and so a future per-rule branching layer has a hook.
+    """
+    del rule_id  # parity with other fix dispatchers; not used yet
+    file = str(diag.get("file", "") or "")
+    if not file:
+        return None
+    rel_file = _relative_to_workspace(file, workspace_path)
+    if rel_file is None:
+        return None
+    file_abs = os.path.join(workspace_path, rel_file)
+    if not os.path.isfile(file_abs):
+        return None
+
+    fix = diag.get("fix")
+    if not isinstance(fix, str) or not fix:
+        return None
+    try:
+        start_line = int(diag.get("line", 0) or 0)
+        end_line = int(diag.get("end_line", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if start_line < 1 or end_line < start_line:
+        return None
+
+    # Pin to the current on-disk hash so a sibling patch can't cause a
+    # silent wrong-line edit. The patcher's drift guard fail-closes:
+    # the LLM (or the next compile cycle) sees a clean rejection and
+    # the diagnostic re-extracts with fresh coordinates.
+    from harness.patcher import sha256_file_bytes
+    file_hash = sha256_file_bytes(file_abs) or ""
+
+    return PatchBlock(
+        operation=OperationType.REPLACE_LINE_RANGE,
+        file=rel_file,
+        line=start_line,
+        end_line=end_line,
+        content=fix.rstrip("\n"),
+        expected_file_hash=file_hash,
+    )
+
+
 _SECURITY_FIX_TABLE: dict[str, Any] = {
     "BANDIT": _fix_bandit,
     "GITLEAKS": _fix_gitleaks,
     "GITLEAKS-FALLBACK": _fix_gitleaks,
     "TRIVY": _fix_trivy,
+    "SEMGREP": _fix_semgrep,
 }
 
 

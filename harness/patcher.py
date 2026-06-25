@@ -38,11 +38,22 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class OperationType(Enum):
-    """The four canonical file modification operations."""
+    """File modification operations.
+
+    The first four are anchor-based: the caller supplies a search string
+    or anchor symbol and the patcher locates it in the file. The last two
+    (added for scanner-driven autofix, Layer 1 of the security pipeline)
+    are line-coordinate-based: the caller supplies a 1-based line number
+    or range and the patcher splices directly. Line-based ops sidestep
+    the failure mode where a scanner's "missing X" finding has no anchor
+    string for the LLM to latch onto.
+    """
     CREATE_FILE = "create_file"
     REPLACE_BLOCK = "replace_block"
     DELETE_BLOCK = "delete_block"
     INSERT_AT_BLOCK = "insert_at_block"
+    INSERT_AT_LINE = "insert_at_line"
+    REPLACE_LINE_RANGE = "replace_line_range"
 
 
 class Placement(Enum):
@@ -76,6 +87,18 @@ class PatchBlock:
     # the LLM an explicit escape from the "matched N times. Must be unique"
     # dead-end without forcing it to pad the search with extra context.
     count: str = "unique"
+    # Line coordinates for INSERT_AT_LINE / REPLACE_LINE_RANGE.
+    # ``line`` is the 1-based line number the content lands at (or starts
+    # at, for the range op). ``end_line`` is the inclusive end for the
+    # range op; left at 0 for the insert op. ``expected_file_hash`` is an
+    # optional sha256 of the file's bytes at the time the caller chose
+    # the line number — when supplied the patcher rejects the patch if
+    # the file has drifted, reusing the B5 drift sensor. Empty string
+    # means "trust the line number unconditionally" (callers that always
+    # re-extract diagnostics fresh per round can leave it blank).
+    line: int = 0
+    end_line: int = 0
+    expected_file_hash: str = ""
 
     raw_block: str = ""  # The full matched block text for debugging
 
@@ -230,6 +253,35 @@ _BLOCK_PATTERNS = {
         r'<<<END_INSERT_AT_BLOCK>>>',
         re.DOTALL,
     ),
+    # Line-coordinate operations — used by scanner-driven autofix paths
+    # whose findings carry start.line / end.line metadata (semgrep
+    # extra.fix, ESLint rules, etc.). The LLM may also emit these
+    # directly when it sees a line-numbered file view in its prompt and
+    # decides a coordinate is more reliable than picking an anchor.
+    #
+    # Both ops support an optional ``hash:`` field carrying the sha256
+    # hex digest of the file the caller saw. The patcher rejects the
+    # patch when the on-disk hash differs — line numbers go stale fast
+    # if a sibling patch in the same round mutated the file first.
+    OperationType.INSERT_AT_LINE: re.compile(
+        r'<<<INSERT_AT_LINE>>>\s*\n'
+        r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
+        r'line:\s*(?P<line>\d+)\s*\n'
+        r'(?:hash:\s*(?P<hash>[0-9a-fA-F]+)\s*\n)?'
+        r'content:\s*\n(?P<content>' + _TEMPERED_CONTENT + r')'
+        r'<<<END_INSERT_AT_LINE>>>',
+        re.DOTALL,
+    ),
+    OperationType.REPLACE_LINE_RANGE: re.compile(
+        r'<<<REPLACE_LINE_RANGE>>>\s*\n'
+        r'file:\s*(?P<file>' + _FIELD_VALUE + r')\s*\n'
+        r'start_line:\s*(?P<line>\d+)\s*\n'
+        r'end_line:\s*(?P<end_line>\d+)\s*\n'
+        r'(?:hash:\s*(?P<hash>[0-9a-fA-F]+)\s*\n)?'
+        r'content:\s*\n(?P<content>' + _TEMPERED_CONTENT + r')'
+        r'<<<END_REPLACE_LINE_RANGE>>>',
+        re.DOTALL,
+    ),
 }
 
 
@@ -297,6 +349,25 @@ def parse_patch_blocks(llm_output: str) -> list[PatchBlock]:
                     file=gd["file"].strip(),
                     anchor=gd["anchor"].strip(),
                     placement=placement,
+                    content=gd["content"].rstrip(),
+                    raw_block=raw,
+                ))
+            elif op_type == OperationType.INSERT_AT_LINE:
+                blocks.append(PatchBlock(
+                    operation=OperationType.INSERT_AT_LINE,
+                    file=gd["file"].strip(),
+                    line=int(gd["line"]),
+                    expected_file_hash=(gd.get("hash") or "").strip().lower(),
+                    content=gd["content"].rstrip(),
+                    raw_block=raw,
+                ))
+            elif op_type == OperationType.REPLACE_LINE_RANGE:
+                blocks.append(PatchBlock(
+                    operation=OperationType.REPLACE_LINE_RANGE,
+                    file=gd["file"].strip(),
+                    line=int(gd["line"]),
+                    end_line=int(gd["end_line"]),
+                    expected_file_hash=(gd.get("hash") or "").strip().lower(),
                     content=gd["content"].rstrip(),
                     raw_block=raw,
                 ))
@@ -565,6 +636,33 @@ class BasePatcher(ABC):
         """
         Insert content before or after a named structural block (function, class, etc.)
         identified by anchor string.
+        """
+        ...
+
+    @abstractmethod
+    async def insert_at_line(
+        self, filepath: str, line: int, content: str,
+        *, expected_file_hash: str = "",
+    ) -> PatchResult:
+        """Insert content as new line(s) at 1-based line ``line``.
+
+        After the patch, ``content`` becomes line ``line`` and the
+        previous line ``line`` is shifted to ``line + 1``. ``line == 1``
+        prepends; ``line == len(file_lines) + 1`` appends. When
+        ``expected_file_hash`` is supplied and does not match the file's
+        current sha256, the patch is rejected (the line number is stale).
+        """
+        ...
+
+    @abstractmethod
+    async def replace_line_range(
+        self, filepath: str, start_line: int, end_line: int, content: str,
+        *, expected_file_hash: str = "",
+    ) -> PatchResult:
+        """Replace lines ``[start_line, end_line]`` (inclusive, 1-based)
+        with ``content``. Hash-guarded the same way as ``insert_at_line``.
+        Idempotent: when the target range already equals ``content``
+        verbatim the patch returns a no-op success.
         """
         ...
 
@@ -1112,6 +1210,212 @@ class TextPatcher(BasePatcher):
         except OSError as exc:
             return PatchResult(success=False, file=filepath, operation=OperationType.INSERT_AT_BLOCK, error=str(exc))
 
+    async def insert_at_line(
+        self, filepath: str, line: int, content: str,
+        *, expected_file_hash: str = "",
+    ) -> PatchResult:
+        full_path = self._resolve_safe(filepath, OperationType.INSERT_AT_LINE)
+        if isinstance(full_path, PatchResult):
+            return full_path
+        if not os.path.isfile(full_path):
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.INSERT_AT_LINE,
+                error=f"File not found: {filepath}. Use CREATE_FILE for new files.",
+            )
+        if line < 1:
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.INSERT_AT_LINE,
+                error=f"line must be >= 1 (got {line}).",
+            )
+
+        hash_err = _check_file_hash(full_path, expected_file_hash, OperationType.INSERT_AT_LINE, filepath)
+        if hash_err is not None:
+            return hash_err
+        try:
+            original = await _aread(full_path)
+        except OSError as exc:
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.INSERT_AT_LINE, error=str(exc),
+            )
+
+        file_lines = original.splitlines(keepends=True)
+        n_lines = len(file_lines)
+        if line > n_lines + 1:
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.INSERT_AT_LINE,
+                error=(
+                    f"line={line} is past end of file ({n_lines} lines). "
+                    f"Use line={n_lines + 1} to append."
+                ),
+            )
+
+        # Normalise the content to a list of lines, each terminated with
+        # \n. The user supplies content without a trailing newline; we
+        # always add one so the inserted block sits on its own line(s).
+        insert_lines = (content + "\n").splitlines(keepends=True)
+
+        # Idempotency: if file_lines[line-1 : line-1+len(insert_lines)]
+        # already equals insert_lines, this patch already landed (or the
+        # caller hit a no-op race). Don't duplicate.
+        existing_slice = file_lines[line - 1 : line - 1 + len(insert_lines)]
+        if existing_slice == insert_lines:
+            logger.info(
+                "[patcher:text] INSERT_AT_LINE no-op: %s line %d already contains the target content.",
+                filepath, line,
+            )
+            return PatchResult(
+                success=True, file=filepath,
+                operation=OperationType.INSERT_AT_LINE,
+                message=f"already inserted (no-op on resume): {filepath}:{line}",
+                lines_changed=0, no_op=True,
+            )
+
+        new_lines = file_lines[: line - 1] + insert_lines + file_lines[line - 1 :]
+        modified = "".join(new_lines)
+        try:
+            await _awrite(full_path, modified)
+            lines_changed = len(insert_lines)
+            logger.info(
+                "[patcher:text] INSERT_AT_LINE landed: %s line=%d (+%d line(s)).",
+                filepath, line, lines_changed,
+            )
+            return PatchResult(
+                success=True, file=filepath,
+                operation=OperationType.INSERT_AT_LINE,
+                message=f"Inserted {lines_changed} line(s) at {filepath}:{line}",
+                lines_changed=lines_changed,
+            )
+        except OSError as exc:
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.INSERT_AT_LINE, error=str(exc),
+            )
+
+    async def replace_line_range(
+        self, filepath: str, start_line: int, end_line: int, content: str,
+        *, expected_file_hash: str = "",
+    ) -> PatchResult:
+        full_path = self._resolve_safe(filepath, OperationType.REPLACE_LINE_RANGE)
+        if isinstance(full_path, PatchResult):
+            return full_path
+        if not os.path.isfile(full_path):
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.REPLACE_LINE_RANGE,
+                error=f"File not found: {filepath}.",
+            )
+        if start_line < 1 or end_line < start_line:
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.REPLACE_LINE_RANGE,
+                error=(
+                    f"invalid range: start_line={start_line}, "
+                    f"end_line={end_line}. Require 1 <= start_line <= end_line."
+                ),
+            )
+
+        hash_err = _check_file_hash(
+            full_path, expected_file_hash, OperationType.REPLACE_LINE_RANGE, filepath,
+        )
+        if hash_err is not None:
+            return hash_err
+        try:
+            original = await _aread(full_path)
+        except OSError as exc:
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.REPLACE_LINE_RANGE, error=str(exc),
+            )
+
+        file_lines = original.splitlines(keepends=True)
+        n_lines = len(file_lines)
+        if end_line > n_lines:
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.REPLACE_LINE_RANGE,
+                error=(
+                    f"end_line={end_line} is past end of file ({n_lines} lines). "
+                    "Re-extract diagnostics or use INSERT_AT_LINE to append."
+                ),
+            )
+
+        replacement_lines = (content + "\n").splitlines(keepends=True)
+
+        # Idempotency: target range already equals the replacement.
+        existing_slice = file_lines[start_line - 1 : end_line]
+        if existing_slice == replacement_lines:
+            logger.info(
+                "[patcher:text] REPLACE_LINE_RANGE no-op: %s lines %d-%d already at target state.",
+                filepath, start_line, end_line,
+            )
+            return PatchResult(
+                success=True, file=filepath,
+                operation=OperationType.REPLACE_LINE_RANGE,
+                message=f"already at target state (no-op): {filepath}:{start_line}-{end_line}",
+                lines_changed=0, no_op=True,
+            )
+
+        new_lines = (
+            file_lines[: start_line - 1]
+            + replacement_lines
+            + file_lines[end_line :]
+        )
+        modified = "".join(new_lines)
+        try:
+            await _awrite(full_path, modified)
+            lines_changed = _count_diff_lines(original, modified)
+            logger.info(
+                "[patcher:text] REPLACE_LINE_RANGE landed: %s lines %d-%d (%d line(s) changed).",
+                filepath, start_line, end_line, lines_changed,
+            )
+            return PatchResult(
+                success=True, file=filepath,
+                operation=OperationType.REPLACE_LINE_RANGE,
+                message=f"Replaced lines {start_line}-{end_line} in {filepath}",
+                lines_changed=lines_changed,
+            )
+        except OSError as exc:
+            return PatchResult(
+                success=False, file=filepath,
+                operation=OperationType.REPLACE_LINE_RANGE, error=str(exc),
+            )
+
+
+def _check_file_hash(
+    abs_path: str,
+    expected_hash: str,
+    op: OperationType,
+    rel_path: str,
+) -> Optional[PatchResult]:
+    """Return a PatchResult error when the file's current sha256 disagrees
+    with ``expected_hash``, or None when the check passes (or is skipped
+    because ``expected_hash`` is empty).
+
+    Reuses ``sha256_file_bytes`` — the same drift sensor B5 uses for the
+    anchor-based ops. Keeping line-based ops on the same hashing primitive
+    means the "file drifted under the LLM's mental model" failure mode is
+    surfaced with one consistent error shape regardless of which op type
+    the LLM (or autofix) chose.
+    """
+    if not expected_hash:
+        return None
+    actual = sha256_file_bytes(abs_path) or ""
+    if actual.lower() != expected_hash.lower():
+        return PatchResult(
+            success=False, file=rel_path, operation=op,
+            error=(
+                f"File hash drift on {rel_path}: expected sha256="
+                f"{expected_hash[:12]}…, actual sha256={actual[:12] if actual else 'unreadable'}…. "
+                "The file changed since the line numbers were chosen — re-extract "
+                "diagnostics and retry."
+            ),
+        )
+    return None
+
 
 # ---------------------------------------------------------------------------
 # 7. TreeSitterPatcher — AST-Aware Rewriting
@@ -1492,6 +1796,26 @@ class TreeSitterPatcher(BasePatcher):
 
         return results
 
+    async def insert_at_line(
+        self, filepath: str, line: int, content: str,
+        *, expected_file_hash: str = "",
+    ) -> PatchResult:
+        # Line ops are file-bytes-level — there is no AST advantage to be
+        # had. Delegate so the idempotency / hash-drift / boundary checks
+        # live in exactly one place.
+        return await TextPatcher(self.workspace_root).insert_at_line(
+            filepath, line, content, expected_file_hash=expected_file_hash,
+        )
+
+    async def replace_line_range(
+        self, filepath: str, start_line: int, end_line: int, content: str,
+        *, expected_file_hash: str = "",
+    ) -> PatchResult:
+        return await TextPatcher(self.workspace_root).replace_line_range(
+            filepath, start_line, end_line, content,
+            expected_file_hash=expected_file_hash,
+        )
+
 
 # ---------------------------------------------------------------------------
 # 8. HybridPatcher — Auto-Selects Best Strategy
@@ -1556,6 +1880,16 @@ class HybridPatcher:
             )
         elif block.operation == OperationType.INSERT_AT_BLOCK:
             return await patcher.insert_at_block(block.file, block.anchor, block.placement, block.content)
+        elif block.operation == OperationType.INSERT_AT_LINE:
+            return await patcher.insert_at_line(
+                block.file, block.line, block.content,
+                expected_file_hash=block.expected_file_hash,
+            )
+        elif block.operation == OperationType.REPLACE_LINE_RANGE:
+            return await patcher.replace_line_range(
+                block.file, block.line, block.end_line, block.content,
+                expected_file_hash=block.expected_file_hash,
+            )
         else:
             return PatchResult(
                 success=False,

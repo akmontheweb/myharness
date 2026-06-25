@@ -957,6 +957,15 @@ class SecurityFinding:
     message: str
     cwe: Optional[str] = None       # "CWE-89" etc. (None when scanner doesn't emit it)
     confidence: str = "medium"      # bandit-style high/medium/low — defaults to medium
+    # Scanner-suggested autofix metadata. Semgrep, modern ESLint rules,
+    # and some Trivy CVE fixes ship an exact replacement payload + the
+    # line range it should overwrite. When ``fix`` is non-empty,
+    # ``harness.autofix._fix_semgrep`` (Layer 1 of the security autofix)
+    # consumes it directly via REPLACE_LINE_RANGE — no LLM round needed.
+    # Empty when the scanner doesn't emit a fix; the diagnostic still
+    # flows to the LLM repair loop as before.
+    end_line: int = 0
+    fix: str = ""
 
     def dedupe_key(self) -> tuple[str, str, int, str]:
         """Stable key for collapsing duplicates across scanners (same
@@ -1454,6 +1463,20 @@ def _parse_semgrep_json(stdout: str) -> list[SecurityFinding]:
             cleaned = cleaned.split(":")[0].strip()
             cwe = f"CWE-{cleaned}" if cleaned else None
         confidence_raw = meta.get("confidence", "medium")
+        # Capture autofix metadata when the rule ships one. Semgrep puts
+        # the suggested replacement in ``extra.fix`` and the byte/line
+        # range under top-level ``start``/``end``. We propagate both so
+        # the autofix path can issue REPLACE_LINE_RANGE without ever
+        # entering the LLM repair loop. ``rendered_fix`` is the rule's
+        # rendered template result; ``fix`` is the raw template — the
+        # rendered form is what we want to apply.
+        fix_raw = extra.get("rendered_fix") or extra.get("fix") or ""
+        fix_str = str(fix_raw) if isinstance(fix_raw, str) else ""
+        end_line_raw = (r.get("end") or {}).get("line", 0)
+        try:
+            end_line_val = int(end_line_raw or 0)
+        except (TypeError, ValueError):
+            end_line_val = 0
         findings.append(SecurityFinding(
             scanner="semgrep",
             rule_id=str(r.get("check_id", "semgrep.unknown")),
@@ -1463,6 +1486,8 @@ def _parse_semgrep_json(stdout: str) -> list[SecurityFinding]:
             message=str(extra.get("message", "Semgrep finding")),
             cwe=cwe,
             confidence=str(confidence_raw).lower() if isinstance(confidence_raw, str) else "medium",
+            end_line=end_line_val,
+            fix=fix_str,
         ))
     return findings
 
@@ -1752,7 +1777,7 @@ def _findings_to_diagnostics(
         ]
         if f.cwe:
             msg_parts.append(f"({f.cwe})")
-        diagnostics.append({
+        diag: dict[str, Any] = {
             "file": f.file or "unknown",
             "line": f.line,
             "column": 0,
@@ -1767,7 +1792,15 @@ def _findings_to_diagnostics(
                 f"Severity: {f.severity} | Confidence: {f.confidence}"
                 + (f" | {f.cwe}" if f.cwe else "")
             )[:500],
-        })
+        }
+        # Scanner-suggested autofix passthrough. _fix_semgrep reads these
+        # fields directly and emits REPLACE_LINE_RANGE when ``fix`` is
+        # populated, bypassing the LLM repair loop for any rule whose
+        # upstream community shipped a fix template.
+        if f.fix:
+            diag["fix"] = f.fix
+            diag["end_line"] = f.end_line or f.line
+        diagnostics.append(diag)
     return diagnostics
 
 
