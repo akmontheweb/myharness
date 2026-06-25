@@ -1,0 +1,5 @@
+The three jwt.sign() calls at server/src/services/AuthService.ts lines 20, 25, 73 are wired to the wrong @types/jsonwebtoken overload — the `expiresIn: config.jwtExpiresIn` options object can't satisfy any of the 5 overloads because config.jwtExpiresIn is typed as plain string, not number | ms.StringValue. Fix is to cast it (`expiresIn: config.jwtExpiresIn as any`) or tighten the type of config.jwtExpiresIn.
+
+A correct diagnosis must mention BOTH:
+  (a) the file `server/src/services/AuthService.ts` or just `AuthService.ts`, AND
+  (b) the TS2769 overload mismatch / jwt.sign / expiresIn issue.

@@ -1,0 +1,7 @@
+Real blocker is the three jwt.sign() calls in server/src/services/AuthService.ts at lines 20, 25, and 73. Argument signature is misaligned with the @types/jsonwebtoken v9 overloads — `expiresIn` is being passed in the wrong arg slot. The error type is TS2769 ("No overload matches this call"). It is shown in the DEFERRED section of the prompt, not the top 3, so a blind LLM that takes the prompt's prioritisation at face value will miss it.
+
+A correct diagnosis must mention BOTH:
+  (a) the file `server/src/services/AuthService.ts` (or just `AuthService.ts`) OR the jwt.sign signature, AND
+  (b) the TS2769 / overload-mismatch / expiresIn issue.
+
+A diagnosis that names only the TS2741 cookie-mock fix or only the TS2353 updated_at issue is wrong — those were addressed in real session 6cf20a5d and the build still failed with the TS2769s.

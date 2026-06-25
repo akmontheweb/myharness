@@ -1,0 +1,21 @@
+The build failed with the following errors. Generate precise SEARCH/REPLACE patches to fix them.
+
+## Compiler Diagnostics (3 total, 3 distinct shapes)
+
+**Error 1:** `TS2769` × 3 [error] **[persisted from previous round]**
+  Message: No overload matches this call.
+  Locations: `src/services/AuthService.ts:20:14`, `src/services/AuthService.ts:25:16`, `src/services/AuthService.ts:73:15`
+  Context (first occurrence):
+```
+const accessToken = jwt.sign(
+  { userId, email, role },
+  config.jwtSecret,
+  { expiresIn: config.jwtExpiresIn }
+);
+```
+**Error 2:** `TS2339` × 1 [error]
+  Message: Property 'generateTokens' does not exist on type 'typeof import("/workspace/server/src/services/AuthService")'.
+  Locations: `src/services/AuthService.test.ts:8:30`
+**Error 3:** `TS2741` × 1 [error]
+  Message: Property 'cookie' is missing in type '{ status: jest.Mock<any, any, any>; json: jest.Mock<any, any, any>; }' but required in type '{ cookie: Mock<any, any, any>; status: Mock<any, any, any>; json: Mock<any, any, any>; }'.
+  Locations: `src/middleware/auth.test.ts:18:5`

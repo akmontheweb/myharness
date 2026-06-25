@@ -1,0 +1,1 @@
+This fixture is the BEFORE-FIX state. The whole point of the cascade-defense fix is to make a fresh LLM able to locate TS2769 even though the harness's old prompt-shaping pushed it to the deferred section. Match=true iff the diagnosis names the AuthService.ts jwt.sign issue OR the TS2769 overload mismatch. Anything else (cookie mock, updated_at, etc.) is a fail by design.

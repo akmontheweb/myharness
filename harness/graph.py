@@ -108,6 +108,29 @@ class AgentState(TypedDict, total=False):
     messages: list[MessageDict]
     modified_files: list[str]
     compiler_errors: list[DiagnosticObjectDict]
+    # Sorted ``"<code>::<message>"`` fingerprints of the diagnostics from the
+    # CURRENT compiler run, written by compiler_node every time it executes
+    # (empty list on exit_code == 0). The rotation is: at the top of
+    # compiler_node, whatever is in ``last_diag_fingerprints`` is copied into
+    # ``prior_diag_fingerprints`` (i.e. yesterday's "current" is today's
+    # "prior") before the new value overwrites it.
+    last_diag_fingerprints: list[str]
+    # Sorted fingerprints from the PREVIOUS compiler run, populated by
+    # compiler_node's rotate-then-write step. Read by repair_node's
+    # diagnostic formatter: any group whose fingerprint is in this set is
+    # unconditionally promoted to top-N in the next prompt, regardless of
+    # cascade rank. This is the empirical override that catches cases
+    # where the cascade prior mis-classified a non-upstream error as "may
+    # resolve on its own" (e.g. a TS2769 overload mismatch deferred for
+    # 3 rounds, then HITL).
+    prior_diag_fingerprints: list[str]
+    # Error codes the LLM explicitly requested to promote into top-N on
+    # the NEXT repair iteration (Phase 1.2 escape hatch). Populated by
+    # repair_node when it parses ``<<<PROMOTE_DEFERRED>>>`` blocks from
+    # the LLM response; consumed by ``_format_diagnostics_for_repair``
+    # which bumps any matching group past the cascade prior. Cleared
+    # after consumption so a promotion only lasts one round.
+    promoted_codes_next_round: list[str]
     token_tracker: TokenTrackerDict
     # Mostly int counters per node ("planning", "patching", "repair", ...),
     # but a few sentinel-string entries piggy-back on the dict too
@@ -635,6 +658,46 @@ def _read_spec_layout(workspace_path: str) -> Any:
     return parse_layout(spec_md)
 
 
+def _read_extra_allowlist_globs() -> list[str]:
+    """Return operator-supplied extra allowlist entries from config.json
+    (Phase 3(d)). Defaults to ``[]`` when absent.
+
+    The patcher's built-in allowlist refuses paths it has never seen the
+    spec or filesystem declare. Some files that operators legitimately
+    want to edit don't fit the spec contract — ``LICENSE``,
+    ``CHANGELOG.md``, ``.editorconfig``, ``.dockerignore``, top-level
+    ``*.lock`` files. Rather than widen the built-in list (and quietly
+    expand the LLM's blast radius for every project), expose a config
+    knob so operators can opt-in per-repo:
+
+        "patcher": {
+          "extra_allowlist_globs": ["LICENSE", "CHANGELOG.md", ".editorconfig"]
+        }
+
+    Reading is best-effort: any config-loading error falls back to ``[]``
+    so the patcher still works on a malformed config. The list is appended
+    to BOTH the spec-driven and filesystem-fallback allowlists so the
+    knob behaves the same regardless of which tier built the rest of the
+    list.
+    """
+    try:
+        from harness.cli import _strip_comments, load_raw_config
+        cfg = _strip_comments(load_raw_config())
+    except Exception:  # noqa: BLE001 — config absence must not break the patcher
+        return []
+    patcher_cfg = cfg.get("patcher") if isinstance(cfg, dict) else None
+    if not isinstance(patcher_cfg, dict):
+        return []
+    raw = patcher_cfg.get("extra_allowlist_globs")
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for entry in raw:
+        if isinstance(entry, str) and entry.strip():
+            out.append(entry.strip())
+    return out
+
+
 def _build_patcher_allowlist(workspace_path: str) -> Optional[list[str]]:
     """Return the patcher allowed_paths list for ``workspace_path``.
 
@@ -660,6 +723,8 @@ def _build_patcher_allowlist(workspace_path: str) -> Optional[list[str]]:
     no source files), preserving the LLM's freedom to pick the layout.
     Mirrors the language used in the system prompt's "Workspace Layout"
     section, so the LLM sees the same rules as the patcher applies.
+    Phase 3(d): operator-supplied ``patcher.extra_allowlist_globs`` is
+    appended to whichever tier wins.
     """
     layout = _read_spec_layout(workspace_path)
     if layout is not None and layout.has_layout:
@@ -672,9 +737,19 @@ def _build_patcher_allowlist(workspace_path: str) -> Optional[list[str]]:
             (f" test_placement={layout.test_placement}"
              if layout.test_placement else ""),
         )
-        return allowlist
-
-    return _filesystem_allowlist(workspace_path)
+    else:
+        allowlist = _filesystem_allowlist(workspace_path)
+    if allowlist is not None:
+        extra = _read_extra_allowlist_globs()
+        for entry in extra:
+            if entry not in allowlist:
+                allowlist.append(entry)
+        if extra:
+            logger.info(
+                "[allowlist] extra_allowlist_globs appended: %s",
+                extra,
+            )
+    return allowlist
 
 
 def _spec_driven_allowlist(workspace_path: str, layout: Any) -> list[str]:
@@ -2145,11 +2220,36 @@ def apply_repair_iteration_cleanse(state: AgentState) -> dict[str, Any]:
     if len(cleansed) >= len(messages):
         return {}  # No-op — nothing trimmed.
 
+    dropped_n = len(messages) - len(cleansed)
     logger.info(
         "[memory_cleanse] Trimmed mid-loop messages: %d → %d (kept system + "
         "planning + last assistant; dropped %d intermediate turns).",
-        len(messages), len(cleansed), len(messages) - len(cleansed),
+        len(messages), len(cleansed), dropped_n,
     )
+    # Phase 2.1 — decision-point logging. Mid-loop cleanse is a known
+    # signal-loss site (it drops intermediate assistant chatter and
+    # related user feedback). Surface dropped role-counts so a HITL
+    # post-mortem can tell whether the cleanse ate something important.
+    try:
+        from harness.observability import emit_event as _emit_drop
+        kept_roles = [str(m.get("role", "?")) for m in cleansed]
+        dropped_roles: dict[str, int] = {}
+        for m in messages:
+            if m in cleansed:
+                continue
+            r = str(m.get("role", "?"))
+            dropped_roles[r] = dropped_roles.get(r, 0) + 1
+        _emit_drop(
+            "dropped_from_prompt",
+            site="repair_iteration_cleanse",
+            dropped_count=dropped_n,
+            kept_count=len(cleansed),
+            reason="trim_mid_loop_chatter_before_next_repair_dispatch",
+            kept_roles=kept_roles,
+            dropped_roles=dropped_roles,
+        )
+    except Exception:  # noqa: BLE001
+        pass
     return {"messages": cleansed}
 
 
@@ -5257,6 +5357,127 @@ def _parse_preflight_verdict(
     return non_fixable
 
 
+def _build_repair_reflection_prompt(
+    *,
+    prior_diagnostics_count: int,
+    current_diagnostics_count: int,
+    resolved_fingerprints: list[str],
+    persisted_fingerprints: list[str],
+    new_fingerprints: list[str],
+    top_persisted_messages: list[tuple[str, str]],
+) -> str:
+    """Compose the prompt for the per-round repair-reflection judgment
+    (Phase 2.2).
+
+    The judgment LLM gets a structured before/after view of the failing
+    diagnostics and is asked two questions: did the previous round
+    address the highest-priority error, and if not, what is the real
+    blocker now? It must answer with strict JSON so the parser can act
+    on the verdict without LLM-shape gymnastics.
+
+    The verdict is consumed by repair_node, which — when ``progressed``
+    is false — injects ``blocker`` as a system message into the
+    upcoming dispatch, giving the repair LLM a second opinion before
+    it writes patches. This is the harness's way of telling the model
+    "the harness thinks you got distracted last round; the real bug is
+    over here."
+    """
+    res_block = (
+        "\n".join(f"  - {fp}" for fp in resolved_fingerprints[:5])
+        if resolved_fingerprints else "  (none)"
+    )
+    pers_block = (
+        "\n".join(f"  - {fp}" for fp in persisted_fingerprints[:5])
+        if persisted_fingerprints else "  (none)"
+    )
+    new_block = (
+        "\n".join(f"  - {fp}" for fp in new_fingerprints[:5])
+        if new_fingerprints else "  (none)"
+    )
+    top_block = (
+        "\n".join(
+            f"  - [{code}] {msg[:120]}"
+            for code, msg in top_persisted_messages[:3]
+        )
+        if top_persisted_messages else "  (no persistent errors)"
+    )
+    return (
+        "You are auditing the previous repair iteration's outcome to "
+        "tell the harness whether to keep going on the same track or "
+        "redirect. The repair LLM applied patches to fix compile/test "
+        "errors; the build was re-run; here is the delta in failing "
+        "diagnostics.\n\n"
+        f"Diagnostics before this round: {prior_diagnostics_count}\n"
+        f"Diagnostics after this round:  {current_diagnostics_count}\n\n"
+        f"Resolved (previous round → gone):\n{res_block}\n\n"
+        f"Persisted (still failing):\n{pers_block}\n\n"
+        f"New (introduced by this round's patches):\n{new_block}\n\n"
+        f"Top persistent error messages (truncated):\n{top_block}\n\n"
+        "Answer ONE structured question: did the previous round make "
+        "PROGRESS on the highest-priority error, or did it spend the "
+        "iteration on a distraction? Use these definitions:\n"
+        "  PROGRESS — the most-critical persistent error from the prior "
+        "round was either resolved OR meaningfully changed (e.g. its "
+        "message moved closer to a fix). Even partial progress counts.\n"
+        "  DISTRACTION — the most-critical error is unchanged AND the "
+        "round's patches addressed lower-priority items (test mocks, "
+        "lint fixes, cosmetics) instead of the blocker.\n"
+        "  REGRESSION — the round introduced new failures that didn't "
+        "exist before, and the original blocker is also unchanged.\n\n"
+        "Respond with STRICT JSON ONLY — no prose, no markdown, no code "
+        "fences. Shape:\n"
+        '{"verdict": "PROGRESS" | "DISTRACTION" | "REGRESSION", '
+        '"real_blocker": "<one-sentence description of what should be '
+        'fixed next, citing a specific file/symbol/error from the data '
+        'above>", '
+        '"recommendation": "<one short imperative sentence for the next '
+        'repair LLM, e.g. \\"Edit src/services/AuthService.ts lines '
+        '20/25/73 to call jwt.sign(payload, secret, {expiresIn: ...}) '
+        'instead of passing options as the second arg.\\""}\n'
+    )
+
+
+def _parse_repair_reflection_verdict(
+    raw: str,
+) -> Optional[dict[str, str]]:
+    """Parse the strict-JSON response from the repair-reflection judgment.
+
+    Returns a dict with keys ``verdict``, ``real_blocker``,
+    ``recommendation`` (all strings) when the response is well-formed,
+    or ``None`` on any parse failure / missing keys. The caller treats
+    None as "skip reflection injection, proceed as normal."
+    """
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        logger.debug(
+            "[judgment:repair_reflection] Non-JSON verdict; skipping (raw=%r).",
+            text[:200],
+        )
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    verdict = str(parsed.get("verdict", "")).strip().upper()
+    if verdict not in {"PROGRESS", "DISTRACTION", "REGRESSION"}:
+        return None
+    real_blocker = str(parsed.get("real_blocker", "")).strip()
+    recommendation = str(parsed.get("recommendation", "")).strip()
+    if not real_blocker and verdict != "PROGRESS":
+        # PROGRESS verdicts can omit the blocker; the other two need it.
+        return None
+    return {
+        "verdict": verdict,
+        "real_blocker": real_blocker,
+        "recommendation": recommendation,
+    }
+
+
 def _workspace_has_source_files(workspace_path: str) -> bool:
     """True when the workspace contains at least one source file under a
     non-ignored directory. Used by the router to decide whether 'no tests
@@ -5900,11 +6121,21 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             "route to test_generation" if has_source else "route to HITL",
         )
 
+    # Rotate the survival-tracking fingerprints: yesterday's "current"
+    # becomes today's "prior", and the new diagnostics' shape becomes the
+    # new "current". repair_node reads ``prior_diag_fingerprints`` to
+    # detect which groups survived between two compile rounds. Cleared
+    # to [] on success. Warnings are excluded — they don't drive the
+    # repair loop, so survival of a warning is irrelevant.
     return_dict: dict[str, Any] = {
         "exit_code": exit_code,
         "compiler_errors": compiler_errors,
         "loop_counter": loop_counter,
         "node_state": node_state,
+        "prior_diag_fingerprints": list(state.get("last_diag_fingerprints") or []),
+        "last_diag_fingerprints": (
+            _fingerprint_diagnostics(compiler_errors) if exit_code != 0 else []
+        ),
     }
 
     # Persist the adapted command so repair_node / patching_node prompts
@@ -5994,6 +6225,131 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     loop_counter["repair"] = loop_counter.get("repair", 0) + 1
     loop_counter["total_repairs"] = loop_counter.get("total_repairs", 0) + 1
 
+    # Phase 1.1 — progress-based budget. The previous repair iteration's
+    # patches were applied, then compiler_node ran again; if the resulting
+    # fingerprint set is missing AT LEAST ONE fingerprint from the prior
+    # round, the previous round made real progress (some earlier error is
+    # gone). When this fails, we tick a separate ``no_progress_repairs``
+    # counter that route_after_compiler uses for the HITL gate, while
+    # ``total_repairs`` keeps incrementing for telemetry. Net effect: rounds
+    # that demonstrably move the failing-set forward don't count against the
+    # budget, so a session that improves 251 → 9 → 3 → 1 → 0 fits in budget
+    # even if it took 4 rounds, while a session that goes 3 → 3 → 3 hits
+    # HITL at the no_progress cap. The first repair iteration has no prior
+    # to compare against — credit it neutrally (don't tick no_progress).
+    prior_fps_set = set(state.get("prior_diag_fingerprints") or [])
+    current_fps_set = set(state.get("last_diag_fingerprints") or [])
+    is_first_iteration = loop_counter["total_repairs"] == 1
+    prior_round_made_progress = bool(prior_fps_set - current_fps_set)
+    if is_first_iteration:
+        prior_round_made_progress = True  # neutral; nothing to evaluate yet
+    if not prior_round_made_progress:
+        loop_counter["no_progress_repairs"] = (
+            loop_counter.get("no_progress_repairs", 0) + 1
+        )
+        logger.info(
+            "[repair_node] Prior repair did not shrink failing fingerprints "
+            "(prior=%d, current=%d, shared=%d). no_progress_repairs=%d.",
+            len(prior_fps_set), len(current_fps_set),
+            len(prior_fps_set & current_fps_set),
+            loop_counter["no_progress_repairs"],
+        )
+    else:
+        # Reset on progress so non-consecutive stalls don't accumulate.
+        # Matches the spirit of consecutive_zero_patch_rounds: a stretch
+        # of progress earns back the budget.
+        if loop_counter.get("no_progress_repairs", 0) > 0:
+            logger.info(
+                "[repair_node] Prior repair shrank failing fingerprints "
+                "(prior=%d → current=%d). Resetting no_progress_repairs "
+                "from %d to 0.",
+                len(prior_fps_set), len(current_fps_set),
+                loop_counter["no_progress_repairs"],
+            )
+        loop_counter["no_progress_repairs"] = 0
+
+    # Phase 2.2 — per-round repair reflection. Cheap LLM judges whether
+    # the PREVIOUS round actually addressed the highest-priority error.
+    # When it didn't (verdict = DISTRACTION or REGRESSION), the verdict's
+    # ``real_blocker`` is injected as a system message into the upcoming
+    # dispatch so the repair LLM sees a second opinion before it writes
+    # its next patches. Only runs from iteration 2 onward — iteration 1
+    # has nothing to reflect on. Strictly fail-open: any error in the
+    # reflection path leaves repair behavior unchanged.
+    reflection_verdict: Optional[dict[str, str]] = None
+    if (
+        not is_first_iteration
+        and bool(prior_fps_set)  # need a prior to compare against
+    ):
+        gw_for_reflection = get_gateway()
+        reflection_enabled = bool(
+            gw_for_reflection is not None
+            and getattr(
+                gw_for_reflection.config,
+                "llm_judgment_repair_reflection",
+                True,
+            )
+        )
+        if reflection_enabled:
+            # Diff the fingerprint sets and grab a few top persistent
+            # error messages for the prompt body. The fingerprint sets
+            # use Phase 3(a) normalisation; re-normalise when matching
+            # against raw compiler_errors so quoted-span variants align.
+            resolved = sorted(prior_fps_set - current_fps_set)
+            persisted = sorted(current_fps_set & prior_fps_set)
+            new_fps = sorted(current_fps_set - prior_fps_set)
+            top_persisted_messages: list[tuple[str, str]] = []
+            _reflection_errors: list[DiagnosticObjectDict] = (
+                state.get("compiler_errors", []) or []
+            )
+            for err in _reflection_errors:
+                code = str(err.get("error_code", "?"))
+                msg = str(err.get("message", ""))
+                fp = f"{code}::{_normalize_diagnostic_message(msg)}"
+                if fp in persisted and (code, msg) not in top_persisted_messages:
+                    top_persisted_messages.append((code, msg))
+                if len(top_persisted_messages) >= 3:
+                    break
+            reflection_prompt = _build_repair_reflection_prompt(
+                prior_diagnostics_count=len(prior_fps_set),
+                current_diagnostics_count=len(current_fps_set),
+                resolved_fingerprints=resolved,
+                persisted_fingerprints=persisted,
+                new_fingerprints=new_fps,
+                top_persisted_messages=top_persisted_messages,
+            )
+            verdict_raw, new_budget = await _maybe_judgment_llm(
+                prompt=reflection_prompt,
+                budget_remaining_usd=state.get("budget_remaining_usd", 0.0),
+                purpose="repair_reflection",
+                enabled=True,
+            )
+            # Persist the (possibly reduced) budget back to state so the
+            # main repair dispatch sees the up-to-date number.
+            if isinstance(new_budget, (int, float)) and new_budget != state.get("budget_remaining_usd", 0.0):
+                state = cast(AgentState, dict(state))
+                state["budget_remaining_usd"] = float(new_budget)
+            reflection_verdict = _parse_repair_reflection_verdict(verdict_raw or "")
+            if reflection_verdict:
+                logger.info(
+                    "[repair_node] Reflection verdict: %s. Blocker: %s",
+                    reflection_verdict["verdict"],
+                    reflection_verdict["real_blocker"][:200],
+                )
+                try:
+                    from harness.observability import emit_event as _emit
+                    _emit(
+                        "repair_reflection_verdict",
+                        iteration=loop_counter["total_repairs"],
+                        verdict=reflection_verdict["verdict"],
+                        real_blocker=reflection_verdict["real_blocker"][:500],
+                        recommendation=reflection_verdict["recommendation"][:500],
+                        prior_count=len(prior_fps_set),
+                        current_count=len(current_fps_set),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
     # Failure-path memory cleanse: from the SECOND repair iteration onward,
     # trim the message list so iteration N's LLM call doesn't carry the bloat
     # of 1..N-1. apply_memory_cleanse fires only on success/HITL; this
@@ -6021,11 +6377,32 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         if str(e.get("severity", "error")).lower() != "warning"
     ]
     if len(errors) < len(raw_errors):
+        dropped_warn = len(raw_errors) - len(errors)
         logger.info(
             "[repair_node] Filtered %d warning-severity diagnostic(s); "
             "%d error(s) passed through to repair.",
-            len(raw_errors) - len(errors), len(errors),
+            dropped_warn, len(errors),
         )
+        # Phase 2.1 — decision-point logging.
+        try:
+            from harness.observability import emit_event as _emit_drop
+            _emit_drop(
+                "dropped_from_prompt",
+                site="warning_severity_filter",
+                dropped_count=dropped_warn,
+                kept_count=len(errors),
+                reason="warnings_do_not_block_build",
+                examples=[
+                    {
+                        "code": str(e.get("error_code", "?")),
+                        "message_excerpt": str(e.get("message", ""))[:80],
+                    }
+                    for e in raw_errors
+                    if str(e.get("severity", "error")).lower() == "warning"
+                ][:5],
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     # LLM-judgment pre-flight autofix classifier (#2). On the FIRST repair
     # iteration, when the diagnostics carry MISSING_DEP or
@@ -6238,7 +6615,28 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     error_summary += _format_test_collection_cascade_section(
         errors, workspace_path,
     )
-    error_summary += _format_diagnostics_for_repair(errors)
+    # Pass the prior round's diagnostic fingerprints so the formatter can
+    # promote any group that survived past the cascade prior. See
+    # ``_format_diagnostics_for_repair`` for the layered defense (Layer 3).
+    # Also pass any codes the LLM requested via PROMOTE_DEFERRED on the
+    # PREVIOUS round (Phase 1.2 escape hatch).
+    # Phase 4 — emit structured JSON payload alongside markdown unless
+    # the operator has disabled it via config.
+    _gw_for_payload = get_gateway()
+    _emit_structured_payload = bool(
+        _gw_for_payload is None
+        or getattr(
+            _gw_for_payload.config,
+            "repair_structured_diagnostic_payload",
+            True,
+        )
+    )
+    error_summary += _format_diagnostics_for_repair(
+        errors,
+        prior_fingerprints=set(state.get("prior_diag_fingerprints") or []),
+        promoted_codes=set(state.get("promoted_codes_next_round") or []),
+        emit_structured_payload=_emit_structured_payload,
+    )
 
     gateway = get_gateway()
     if gateway is None:
@@ -6257,8 +6655,19 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     # tells the LLM to fix the vulnerability root cause rather than
     # patch over a build error.
     _SECURITY_PREFIXES = ("BANDIT:", "SEMGREP:", "TRIVY:", "GITLEAKS:", "GITLEAKS-FALLBACK:")
-    is_security_repair = bool(errors) and all(
-        str(e.get("error_code", "")).upper().startswith(_SECURITY_PREFIXES) for e in errors
+    # Phase 3(e) — tolerate mixed-prefix repair contexts. The original
+    # ``all(...)`` flipped the entire prompt frame to non-security
+    # whenever even one stray compile error appeared alongside scanner
+    # findings (e.g. when semgrep's ``extra.fix`` leaves a syntactically
+    # broken patch behind and the next compile surfaces both). Use a
+    # supermajority threshold so the dominant repair context wins.
+    _SECURITY_PREFIX_DOMINANCE_THRESHOLD = 0.8
+    _security_count = sum(
+        1 for e in errors
+        if str(e.get("error_code", "")).upper().startswith(_SECURITY_PREFIXES)
+    )
+    is_security_repair = bool(errors) and (
+        _security_count / len(errors) >= _SECURITY_PREFIX_DOMINANCE_THRESHOLD
     )
 
     # Detect repair driven by harness-generated test failures. The
@@ -6266,8 +6675,15 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
     # with "TEST_FAILURE" so we can swap in framing that tells the LLM these
     # are unit-test failures (not compile errors) and that fixing the
     # implementation is preferred over weakening the test assertion.
-    is_test_failure_repair = bool(errors) and all(
-        str(e.get("error_code", "")).upper().startswith("TEST_FAILURE") for e in errors
+    # Phase 3(e) — same supermajority logic as is_security_repair so a
+    # single stray compile diagnostic alongside test failures doesn't
+    # flip the entire prompt out of the test-failure framing.
+    _test_failure_count = sum(
+        1 for e in errors
+        if str(e.get("error_code", "")).upper().startswith("TEST_FAILURE")
+    )
+    is_test_failure_repair = bool(errors) and (
+        _test_failure_count / len(errors) >= _SECURITY_PREFIX_DOMINANCE_THRESHOLD
     )
 
     # Include lintgate errors from the previous compiler run
@@ -6591,8 +7007,14 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             )
         # Soft turn-budget warning (audit #19). Injected as a system
         # message so the LLM treats it with authority. Fires only on the
-        # last two repair iterations; quiet otherwise.
-        budget_warning = _repair_budget_warning(total_repairs, max_repair_attempts)
+        # last two repair iterations; quiet otherwise. With Phase 1.1
+        # the warning is keyed on ``no_progress_repairs`` (the actual HITL
+        # gate), not raw ``total_repairs``. A model that has spent 5 total
+        # rounds but made progress in every one shouldn't see a "last
+        # iteration" warning — its budget is intact. Conversely, a model
+        # that has stalled twice will see the warning at total=2.
+        _no_progress_for_warning = int(loop_counter.get("no_progress_repairs", 0))
+        budget_warning = _repair_budget_warning(_no_progress_for_warning, max_repair_attempts)
         if budget_warning is not None:
             messages.append(MessageDict(role="system", content=budget_warning))
             try:
@@ -6600,11 +7022,37 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 emit_event(
                     "repair_budget_warning",
                     total_repairs=total_repairs,
+                    no_progress_repairs=_no_progress_for_warning,
                     cap=max_repair_attempts,
-                    remaining=max_repair_attempts - total_repairs,
+                    remaining=max_repair_attempts - _no_progress_for_warning,
                 )
             except Exception:  # noqa: BLE001 — telemetry must not block
                 pass
+
+        # Phase 2.2 — inject the reflection verdict as an authoritative
+        # system message ahead of the repair prompt. The model that just
+        # finished an iteration was, by definition, blind to whether its
+        # patches addressed the right error; the cheap reflection judge
+        # has perspective and tells it explicitly. For PROGRESS verdicts
+        # we don't inject anything (don't waste tokens on "you did fine"),
+        # only on DISTRACTION or REGRESSION where the next round needs to
+        # change direction.
+        if (
+            reflection_verdict is not None
+            and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
+            and reflection_verdict["real_blocker"]
+        ):
+            reflection_msg = (
+                f"[Reflection — verdict: {reflection_verdict['verdict']}] "
+                f"The previous repair iteration did not address the "
+                f"highest-priority error. Real blocker: "
+                f"{reflection_verdict['real_blocker']}"
+            )
+            if reflection_verdict["recommendation"]:
+                reflection_msg += (
+                    f" Recommendation: {reflection_verdict['recommendation']}"
+                )
+            messages.append(MessageDict(role="system", content=reflection_msg))
 
         # Append the repair prompt first
         messages.append(MessageDict(role="user", content=repair_prompt))
@@ -6746,6 +7194,36 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
         # Strip any residual READ_FILE blocks so the patcher doesn't try to
         # parse them as patches and so commit messages stay clean.
         patch_payload = _strip_read_blocks(response.content)
+        # Phase 1.2 — capture PROMOTE_DEFERRED escape-hatch requests.
+        # Parse, strip from the patch payload, stash on state for the
+        # NEXT round's formatter to consume. Promotion only lasts one
+        # round (single-use credit), which keeps the budget bounded.
+        try:
+            from harness.patcher import (
+                parse_promote_deferred_blocks as _parse_promote_blocks,
+                strip_promote_deferred_blocks as _strip_promote_blocks,
+            )
+            promoted_for_next = _parse_promote_blocks(patch_payload)
+            patch_payload = _strip_promote_blocks(patch_payload)
+            if promoted_for_next:
+                logger.info(
+                    "[repair_node] PROMOTE_DEFERRED captured for next round: %s",
+                    promoted_for_next,
+                )
+                try:
+                    from harness.observability import emit_event
+                    emit_event(
+                        "promote_deferred_request",
+                        codes=list(promoted_for_next),
+                        total_repairs=loop_counter.get("total_repairs", 0),
+                    )
+                except Exception:  # noqa: BLE001 — telemetry must not block
+                    pass
+        except Exception:  # noqa: BLE001 — escape-hatch parsing must not block patches
+            logger.exception(
+                "[repair_node] PROMOTE_DEFERRED capture failed; continuing without."
+            )
+            promoted_for_next = []
         # B5 enforce flag: opt-in via gateway config. False by default so we
         # don't break callers that haven't been updated to emit READ_FILE.
         gw_cfg = getattr(gateway, "config", None)
@@ -6786,6 +7264,28 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             if not r.success and isinstance(r.error, str)
             and "not in skill allowlist" in r.error
         ]
+        # Phase 2.1 — decision-point logging. Allowlist refusals are a
+        # quiet failure mode: the LLM's patch never lands, the repair
+        # round burns a slot, and unless you grep for "Rejected by
+        # allowlist" the loss is invisible. One structured event per
+        # rejection lets a post-mortem reconstruct exactly what files
+        # the harness refused to let the LLM touch.
+        if allowlist_rejections:
+            try:
+                from harness.observability import emit_event as _emit_drop
+                _emit_drop(
+                    "dropped_from_prompt",
+                    site="patcher_allowlist_rejection",
+                    dropped_count=len(allowlist_rejections),
+                    kept_count=success_count,
+                    reason="path_not_in_patcher_allowlist",
+                    examples=[
+                        {"file": r["file"], "operation": r["operation"]}
+                        for r in allowlist_rejections[:5]
+                    ],
+                )
+            except Exception:  # noqa: BLE001
+                pass
         # Capture the remaining failures (search-block-not-found,
         # file-already-exists, etc.) so the *next* repair iteration sees the
         # full error including the patcher's closest-match suggestion. The
@@ -6955,6 +7455,13 @@ Generate your fix patches NOW. Only the blocks above. No other text."""
             "token_tracker": token_tracker,
             "budget_remaining_usd": new_budget,
             "loop_counter": loop_counter,
+            # Phase 1.2 — single-round promotion credit. The codes the
+            # LLM requested in this round's response surface on the NEXT
+            # round's diagnostic formatter, then get cleared. If empty
+            # (no request was made), this still overwrites any prior
+            # round's list — which is intentional: each request is
+            # consumed-on-use, not stacked.
+            "promoted_codes_next_round": list(promoted_for_next),
             "node_state": {
                 **(state.get("node_state") or {}),
                 "current_node": "repair",
@@ -7238,13 +7745,162 @@ def _build_hitl_escalation_summary_prompt(
         f"Tail of last build output (truncated):\n"
         f"{last_build_output[-1200:] if last_build_output else '(empty)'}\n"
     )
+    # Phase 2.1 — decision-point logging. The 1200-char tail is a hard
+    # truncation that hides the FIRST stack frames of multi-stage builds
+    # (webpack's initial import resolution error, javac's first
+    # cannot-find-symbol, etc.) when the log is long. Emit a structured
+    # event so post-mortems can tell whether the truncation chopped the
+    # signal vs. genuinely had nothing important earlier in the log.
+    if last_build_output and len(last_build_output) > 1200:
+        try:
+            from harness.observability import emit_event as _emit_drop
+            _emit_drop(
+                "dropped_from_prompt",
+                site="hitl_summary_build_log_truncation",
+                dropped_count=len(last_build_output) - 1200,
+                kept_count=1200,
+                reason="hitl_summary_keeps_last_1200_chars",
+                full_log_size=len(last_build_output),
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
 # 5. Helper Utilities
 # ---------------------------------------------------------------------------
 
-def _format_diagnostics_for_repair(errors: list[DiagnosticObjectDict]) -> str:
+# Phase 3(a) — message normalization for fingerprinting. Many compilers
+# (TypeScript especially) embed concrete types and identifiers inside the
+# error message itself, not just in the location. The same morally
+# identical bug at rounds N and N+1 can produce different raw messages
+# because a partial fix changed one of the types in the inferred chain.
+# Example: ``Type 'string[]' is not assignable to type 'number[]'`` →
+# ``Type 'string[]' is not assignable to type 'boolean[]'`` after a fix
+# attempt that swapped one concrete to another. Without normalization,
+# the fingerprint changes, Layer 3's survival promotion misses it, and
+# the cascade prior (which dropped it last round) keeps dropping it.
+# We strip:
+#   * single-quoted spans  ('foo', 'string[]', 'Foo<Bar>')  →  '*'
+#   * back-quoted spans   (`foo`, `Foo`)                    →  `*`
+#   * double-quoted spans ("foo")                           →  "*"
+# Numeric tokens with no semantic value (line/col numbers occasionally
+# inlined in messages) are NOT stripped — they're rare in error messages
+# (location is a separate field) and stripping them risks collapsing
+# distinct errors that genuinely differ by line.
+_FINGERPRINT_QUOTED_SPAN = re.compile(r"'[^']{1,200}'|`[^`]{1,200}`|\"[^\"]{1,200}\"")
+
+
+def _normalize_diagnostic_message(msg: str) -> str:
+    """Normalise a diagnostic message into a fingerprint-stable form.
+
+    Replaces concrete identifiers and type spellings inside quotes with
+    a generic placeholder so the message shape (which represents the
+    error class) stays stable across rounds even when the LLM's partial
+    fix swapped one type/symbol for another. See module-level docstring
+    of _FINGERPRINT_QUOTED_SPAN for the failure mode this addresses.
+
+    Whitespace is collapsed to single spaces so subtle reformatting
+    (e.g. compiler v1 prints ``X is not assignable to Y`` vs v2
+    ``X\nis not assignable to\nY``) doesn't create false divergence.
+    """
+    if not msg:
+        return ""
+    collapsed = _FINGERPRINT_QUOTED_SPAN.sub("'*'", msg)
+    return " ".join(collapsed.split())
+
+
+def _fingerprint_diagnostics(
+    errors: list[DiagnosticObjectDict],
+) -> list[str]:
+    """Return a sorted, deduped list of ``"<code>::<normalised_message>"``
+    fingerprints for error-severity diagnostics in ``errors``.
+
+    Used by compiler_node to stash the current round's diagnostic shape so
+    repair_node can detect which groups survived into the next round and
+    promote them past the cascade-ranking prior. Warnings are excluded —
+    they don't enter the repair prompt and shouldn't pollute the survival
+    set. Phase 3(a): the message component is normalised via
+    ``_normalize_diagnostic_message`` so a partial fix that swaps one
+    concrete type for another doesn't break the survival match.
+    """
+    out: set[str] = set()
+    for err in errors:
+        if str(err.get("severity", "error")).lower() == "warning":
+            continue
+        code = str(err.get("error_code", "UNKNOWN"))
+        msg = _normalize_diagnostic_message(
+            str(err.get("message", "No message"))
+        )
+        out.add(f"{code}::{msg}")
+    return sorted(out)
+
+
+def _format_structured_diagnostic_payload(
+    errors: list[DiagnosticObjectDict],
+    *,
+    max_total: int = 25,
+) -> str:
+    """Phase 4 — produce a structured JSON block of every diagnostic (up
+    to ``max_total``) so the LLM can sort/filter/group itself.
+
+    The cascade-defense layers expose the harness's *suggested* ordering
+    via the markdown summary; this block gives the LLM the *raw* data
+    to override that ordering if it disagrees. Caps at ``max_total`` to
+    bound token cost (250-error builds would otherwise pay an extra
+    50-100k tokens of JSON). When the cap is hit, an ``"_truncated"``
+    field announces it so the LLM knows there's more not shown.
+
+    Returns the empty string when there's nothing to serialise — the
+    caller will skip appending an empty section.
+    """
+    if not errors:
+        return ""
+    payload_items: list[dict[str, Any]] = []
+    for err in errors[:max_total]:
+        item = {
+            "file": str(err.get("file", "?")),
+            "line": int(err.get("line", 0) or 0),
+            "column": int(err.get("column", 0) or 0),
+            "code": str(err.get("error_code", "?")),
+            "severity": str(err.get("severity", "error")),
+            "message": str(err.get("message", "")),
+        }
+        ctx = (err.get("semantic_context") or "").strip()
+        if ctx:
+            item["semantic_context"] = ctx[:1000]
+        sym = (err.get("missing_symbol") or "").strip()
+        if sym:
+            item["missing_symbol"] = sym
+        payload_items.append(item)
+    payload: dict[str, Any] = {"diagnostics": payload_items}
+    if len(errors) > max_total:
+        payload["_truncated"] = {
+            "shown": max_total,
+            "total": len(errors),
+            "reason": (
+                f"structured payload capped at {max_total} items to bound "
+                "token cost; see the markdown summary above for the "
+                "harness's prioritised view of the rest."
+            ),
+        }
+    body = json.dumps(payload, indent=2, default=str)
+    return (
+        "\n\n### Structured payload (for programmatic processing)\n"
+        "_The same diagnostics in machine-readable form. If you want to "
+        "sort or filter differently than the harness's cascade ranking "
+        "above, use this view. Both views show the same underlying data._\n"
+        f"```json\n{body}\n```"
+    )
+
+
+def _format_diagnostics_for_repair(
+    errors: list[DiagnosticObjectDict],
+    *,
+    prior_fingerprints: Optional[set[str]] = None,
+    promoted_codes: Optional[set[str]] = None,
+    emit_structured_payload: bool = True,
+) -> str:
     """Format structured diagnostics into a concise, **grouped** repair prompt.
 
     Without grouping, 16 occurrences of "F821 Undefined name 'pytest'" across
@@ -7277,21 +7933,83 @@ def _format_diagnostics_for_repair(errors: list[DiagnosticObjectDict]) -> str:
             f"{err.get('file', '?')}:{err.get('line', 0)}:{err.get('column', 0)}"
         )
 
+    # Tag each group with its survival status from the prior round so the
+    # ranker can promote persisted groups past the cascade prior. Layer 3
+    # of the cascade-defense hierarchy — see the function-level note above.
+    # Phase 3(a): the lookup uses the SAME normalisation as
+    # ``_fingerprint_diagnostics`` so a partial fix that swapped one
+    # concrete type for another still matches the prior round's group.
+    _prior: set[str] = prior_fingerprints or set()
+    # LLM-requested promotion (Phase 1.2). The model emits
+    # ``<<<PROMOTE_DEFERRED>>>`` with codes; repair_node captures them and
+    # passes them here. These rank ABOVE survival promotion: an explicit
+    # request from the model that just saw the prompt is the strongest
+    # signal possible. Normalised to upper-case so ``ts2769`` matches
+    # ``TS2769``.
+    _promoted: set[str] = {c.upper() for c in (promoted_codes or set())}
+    for group in groups.values():
+        normalized_fp = (
+            f"{group['code']}::"
+            f"{_normalize_diagnostic_message(str(group['message']))}"
+        )
+        group["persisted"] = normalized_fp in _prior
+        group["llm_promoted"] = (
+            str(group["code"]).upper() in _promoted
+        )
+
     # Rank groups by likely cascade impact so the top-N the LLM sees are the
     # ones whose fix is most likely to make other errors disappear.
-    # Heuristic order:
-    #   1. Severity error > warning (warnings don't break the build).
-    #   2. "Upstream" kinds first — undefined names, missing imports, missing
-    #      deps. F821/F401 are pyflakes-shaped; ImportError /
-    #      ModuleNotFoundError surface from pytest. Fix one of these and
-    #      multiple downstream diagnostics often vanish at once.
-    #   3. Original first-seen position breaks ties so the LLM still gets a
+    # Heuristic order (lower rank = higher priority, sorted ascending):
+    #   1. Survival rank — groups that persisted from the previous repair
+    #      round are unconditionally promoted. Empirical evidence beats the
+    #      cascade prior: if a group survived the last round, the prior was
+    #      wrong about it cascading away. This is the fix for the failure
+    #      mode where TS2769 / TS2353 / any non-upstream error was deferred
+    #      for 3 rounds, never got top-N context, and burned the budget.
+    #   2. Severity error > warning (warnings don't break the build).
+    #   3. "Upstream" kinds first — undefined names, missing imports, missing
+    #      deps. F821/F401 are pyflakes-shaped; TS2304/TS2305/TS2307 are
+    #      the TypeScript equivalents (cannot-find-name / missing-export /
+    #      cannot-find-module); ImportError / ModuleNotFoundError surface
+    #      from pytest. Fix one of these and multiple downstream diagnostics
+    #      often vanish at once.
+    #   4. Original first-seen position breaks ties so the LLM still gets a
     #      stable order across iterations.
     _UPSTREAM_PREFIXES = (
+        # Python — pyflakes / pylint / pytest collection
         "F821", "F401", "E0001", "E0401", "E0602", "E1101",
+        # TypeScript — tsc absence-shaped diagnostics
+        "TS2304", "TS2305", "TS2307", "TS2552", "TS2459",
+        # Phase 3(c) — per-language absence-shaped codes from supported
+        # parsers. Each language's "X cannot be found" / "no such Y" /
+        # "module not declared" errors get the cascade-prior bump that
+        # F821 et al. already enjoy. Add new prefixes here as you add
+        # parser support; sourced from observed compiler/linter output
+        # rather than allowlist guesses.
+        # Rust — rustc (E0xxx absence codes)
+        "E0405", "E0412", "E0422", "E0423", "E0425", "E0432", "E0433",
+        # Go — go build / go vet markers
+        "GO:UNDEFINED", "GO:CANNOT_FIND_PACKAGE", "GO:UNDEFINED_SYMBOL",
+        # Java — javac
+        "JAVA:CANNOT_FIND_SYMBOL", "JAVA:PACKAGE_DOES_NOT_EXIST",
+        # Kotlin — kotlinc
+        "KOTLIN:UNRESOLVED_REFERENCE",
+        # C / C++ — gcc/clang
+        "GCC:UNDECLARED", "CLANG:UNDECLARED", "GCC:FATAL_FILE_NOT_FOUND",
+        # C# / dotnet — Roslyn
+        "CS0103", "CS0234", "CS0246",
+        # Swift — swiftc
+        "SWIFT:CANNOT_FIND_IN_SCOPE", "SWIFT:NO_SUCH_MODULE",
+        # Generic miss markers from the harness's own parsers / runners
         "MISSING_DEP", "MISSING_IMPORT", "IMPORTERROR", "MODULENOTFOUND",
         "SYNTAXERR", "TEST_FAILURE:IMPORTERROR",
     )
+
+    def _llm_promoted_rank(g: dict[str, Any]) -> int:
+        return 0 if g.get("llm_promoted") else 1
+
+    def _survival_rank(g: dict[str, Any]) -> int:
+        return 0 if g.get("persisted") else 1
 
     def _severity_rank(g: dict[str, Any]) -> int:
         return 0 if str(g.get("severity", "error")).lower() == "error" else 1
@@ -7358,23 +8076,52 @@ def _format_diagnostics_for_repair(errors: list[DiagnosticObjectDict]) -> str:
     group_list = list(groups.values())
     ranked = sorted(
         enumerate(group_list),
-        key=lambda pair: (_severity_rank(pair[1]), _kind_rank(pair[1]), pair[0]),
+        key=lambda pair: (
+            _llm_promoted_rank(pair[1]),
+            _survival_rank(pair[1]),
+            _severity_rank(pair[1]),
+            _kind_rank(pair[1]),
+            pair[0],
+        ),
     )
+    # Layer 2 — small-N short-circuit. Deferring a group strips its full
+    # source context from the prompt; that's only a worthwhile token saving
+    # when there are enough groups that the context bloat would matter. At
+    # ≤ 5 distinct shapes, show all of them with full context. This handles
+    # the late-iteration "small surviving tail" case where the LLM has
+    # cleared most diagnostics and is being asked to finish off a handful,
+    # without the deferral mechanism stealing context from any of them.
     TOP_N = 3
-    shown = [g for _, g in ranked[:TOP_N]]
-    hidden = [g for _, g in ranked[TOP_N:]]
+    _SMALL_N_THRESHOLD = 5
+    if len(group_list) <= _SMALL_N_THRESHOLD:
+        shown = [g for _, g in ranked]
+        hidden: list[dict[str, Any]] = []
+    else:
+        shown = [g for _, g in ranked[:TOP_N]]
+        hidden = [g for _, g in ranked[TOP_N:]]
 
     lines: list[str] = [
         f"## Compiler Diagnostics ({len(errors)} total, "
         f"{len(groups)} distinct shape{'s' if len(groups) != 1 else ''})\n"
     ]
     if hidden:
+        # Layer 0 — honest wording. The previous text claimed deferred
+        # groups "may resolve on their own", which the LLM took at face
+        # value and consistently ignored them. They didn't resolve; the
+        # repair budget exhausted; HITL fired. The replacement framing
+        # tells the truth: deferred items aren't sentenced, just lower
+        # priority for THIS round's context budget. If they survive into
+        # the next round, Layer 3 will promote them.
         lines.append(
             f"_Showing the top {len(shown)} of {len(groups)} groups ranked by "
             f"likely cascade impact (fixing an upstream undefined-name / "
             f"missing-import often resolves multiple downstream errors). "
-            f"Address these first; the {len(hidden)} other group(s) may "
-            f"resolve on their own._\n"
+            f"Full source context is shown for these. The {len(hidden)} "
+            f"deferred group(s) are listed for awareness — address them "
+            f"too in the same response if the fix is unambiguous from "
+            f"the message alone; otherwise focus on the top groups and "
+            f"the deferred items will be promoted to top context next "
+            f"iteration if they persist._\n"
         )
     for i, group in enumerate(shown, 1):
         locs = group["locations"]
@@ -7387,9 +8134,20 @@ def _format_diagnostics_for_repair(errors: list[DiagnosticObjectDict]) -> str:
             head = ", ".join(f"`{loc}`" for loc in locs[:4])
             tail = "" if count <= 4 else f" (+ {count - 4} more)"
             loc_display = head + tail
+        # Layer 0 — mark persisted groups in the header so the LLM knows
+        # exactly which item the harness had to bump past the cascade
+        # prior. Signals "this is the one we missed last round, don't
+        # miss it again." LLM-promoted groups (Phase 1.2 escape hatch)
+        # get a distinct tag so the model knows its request was honored.
+        tags: list[str] = []
+        if group.get("llm_promoted"):
+            tags.append("**[promoted at your request]**")
+        if group.get("persisted"):
+            tags.append("**[persisted from previous round]**")
+        tag_block = (" " + " ".join(tags)) if tags else ""
         lines.append(
             f"**Error {i}:** `{group['code']}` × {count} "
-            f"[{group['severity']}]"
+            f"[{group['severity']}]{tag_block}"
         )
         lines.append(f"  Message: {group['message']}")
         lines.append(f"  Locations: {loc_display}")
@@ -7400,10 +8158,38 @@ def _format_diagnostics_for_repair(errors: list[DiagnosticObjectDict]) -> str:
         if context:
             lines.append(f"  Context (first occurrence):\n```\n{context}\n```")
     if hidden:
+        # Phase 2.1 — decision-point logging. Emit a structured event
+        # naming exactly which groups got deferred from full context, so
+        # post-mortem investigations can grep one event name and see
+        # whether the harness's prompt-shaping starved the model of
+        # signal. Would have caught session 6cf20a5d's TS2769 deferral
+        # in one grep instead of an hour of debugging.
+        try:
+            from harness.observability import emit_event as _emit_drop
+            _emit_drop(
+                "dropped_from_prompt",
+                site="deferred_diagnostics",
+                dropped_count=len(hidden),
+                kept_count=len(shown),
+                reason="cascade_rank_topN_cutoff",
+                examples=[
+                    {
+                        "code": g["code"],
+                        "message_excerpt": (g["message"][:80] + "...") if len(g["message"]) > 80 else g["message"],
+                        "occurrences": len(g.get("locations", [])),
+                    }
+                    for g in hidden[:5]
+                ],
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not block
+            pass
         # One-line summary of the deferred groups so the LLM knows they exist
         # without bloating the prompt with full context blocks. Each entry
         # lists code + a short message excerpt + count.
-        tail_lines = ["", f"### Deferred ({len(hidden)} group(s) — fix the top {len(shown)} first):"]
+        tail_lines = [
+            "",
+            f"### Deferred ({len(hidden)} group(s) — top {len(shown)} have priority for this round):",
+        ]
         for g in hidden:
             msg = g["message"]
             if len(msg) > 80:
@@ -7411,8 +8197,34 @@ def _format_diagnostics_for_repair(errors: list[DiagnosticObjectDict]) -> str:
             tail_lines.append(
                 f"- `{g['code']}` × {len(g['locations'])}: {msg}"
             )
+        # Phase 1.2 — advertise the escape hatch. The LLM can override
+        # this round's cascade ranking by emitting a PROMOTE_DEFERRED
+        # block; the codes named get full ``semantic_context`` next round.
+        tail_lines.extend([
+            "",
+            "**If you believe a deferred group above is actually the "
+            "blocker** (e.g. it's a type-mismatch the cascade prior "
+            "underestimates, not a downstream cascade victim), emit "
+            "this block alongside your patches to force full source "
+            "context on the next round:",
+            "```",
+            "<<<PROMOTE_DEFERRED>>>",
+            "codes: TS2769, F401",
+            "<<<END_PROMOTE_DEFERRED>>>",
+            "```",
+            "The named codes get top-N treatment regardless of cascade "
+            "rank. Use sparingly — promotion costs context budget on "
+            "the next round.",
+        ])
         lines.extend(tail_lines)
-    return "\n".join(lines)
+    rendered = "\n".join(lines)
+    # Phase 4 — append a structured JSON block of every diagnostic so
+    # the LLM can sort/filter/group on its own if it disagrees with the
+    # harness's cascade ranking. Capped + opt-out via config so the
+    # token cost is bounded.
+    if emit_structured_payload:
+        rendered += _format_structured_diagnostic_payload(errors)
+    return rendered
 
 
 # ---------------------------------------------------------------------------
@@ -7622,11 +8434,36 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
         )
         return _transition("human_intervention_node")
 
-    if total_repairs >= max_iterations and not has_autofixable:
+    # Phase 1.1 — progress-based budget gate. The HITL escalation now reads
+    # ``no_progress_repairs`` (rounds that failed to shrink the fingerprint
+    # set; see repair_node for the counter) instead of raw ``total_repairs``.
+    # A session that goes 251 → 9 → 3 → 1 → 0 over 4 rounds no longer
+    # escalates at round 3 even though it spent 3 iterations — those rounds
+    # all made progress and don't count against the budget. The safety
+    # ceiling at ``2 * max_iterations`` total prevents runaway loops where
+    # the LLM keeps producing different patches that never converge but
+    # appear to make per-round progress (fingerprint churn).
+    no_progress_repairs = int(loop_counter.get("no_progress_repairs", 0))
+    if no_progress_repairs >= max_iterations and not has_autofixable:
         logger.warning(
-            "[router] Repair limit reached (%d/%d). Routing to HITL.",
-            total_repairs,
-            max_iterations,
+            "[router] No-progress repair limit reached (%d non-progress / "
+            "%d cap; %d total rounds). Routing to HITL.",
+            no_progress_repairs, max_iterations, total_repairs,
+        )
+        return _transition("human_intervention_node")
+
+    # Hard safety ceiling on total iterations regardless of per-round
+    # progress signal. Catches the fingerprint-churn case where each round
+    # technically resolves one fingerprint but introduces a new one of
+    # equal weight, so no_progress_repairs never trips.
+    _TOTAL_HARD_CAP_MULTIPLIER = 2
+    total_hard_cap = max_iterations * _TOTAL_HARD_CAP_MULTIPLIER
+    if total_repairs >= total_hard_cap and not has_autofixable:
+        logger.warning(
+            "[router] Hard total-iteration ceiling reached (%d/%d). "
+            "Loop is making per-round progress but not converging. "
+            "Routing to HITL.",
+            total_repairs, total_hard_cap,
         )
         return _transition("human_intervention_node")
 

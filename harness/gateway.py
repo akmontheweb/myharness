@@ -1225,6 +1225,72 @@ def hash_stable_prefix(
     return h.hexdigest()
 
 
+def _serialize_prefix_for_diff(
+    messages: list[dict[str, Any]],
+    n_stable: int = 2,
+) -> str:
+    """Phase 3(b) — return a stable text serialisation of the first
+    ``n_stable`` messages so a subsequent call can diff against it.
+
+    Uses the same shape rules as ``hash_stable_prefix`` (role|content
+    blocks separated by ``\\n---\\n``) so the diff aligns with the hash
+    boundaries the cache-drift detector saw. JSON content is serialised
+    with sort_keys=True to ensure dict ordering doesn't cause spurious
+    diffs.
+    """
+    parts: list[str] = []
+    for msg in messages[: max(0, n_stable)]:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            content_str = content
+        else:
+            content_str = json.dumps(content, sort_keys=True, default=str)
+        parts.append(f"{role}|{content_str}")
+    return "\n---\n".join(parts)
+
+
+def _summarize_prefix_diff(
+    *, old: str, new: str, max_excerpt_chars: int = 240,
+) -> dict[str, Any]:
+    """Phase 3(b) — produce a compact, observability-event-friendly
+    summary of where two prefix snapshots first diverge.
+
+    Returns a dict with:
+      ``size_old`` / ``size_new`` — byte length of each snapshot
+      ``first_diff_offset`` — character offset where they first differ
+      ``first_diff_line`` — 1-indexed line where they first differ
+      ``before_excerpt`` — short slice from the OLD prefix at the
+        divergence point (so the post-mortem can see what was there)
+      ``after_excerpt`` — short slice from the NEW prefix at the
+        divergence point (so the post-mortem can see what changed it)
+
+    When the snapshots are byte-identical (drift hash false-positive,
+    rare but possible with collision-resistant SHA-256 we can rule it
+    out), returns ``{"identical": True}``.
+    """
+    if old == new:
+        return {"identical": True}
+    n = min(len(old), len(new))
+    first_diff = n  # default if one is a strict prefix of the other
+    for i in range(n):
+        if old[i] != new[i]:
+            first_diff = i
+            break
+    line_no = old.count("\n", 0, first_diff) + 1
+    half = max_excerpt_chars // 2
+    before = old[max(0, first_diff - half): first_diff + half]
+    after = new[max(0, first_diff - half): first_diff + half]
+    return {
+        "size_old": len(old),
+        "size_new": len(new),
+        "first_diff_offset": first_diff,
+        "first_diff_line": line_no,
+        "before_excerpt": before,
+        "after_excerpt": after,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 10. Context Window Guardrail & Truncation
 # ---------------------------------------------------------------------------
@@ -1667,6 +1733,21 @@ class GatewayConfig:
     llm_judgment_patcher_rejection_diagnosis: bool = True
     llm_judgment_preflight_autofix: bool = True
     llm_judgment_discovery_saturation: bool = True
+    # Phase 2.2 — per-round reflection. After each repair iteration
+    # (from total_repairs >= 2 onward, when there's a prior round to
+    # evaluate), a cheap LLM judges whether the previous round's patches
+    # actually addressed the highest-priority error. If not, it names
+    # the real blocker and injects that as a system message for the
+    # current round's repair LLM. ~$0.001 per round. Off by setting
+    # llm_judgment.repair_reflection=false.
+    llm_judgment_repair_reflection: bool = True
+    # Phase 4 — emit a structured JSON block of every diagnostic in the
+    # repair prompt alongside the markdown summary, so the LLM has the
+    # raw data and can override the harness's cascade ranking if it
+    # disagrees. Capped at 25 items inside the formatter to bound token
+    # cost. Off by setting repair_structured_diagnostic_payload=false in
+    # config to fall back to markdown-only.
+    repair_structured_diagnostic_payload: bool = True
     # Sixth touchpoint (added alongside the saturation check): on each
     # discovery follow-up round, picks the 3-5 sectors most worth
     # re-auditing this round and splices them into the prompt's
@@ -1766,6 +1847,13 @@ class Gateway:
         # Bounded in size: cleared when the gateway closes; in-memory only
         # so it doesn't survive process restarts (no value in resuming it).
         self._prefix_hashes: dict[tuple[str, str], str] = {}
+        # Phase 3(b) — companion snapshot of the previous prefix as a
+        # plain string per (session, role). When drift is detected, the
+        # next call's prefix is diffed against this snapshot so the
+        # observability event can carry "first changed line index" +
+        # excerpt. Keeps a single string per key (~tens of KB max) so
+        # the dict bounds match _prefix_hashes.
+        self._prefix_snapshots: dict[tuple[str, str], str] = {}
 
     async def _get_provider(self, model_key: str) -> BaseLLM:
         """Get or create a cached provider instance."""
@@ -2212,6 +2300,26 @@ class Gateway:
                     role.value, _sid[:8] if _sid else "?",
                     _last_hash[:8], _prefix_hash[:8],
                 )
+                # Phase 3(b) — diff the prefix against the prior snapshot
+                # so post-mortems can SEE what changed. The hash-only
+                # event lets you grep for drift but tells you nothing
+                # about the cause — so most teams have learned to
+                # ignore it. Capture the first changed line index + a
+                # short snippet of the new prefix at that offset.
+                # All-best-effort: any error here downgrades silently
+                # to the hash-only emit below.
+                _diff_payload: dict[str, Any] = {}
+                try:
+                    _prev_snapshot = self._prefix_snapshots.get(_drift_key)
+                    if _prev_snapshot is not None:
+                        new_snapshot = _serialize_prefix_for_diff(
+                            messages, n_stable=2,
+                        )
+                        _diff_payload = _summarize_prefix_diff(
+                            old=_prev_snapshot, new=new_snapshot,
+                        )
+                except Exception:  # noqa: BLE001
+                    _diff_payload = {}
                 if emit_event is not None:
                     try:
                         emit_event(
@@ -2220,10 +2328,20 @@ class Gateway:
                             session_id=_sid,
                             prev_hash=_last_hash[:8],
                             now_hash=_prefix_hash[:8],
+                            **_diff_payload,
                         )
                     except Exception:  # noqa: BLE001
                         pass
             self._prefix_hashes[_drift_key] = _prefix_hash
+            # Stash a string snapshot of the new prefix so the NEXT
+            # call can diff against it without re-serialising both
+            # sides.
+            try:
+                self._prefix_snapshots[_drift_key] = (
+                    _serialize_prefix_for_diff(messages, n_stable=2)
+                )
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as exc:  # noqa: BLE001 — drift telemetry must never block dispatch
             logger.debug("[gateway] prefix drift check skipped: %s", exc)
 
@@ -2929,6 +3047,16 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         llm_judgment_discovery_saturation=bool(
             (config_dict.get("llm_judgment", {}) or {}).get(
                 "discovery_saturation_check", True,
+            )
+        ),
+        llm_judgment_repair_reflection=bool(
+            (config_dict.get("llm_judgment", {}) or {}).get(
+                "repair_reflection", True,
+            )
+        ),
+        repair_structured_diagnostic_payload=bool(
+            (config_dict.get("repair", {}) or {}).get(
+                "structured_diagnostic_payload", True,
             )
         ),
         llm_judgment_discovery_followup_focus=bool(

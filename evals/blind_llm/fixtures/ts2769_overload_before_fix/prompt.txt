@@ -1,0 +1,19 @@
+The build failed with the following errors. Generate precise SEARCH/REPLACE patches to fix them.
+
+## Compiler Diagnostics (9 total, 5 distinct shapes)
+
+_Showing the top 3 of 5 groups ranked by likely cascade impact (fixing an upstream undefined-name / missing-import often resolves multiple downstream errors). Address these first; the 2 other group(s) may resolve on their own._
+
+**Error 1:** `TS2741` × 1 [error]
+  Message: Property 'cookie' is missing in type '{ status: jest.Mock<any, any, any>; json: jest.Mock<any, any, any>; }' but required in type '{ cookie: Mock<any, any, any>; status: Mock<any, any, any>; json: Mock<any, any, any>; }'.
+  Locations: `src/middleware/auth.test.ts:18:5`
+**Error 2:** `TS2353` × 2 [error]
+  Message: Object literal may only specify known properties, and 'updated_at' does not exist in type 'Omit<User, "id" | "created_at" | "updated_at">'.
+  Locations: `src/seed.ts:19:7`, `src/services/AuthService.ts:47:5`
+**Error 3:** `TS2353` × 2 [error]
+  Message: Object literal may only specify known properties, and 'updated_at' does not exist in type 'Omit<Product, "id" | "created_at" | "updated_at">'.
+  Locations: `src/seed.ts:42:9`, `src/services/ProductService.ts:54:5`
+
+### Deferred (2 group(s) — fix the top 3 first):
+- `TS2339` × 1: Property 'generateTokens' does not exist on type 'typeof import("/mnt/data1/a...
+- `TS2769` × 3: No overload matches this call.

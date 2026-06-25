@@ -1,0 +1,1 @@
+This fixture is the AFTER-FIX state: same session, but with Layer 3 (survival-aware promotion) and Layer 2 (small-N short-circuit) applied. TS2769 is in the top-N now with full semantic_context and a [persisted] tag. A blind LLM should reliably identify the jwt.sign / AuthService.ts issue from this prompt.

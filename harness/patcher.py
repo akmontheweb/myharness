@@ -192,6 +192,59 @@ def strip_read_blocks(llm_output: str) -> str:
     return _READ_FILE_PATTERN.sub("", llm_output)
 
 
+# PROMOTE_DEFERRED is the LLM's escape hatch against the cascade-ranking
+# heuristic. When the diagnostic formatter defers a group to the "for
+# awareness" tail, the LLM can emit:
+#
+#   <<<PROMOTE_DEFERRED>>>
+#   codes: TS2769, TS2353
+#   <<<END_PROMOTE_DEFERRED>>>
+#
+# to force the named error codes into top-N (full ``semantic_context``)
+# on the NEXT repair iteration. Mirrors READ_FILE's pattern: it's not a
+# patch operation, the harness consumes it inline and acts on it during
+# prompt assembly. The model knows when it disagrees with the harness's
+# prioritisation; this is how it says so.
+_PROMOTE_DEFERRED_PATTERN = re.compile(
+    r'<<<PROMOTE_DEFERRED>>>\s*\n'
+    r'codes:\s*(?P<codes>[^\n]+)\s*\n'
+    r'<<<END_PROMOTE_DEFERRED>>>',
+    re.DOTALL,
+)
+
+
+def parse_promote_deferred_blocks(llm_output: str) -> list[str]:
+    """Extract error codes from PROMOTE_DEFERRED blocks in ``llm_output``.
+
+    Returns a deduped, order-preserving list of code strings (e.g.
+    ``["TS2769", "F401"]``). Whitespace around individual codes is
+    stripped; empty entries are dropped. Multiple PROMOTE_DEFERRED blocks
+    in one response are combined. Best-effort: malformed blocks
+    contribute nothing rather than raising.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _PROMOTE_DEFERRED_PATTERN.finditer(llm_output):
+        codes_field = match.group("codes") or ""
+        for raw in codes_field.split(","):
+            code = raw.strip()
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            out.append(code)
+    return out
+
+
+def strip_promote_deferred_blocks(llm_output: str) -> str:
+    """Return ``llm_output`` with every PROMOTE_DEFERRED block removed.
+
+    Called after the harness has captured the promoted codes so the
+    blocks don't leak into ``parse_patch_blocks`` (they're not patches),
+    commit messages, or transcripts.
+    """
+    return _PROMOTE_DEFERRED_PATTERN.sub("", llm_output)
+
+
 # Tempered greedy token: matches any character (DOTALL) UNLESS that
 # character is the start of another block opener. This prevents a
 # non-greedy ``.*?`` body from spanning a forbidden boundary when the

@@ -3464,11 +3464,34 @@ class TestAgentState:
         with tempfile.TemporaryDirectory() as tmpdir:
             state = _make_state(tmpdir)
             state["exit_code"] = 1
-            # Default cap was raised from 3 → 5 (A5). HITL kicks in once
-            # total_repairs hits the cap; pin to the current default.
+            # Phase 1.1 — HITL gate is now keyed on no_progress_repairs,
+            # not total_repairs. A session that has spent 5 rounds but
+            # made progress every round shouldn't HITL — only one where
+            # the no_progress counter has hit the cap. Default cap is 5
+            # (node_throttle.max_patch_repair_iterations). Setting
+            # total_repairs=5 alone is no longer sufficient.
             state["loop_counter"]["total_repairs"] = 5
+            state["loop_counter"]["no_progress_repairs"] = 5
             state["budget_remaining_usd"] = 1.0
             assert route_after_compiler(state) == "human_intervention_node"
+
+    def test_route_after_compiler_total_repairs_without_no_progress_continues(self):
+        """Phase 1.1 — high total_repairs without no_progress signal means
+        the LLM has been making real progress every round. Don't HITL until
+        the hard ceiling (2 * max_iterations) or no_progress hits the cap."""
+        from harness.graph import route_after_compiler
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir)
+            state["exit_code"] = 1
+            state["loop_counter"]["total_repairs"] = 5
+            state["loop_counter"]["no_progress_repairs"] = 0
+            # Provide a non-empty compiler_errors so the autofix bypass
+            # doesn't claim the routing decision.
+            state["compiler_errors"] = [
+                {"error_code": "TS2769", "message": "x"}
+            ]
+            state["budget_remaining_usd"] = 1.0
+            assert route_after_compiler(state) == "repair_node"
 
     def test_route_after_compiler_budget_exhausted(self):
         from harness.graph import route_after_compiler

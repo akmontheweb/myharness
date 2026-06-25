@@ -4,6 +4,7 @@ import asyncio
 
 from harness.graph import (
     apply_memory_cleanse,
+    _fingerprint_diagnostics,
     _format_diagnostics_for_repair,
     _repair_budget_warning,
     route_after_deployment,
@@ -174,6 +175,658 @@ class TestFormatDiagnosticsForRepair:
         ]
         result = _format_diagnostics_for_repair(errors)
         assert isinstance(result, str)
+
+
+class TestCascadeDefenseLayers:
+    """Four-layer defense against the cascade-ranking heuristic deferring a
+    real error past the repair budget — see the AuthService.ts TS2769 case
+    in session 6cf20a5d. Each test pins one layer; they compose in real use.
+    """
+
+    def _err(self, code: str, msg: str, file: str = "x.ts") -> dict:
+        return {
+            "file": file,
+            "line": 1,
+            "column": 1,
+            "error_code": code,
+            "message": msg,
+            "severity": "error",
+            "semantic_context": f"// snippet for {code}",
+        }
+
+    def test_layer0_no_lying_wording(self):
+        """The deferred-section header must NOT claim items 'may resolve on
+        their own' — that was the false promise the LLM took at face value."""
+        # 7 distinct groups forces the deferred section to render.
+        errors = [self._err(f"TS{n}", f"msg {n}") for n in range(7000, 7007)]
+        out = _format_diagnostics_for_repair(errors)
+        assert "may resolve on their own" not in out
+        # And the deferred section must still appear (we didn't accidentally
+        # delete it — Layer 0 is wording-only).
+        assert "Deferred" in out
+
+    def test_layer1_typescript_upstream_promoted(self):
+        """TS2304/TS2305/TS2307 are upstream-shaped: cannot-find-name,
+        missing-export, cannot-find-module. They must outrank a generic
+        type-mismatch like TS2741 even when seen later."""
+        errors = [
+            self._err("TS2741", "Property 'cookie' is missing"),  # not upstream
+            self._err("TS2741", "Property 'cookie' is missing", file="y.ts"),
+            self._err("TS2741", "Property 'cookie' is missing", file="z.ts"),
+            self._err("TS2741", "Property 'cookie' is missing", file="w.ts"),
+            self._err("TS2304", "Cannot find name 'Foo'"),         # upstream — newer
+            self._err("TS2307", "Cannot find module 'bar'", file="b.ts"),
+            self._err("TS2305", "Module has no exported member 'baz'"),
+        ]
+        out = _format_diagnostics_for_repair(errors)
+        # The upstream TS codes must appear in the prompt before TS2741.
+        i_2304 = out.find("TS2304")
+        i_2307 = out.find("TS2307")
+        i_2305 = out.find("TS2305")
+        i_2741 = out.find("TS2741")
+        assert -1 not in (i_2304, i_2307, i_2305, i_2741)
+        assert i_2304 < i_2741
+        assert i_2307 < i_2741
+        assert i_2305 < i_2741
+
+    def test_layer2_small_n_short_circuit_shows_every_group(self):
+        """At ≤ 5 distinct groups, every group is shown with full context
+        and the deferred section is suppressed entirely."""
+        errors = [self._err(f"TS{n}", f"shape {n}") for n in range(2700, 2705)]  # 5 groups
+        out = _format_diagnostics_for_repair(errors)
+        for n in range(2700, 2705):
+            assert f"TS{n}" in out
+            # Each group's semantic_context must render (full-context proof).
+            assert f"// snippet for TS{n}" in out
+        # No deferred section.
+        assert "Deferred" not in out
+        assert "deferred" not in out
+
+    def test_layer2_threshold_boundary(self):
+        """At 6 groups (just past the small-N threshold) the deferred
+        section reappears and only top-3 get context."""
+        errors = [self._err(f"TS{n}", f"shape {n}") for n in range(2700, 2706)]  # 6 groups
+        out = _format_diagnostics_for_repair(errors)
+        assert "Deferred" in out
+        # Exactly 3 semantic_context blocks appear in the MARKDOWN portion
+        # (one per shown top-N). The Phase 4 structured JSON payload
+        # below echoes every snippet but we don't count those here.
+        markdown_only = out.split("### Structured payload", 1)[0]
+        assert markdown_only.count("// snippet for TS") == 3
+
+    def test_layer3_persisted_group_promoted_past_cascade(self):
+        """The AuthService.ts case in miniature. Round N has a non-upstream
+        TS2769 deferred behind 3 upstream errors. Round N+1, the upstream
+        errors got fixed but TS2769 survived — it must be promoted to the
+        top of the prompt regardless of cascade rank."""
+        # Build round 2's diagnostics: TS2769 survived, two upstream errors
+        # are NEW (e.g. a new cascade victim and a fresh missing-import).
+        # Sized at 6 distinct groups to force the deferred section to
+        # render (so we can prove the persisted item is in `shown`, not
+        # `hidden`).
+        errors = [
+            self._err("TS2304", "Cannot find name 'Brand new'", file="a.ts"),
+            self._err("TS2307", "Cannot find module 'fresh'", file="b.ts"),
+            self._err("TS2305", "Module has no exported member 'extra'", file="c.ts"),
+            self._err("TS2741", "Property 'x' is missing", file="d.ts"),
+            self._err("TS2353", "updated_at not in Omit<>", file="e.ts"),
+            self._err("TS2769", "No overload matches this call.",
+                      file="services/AuthService.ts"),
+        ]
+        # Prior round had only the TS2769 (the survivor).
+        prior = {"TS2769::No overload matches this call."}
+        out = _format_diagnostics_for_repair(errors, prior_fingerprints=prior)
+        # The persisted marker must render on the surviving group.
+        assert "persisted from previous round" in out
+        i_persisted_marker = out.find("persisted from previous round")
+        # TS2769 must be in the TOP-N (shown with full context), not in
+        # the deferred tail. Prove this by locating its semantic_context.
+        assert "// snippet for TS2769" in out
+        # And its top-N entry must appear BEFORE the deferred section
+        # header (so it wasn't shoved into the tail).
+        i_deferred = out.find("### Deferred")
+        assert i_deferred != -1, "deferred section should still render"
+        i_2769 = out.find("TS2769")
+        assert i_2769 < i_deferred
+        assert i_persisted_marker < i_deferred
+
+    def test_layer3_no_prior_state_behaves_like_before(self):
+        """No prior fingerprints (round 1 or after a green compile) →
+        formatter must rank by the original cascade prior. Backward
+        compat for the first-iteration case."""
+        errors = [
+            self._err("TS2741", "non-upstream A"),
+            self._err("TS2353", "non-upstream B"),
+            self._err("F821", "upstream undefined name"),
+        ]
+        out_no_prior = _format_diagnostics_for_repair(errors)
+        out_empty_prior = _format_diagnostics_for_repair(
+            errors, prior_fingerprints=set()
+        )
+        # F821 (upstream) must outrank both non-upstream errors in both
+        # codepaths.
+        assert out_no_prior.find("F821") < out_no_prior.find("TS2741")
+        assert out_empty_prior.find("F821") < out_empty_prior.find("TS2741")
+        # No persisted marker rendered.
+        assert "persisted from previous round" not in out_no_prior
+
+    def test_fingerprint_helper_round_trips_with_formatter(self):
+        """The fingerprint helper must produce a string that matches the
+        group key the formatter compares against. If these ever diverge,
+        survival promotion silently fails."""
+        errors = [
+            self._err("TS2769", "No overload matches this call."),
+            self._err("TS2769", "No overload matches this call.", file="b.ts"),
+            self._err("F401", "imported but unused"),
+        ]
+        fps = _fingerprint_diagnostics(errors)
+        # Deduped → 2 fingerprints from 3 errors.
+        assert len(fps) == 2
+        assert "TS2769::No overload matches this call." in fps
+        assert "F401::imported but unused" in fps
+        # And feeding them back as prior_fingerprints actually promotes
+        # the matching groups.
+        out = _format_diagnostics_for_repair(errors, prior_fingerprints=set(fps))
+        # Both groups persisted → both should be tagged.
+        assert out.count("persisted from previous round") == 2
+
+    def test_fingerprint_helper_excludes_warnings(self):
+        """Warnings don't enter the repair prompt; their fingerprints
+        shouldn't enter the survival set either."""
+        errors = [
+            {"error_code": "W001", "message": "warn", "severity": "warning"},
+            {"error_code": "E001", "message": "err", "severity": "error"},
+        ]
+        fps = _fingerprint_diagnostics(errors)
+        assert fps == ["E001::err"]
+
+
+class TestPromoteDeferredEscapeHatch:
+    """Phase 1.2 — the LLM can force a deferred code into top-N on the next
+    round by emitting <<<PROMOTE_DEFERRED>>>. Validates the patcher parser
+    and the formatter's honoring of the request.
+    """
+
+    def _err(self, code: str, msg: str, file: str = "x.ts") -> dict:
+        return {
+            "file": file,
+            "line": 1,
+            "column": 1,
+            "error_code": code,
+            "message": msg,
+            "severity": "error",
+            "semantic_context": f"// snippet for {code}",
+        }
+
+    def test_parser_extracts_codes(self):
+        from harness.patcher import parse_promote_deferred_blocks
+        text = (
+            "Some preamble.\n"
+            "<<<PROMOTE_DEFERRED>>>\n"
+            "codes: TS2769, F401\n"
+            "<<<END_PROMOTE_DEFERRED>>>\n"
+            "More text."
+        )
+        assert parse_promote_deferred_blocks(text) == ["TS2769", "F401"]
+
+    def test_parser_dedupes_and_strips_whitespace(self):
+        from harness.patcher import parse_promote_deferred_blocks
+        text = (
+            "<<<PROMOTE_DEFERRED>>>\n"
+            "codes:   TS2769 ,  F401,  TS2769 ,  \n"
+            "<<<END_PROMOTE_DEFERRED>>>"
+        )
+        assert parse_promote_deferred_blocks(text) == ["TS2769", "F401"]
+
+    def test_parser_handles_multiple_blocks(self):
+        from harness.patcher import parse_promote_deferred_blocks
+        text = (
+            "<<<PROMOTE_DEFERRED>>>\ncodes: TS2769\n<<<END_PROMOTE_DEFERRED>>>\n"
+            "Other content.\n"
+            "<<<PROMOTE_DEFERRED>>>\ncodes: F401, F821\n<<<END_PROMOTE_DEFERRED>>>"
+        )
+        assert parse_promote_deferred_blocks(text) == ["TS2769", "F401", "F821"]
+
+    def test_strip_removes_block(self):
+        from harness.patcher import strip_promote_deferred_blocks
+        text = (
+            "Patch A.\n"
+            "<<<PROMOTE_DEFERRED>>>\ncodes: TS2769\n<<<END_PROMOTE_DEFERRED>>>\n"
+            "Patch B."
+        )
+        stripped = strip_promote_deferred_blocks(text)
+        assert "PROMOTE_DEFERRED" not in stripped
+        assert "Patch A" in stripped and "Patch B" in stripped
+
+    def test_parser_returns_empty_on_no_blocks(self):
+        from harness.patcher import parse_promote_deferred_blocks
+        assert parse_promote_deferred_blocks("Just patches, no directive.") == []
+
+    def test_formatter_promotes_requested_code_past_cascade_prior(self):
+        """The LLM's explicit request beats the cascade prior — TS2769 (a
+        non-upstream code) outranks the upstream F821 when promoted."""
+        errors = [
+            self._err("F821", "Undefined name 'foo'"),
+            self._err("F401", "imported but unused"),
+            self._err("MISSING_DEP", "missing pkg"),
+            self._err("TS2741", "type mismatch A"),
+            self._err("TS2353", "type mismatch B"),
+            self._err("TS2769", "No overload matches this call.",
+                      file="services/AuthService.ts"),
+        ]
+        out = _format_diagnostics_for_repair(
+            errors, promoted_codes={"TS2769"},
+        )
+        # TS2769 must appear before every other code.
+        i_2769 = out.find("TS2769")
+        for code in ("F821", "F401", "MISSING_DEP", "TS2741", "TS2353"):
+            assert i_2769 < out.find(code), (
+                f"Promoted TS2769 should outrank {code}; "
+                f"i_2769={i_2769}, i_{code}={out.find(code)}"
+            )
+        # Promotion marker rendered.
+        assert "promoted at your request" in out
+
+    def test_formatter_promotion_case_insensitive(self):
+        errors = [
+            self._err("F821", "upstream"),
+            self._err("TS2769", "type mismatch"),
+        ]
+        out = _format_diagnostics_for_repair(
+            errors, promoted_codes={"ts2769"},  # lower case
+        )
+        assert "promoted at your request" in out
+
+    def test_formatter_promotion_outranks_survival(self):
+        """An explicit LLM request outranks empirical survival promotion —
+        the model just saw the prompt and disagrees, so honor it."""
+        errors = [
+            self._err("F821", "upstream + persisted"),
+            self._err("TS2769", "type mismatch + promoted"),
+        ]
+        out = _format_diagnostics_for_repair(
+            errors,
+            prior_fingerprints={"F821::upstream + persisted"},
+            promoted_codes={"TS2769"},
+        )
+        # TS2769 (promoted) before F821 (persisted only).
+        assert out.find("TS2769") < out.find("F821")
+
+    def test_formatter_advertises_directive_when_deferred(self):
+        """The 'how to use' instructions must appear in the prompt when
+        there are deferred groups (so the LLM knows the option exists)."""
+        errors = [self._err(f"TS{n}", f"shape {n}") for n in range(7000, 7008)]
+        out = _format_diagnostics_for_repair(errors)
+        assert "<<<PROMOTE_DEFERRED>>>" in out
+        assert "<<<END_PROMOTE_DEFERRED>>>" in out
+
+    def test_formatter_no_directive_when_nothing_deferred(self):
+        """If there's no deferred section, don't pollute the prompt with
+        the escape-hatch instructions."""
+        errors = [self._err(f"TS{n}", f"shape {n}") for n in range(7000, 7003)]  # 3 groups, all shown
+        out = _format_diagnostics_for_repair(errors)
+        assert "<<<PROMOTE_DEFERRED>>>" not in out
+
+
+class TestPhase4StructuredPayload:
+    """Phase 4 — alongside the markdown summary, the formatter emits a
+    structured JSON block so the LLM can sort/filter the raw diagnostics
+    if it disagrees with the harness's cascade ranking."""
+
+    def _err(self, code: str, msg: str, file: str = "x.ts") -> dict:
+        return {
+            "file": file,
+            "line": 1,
+            "column": 1,
+            "error_code": code,
+            "message": msg,
+            "severity": "error",
+            "semantic_context": f"// snippet for {code}",
+        }
+
+    def test_structured_payload_includes_every_diagnostic(self):
+        from harness.graph import _format_structured_diagnostic_payload
+        errors = [self._err(f"TS{n}", f"msg {n}") for n in range(2700, 2703)]
+        out = _format_structured_diagnostic_payload(errors)
+        import json
+        # Extract the JSON fenced block.
+        body = out.split("```json", 1)[1].split("```", 1)[0]
+        parsed = json.loads(body)
+        assert "diagnostics" in parsed and len(parsed["diagnostics"]) == 3
+        codes = [d["code"] for d in parsed["diagnostics"]]
+        assert codes == ["TS2700", "TS2701", "TS2702"]
+
+    def test_structured_payload_caps_at_max_total(self):
+        from harness.graph import _format_structured_diagnostic_payload
+        errors = [self._err(f"TS{n}", f"msg {n}") for n in range(2700, 2735)]  # 35
+        out = _format_structured_diagnostic_payload(errors, max_total=10)
+        import json
+        body = out.split("```json", 1)[1].split("```", 1)[0]
+        parsed = json.loads(body)
+        assert len(parsed["diagnostics"]) == 10
+        assert "_truncated" in parsed
+        assert parsed["_truncated"]["total"] == 35
+
+    def test_structured_payload_empty_input_returns_empty(self):
+        from harness.graph import _format_structured_diagnostic_payload
+        assert _format_structured_diagnostic_payload([]) == ""
+
+    def test_formatter_appends_structured_block_by_default(self):
+        errors = [self._err("TS2769", "x")]
+        out = _format_diagnostics_for_repair(errors)
+        assert "Structured payload" in out
+        assert '"diagnostics"' in out
+
+    def test_formatter_omits_structured_block_when_opted_out(self):
+        errors = [self._err("TS2769", "x")]
+        out = _format_diagnostics_for_repair(errors, emit_structured_payload=False)
+        assert "Structured payload" not in out
+
+
+class TestPhase3Hardening:
+    """Phase 3 — five small hardening items that close common signal-loss
+    paths the cascade-defense layers depend on."""
+
+    def _err(self, code: str, msg: str, file: str = "x.ts") -> dict:
+        return {
+            "file": file,
+            "line": 1,
+            "column": 1,
+            "error_code": code,
+            "message": msg,
+            "severity": "error",
+            "semantic_context": f"// snippet for {code}",
+        }
+
+    def test_3a_fingerprint_normalizes_quoted_spans(self):
+        """A partial fix that swaps one concrete type for another must
+        still leave the fingerprint stable."""
+        from harness.graph import _normalize_diagnostic_message
+        msg1 = "Type 'string[]' is not assignable to type 'number[]'"
+        msg2 = "Type 'string[]' is not assignable to type 'boolean[]'"
+        assert _normalize_diagnostic_message(msg1) == _normalize_diagnostic_message(msg2)
+
+    def test_3a_fingerprint_normalises_backticks_and_doublequotes(self):
+        from harness.graph import _normalize_diagnostic_message
+        a = "Property `foo` does not exist"
+        b = "Property `bar` does not exist"
+        c = 'Property "baz" does not exist'
+        assert _normalize_diagnostic_message(a) == _normalize_diagnostic_message(b)
+        assert _normalize_diagnostic_message(a) == _normalize_diagnostic_message(c)
+
+    def test_3a_fingerprint_collapses_whitespace(self):
+        from harness.graph import _normalize_diagnostic_message
+        a = "Type 'X' is not assignable to type 'Y'"
+        b = "Type 'X' is not\n  assignable to\ntype 'Y'"
+        assert _normalize_diagnostic_message(a) == _normalize_diagnostic_message(b)
+
+    def test_3a_survival_promotion_survives_partial_fix(self):
+        """The TS2769 case in miniature — Round N had `string` in the
+        message, Round N+1 has `number` after a partial fix, but the
+        error shape is morally identical. Layer 3 must still promote."""
+        round_n1 = self._err(
+            "TS2769",
+            "Type 'string' is not assignable to type 'number | StringValue | undefined'",
+        )
+        prior_fps = set(_fingerprint_diagnostics([round_n1]))
+        # Round N+1: same code, message has different concrete types.
+        round_n2 = self._err(
+            "TS2769",
+            "Type 'string' is not assignable to type 'boolean | StringValue | undefined'",
+        )
+        out = _format_diagnostics_for_repair(
+            [round_n2], prior_fingerprints=prior_fps,
+        )
+        assert "persisted from previous round" in out
+
+    def test_3c_typescript_upstream_codes_recognised(self):
+        """TS2304 (cannot-find-name), TS2307 (cannot-find-module),
+        TS2305 (missing-export) must outrank generic non-upstream codes."""
+        errors = [
+            self._err("TS2741", "type mismatch"),
+            self._err("TS2304", "Cannot find name 'Foo'"),
+        ]
+        out = _format_diagnostics_for_repair(errors)
+        assert out.find("TS2304") < out.find("TS2741")
+
+    def test_3c_rust_upstream_codes_recognised(self):
+        errors = [
+            self._err("E9999", "irrelevant"),
+            self._err("E0432", "Unresolved import 'foo'"),  # Rust upstream
+        ]
+        out = _format_diagnostics_for_repair(errors)
+        assert out.find("E0432") < out.find("E9999")
+
+    def test_3c_java_kotlin_csharp_upstream_codes(self):
+        errors = [
+            self._err("CUSTOM_ERR_X", "irrelevant"),
+            self._err("JAVA:CANNOT_FIND_SYMBOL", "cannot find symbol 'foo'"),
+            self._err("KOTLIN:UNRESOLVED_REFERENCE", "unresolved 'bar'"),
+            self._err("CS0103", "name 'baz' does not exist"),
+        ]
+        out = _format_diagnostics_for_repair(errors)
+        custom_pos = out.find("CUSTOM_ERR_X")
+        for code in ("JAVA:CANNOT_FIND_SYMBOL", "KOTLIN:UNRESOLVED_REFERENCE", "CS0103"):
+            assert out.find(code) < custom_pos
+
+    def test_3b_prefix_diff_finds_first_divergence(self):
+        from harness.gateway import _summarize_prefix_diff
+        old = "system|hello\n---\nuser|world"
+        new = "system|hello\n---\nuser|wOrld"
+        result = _summarize_prefix_diff(old=old, new=new)
+        assert "first_diff_offset" in result
+        # Divergence at position of capital O in "wOrld".
+        assert result["first_diff_offset"] == old.index("world") + 1
+        assert "before_excerpt" in result and "after_excerpt" in result
+        assert "world" in result["before_excerpt"]
+        assert "wOrld" in result["after_excerpt"]
+
+    def test_3b_prefix_diff_identical(self):
+        from harness.gateway import _summarize_prefix_diff
+        s = "system|same|same"
+        assert _summarize_prefix_diff(old=s, new=s) == {"identical": True}
+
+
+class TestRepairReflection:
+    """Phase 2.2 — per-round repair reflection. The cheap LLM judges whether
+    the previous round addressed the highest-priority error and returns
+    a structured verdict the harness can inject into the next dispatch.
+    Tests cover the prompt builder, the strict-JSON parser, and the
+    edge cases the parser must reject."""
+
+    def test_prompt_includes_before_after_counts(self):
+        from harness.graph import _build_repair_reflection_prompt
+        prompt = _build_repair_reflection_prompt(
+            prior_diagnostics_count=9,
+            current_diagnostics_count=3,
+            resolved_fingerprints=["F401::imported but unused"],
+            persisted_fingerprints=["TS2769::No overload matches"],
+            new_fingerprints=[],
+            top_persisted_messages=[("TS2769", "No overload matches this call.")],
+        )
+        assert "before this round: 9" in prompt
+        assert "after this round:  3" in prompt
+        assert "TS2769" in prompt
+        # Strict-JSON instruction must appear so the model knows the shape.
+        assert "STRICT JSON" in prompt
+        assert "verdict" in prompt
+
+    def test_parser_accepts_well_formed_distraction(self):
+        from harness.graph import _parse_repair_reflection_verdict
+        raw = (
+            '{"verdict": "DISTRACTION", '
+            '"real_blocker": "AuthService.ts:20 jwt.sign signature is wrong", '
+            '"recommendation": "Pass options as the third arg, not second."}'
+        )
+        v = _parse_repair_reflection_verdict(raw)
+        assert v is not None
+        assert v["verdict"] == "DISTRACTION"
+        assert "AuthService.ts" in v["real_blocker"]
+
+    def test_parser_handles_markdown_fence(self):
+        from harness.graph import _parse_repair_reflection_verdict
+        raw = (
+            "```json\n"
+            '{"verdict": "PROGRESS", "real_blocker": "", "recommendation": ""}\n'
+            "```"
+        )
+        v = _parse_repair_reflection_verdict(raw)
+        assert v is not None and v["verdict"] == "PROGRESS"
+
+    def test_parser_rejects_invalid_verdict(self):
+        from harness.graph import _parse_repair_reflection_verdict
+        raw = '{"verdict": "DUNNO", "real_blocker": "x", "recommendation": "y"}'
+        assert _parse_repair_reflection_verdict(raw) is None
+
+    def test_parser_rejects_distraction_without_blocker(self):
+        """DISTRACTION/REGRESSION are useless without a blocker — the
+        whole point is to redirect the next round."""
+        from harness.graph import _parse_repair_reflection_verdict
+        raw = '{"verdict": "DISTRACTION", "real_blocker": "", "recommendation": ""}'
+        assert _parse_repair_reflection_verdict(raw) is None
+
+    def test_parser_progress_allows_empty_blocker(self):
+        """PROGRESS verdicts can omit the blocker — there's nothing to
+        redirect to."""
+        from harness.graph import _parse_repair_reflection_verdict
+        raw = '{"verdict": "PROGRESS", "real_blocker": "", "recommendation": ""}'
+        v = _parse_repair_reflection_verdict(raw)
+        assert v is not None and v["verdict"] == "PROGRESS"
+
+    def test_parser_rejects_non_json(self):
+        from harness.graph import _parse_repair_reflection_verdict
+        assert _parse_repair_reflection_verdict("not json") is None
+        assert _parse_repair_reflection_verdict("") is None
+
+
+class TestDecisionPointLogging:
+    """Phase 2.1 — every filter/drop site emits a 'dropped_from_prompt'
+    event so post-mortems can grep one event name and see exactly what
+    the harness hid from the LLM."""
+
+    def _err(self, code: str, msg: str, file: str = "x.ts") -> dict:
+        return {
+            "file": file,
+            "line": 1,
+            "column": 1,
+            "error_code": code,
+            "message": msg,
+            "severity": "error",
+            "semantic_context": f"// snippet for {code}",
+        }
+
+    def test_deferred_diagnostics_emit_event(self, caplog):
+        import logging
+        # Force ≥ 6 groups so deferral renders (Layer 2 threshold).
+        errors = [self._err(f"TS{n}", f"msg {n}") for n in range(7000, 7008)]
+        caplog.set_level(logging.INFO, logger="harness.events")
+        _format_diagnostics_for_repair(errors)
+        events = [r for r in caplog.records if getattr(r, "event", "") == "dropped_from_prompt"]
+        deferred_events = [r for r in events if getattr(r, "site", "") == "deferred_diagnostics"]
+        assert deferred_events, "expected a deferred_diagnostics event"
+        ev = deferred_events[-1]
+        assert getattr(ev, "dropped_count", 0) > 0
+        # Examples list should carry codes for grep-ability.
+        examples = getattr(ev, "examples", [])
+        assert isinstance(examples, list) and len(examples) > 0
+        assert "code" in examples[0]
+
+    def test_no_event_when_nothing_deferred(self, caplog):
+        import logging
+        # ≤ 5 groups → Layer 2 short-circuit, no deferral, no event.
+        errors = [self._err(f"TS{n}", f"msg {n}") for n in range(7000, 7003)]
+        caplog.set_level(logging.INFO, logger="harness.events")
+        _format_diagnostics_for_repair(errors)
+        deferred_events = [
+            r for r in caplog.records
+            if getattr(r, "event", "") == "dropped_from_prompt"
+            and getattr(r, "site", "") == "deferred_diagnostics"
+        ]
+        assert not deferred_events
+
+
+class TestProgressBasedBudget:
+    """Phase 1.1 — repair counter should tick the no_progress_repairs
+    counter only when the prior round's patches did not shrink the failing
+    fingerprint set. Validates the routing-gate change in
+    route_after_compiler and the conditional increment in repair_node by
+    calling the relevant pieces in isolation.
+    """
+
+    def test_router_HITLs_on_no_progress_cap_not_total_repairs(self, monkeypatch):
+        from harness import graph as _graph
+        # max_iterations=3 default in test scope (no gateway). Build state
+        # where total_repairs is high (LLM has been working hard) but
+        # no_progress_repairs is 0 — should NOT HITL.
+        state = {
+            "exit_code": 2,
+            "compiler_errors": [{"error_code": "TS2769", "message": "x"}],
+            "loop_counter": {
+                "total_repairs": 5,        # high
+                "no_progress_repairs": 0,  # but every round made progress
+                "consecutive_zero_patch_rounds": 0,
+            },
+            "budget_remaining_usd": 1.0,
+            "node_state": {},
+        }
+        result = _graph.route_after_compiler(state)
+        assert result == "repair_node", (
+            "5 total rounds with 0 no-progress should not escalate — "
+            f"got {result}"
+        )
+
+    def test_router_HITLs_when_no_progress_hits_cap(self):
+        from harness import graph as _graph
+        state = {
+            "exit_code": 2,
+            "compiler_errors": [{"error_code": "TS2769", "message": "x"}],
+            "loop_counter": {
+                "total_repairs": 3,
+                "no_progress_repairs": 3,  # at cap (3)
+                "consecutive_zero_patch_rounds": 0,
+            },
+            "budget_remaining_usd": 1.0,
+            "node_state": {},
+        }
+        result = _graph.route_after_compiler(state)
+        assert result == "human_intervention_node"
+
+    def test_router_hard_ceiling_at_2x_total_repairs(self):
+        """Even with every round making progress, run away protection
+        kicks in at 2 * max_iterations to prevent fingerprint-churn loops."""
+        from harness import graph as _graph
+        state = {
+            "exit_code": 2,
+            "compiler_errors": [{"error_code": "TS2769", "message": "x"}],
+            "loop_counter": {
+                "total_repairs": 6,        # 2 * 3 = hard ceiling
+                "no_progress_repairs": 0,
+                "consecutive_zero_patch_rounds": 0,
+            },
+            "budget_remaining_usd": 1.0,
+            "node_state": {},
+        }
+        result = _graph.route_after_compiler(state)
+        assert result == "human_intervention_node"
+
+    def test_router_backward_compat_no_progress_field_absent(self):
+        """Sessions checkpointed before Phase 1.1 won't have
+        no_progress_repairs in state. Default-0 → behaves like a fresh
+        session, no premature HITL."""
+        from harness import graph as _graph
+        state = {
+            "exit_code": 2,
+            "compiler_errors": [{"error_code": "TS2769", "message": "x"}],
+            "loop_counter": {
+                "total_repairs": 2,
+                # no_progress_repairs ABSENT — old checkpoint
+                "consecutive_zero_patch_rounds": 0,
+            },
+            "budget_remaining_usd": 1.0,
+            "node_state": {},
+        }
+        result = _graph.route_after_compiler(state)
+        assert result == "repair_node"
 
 
 class TestGraphStateTypes:
