@@ -332,27 +332,30 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
     The product decision (2026-06-25) was that v3 history doesn't carry
     forward — the decomposition shape changed enough that old rows can't
     be meaningfully reinterpreted, so existing DBs reset rather than
-    migrate row-by-row. Foreign-key cascades from ``stories.id`` /
-    ``batches.id`` clear ``batch_stories``, ``file_links``,
-    ``commits``, ``test_runs``, and ``defects`` automatically; we drop
-    them explicitly anyway to keep the post-migration state obvious.
+    migrate row-by-row.
 
-    No-op on a fresh DB (no ``epic`` column on ``stories``) — the
-    surrounding ``open_story_db`` already ran ``_SCHEMA_SQL`` to create
-    the v4 tables; there's nothing to drop.
+    No-op on a fresh DB (no ``stories`` table) and on an already-v4 DB
+    (no ``epic`` column on ``stories``). The surrounding
+    ``open_story_db`` runs ``_SCHEMA_SQL`` AFTER this migration, so we
+    just drop the legacy tables here and let the caller re-create the
+    v4 shape.
     """
     try:
         cols = conn.execute("PRAGMA table_info(stories)").fetchall()
     except sqlite3.DatabaseError:
         return
+    if not cols:
+        # Fresh DB — no stories table yet. _SCHEMA_SQL will create the
+        # v4 shape from scratch after we return.
+        return
     if not any(c[1] == "epic" for c in cols):
+        # Already migrated — stories table is v4-shaped.
         return
     for table in (
         "commits", "test_runs", "file_links", "defects",
         "batch_stories", "batches", "stories", "features",
     ):
         conn.execute(f"DROP TABLE IF EXISTS {table}")
-    conn.executescript(_SCHEMA_SQL)
     conn.commit()
 
 
@@ -521,8 +524,24 @@ def open_story_db(workspace_path: Optional[str] = None) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     try:
         _apply_sqlite_pragmas(conn)
-        conn.executescript(_SCHEMA_SQL)
+        # Ensure schema_meta exists so _apply_migrations can read /
+        # write schema_version even on a legacy v3 DB whose tables
+        # predate the migration framework. Without this bootstrap
+        # ``_write_schema_version`` would crash with "no such table:
+        # schema_meta" on the very first migration of a v3 DB.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_meta ("
+            "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        # Apply migrations BEFORE _SCHEMA_SQL: _SCHEMA_SQL creates v4
+        # indexes that reference v4-only columns (e.g.
+        # ``stories.feature_id``). If a v3 DB still has the legacy
+        # ``stories`` table on disk, ``executescript`` blows up with
+        # ``no such column: feature_id`` before the v3→v4 migration
+        # ever gets a chance to drop the legacy tables. Running
+        # migrations first leaves a clean slate for the v4 schema.
         _apply_migrations(conn)
+        conn.executescript(_SCHEMA_SQL)
         conn.commit()
     except Exception:
         try:

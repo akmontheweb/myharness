@@ -120,6 +120,67 @@ def test_schema_version_persisted(conn: sqlite3.Connection):
     assert _read_schema_version(conn) == SCHEMA_VERSION
 
 
+def test_open_migrates_legacy_v3_db(isolated_state_db):
+    """A pre-existing v3 DB (``stories.epic``, no ``feature_id``,
+    schema_version=3) MUST migrate cleanly when reopened. Regression
+    guard for the ordering bug where ``_SCHEMA_SQL`` ran BEFORE
+    ``_apply_migrations`` and crashed on ``no such column:
+    feature_id`` while building v4 indexes against the still-v3
+    ``stories`` table."""
+    # Materialise a v3-shaped DB on disk at the isolated path.
+    db_path = str(isolated_state_db)
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO schema_meta(key, value) VALUES ('schema_version', '3');
+        CREATE TABLE stories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace TEXT NOT NULL,
+            story_key TEXT NOT NULL,
+            epic TEXT,
+            title TEXT NOT NULL,
+            description TEXT,
+            status TEXT NOT NULL DEFAULT 'planned',
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO stories(workspace, story_key, epic, title, status, created_at)
+        VALUES ('legacy-ws', 'STORY-1', 'legacy-epic', 'old story', 'done', '2026-01-01');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    # Reopen via the public API — must NOT raise.
+    conn = open_story_db()
+    try:
+        assert _read_schema_version(conn) == SCHEMA_VERSION
+        cols = {c[1] for c in conn.execute("PRAGMA table_info(stories)").fetchall()}
+        assert "feature_id" in cols
+        assert "epic" not in cols
+        # v3 rows are dropped — clean-slate migration is documented.
+        assert conn.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 0
+        # features table exists in v4.
+        feature_cols = {c[1] for c in conn.execute("PRAGMA table_info(features)").fetchall()}
+        assert "feature_key" in feature_cols
+    finally:
+        conn.close()
+
+
+def test_open_is_idempotent_after_migration(isolated_state_db):
+    """Reopening a migrated DB MUST be a no-op (no exceptions, no row
+    loss). Pins the post-migration steady state."""
+    # First open lands at v4.
+    conn = open_story_db()
+    conn.close()
+    # Second open re-runs the same path — must not blow up or reset.
+    conn = open_story_db()
+    try:
+        assert _read_schema_version(conn) == SCHEMA_VERSION
+    finally:
+        conn.close()
+
+
 def test_pragmas_applied(conn: sqlite3.Connection):
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
