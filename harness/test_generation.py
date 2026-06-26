@@ -532,8 +532,24 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # Change-request mode: prepend the CR-N attribution rules so generated
     # tests follow the `test_cr_N_*` naming convention and reference the
     # CR in their docstrings. No-op (empty string) outside CR mode.
-    from harness.graph import _build_change_request_preamble
-    user_prompt = _build_change_request_preamble(cast("AgentState", state), "tests") + user_prompt
+    from harness.graph import _build_change_request_preamble, _build_arch_summary_preamble
+    # Architecture-summary preamble — every endpoint in §11 should
+    # have at least one test, every component at least one render
+    # test. Empty string when the arch doc has no §11 block (legacy
+    # / third-party arch docs); the test generator falls back to
+    # source-file-driven coverage in that case.
+    # patching_node (upstream) already caches the resolved summary onto
+    # state, so the helper hits the in-state copy without a disk read
+    # on the common path; the rare lazy-load case (e.g. a re-entry that
+    # skipped patching) is cheap enough we don't bother caching here.
+    arch_preamble, _resolved_arch = _build_arch_summary_preamble(
+        cast("AgentState", state), consumer="test_generator",
+    )
+    user_prompt = (
+        _build_change_request_preamble(cast("AgentState", state), "tests")
+        + arch_preamble
+        + user_prompt
+    )
     messages.append({"role": "user", "content": user_prompt})
 
     budget = float(state.get("budget_remaining_usd", 2.00))

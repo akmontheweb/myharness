@@ -9395,8 +9395,10 @@ def _build_story_preamble(state: AgentState, phase: str) -> str:
     )
 
 
-def _build_arch_summary_preamble(state: AgentState) -> tuple[str, dict[str, Any]]:
-    """Return ``(preamble_text, resolved_summary)`` for the patching loop.
+def _build_arch_summary_preamble(
+    state: AgentState, *, consumer: str = "patcher",
+) -> tuple[str, dict[str, Any]]:
+    """Return ``(preamble_text, resolved_summary)`` for a downstream node.
 
     Reads ``state["arch_summary"]`` if present; otherwise lazy-loads
     from ``<workspace>/docs/SPEC_ARCHITECTURE.md`` (monolithic / non-
@@ -9404,7 +9406,13 @@ def _build_arch_summary_preamble(state: AgentState) -> tuple[str, dict[str, Any]
     summary never gets populated by that path). The resolved summary
     is returned alongside the preamble so the caller can stash it
     back onto state as part of its delta — a one-time cost per
-    patching session.
+    session.
+
+    ``consumer`` picks which one-paragraph guidance block prefaces
+    the tables: ``"patcher"`` (emit NO_PROGRESS on gap), ``"reviewer"``
+    (flag drift as a finding), or ``"test_generator"`` (treat the
+    tables as a coverage target). The endpoint / component tables
+    are identical across consumers; only the guidance differs.
 
     Returns ``("", {})`` when the arch doc has no §11 jsonc block,
     schema_version is unrecognised, or the file is missing. Callers
@@ -9421,7 +9429,7 @@ def _build_arch_summary_preamble(state: AgentState) -> tuple[str, dict[str, Any]
         return "", {}
 
     from harness.arch_summary import render_arch_preamble
-    return render_arch_preamble(summary), summary
+    return render_arch_preamble(summary, consumer=consumer), summary
 
 
 async def reverse_spec_node(state: AgentState) -> dict[str, Any]:
@@ -10943,8 +10951,18 @@ async def code_review_node(state: AgentState) -> dict[str, Any]:
 
     from harness.gateway import NodeRole
 
+    # Architecture-summary preamble — tells the reviewer to flag drift
+    # between the code under review and the resolved §11 tables
+    # (endpoint paths, schema names, contract location, component
+    # paths). Empty string when the arch doc has no §11 block, in
+    # which case the reviewer falls back to the prose document the
+    # system prompt already carries.
+    arch_preamble, _resolved_arch = _build_arch_summary_preamble(
+        state, consumer="reviewer",
+    )
     critique_user_prompt = (
-        "## Modified Files\n" + "\n".join(snapshot_chunks) +
+        arch_preamble
+        + "## Modified Files\n" + "\n".join(snapshot_chunks) +
         "\n\nProduce the JSON critique now."
     )
     critique_messages: list[MessageDict] = [

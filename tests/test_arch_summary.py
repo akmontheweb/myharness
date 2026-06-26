@@ -260,10 +260,39 @@ def test_render_preamble_renders_rsd_ids_in_id_cell():
 
 
 def test_render_preamble_includes_arch_gap_guidance():
-    """The preamble must tell the LLM what to do when a decision is
-    missing — that's the whole point of the structured handoff."""
+    """The patcher preamble must tell the LLM what to do when a
+    decision is missing — that's the whole point of the structured
+    handoff."""
     out = arch_summary.render_arch_preamble(_VALID_SUMMARY)
-    assert "ARCH_GAP" in out, "preamble should instruct the patcher to halt on missing decisions"
+    assert "ARCH_GAP" in out, "patcher preamble should instruct the LLM to halt on missing decisions"
+
+
+def test_render_preamble_reviewer_consumer_uses_drift_language():
+    """The reviewer should be told to flag *drift* (contradiction
+    between code and tables), not to halt — halting belongs to the
+    patcher."""
+    out = arch_summary.render_arch_preamble(_VALID_SUMMARY, consumer="reviewer")
+    assert "ARCH_GAP" not in out
+    assert "finding" in out.lower()
+    assert "drift" in out.lower()
+
+
+def test_render_preamble_test_generator_consumer_uses_coverage_language():
+    """Test-generation should treat the tables as a coverage target —
+    every endpoint at least one test, every component at least one
+    render test."""
+    out = arch_summary.render_arch_preamble(_VALID_SUMMARY, consumer="test_generator")
+    assert "ARCH_GAP" not in out
+    assert "coverage" in out.lower()
+    # Still surfaces the endpoint table — same structural index.
+    assert "EP-001" in out
+
+
+def test_render_preamble_unknown_consumer_falls_back_to_patcher():
+    """An unknown consumer string MUST NOT crash; it should fall back
+    to the patcher block (the most informative default)."""
+    out = arch_summary.render_arch_preamble(_VALID_SUMMARY, consumer="nonsense")
+    assert "ARCH_GAP" in out
 
 
 def test_render_preamble_falls_back_to_legacy_frontend_object():

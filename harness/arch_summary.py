@@ -170,8 +170,37 @@ def load_arch_summary(workspace_path: str) -> Optional[dict[str, Any]]:
     return data
 
 
-def render_arch_preamble(summary: Optional[dict[str, Any]]) -> str:
-    """Render the architecture-summary preamble used by ``patching_node``.
+_CONSUMER_GUIDANCE: dict[str, str] = {
+    "patcher": (
+        "These decisions are RESOLVED — do not re-derive paths, "
+        "schema names, or contract locations. If a decision you "
+        "need is NOT listed here, emit `<<<NO_PROGRESS reason=\"ARCH_GAP: "
+        "<what is missing>\">>>` instead of guessing."
+    ),
+    "reviewer": (
+        "These tables are the resolved contract. When the modified "
+        "code drifts from a listed endpoint path, schema name, "
+        "contract location, or component path, raise it as a "
+        "finding (severity: high). Endpoints / components not yet "
+        "implemented are NOT findings — only contradictions are."
+    ),
+    "test_generator": (
+        "Use these tables as your coverage target. Every endpoint "
+        "below should have at least one test that hits the listed "
+        "method+path and asserts against the listed response "
+        "schema; every component listed should have at least one "
+        "render test. Schema names map directly to the request / "
+        "response classes the patcher generated."
+    ),
+}
+
+
+def render_arch_preamble(
+    summary: Optional[dict[str, Any]],
+    *,
+    consumer: str = "patcher",
+) -> str:
+    """Render the architecture-summary preamble.
 
     Returns the empty string when ``summary`` is ``None`` or carries no
     actionable structured fields — keeps the planning prompt byte-
@@ -183,6 +212,18 @@ def render_arch_preamble(summary: Optional[dict[str, Any]]) -> str:
     rationale stays in the prose document the system prompt already
     prepends; this preamble is the structural index the LLM should not
     have to re-derive.
+
+    Args:
+        summary: parsed §11 jsonc, or ``None``.
+        consumer: which downstream node will read this — selects the
+            one-paragraph guidance block at the top. One of
+            ``"patcher"`` (default; tells the LLM to emit
+            ``NO_PROGRESS`` on missing decisions), ``"reviewer"``
+            (tells the reviewer to flag *drift* — endpoints / schemas
+            implemented inconsistently with the tables), or
+            ``"test_generator"`` (tells the test author to treat the
+            tables as a coverage target). Unknown values fall back to
+            the patcher block.
     """
     if not summary or not isinstance(summary, dict):
         return ""
@@ -201,12 +242,8 @@ def render_arch_preamble(summary: Optional[dict[str, Any]]) -> str:
     lines.append(
         "## Architecture summary (from docs/SPEC_ARCHITECTURE.md §11)\n"
     )
-    lines.append(
-        "These decisions are RESOLVED — do not re-derive paths, "
-        "schema names, or contract locations. If a decision you "
-        "need is NOT listed here, emit `<<<NO_PROGRESS reason=\"ARCH_GAP: "
-        "<what is missing>\">>>` instead of guessing.\n"
-    )
+    guidance = _CONSUMER_GUIDANCE.get(consumer, _CONSUMER_GUIDANCE["patcher"])
+    lines.append(guidance + "\n")
     lines.append(
         f"- **Backend stack:** `{backend_lang}` · DB `{db_engine}` · auth `{auth}`"
     )

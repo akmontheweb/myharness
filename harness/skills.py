@@ -643,7 +643,7 @@ def register_docgen_skills() -> int:
     count = 0
 
     register(DocGenSkill(
-        doc_type="arch_doc", output_file="docs/architecture.md",
+        doc_type="arch_doc", output_file="docs/SPEC_ARCHITECTURE.md",
         model_override="planning_primary", max_iterations=2,
     ))
     count += 1
