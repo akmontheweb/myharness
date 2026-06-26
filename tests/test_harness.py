@@ -4491,7 +4491,10 @@ class TestDetectDefaultBuildCommandPyFallback:
         (tmp_path / "app.py").write_text("print('hi')\n")
         cmd = _detect_default_build_command(str(tmp_path))
         assert cmd is not None
-        assert "pip install pytest" in cmd
+        # uv pip install is canonical now (see makefile_python.md skill);
+        # the fallback still emits an install step so workspaces outside
+        # the pre-baked builder image succeed on the first run.
+        assert "uv pip install" in cmd
         assert "pytest" in cmd
 
     def test_nested_py_file_also_triggers_fallback(self, tmp_path):
@@ -4504,7 +4507,8 @@ class TestDetectDefaultBuildCommandPyFallback:
         (tmp_path / "app" / "__init__.py").write_text("")
         cmd = _detect_default_build_command(str(tmp_path))
         assert cmd is not None
-        assert "pip install pytest" in cmd
+        assert "uv pip install" in cmd
+        assert "pytest" in cmd
 
     def test_pyproject_still_wins_over_py_fallback(self, tmp_path):
         from harness.cli import _detect_default_build_command
@@ -4513,7 +4517,8 @@ class TestDetectDefaultBuildCommandPyFallback:
         (tmp_path / "app" / "__init__.py").write_text("")
         cmd = _detect_default_build_command(str(tmp_path))
         # pyproject.toml branch fires first → editable install + pytest
-        assert "pip install -e ." in cmd
+        assert "uv pip install" in cmd
+        assert "-e ." in cmd
 
 
 class TestMakefileBuildTargetDetection:
@@ -4536,8 +4541,9 @@ class TestMakefileBuildTargetDetection:
         (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
         cmd = _detect_default_build_command(str(tmp_path))
         # Without a `build:` target the Makefile is ignored; we use the
-        # manifest-based command directly.
-        assert cmd == "python3 -m pip install -e . && python3 -m pytest -q"
+        # manifest-based command directly. uv pip install replaces plain
+        # pip — same semantics, much faster, persistent cache volume.
+        assert cmd == "uv pip install --system -e . && python3 -m pytest -q"
 
     def test_makefile_with_build_target_still_returns_make_build(self, tmp_path):
         from harness.cli import _detect_default_build_command
@@ -4586,7 +4592,8 @@ class TestMakefileBuildTargetDetection:
         (tmp_path / "app.py").write_text("print('hi')\n")
         cmd = _detect_default_build_command(str(tmp_path))
         assert cmd is not None
-        assert "pip install pytest" in cmd
+        assert "uv pip install" in cmd
+        assert "pytest" in cmd
         assert "make build" not in cmd
 
     def test_no_python_returns_none(self, tmp_path):
@@ -6480,7 +6487,8 @@ class TestCLI:
             Path(tmpdir, "requirements.txt").write_text("pytest\n")
             cmd = _detect_default_build_command(tmpdir)
             assert cmd is not None
-            assert "pip install -r requirements.txt" in cmd
+            assert "uv pip install" in cmd
+            assert "-r requirements.txt" in cmd
             assert "pytest" in cmd
 
     def test_detect_build_command_python_pyproject(self):
@@ -6489,7 +6497,8 @@ class TestCLI:
             Path(tmpdir, "pyproject.toml").write_text("[project]\nname='x'\n")
             cmd = _detect_default_build_command(tmpdir)
             assert cmd is not None
-            assert "pip install -e" in cmd
+            assert "uv pip install" in cmd
+            assert "-e" in cmd
             assert "pytest" in cmd
 
     def test_detect_build_command_node(self):
@@ -6505,12 +6514,13 @@ class TestCLI:
         # Before this change the branch returned bare ``python3 -m pytest -q``,
         # which trips pytest-not-installed on every greenfield workspace
         # and wedges the repair loop (the LLM keeps editing manifests
-        # the build_command never consults).
+        # the build_command never consults). Installer is `uv pip install`
+        # now (see harness/skills/makefile_python.md).
         from harness.cli import _detect_default_build_command
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "main.py").write_text("print('hi')\n")
             assert _detect_default_build_command(tmpdir) == (
-                "python3 -m pip install pytest && python3 -m pytest -q"
+                "uv pip install --system pytest && python3 -m pytest -q"
             )
 
     def test_detect_build_command_no_hints_returns_none(self):

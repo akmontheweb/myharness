@@ -146,17 +146,22 @@ class TestHelpers:
         assert _pick_primary_stack({"cobol"}) is None
         assert _pick_primary_stack(set()) is None
 
-    def test_stack_test_command_pip_install_token_for_python(self):
+    def test_stack_test_command_runs_pytest_for_python(self):
+        # pytest is pre-baked into the builder image so the per-run install
+        # step is gone — the command is now just the pytest invocation.
         cmd = _stack_test_command("python")
         assert cmd is not None
-        assert "pip install" in cmd
         assert "pytest" in cmd
+        # Regression: the legacy `pip install -q pytest && ...` prefix must
+        # NOT come back; that round-tripped to PyPI on every single test run.
+        assert "pip install" not in cmd
 
-    def test_stack_test_command_npm_install_for_javascript(self):
+    def test_stack_test_command_runs_jest_for_javascript(self):
+        # jest is also pre-baked; `npx --no-install` resolves it from PATH.
         cmd = _stack_test_command("javascript")
         assert cmd is not None
-        assert "npm install" in cmd
         assert "jest" in cmd
+        assert "npm install" not in cmd
 
     def test_every_priority_stack_has_a_test_command(self):
         # If we add a new stack to the priority list we must also add its
@@ -304,9 +309,11 @@ class TestHappyPath:
         user_msgs = [m for m in sent if m.get("role") == "user"]
         joined_user = "\n".join(m.get("content", "") for m in user_msgs)
         assert "Do NOT generate mocks" in joined_user or "do not generate mocks" in joined_user.lower()
-        # 4. The deterministic test command ran in the sandbox
+        # 4. The deterministic test command ran in the sandbox. pytest is
+        # pre-baked into the builder image so there's no install prefix —
+        # just the bare pytest invocation.
         assert "pytest" in _StubSandboxExecutor.last_command
-        assert "pip install" in _StubSandboxExecutor.last_command
+        assert "pip install" not in _StubSandboxExecutor.last_command
         # 5. The result reports a pass and lists the generated test
         assert result["node_state"]["test_generation"]["status"] == "passed"
         assert result["generated_tests"] == ["tests/test_calculator.py"]

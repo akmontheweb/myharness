@@ -7,6 +7,14 @@ applies_to: [python]
 ### When this skill applies
 The workspace is a Python project — detected via `requirements.txt`, `pyproject.toml`, `setup.py`, or any top-level `.py` file. Applies to FastAPI, Django, Flask, library, and CLI projects alike. The harness runs `make build` by default; without a Makefile it falls back to noisy command-adaptation logic that's harder to reproduce locally.
 
+### Installer: ALWAYS `uv pip install` — NEVER plain `pip install`
+The harness sandbox pre-installs [`uv`](https://github.com/astral-sh/uv) on the system PATH. `uv pip install` is a drop-in replacement for `pip install` that reads the same `requirements.txt` / `pyproject.toml` and writes to the same site-packages, but resolves and installs **10–30× faster** on cold caches. The sandbox also persists `uv`'s download cache between containers, so the second build in a session installs from local wheels.
+
+**Rules — absolute:**
+- Every install line in your Makefile MUST start with `uv pip install` (with `--system` so it targets the container's system Python, not a venv).
+- Do NOT write `pip install`, `pip3 install`, `python3 -m pip install`, `poetry install`, or `pdm install`. The harness recognises `uv pip install` / `uv sync` / `uv add` as install steps and configures the sandbox accordingly; other forms still work but are slower and miss the harness-managed cache.
+- Do NOT create a virtualenv (`python -m venv`, `uv venv`). The container is already isolated and pytest / uv themselves are on PATH; an inner venv just adds latency.
+
 ### Always emit a `Makefile` in your first patch
 Pick the variant matching the dependency manifest you're also creating (or that already exists). Each variant has separate `build:` and `test:` targets plus a `.PHONY:` line, so operators can run `make test` independently.
 
@@ -15,7 +23,7 @@ Pick the variant matching the dependency manifest you're also creating (or that 
 .PHONY: build test all clean
 
 build:
-	python3 -m pip install -r requirements.txt
+	uv pip install --system -r requirements.txt
 
 test:
 	python3 -m pytest -q
@@ -31,7 +39,7 @@ clean:
 .PHONY: build test all clean
 
 build:
-	python3 -m pip install -e .
+	uv pip install --system -e .
 
 test:
 	python3 -m pytest -q
@@ -43,11 +51,12 @@ clean:
 ```
 
 **Bare workspace** (no manifest yet — only when you also can't create one):
+The sandbox already has pytest pre-installed, so `build:` is a no-op. Still emit the target so `make all` works.
 ```make
 .PHONY: build test all
 
 build:
-	python3 -m pip install pytest
+	@true
 
 test:
 	python3 -m pytest -q
@@ -63,7 +72,9 @@ all: build test
 
 ### Common patches the LLM gets wrong
 - Using spaces instead of tabs for recipe indentation (silent fail).
-- Calling `pip install` without `python3 -m` prefix — picks up the wrong interpreter when multiple Pythons are installed.
+- Calling `pip install` instead of `uv pip install --system` — slower and bypasses the harness's persistent install cache.
+- Forgetting the `--system` flag on `uv pip install` — uv refuses to install into the system Python without it (safety guardrail) and the build fails with "Use `--system` to install into the system Python".
 - Mixing `pytest` and `python -m pytest` across targets — pick one (prefer `python3 -m pytest` so the import path matches `build:`).
 - Forgetting `.PHONY:` and then debugging why `make test` skipped when a `test/` directory exists.
 - Hard-coding a virtualenv path (`venv/bin/pip`) — the harness runs inside a clean Docker container; venvs aren't needed.
+- Adding `pytest` / `pytest-cov` / `pytest-xdist` to `requirements.txt` — they're pre-installed in the sandbox. Only add them as dev dependencies if the project will be installed outside the sandbox too.

@@ -537,7 +537,10 @@ class TestDetectSubdirBuildCommand:
         detected = _detect_default_build_command(str(tmp_path))
         assert detected is not None
         assert detected.startswith("cd server &&")
-        assert "pip install -r requirements.txt" in detected
+        # uv pip install is the canonical installer (see makefile_python.md);
+        # plain `pip install` is no longer emitted by the detector.
+        assert "uv pip install" in detected
+        assert "-r requirements.txt" in detected
         assert "pytest -q" in detected
 
     def test_subdir_pyproject_preferred_over_requirements(self, tmp_path):
@@ -549,7 +552,8 @@ class TestDetectSubdirBuildCommand:
         detected = _detect_default_build_command(str(tmp_path))
         assert detected is not None
         assert detected.startswith("cd backend &&")
-        assert "pip install -e ." in detected
+        assert "uv pip install" in detected
+        assert "-e ." in detected
 
     def test_root_manifest_still_wins_over_subdir(self, tmp_path):
         """Subdir probe runs AFTER the root probe — repos with deps at
@@ -563,7 +567,8 @@ class TestDetectSubdirBuildCommand:
         detected = _detect_default_build_command(str(tmp_path))
         assert detected is not None
         assert not detected.startswith("cd ")
-        assert "pip install -r requirements.txt" in detected
+        assert "uv pip install" in detected
+        assert "-r requirements.txt" in detected
 
     def test_pure_python_scaffold_falls_through_to_bare_pytest(self, tmp_path):
         """Last-chance heuristic still fires when the subdir has only
@@ -576,7 +581,8 @@ class TestDetectSubdirBuildCommand:
 
         detected = _detect_default_build_command(str(tmp_path))
         assert detected is not None
-        assert "pip install pytest" in detected
+        assert "uv pip install" in detected
+        assert "pytest" in detected
 
 
 # ---------------------------------------------------------------------------

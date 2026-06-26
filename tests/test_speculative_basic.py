@@ -228,7 +228,7 @@ class TestSpeculativeBuildCommandAdaptation:
         (tmp_path / "app" / "__init__.py").write_text("")
 
         detected = _detect_default_build_command(str(tmp_path))
-        assert detected is not None and "pip install pytest" in detected
+        assert detected is not None and "uv pip install" in detected and "pytest" in detected
 
         _cfg, allow_net, img_adapted, net_adapted, _ro = _apply_toolchain_adaptation(
             detected,
@@ -265,7 +265,8 @@ class TestSpeculativeBuildCommandAdaptation:
 
         per_variant_build = _detect_default_build_command(str(worktree))
         assert per_variant_build is not None
-        assert "pip install -e ." in per_variant_build
+        assert "uv pip install" in per_variant_build
+        assert "-e ." in per_variant_build
         assert "pytest" in per_variant_build
 
         _cfg, _allow_net, img_adapted, _net, _ro = _apply_toolchain_adaptation(

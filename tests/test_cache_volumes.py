@@ -121,7 +121,12 @@ class TestDockerCacheMountEmission:
 # ---------------------------------------------------------------------------
 
 class TestSandboxExecutorThreadsCacheVolumesConfig:
-    def test_executor_forwards_cache_volumes_to_backend(self):
+    def test_executor_defaults_to_global_scope(self):
+        # Default scope is "global" → the docker backend gets no session_id,
+        # so _cache_volume_name collapses to a "global" slug shared across
+        # sessions. This is the new default since the per-session isolation
+        # forced every session to re-download wheels for no gain on the
+        # single-tenant workstation case.
         from harness.sandbox import SandboxExecutor, DockerBackend
         executor = SandboxExecutor(
             workspace_path="/work",
@@ -134,7 +139,40 @@ class TestSandboxExecutorThreadsCacheVolumesConfig:
         )
         assert isinstance(executor.backend, DockerBackend)
         assert executor.backend.cache_volumes_enabled is True
+        assert executor.backend.cache_volumes_session_id is None
+
+    def test_executor_session_scope_forwards_session_id(self):
+        # Operators who need per-tenant isolation set
+        # ``sandbox.cache_volumes_scope = "session"`` — the session id then
+        # gets baked into the volume name.
+        from harness.sandbox import SandboxExecutor, DockerBackend
+        executor = SandboxExecutor(
+            workspace_path="/work",
+            session_id="sess-xyz",
+            sandbox_config={
+                "backend": "docker",
+                "docker_image": "python:3.12-slim",
+                "cache_volumes": True,
+                "cache_volumes_scope": "session",
+            },
+        )
+        assert isinstance(executor.backend, DockerBackend)
+        assert executor.backend.cache_volumes_enabled is True
         assert executor.backend.cache_volumes_session_id == "sess-xyz"
+
+    def test_executor_defaults_cache_volumes_on(self):
+        # cache_volumes default flipped from False to True. Operators don't
+        # need to opt in; the cache just works.
+        from harness.sandbox import SandboxExecutor
+        executor = SandboxExecutor(
+            workspace_path="/work",
+            session_id="sess-xyz",
+            sandbox_config={
+                "backend": "docker",
+                "docker_image": "python:3.12-slim",
+            },
+        )
+        assert executor.backend.cache_volumes_enabled is True
 
     def test_executor_skips_cache_volumes_when_flag_off(self):
         from harness.sandbox import SandboxExecutor

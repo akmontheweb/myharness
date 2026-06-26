@@ -43,18 +43,30 @@ logger = logging.getLogger(__name__)
 
 
 # The harness's kitchen-sink builder image. One image with every toolchain
-# the supported stacks need (Python 3.11 + pip + venv, Java JDK 21 + Maven +
-# Gradle, Node 20 LTS + npm + yarn + pnpm + tsc, SQLite, Playwright +
+# the supported stacks need (Python 3.11 + pip + venv + uv + pytest +
+# pytest-cov + pytest-xdist, Java JDK 21 + Maven + Gradle, Node 20 LTS +
+# npm + yarn + pnpm + tsc + jest + ts-jest, SQLite, Playwright +
 # Chromium, plus make/gcc/git/curl). Built from
 # ``harness/vendor/Dockerfile.builder``. Pinning here means the sandbox
 # never needs to swap images or apt-get inside the container at runtime —
 # the latter is impossible under ``--user $UID:$GID`` mode anyway.
 #
-# Replace the ``:latest`` tag with the pushed digest
-# (e.g. ``ghcr.io/<owner>/harness-builder@sha256:<digest>``) once the
-# image is published; the local ``harness-builder:latest`` tag works for
-# a local ``docker build harness/vendor/`` while iterating.
-BUILDER_IMAGE = "harness-builder:latest"
+# Pinned to the content-addressable manifest digest (set by buildx during
+# the local build) so every operator runs against bit-for-bit the same
+# image. Rebuild + re-pin recipe:
+#   docker build --pull \
+#     -f harness/vendor/Dockerfile.builder \
+#     -t harness-builder:latest \
+#     -t harness-builder:$(date +%Y-%m-%d) \
+#     harness/vendor/
+#   docker inspect harness-builder:latest --format '{{.RepoDigests}}'
+# Then paste the new digest below. The image is local-only by default;
+# a registry push (e.g. to ghcr.io/<owner>/harness-builder) is optional
+# and only required for multi-host fleets.
+BUILDER_IMAGE = (
+    "harness-builder"
+    "@sha256:92f163b2817a13cda603d93d9b34686e4b4f1fae6cfe907f2dccd208a1bcad19"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +432,20 @@ class DockerBackend(SandboxBackend):
           up needing sudo to delete on the host).
     """
 
+    # Fixed in-container cache paths the builder image (Dockerfile.builder)
+    # pre-creates world-writable. The image's ENV block also points
+    # PIP_CACHE_DIR / UV_CACHE_DIR / npm_config_cache at these paths, so when
+    # ``cache_volumes_enabled`` is on we just need to mount a named Docker
+    # volume on each path — pip / uv / npm pick it up automatically without
+    # the workspace having to configure anything. Independent of any
+    # operator-supplied ``readonly_cache_mounts``: those still get their
+    # own bind/volume mounts on top.
+    _DEFAULT_CACHE_VOLUME_PATHS: tuple[str, ...] = (
+        "/cache/pip",
+        "/cache/uv",
+        "/cache/npm",
+    )
+
     def __init__(
         self,
         image: str = BUILDER_IMAGE,
@@ -429,7 +455,7 @@ class DockerBackend(SandboxBackend):
         docker_path: str = "docker",
         read_only_root: bool = True,
         restore_workspace_ownership: bool = True,
-        cache_volumes_enabled: bool = False,
+        cache_volumes_enabled: bool = True,
         cache_volumes_session_id: Optional[str] = None,
         cache_volumes_prefix: str = "harness",
     ):
@@ -438,13 +464,16 @@ class DockerBackend(SandboxBackend):
         self.cpu_limit = cpu_limit
         self.pids_limit = pids_limit
         self.docker_path = docker_path
-        # When True, replace the historical read-only host bind-mounts for
-        # readonly_cache_mounts with writable named Docker volumes scoped to
-        # cache_volumes_session_id. Tools (pip/npm) can then persist
-        # downloaded wheels/tarballs between containers in the same
-        # session, removing the cold-cache extraction tax on every compile.
-        # See _cache_volume_name for the volume-naming convention and
-        # _ensure_cache_volumes for idempotent creation.
+        # When True (default), mount writable named Docker volumes on
+        # ``_DEFAULT_CACHE_VOLUME_PATHS`` (/cache/pip, /cache/uv, /cache/npm)
+        # so pip / uv / npm downloads persist across containers. Volume names
+        # are derived from the basename of each mount path (see
+        # ``_cache_volume_name``); ``cache_volumes_session_id`` optionally
+        # namespaces them — when left ``None`` (the default for global
+        # sharing) the slug collapses to ``global`` and every session reuses
+        # the same wheels / tarballs. Any operator-supplied
+        # ``readonly_cache_mounts`` are still mounted on top with the same
+        # rule.
         self.cache_volumes_enabled = cache_volumes_enabled
         self.cache_volumes_session_id = cache_volumes_session_id
         self.cache_volumes_prefix = cache_volumes_prefix
@@ -540,13 +569,21 @@ class DockerBackend(SandboxBackend):
         # initialises an empty volume — we want explicit `docker volume
         # create` so failures (out of disk, daemon socket perms) surface
         # with their actual error message before the build starts.
+        effective_mounts = list(readonly_cache_mounts or [])
         if self.cache_volumes_enabled:
-            self._ensure_cache_volumes(readonly_cache_mounts or [])
+            # Prepend so the fixed /cache/* paths are always the first
+            # volumes ensured. Operators who also supply
+            # ``readonly_cache_mounts`` get those layered on top.
+            effective_mounts = [
+                p for p in self._DEFAULT_CACHE_VOLUME_PATHS
+                if p not in effective_mounts
+            ] + effective_mounts
+            self._ensure_cache_volumes(effective_mounts)
         docker_cmd = self._build_docker_command(
             command,
             workspace_path,
             allow_network,
-            readonly_cache_mounts or [],
+            effective_mounts,
             extra_env or {},
             timeout_seconds,
         )
@@ -1904,18 +1941,31 @@ class SandboxExecutor:
                     cfg["restore_workspace_ownership"]
                 )
             # sandbox.cache_volumes opts the docker backend into writable
-            # named volumes for the read-only cache mounts. session_id (from
-            # the SandboxExecutor constructor, typically state["session_id"])
-            # namespaces the volumes so variant 1's typo-installed package
-            # can't poison another session. When the flag is on but no
-            # session id was passed, _cache_volume_name falls back to a
-            # "global" namespace.
-            if cfg.get("cache_volumes"):
+            # named Docker volumes mounted on the builder image's fixed
+            # /cache/{pip,uv,npm} paths (see DockerBackend._DEFAULT_CACHE_VOLUME_PATHS),
+            # so pip / uv / npm downloads persist across containers.
+            # Default ON — pip's content-addressed cache makes cross-session
+            # sharing safe, and the alternative (every compile re-downloads
+            # every wheel) is the dominant runtime cost on cold workspaces.
+            #
+            # sandbox.cache_volumes_scope controls whether the volume name is
+            # session-namespaced ("session") or shared across sessions
+            # ("global", the default). Operators who explicitly want the old
+            # per-session isolation set it to "session" — useful when running
+            # untrusted code from different tenants under the same daemon.
+            cache_volumes_on = cfg.get("cache_volumes", True)
+            if cache_volumes_on:
                 docker_kwargs["cache_volumes_enabled"] = True
-                docker_kwargs["cache_volumes_session_id"] = session_id
+                scope = str(cfg.get("cache_volumes_scope", "global")).lower()
+                if scope == "session":
+                    docker_kwargs["cache_volumes_session_id"] = session_id
+                # else: leave session_id at None → _cache_volume_name uses
+                # "global" and every session reuses the same volume.
                 cvp = cfg.get("cache_volumes_prefix")
                 if cvp:
                     docker_kwargs["cache_volumes_prefix"] = str(cvp)
+            else:
+                docker_kwargs["cache_volumes_enabled"] = False
             requested_backend = (cfg.get("backend", "auto") or "auto").lower()
             if requested_backend in ("auto", ""):
                 # auto-detect: forward docker kwargs (auto-detect itself

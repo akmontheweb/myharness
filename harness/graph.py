@@ -1531,11 +1531,13 @@ step succeeds but the next step fails with "No module named X" /
 "command not found", and the run wastes a repair iteration.
 
 Audit the build command before writing any manifest:
-  - `pip install -r requirements.txt && pytest`  → `requirements.txt`
-    must list `pytest` (and `pytest-asyncio`, `ruff`, `mypy`, etc. if the
-    command invokes them).
-  - `pip install -e '.[dev]' && pytest`  → `pytest` must live under
-    `[project.optional-dependencies].dev` in `pyproject.toml`.
+  - `uv pip install --system -r requirements.txt && pytest`  → declare
+    every tool the build invokes (pytest-asyncio, ruff, mypy, etc.) in
+    `requirements.txt`. `pytest` itself is pre-installed in the sandbox
+    but adding it to `requirements.txt` is fine — the project will need
+    it when installed outside the sandbox.
+  - `uv pip install --system -e '.[dev]' && pytest`  → declare those
+    tools under `[project.optional-dependencies].dev` in `pyproject.toml`.
   - `npm install && npm run build && npm test`  → the test runner referenced
     by the `test` script (Vitest) must be in `package.json` `devDependencies`.
   - `mvn -B test`  → Maven Surefire runs JUnit automatically; declare JUnit
@@ -1673,11 +1675,13 @@ content:
 **Makefile — MUST declare a `build:` target.** If you CREATE_FILE a `Makefile` (or `makefile` / `GNUmakefile`) at workspace root, it MUST declare a `build:` target. The harness invokes `make build` by default — a Makefile with `install:`, `test:`, `run:`, etc. but no `build:` target crashes the sandbox immediately:
 - The shell can't find `build` → `make` reports "No rule to make target 'build'"; before that, the base `ubuntu:22.04` image doesn't even ship `make` itself → exit 127 in under a second.
 - Zero diagnostics get extracted, the repair LLM has nothing to act on, the loop spins for 5 iterations and routes to HITL.
-- Minimum acceptable shape for a Python project:
+- Minimum acceptable shape for a Python project (uv is pre-installed in
+  the sandbox and 10-30× faster than pip; ALWAYS prefer `uv pip install`
+  over plain `pip install`, see harness/skills/makefile_python.md):
   ```
   .PHONY: build test
   build:
-  	python3 -m pip install -r requirements.txt
+  	uv pip install --system -r requirements.txt
   test:
   	python3 -m pytest -q
   ```
@@ -3979,6 +3983,12 @@ def _build_command_needs_network(build_command: str) -> bool:
     return any(token in cmd for token in (
         "pip install", "pip3 install", "npm install",
         "poetry install",
+        # uv is the harness-preferred Python installer (see
+        # harness/skills/makefile_python.md). All three subcommands hit
+        # PyPI: `uv pip install -r requirements.txt`, `uv sync` (resolve
+        # + install from pyproject.toml / uv.lock), `uv add <pkg>` (add
+        # + install).
+        "uv pip install", "uv sync", "uv add",
     ))
 
 
@@ -5747,11 +5757,11 @@ def _repairable_dep_hint(symbol: str, build_command: str) -> str:
         f"install step — but '{symbol}' isn't in the workspace's "
         f"dependency manifest, so pip never installs it.\n\n"
         f"Fix in ONE place:\n"
-        f"  - If the install step is `pip install -r requirements.txt`: "
+        f"  - If the install step is `(uv )?pip install -r requirements.txt`: "
         f"add `{symbol}` to `requirements.txt`. If the file does not "
         f"exist yet, CREATE it with one dependency per line "
         f"(including `{symbol}`).\n"
-        f"  - If the install step is `pip install -e '.[dev]'`: add "
+        f"  - If the install step is `(uv )?pip install -e '.[dev]'`: add "
         f"`{symbol}` to `[project.optional-dependencies].dev` in "
         f"`pyproject.toml`. If the section does not exist, CREATE it.\n"
         f"Do not change the build_command or docker_image — the package "

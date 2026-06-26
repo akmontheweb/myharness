@@ -537,9 +537,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
         # Toggled by compiler_node when the build command writes to system
         # locations the read-only root FS would block.
         "read_only_root",
-        # Writable named Docker volumes for the readonly_cache_mounts paths,
-        # scoped to the session id. See _cache_volume_name in sandbox.py.
-        "cache_volumes", "cache_volumes_prefix",
+        # Writable named Docker volumes mounted on the builder image's
+        # fixed /cache/{pip,uv,npm} paths so pip / uv / npm downloads
+        # persist across containers. Default ON, default scope "global"
+        # (shared across sessions); set scope = "session" for per-session
+        # isolation. See _cache_volume_name in sandbox.py.
+        "cache_volumes", "cache_volumes_prefix", "cache_volumes_scope",
     }),
     "token_budget": frozenset({
         "hard_cap_usd", "context_window_threshold_pct",
@@ -807,6 +810,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "sandbox.read_only_root": (bool,),
     "sandbox.cache_volumes": (bool,),
     "sandbox.cache_volumes_prefix": (str,),
+    "sandbox.cache_volumes_scope": (str,),
     "token_budget.hard_cap_usd": (int, float),
     "token_budget.stages": (dict,),
     "token_budget.context_window_threshold_pct": (int, float),
@@ -1567,10 +1571,14 @@ def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
         # > Maven > Gradle. Node is intentionally NOT probed here — a
         # subdir-only ``package.json`` typically means the frontend,
         # and the backend smoke check is what unblocks prod-imports.
+        # uv pip install is a drop-in for pip install (same manifest
+        # semantics) but 10-30× faster on cold caches and uses the
+        # harness-managed /cache/uv volume across runs. uv is pre-baked
+        # into the sandbox builder image.
         if os.path.isfile(os.path.join(full, "pyproject.toml")):
-            return f"cd {entry} && python3 -m pip install -e . && python3 -m pytest -q"
+            return f"cd {entry} && uv pip install --system -e . && python3 -m pytest -q"
         if os.path.isfile(os.path.join(full, "requirements.txt")):
-            return f"cd {entry} && python3 -m pip install -r requirements.txt && python3 -m pytest -q"
+            return f"cd {entry} && uv pip install --system -r requirements.txt && python3 -m pytest -q"
         if os.path.isfile(os.path.join(full, "pom.xml")):
             return f"cd {entry} && mvn -B test"
         if os.path.isfile(os.path.join(full, "gradlew")):
@@ -1607,10 +1615,13 @@ def _detect_default_build_command(workspace_path: str) -> Optional[str]:
     if _makefile_has_target(workspace_path, "build"):
         return "make build"
     # Python — pyproject.toml > requirements.txt > any .py file.
+    # uv pip install is preferred over plain pip — same manifest semantics,
+    # 10-30× faster on cold caches, hits the harness-managed /cache/uv
+    # volume across runs. uv is pre-baked into the sandbox builder image.
     if has("pyproject.toml"):
-        return "python3 -m pip install -e . && python3 -m pytest -q"
+        return "uv pip install --system -e . && python3 -m pytest -q"
     if has("requirements.txt"):
-        return "python3 -m pip install -r requirements.txt && python3 -m pytest -q"
+        return "uv pip install --system -r requirements.txt && python3 -m pytest -q"
     # Java — Maven first, then Gradle (wrapper if present).
     if has("pom.xml"):
         return "mvn -B test"
@@ -1633,17 +1644,21 @@ def _detect_default_build_command(workspace_path: str) -> Optional[str]:
         return subdir_cmd
     # Last-chance Python heuristic: any .py file (top level OR one
     # level deep, e.g. ``app/__init__.py`` after LLM scaffolds a
-    # package) → bootstrap pytest. Install pytest explicitly so the
-    # first build can actually succeed.
+    # package) → run pytest. Pytest is pre-baked into the sandbox
+    # builder image so the legacy `pip install pytest &&` prefix is
+    # unnecessary. The legacy substring is kept in the fallback below
+    # only for the (rare) case where the harness runs outside the
+    # builder image and the operator hasn't pre-installed pytest.
+    fallback = "uv pip install --system pytest && python3 -m pytest -q"
     try:
         for entry in os.listdir(workspace_path):
             if entry.endswith(".py"):
-                return "python3 -m pip install pytest && python3 -m pytest -q"
+                return fallback
             full = os.path.join(workspace_path, entry)
             if os.path.isdir(full) and not entry.startswith("."):
                 try:
                     if any(child.endswith(".py") for child in os.listdir(full)):
-                        return "python3 -m pip install pytest && python3 -m pytest -q"
+                        return fallback
                 except OSError:
                     continue
     except OSError:

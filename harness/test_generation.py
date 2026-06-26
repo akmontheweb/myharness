@@ -50,14 +50,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Maps a primary stack tag → the deterministic command we run after generating
-# tests. Tokens like "pip install" / "npm install" trigger the existing
-# _build_command_needs_network heuristic in harness.graph, so the sandbox
-# auto-enables network for these calls without any extra config.
+# tests. pytest / jest / ts-jest are pre-baked into the builder image
+# (harness/vendor/Dockerfile.builder), so the per-run install round-trip is
+# gone. The project's runtime deps are still installed by the workspace's
+# Makefile / build_command upstream of this node — we never bake those.
+# Java uses Maven's local repository cache via the /cache volume; ``mvn test``
+# is the canonical invocation.
 _STACK_TEST_COMMANDS: dict[str, str] = {
-    "python": "pip install -q pytest && python3 -m pytest -q",
-    "node": "npm install --no-save --silent jest && npx jest --silent",
-    "javascript": "npm install --no-save --silent jest && npx jest --silent",
-    "typescript": "npm install --no-save --silent jest ts-jest typescript && npx jest --silent",
+    "python": "python3 -m pytest -q",
+    "node": "npx --no-install jest --silent",
+    "javascript": "npx --no-install jest --silent",
+    "typescript": "npx --no-install jest --silent",
     "java": "mvn -q test",
 }
 
