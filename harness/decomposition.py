@@ -524,17 +524,13 @@ def _validate_stories_payload(
 
 def strip_json_fence(content: str) -> str:
     """Tolerate a code-fenced JSON response even though the prompt
-    forbids it — some models add fences anyway. Shared with
-    ``harness.batch_sizing``; same shape applies to every JSON-mode
-    LLM call we make."""
-    s = content.strip()
-    if s.startswith("```"):
-        first_newline = s.find("\n")
-        if first_newline != -1:
-            s = s[first_newline + 1:]
-        if s.endswith("```"):
-            s = s[:-3]
-    return s.strip()
+    forbids it — some models add fences anyway. Thin wrapper around
+    ``harness.trust.strip_code_fences`` (canonical implementation);
+    kept under this name for backwards compatibility with
+    ``harness.batch_sizing`` and other call sites.
+    """
+    from harness.trust import strip_code_fences
+    return strip_code_fences(content)
 
 
 async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -601,6 +597,15 @@ async def decomposition_node(state: dict[str, Any]) -> dict[str, Any]:
     app_name = story_state.app_name_for_workspace(workspace)
     augment_existing: list[dict[str, Any]] = []
     augment_existing_features: list[dict[str, Any]] = []
+    # The peek-then-write pattern opens TWO sqlite connections to the
+    # same file (this one and the writer below). That's safe because:
+    # (a) the state.db has WAL enabled so readers/writers don't block
+    # each other; (b) ``create_features`` is idempotent on duplicate
+    # feature_key; (c) the LLM call between peek and write would force
+    # us to hold a conn open for 30s+, which is worse than two short
+    # connections. Operators MUST NOT run two ``teane`` processes
+    # against the same workspace concurrently — that's contracted on
+    # by the workspace lock taken at session start.
     try:
         _peek_conn = story_state.open_story_db()
         try:

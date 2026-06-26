@@ -3,8 +3,9 @@ Hybrid file modification engine: tree-sitter AST-aware rewriting with
 pure text SEARCH/REPLACE fallback. Uses aiofiles for async file I/O.
 
 This module implements:
-    - BasePatcher ABC defining the four canonical operations:
-        CREATE_FILE, REPLACE_BLOCK, DELETE_BLOCK, INSERT_AT_BLOCK
+    - BasePatcher ABC defining the canonical OperationType set:
+        CREATE_FILE, REPLACE_BLOCK, DELETE_BLOCK, INSERT_AT_BLOCK,
+        INSERT_AT_LINE, REPLACE_LINE_RANGE
     - TreeSitterPatcher: AST-aware rewriting using tree-sitter grammars.
       Locates target nodes by structural signature, rewrites, and pretty-prints.
       Preserves surrounding codebase formatting entirely.
@@ -22,6 +23,7 @@ This module implements:
 from __future__ import annotations
 
 import difflib
+import errno
 import logging
 import os
 import re
@@ -351,8 +353,8 @@ def parse_patch_blocks(llm_output: str) -> list[PatchBlock]:
         <exact replacement lines>
         <<<END_REPLACE_BLOCK>>>
 
-    Supports all four operation types: REPLACE_BLOCK, CREATE_FILE,
-    DELETE_BLOCK, and INSERT_AT_BLOCK.
+    Supports all six operation types: REPLACE_BLOCK, CREATE_FILE,
+    DELETE_BLOCK, INSERT_AT_BLOCK, INSERT_AT_LINE, REPLACE_LINE_RANGE.
 
     Args:
         llm_output: The full text response from the LLM.
@@ -439,21 +441,11 @@ def parse_patch_blocks(llm_output: str) -> list[PatchBlock]:
 _EXTENSION_LANGUAGE_MAP: dict[str, str] = {
     ".py": "python",
     ".pyi": "python",
-    ".rs": "rust",
     ".ts": "typescript",
     ".tsx": "tsx",
     ".js": "javascript",
     ".jsx": "javascript",
-    ".go": "go",
-    ".c": "c",
-    ".h": "c",
-    ".cpp": "cpp",
-    ".cc": "cpp",
-    ".cxx": "cpp",
-    ".hpp": "cpp",
-    ".hxx": "cpp",
     ".java": "java",
-    ".rb": "ruby",
     ".json": "json",
     ".yaml": "yaml",
     ".yml": "yaml",
@@ -563,8 +555,10 @@ async def _awrite(filepath: str, content: str) -> None:
             check_fd = os.open(filepath, os.O_RDONLY | nofollow)
         except OSError as exc:
             # ELOOP: target is a symlink. Anything else (permissions,
-            # missing file) is fine to let through to the existing write path.
-            if getattr(exc, "errno", None) in (40, 62):  # ELOOP across Linux/BSD
+            # missing file) is fine to let through to the existing write
+            # path. Using ``errno.ELOOP`` covers Linux (40), BSD/macOS
+            # (62), and any future platform the hard-coded tuple missed.
+            if getattr(exc, "errno", None) == errno.ELOOP:
                 raise PermissionError(
                     f"[patcher] O_NOFOLLOW check tripped on {filepath!r}: "
                     f"target resolves through a symlink ({exc})."
@@ -574,9 +568,15 @@ async def _awrite(filepath: str, content: str) -> None:
 
     directory = os.path.dirname(os.path.abspath(filepath)) or "."
     # delete=False so we own cleanup; suffix keeps editor file-watchers happy.
+    # Cap suffix length so an unusually long filename (e.g. a 250-char
+    # generated test name) can't push the tmpfile past NAME_MAX (255 on
+    # ext4/POSIX). The suffix is purely informational; truncating it
+    # keeps editor watchers happy without risking ENAMETOOLONG.
+    base = os.path.basename(filepath)
+    safe_suffix = base[-32:] if len(base) > 32 else base
     fd, tmp_path = tempfile.mkstemp(
         prefix=".harness.tmp.",
-        suffix=os.path.basename(filepath),
+        suffix=safe_suffix,
         dir=directory,
     )
     try:
@@ -1309,7 +1309,10 @@ class TextPatcher(BasePatcher):
         # Normalise the content to a list of lines, each terminated with
         # \n. The user supplies content without a trailing newline; we
         # always add one so the inserted block sits on its own line(s).
-        insert_lines = (content + "\n").splitlines(keepends=True)
+        # ``rstrip("\r\n")`` first to avoid CRLF double-up when the source
+        # of ``content`` is a YAML file authored on Windows.
+        normalised = content.rstrip("\r\n")
+        insert_lines = (normalised + "\n").splitlines(keepends=True) if normalised else []
 
         # Idempotency: if file_lines[line-1 : line-1+len(insert_lines)]
         # already equals insert_lines, this patch already landed (or the
@@ -1396,7 +1399,17 @@ class TextPatcher(BasePatcher):
                 ),
             )
 
-        replacement_lines = (content + "\n").splitlines(keepends=True)
+        # Empty content means "delete this range" — don't synthesise a stray
+        # blank line. (The naive `(content + "\n").splitlines(keepends=True)`
+        # of "" returns ["\n"], which would leave a trailing newline behind.)
+        if content == "":
+            replacement_lines: list[str] = []
+        else:
+            # Normalise: strip any caller-supplied trailing newlines and
+            # CRLFs so we don't double-up EOLs when ``content`` was loaded
+            # from a CRLF source (YAML on Windows, etc.).
+            normalised = content.rstrip("\r\n")
+            replacement_lines = (normalised + "\n").splitlines(keepends=True)
 
         # Idempotency: target range already equals the replacement.
         existing_slice = file_lines[start_line - 1 : end_line]
@@ -1506,7 +1519,7 @@ class TreeSitterPatcher(BasePatcher):
         except ImportError:
             raise ImportError(
                 "tree-sitter is not installed. Install with: pip install tree-sitter tree-sitter-python "
-                "and the relevant language packages (e.g., tree-sitter-rust, tree-sitter-typescript). "
+                "and the relevant language packages (e.g., tree-sitter-typescript, tree-sitter-java). "
                 "Falling back to TextPatcher."
             )
 
@@ -1516,7 +1529,7 @@ class TreeSitterPatcher(BasePatcher):
             # Try to import the language-specific grammar package
             if language_name == "python":
                 language = tree_sitter.Language(tspython.language())
-            elif language_name in ("rust", "typescript", "tsx", "javascript", "go", "c", "cpp"):
+            elif language_name in ("typescript", "tsx", "javascript", "java"):
                 # For these languages, try dynamic import
                 grammar_module = __import__(f"tree_sitter_{language_name}", fromlist=["language"])
                 language = tree_sitter.Language(grammar_module.language())
@@ -1644,10 +1657,18 @@ class TreeSitterPatcher(BasePatcher):
                 )
 
             target = matching_nodes[0]
-            # Replace only the target node's bytes, preserving everything else
+            # Replace only the target node's bytes, preserving everything
+            # else. Encode the source once (the earlier code encoded it
+            # three times in a single expression, allocating 3x source
+            # size for every patch on a 1MB file).
             start_byte = target.start_byte
             end_byte = target.end_byte
-            modified_bytes = source.encode("utf-8")[:start_byte] + replace.encode("utf-8") + source.encode("utf-8")[end_byte:]
+            source_bytes = source.encode("utf-8")
+            modified_bytes = (
+                source_bytes[:start_byte]
+                + replace.encode("utf-8")
+                + source_bytes[end_byte:]
+            )
             modified = modified_bytes.decode("utf-8")
 
             # Verify the result can still be parsed (sanity check)
@@ -1785,10 +1806,6 @@ class TreeSitterPatcher(BasePatcher):
                 node_types = ("function_definition", "class_definition")
             elif lang in ("javascript", "typescript", "tsx"):
                 node_types = ("function_declaration", "class_declaration", "method_definition")
-            elif lang == "rust":
-                node_types = ("function_item", "struct_item", "impl_item")
-            elif lang in ("c", "cpp"):
-                node_types = ("function_definition", "class_specifier")
             else:
                 node_types = ("function_definition", "class_definition")
 
@@ -1802,16 +1819,41 @@ class TreeSitterPatcher(BasePatcher):
             if placement == Placement.BEFORE:
                 insert_byte = target_node.start_byte
             else:
+                # For AFTER: advance past any trailing comment + whitespace
+                # on the SAME line as ``end_byte``. Tree-sitter's end_byte
+                # for a function/class node lands right after the last
+                # statement byte; a trailing inline comment ("def f(): pass
+                # # note") is a SIBLING node that lives past end_byte. The
+                # earlier shape spliced the insert between ``pass`` and the
+                # comment, breaking the file. Advancing to the next newline
+                # (inclusive) keeps the trailing comment attached and puts
+                # the inserted block on the line below.
                 insert_byte = target_node.end_byte
+                nl_pos = source.find("\n", insert_byte)
+                if nl_pos >= 0:
+                    insert_byte = nl_pos + 1
 
-            # Ensure clean newline separation
             prefix = source[:insert_byte]
             suffix = source[insert_byte:]
+            normalised_content = content.rstrip("\r\n")
 
             if placement == Placement.AFTER:
-                modified = prefix.rstrip("\n") + "\n" + content.rstrip("\n") + "\n" + suffix.lstrip("\n")
+                # prefix already ends with "\n" when we found a newline
+                # above; if it does not (last line of file with no EOL),
+                # add one. ``content`` gets its own terminating newline so
+                # the next existing line starts cleanly.
+                if not prefix.endswith("\n"):
+                    prefix = prefix + "\n"
+                modified = prefix + normalised_content + "\n" + suffix.lstrip("\n")
             else:
-                modified = prefix.rstrip("\n") + "\n" + content.rstrip("\n") + "\n" + suffix.lstrip("\n")
+                # BEFORE: insert between any leading code and the anchor.
+                # Strip whatever EOLs precede the anchor and put exactly
+                # one newline before/after the inserted block.
+                modified = (
+                    prefix.rstrip("\n") + ("\n" if prefix else "")
+                    + normalised_content + "\n"
+                    + suffix.lstrip("\n")
+                )
 
             lines_changed = content.count("\n") + 1
 

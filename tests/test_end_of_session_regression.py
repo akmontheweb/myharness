@@ -224,18 +224,6 @@ class TestRouteAfterEndOfSessionRegression:
 # ---------------------------------------------------------------------------
 
 class TestResolvePostEosDestination:
-    def test_flutter_short_circuits_to_installation(self, tmp_path):
-        # _is_flutter_project requires BOTH pubspec.yaml AND a lib/ dir.
-        (tmp_path / "pubspec.yaml").write_text("name: t\n")
-        (tmp_path / "lib").mkdir()
-        st = {
-            "workspace_path": str(tmp_path),
-            "node_state": {},
-            "dev_deployment": True,
-            "cd_discovery": True,
-        }
-        assert _resolve_post_eos_destination(st) == "installation_doc_node"
-
     def test_deployment_already_ran_short_circuits(self):
         st = {
             "workspace_path": "/tmp/not-flutter",

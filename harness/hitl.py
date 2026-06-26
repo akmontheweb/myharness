@@ -280,12 +280,26 @@ class FileChannel(HitlChannel):
 
     def _lookup(self, message: str) -> str:
         message_lower = message.lower()
+        # Two-pass: prefer a not-yet-consumed entry (preserves the
+        # one-shot semantics callers rely on for distinct prompts), but
+        # fall back to ANY substring match if every match has been
+        # consumed. The earlier first-pass-only shape raised RuntimeError
+        # on the second occurrence of an identical prompt (e.g. two
+        # batches both hitting the STORIES gate), even though an entry
+        # for it existed.
         for i, (prompt, answer) in enumerate(self._answers):
+            if prompt.lower() in message_lower and i not in self._used:
+                self._used.add(i)
+                logger.info("[hitl:file] Matched prompt %r → %r", prompt, answer)
+                return answer
+        for prompt, answer in self._answers:
             if prompt.lower() in message_lower:
-                if i not in self._used:
-                    self._used.add(i)
-                    logger.info("[hitl:file] Matched prompt %r → %r", prompt, answer)
-                    return answer
+                logger.info(
+                    "[hitl:file] Replaying prompt %r → %r (all matching "
+                    "entries already used; falling back to replay).",
+                    prompt, answer,
+                )
+                return answer
         raise RuntimeError(
             f"[hitl:file] No pre-recorded answer for prompt: {message[:120]!r}. "
             f"Add an entry to the HARNESS_HITL_FILE to cover this prompt."
@@ -481,6 +495,16 @@ class HttpChannel(HitlChannel):
                     "[hitl:http] Webhook returned malformed JSON "
                     "(non-transient): %s. Failing closed.", exc,
                 )
+                try:
+                    from harness.observability import emit_event
+                    emit_event(
+                        "hitl_resolved",
+                        hitl_type=meta_type,
+                        answer="",
+                        error=f"malformed_json: {exc}",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 raise HitlChannelUnavailable(
                     f"webhook {self.url!r} returned malformed JSON: {exc}"
                 ) from exc
@@ -514,6 +538,21 @@ class HttpChannel(HitlChannel):
             "returning the default %r — audit §5.7.",
             self.max_retries + 1, last_err, default_answer,
         )
+        # Always close the loop on the structured event: every
+        # ``hitl_pending`` we emitted at the top of this call must be
+        # matched by an ``hitl_resolved`` so the dashboard SSE banner
+        # clears, even on failure. Earlier shape only emitted on the
+        # success branch, leaving stuck banners after a webhook outage.
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "hitl_resolved",
+                hitl_type=meta_type,
+                answer="",
+                error=str(last_err) if last_err else "unreachable",
+            )
+        except Exception:  # noqa: BLE001
+            pass
         raise HitlChannelUnavailable(
             f"webhook {self.url!r} unreachable after "
             f"{self.max_retries + 1} attempt(s); last error: {last_err}"

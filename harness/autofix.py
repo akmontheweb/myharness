@@ -5,15 +5,14 @@ and known-safe security finding fixes WITHOUT spending an LLM call.
 Three dispatchers, dispatched per-diagnostic by apply_autofixes():
 
     R1 (compiler)  — _try_compiler_suggestion
-        Consumes the DiagnosticObject.suggested_fix populated by the
-        rustc / gcc / clang parsers (only when applicability is
-        "machine-applicable"). Returns a REPLACE_BLOCK PatchBlock built
-        from (file, span, replacement).
+        Consumes any DiagnosticObject.suggested_fix populated by a parser
+        (only when applicability is "machine-applicable"). Returns a
+        REPLACE_BLOCK PatchBlock built from (file, span, replacement).
 
     R2 (import)    — _try_missing_import
         Recognises common "name undefined" / "cannot find symbol" / "TS2304"
-        / "E0425" / "go: undefined: X" / "cannot find symbol" (java)
-        diagnostics. Grep-walks the workspace for top-level definitions
+        / "cannot find symbol" (java) diagnostics.
+        Grep-walks the workspace for top-level definitions
         of the missing symbol. If EXACTLY ONE definition exists outside
         the offending file, emits an INSERT_AT_BLOCK at the top of the
         offending file with the language-appropriate import statement.
@@ -27,8 +26,7 @@ Three dispatchers, dispatched per-diagnostic by apply_autofixes():
             - gitleaks any rule → DELETE the offending line + add
               <RULE_ID>=<placeholder> to .env.example
             - trivy dep-vuln with FixedVersion → bump pin in the
-              manifest file (requirements.txt / package.json / go.mod /
-              Cargo.toml)
+              manifest file (requirements.txt / package.json)
 
     R6 (web asset) — _try_asset_reference_fix
         Fires when error_code == "WEB_ASSET_REF" (produced by the
@@ -104,8 +102,8 @@ async def apply_autofixes(
     Args:
         diagnostics: A list of DiagnosticObjectDict dicts (the shape the
             graph carries in state["compiler_errors"]). May include the
-            optional ``suggested_fix`` field hoisted by the rustc / gcc
-            parsers.
+            optional ``suggested_fix`` field hoisted by a structured-
+            diagnostic parser.
         workspace_path: Absolute path to the workspace root. Used both for
             resolving relative file paths in patches and for the
             R2 symbol grep.
@@ -129,6 +127,13 @@ async def apply_autofixes(
 
     unhandled: list[dict[str, Any]] = []
     applied: list[AutofixResult] = []
+    # Track files mutated by earlier iterations of THIS loop. Layer-1
+    # semgrep autofixes rely on diagnostic-supplied line numbers + a
+    # current-file hash gate; if an earlier autofix changed the file, the
+    # hash now matches the post-mutation bytes but the diagnostic's line
+    # numbers are stale relative to those bytes. Skipping mutated files
+    # closes that race; the survivor falls through to the LLM repair loop.
+    mutated_files: set[str] = set()
 
     for idx, diag in enumerate(diagnostics):
         candidate = _try_compiler_suggestion(diag, workspace_path)
@@ -139,7 +144,7 @@ async def apply_autofixes(
             if candidate is not None:
                 fix_kind = "import"
         if candidate is None:
-            candidate = _try_security_autofix(diag, workspace_path)
+            candidate = _try_security_autofix(diag, workspace_path, mutated_files=mutated_files)
             if candidate is not None:
                 fix_kind = "security"
         if candidate is None:
@@ -165,6 +170,8 @@ async def apply_autofixes(
 
         result = await _apply_block(patcher, candidate)
         if result.success:
+            if not result.no_op:
+                mutated_files.add(candidate.file)
             applied.append(AutofixResult(
                 diagnostic_index=idx,
                 fix_kind=fix_kind,
@@ -348,6 +355,13 @@ def _slice_span(
 ) -> Optional[str]:
     """Extract the substring of ``source`` covered by a 1-indexed span.
 
+    Structured-diagnostic parsers conventionally ship EXCLUSIVE 1-based
+    end coordinates: a 10-char line spanning the full line gets
+    ``end_col=11``. So ``[start_col-1 : end_col-1]`` is the
+    correct half-open Python slice, and the bound check accepts
+    ``end_col == len+1`` (the after-last position). Do not "fix" the
+    -1 on end_col; it is load-bearing.
+
     Returns None when any coordinate is out of range. The replacement
     will then bypass autofix and fall through to the LLM.
     """
@@ -399,8 +413,6 @@ _PY_IMPORT_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"name\s*'(?P<sym>\w+)'\s*is\s*not\s*defined"),
 ]
 _TS_IMPORT_PATTERN = re.compile(r"Cannot find name\s*'(?P<sym>\w+)'")
-_RUST_IMPORT_PATTERN = re.compile(r"cannot find (?:value|function|type|trait)\s*`(?P<sym>\w+)`")
-_GO_IMPORT_PATTERN = re.compile(r"undefined:\s*(?P<sym>\w+)")
 _JAVA_IMPORT_PATTERN = re.compile(
     r"cannot find symbol[\s\S]*?symbol:\s*(?:class|method|variable)\s+(?P<sym>\w+)"
 )
@@ -500,15 +512,6 @@ def _detect_missing_symbol(
             m = _TS_IMPORT_PATTERN.search(message)
             if m:
                 return "typescript", m.group("sym")
-    if ext == ".rs":
-        if "E0425" in error_code or "E0412" in error_code or "E0422" in error_code or "cannot find" in message:
-            m = _RUST_IMPORT_PATTERN.search(message)
-            if m:
-                return "rust", m.group("sym")
-    if ext == ".go":
-        m = _GO_IMPORT_PATTERN.search(message)
-        if m:
-            return "go", m.group("sym")
     if ext == ".java":
         m = _JAVA_IMPORT_PATTERN.search(message)
         if m:
@@ -528,16 +531,6 @@ _DEFINITION_PATTERNS: dict[str, list[re.Pattern[str]]] = {
         re.compile(r"^(?:async\s+)?function\s+{name}\b"),
         re.compile(r"^class\s+{name}\b"),
     ],
-    "rust": [
-        re.compile(r"^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+{name}\b"),
-        re.compile(r"^(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|trait|type|const|static)\s+{name}\b"),
-    ],
-    "go": [
-        re.compile(r"^func\s+{name}\b"),
-        re.compile(r"^type\s+{name}\b"),
-        re.compile(r"^var\s+{name}\b"),
-        re.compile(r"^const\s+{name}\b"),
-    ],
     "java": [
         re.compile(r"^(?:public|private|protected)?\s*(?:abstract\s+|final\s+|static\s+)*(?:class|interface|enum)\s+{name}\b"),
     ],
@@ -546,8 +539,6 @@ _DEFINITION_PATTERNS: dict[str, list[re.Pattern[str]]] = {
 _EXTENSION_FOR_LANG: dict[str, tuple[str, ...]] = {
     "python": (".py",),
     "typescript": (".ts", ".tsx"),
-    "rust": (".rs",),
-    "go": (".go",),
     "java": (".java",),
 }
 
@@ -626,19 +617,6 @@ def _build_import_statement(
         if not rel:
             return ""
         return f"import {{ {symbol} }} from '{rel}';"
-    if language == "rust":
-        # Use a crate-relative path. We can't reliably compute it without
-        # parsing Cargo.toml, so fall back to ``crate::<filename>::<symbol>``
-        # which the compiler will at least flag clearly if wrong.
-        module = os.path.splitext(os.path.basename(def_path))[0]
-        return f"use crate::{module}::{symbol};"
-    if language == "go":
-        # Go imports are at package level — the simplest correct form is
-        # an import path derived from the workspace location.
-        pkg_dir = os.path.dirname(os.path.relpath(def_path, workspace_path))
-        if not pkg_dir or pkg_dir == ".":
-            return ""
-        return f'import "{pkg_dir}"'
     if language == "java":
         # Best-effort: read a `package X.Y.Z;` declaration from the def file.
         package = _java_package(def_path)
@@ -842,7 +820,6 @@ _NPM_DEV_NAMESPACE_PREFIXES: tuple[str, ...] = (
     "@swc/",
     "@eslint/",
     "@playwright/",
-    "@nestjs/cli",
     "postcss-",
     "eslint-",
     "stylelint-",
@@ -1104,12 +1081,17 @@ def _try_dep_resolution_conflict(
 def _try_security_autofix(
     diag: dict[str, Any],
     workspace_path: str,
+    *,
+    mutated_files: Optional[set[str]] = None,
 ) -> Optional[PatchBlock]:
     """Dispatch security-finding diagnostics through the rule registry.
 
     The diagnostic ``error_code`` is shaped ``SCANNER:RULE_ID`` (built by
     harness/security.py::_findings_to_diagnostics). Only diagnostics with
-    such a prefix are eligible.
+    such a prefix are eligible. ``mutated_files`` (when supplied) lists
+    relative file paths that earlier autofixes in the same loop already
+    changed — Layer-1 semgrep dispatchers refuse to emit line-coordinate
+    patches against them.
     """
     error_code = str(diag.get("error_code", "") or "")
     if ":" not in error_code:
@@ -1121,6 +1103,8 @@ def _try_security_autofix(
     fix_fn = _SECURITY_FIX_TABLE.get(scanner)
     if fix_fn is None:
         return None
+    if scanner == "SEMGREP":
+        return _fix_semgrep(rule_id, diag, workspace_path, mutated_files=mutated_files)
     return fix_fn(rule_id, diag, workspace_path)
 
 
@@ -1231,20 +1215,34 @@ def _fix_gitleaks(
 
     target = lines[line_no - 1]
     naked = target.rstrip("\n").rstrip("\r")
-    # The TextPatcher.delete_block requires the search string to appear
-    # exactly once. If the same secret line appears twice we abort —
-    # ambiguity is the LLM's job.
-    if source.count(naked) != 1 or not naked.strip():
+    if not naked.strip():
         return None
+    # Use REPLACE_LINE_RANGE with empty content to delete the line by
+    # coordinate. The earlier substring-based DELETE_BLOCK approach (a)
+    # left a stray blank line behind because ``naked`` excluded the EOL
+    # but the EOL was never deleted, and (b) overcounted when ``naked``
+    # appeared as a substring inside another line.
     return PatchBlock(
-        operation=OperationType.DELETE_BLOCK,
+        operation=OperationType.REPLACE_LINE_RANGE,
         file=rel_file,
-        search=naked,
+        line=line_no,
+        end_line=line_no,
+        replace="",
     )
 
 
 _TRIVY_FIXED_VERSION_RE = re.compile(r"upgrade to\s+([0-9][\w.\-+]*)")
-_PKG_FROM_TRIVY_MESSAGE_RE = re.compile(r"^(?P<pkg>[\w@./-]+)\s+(?P<ver>[\w.\-+]+):")
+# Trivy's SecurityFinding.message starts with "<pkg> <installed>: <title>".
+# At fix time the diagnostic is usually wrapped with a "[SECURITY ...] ...
+# in <file>:<line>: " prefix; the wrapper-less form is also valid (some
+# callers pass the bare message). We accept BOTH:
+#   * anchored at start-of-string (raw SecurityFinding.message), OR
+#   * immediately after a ``: `` boundary (the wrapper's ":<line>: pkg…").
+# Variable-width alternation in lookbehind is fine here because each
+# branch is fixed-width.
+_PKG_FROM_TRIVY_MESSAGE_RE = re.compile(
+    r"(?:^|(?<=: ))(?P<pkg>[\w@./-]+)\s+(?P<ver>[\w.\-+]+):"
+)
 
 
 def _fix_trivy(
@@ -1338,22 +1336,6 @@ def _find_version_pin(
             if search in source:
                 return search, f"{package}{sep}{fixed}"
         return None
-    if name == "go.mod":
-        # go.mod: require <pkg> v<installed> → v<fixed>
-        search_a = f"{package} v{installed}"
-        if search_a in source:
-            return search_a, f"{package} v{fixed}"
-        search_b = f"{package} {installed}"
-        if search_b in source:
-            return search_b, f"{package} {fixed}"
-        return None
-    if name == "cargo.toml":
-        # Cargo: pkg = "installed" or pkg = "^installed"
-        for prefix in ("", "^", "~"):
-            search = f'{package} = "{prefix}{installed}"'
-            if search in source:
-                return search, f'{package} = "{prefix}{fixed}"'
-        return None
     return None
 
 
@@ -1380,6 +1362,8 @@ def _fix_semgrep(
     rule_id: str,
     diag: dict[str, Any],
     workspace_path: str,
+    *,
+    mutated_files: Optional[set[str]] = None,
 ) -> Optional[PatchBlock]:
     """Two-layer semgrep autofix dispatcher.
 
@@ -1420,22 +1404,33 @@ def _fix_semgrep(
     # --- Layer 1 — scanner-suggested fix --------------------------------
     fix = diag.get("fix")
     if isinstance(fix, str) and fix:
-        try:
-            start_line = int(diag.get("line", 0) or 0)
-            end_line = int(diag.get("end_line", 0) or 0)
-        except (TypeError, ValueError):
-            start_line = end_line = 0
-        if start_line >= 1 and end_line >= start_line:
-            from harness.patcher import sha256_file_bytes
-            file_hash = sha256_file_bytes(file_abs) or ""
-            return PatchBlock(
-                operation=OperationType.REPLACE_LINE_RANGE,
-                file=rel_file,
-                line=start_line,
-                end_line=end_line,
-                content=fix.rstrip("\n"),
-                expected_file_hash=file_hash,
+        # Skip Layer-1 if an earlier autofix in THIS loop already mutated
+        # the file: the diagnostic's start_line/end_line were captured
+        # before that mutation and are now stale. The hash gate is no
+        # protection — sha256_file_bytes() below captures the POST-mutation
+        # bytes, so the gate would pass while writing to the wrong lines.
+        if mutated_files and rel_file in mutated_files:
+            logger.debug(
+                "[autofix] Skipping semgrep Layer-1 for %s: file already mutated this round.",
+                rel_file,
             )
+        else:
+            try:
+                start_line = int(diag.get("line", 0) or 0)
+                end_line = int(diag.get("end_line", 0) or 0)
+            except (TypeError, ValueError):
+                start_line = end_line = 0
+            if start_line >= 1 and end_line >= start_line:
+                from harness.patcher import sha256_file_bytes
+                file_hash = sha256_file_bytes(file_abs) or ""
+                return PatchBlock(
+                    operation=OperationType.REPLACE_LINE_RANGE,
+                    file=rel_file,
+                    line=start_line,
+                    end_line=end_line,
+                    content=fix.rstrip("\n"),
+                    expected_file_hash=file_hash,
+                )
 
     # --- Layer 2 — local rule table -------------------------------------
     try:

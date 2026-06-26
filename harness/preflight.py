@@ -91,25 +91,10 @@ INSTALL_RECIPES: dict[str, dict[str, str]] = {
         "macos": "brew install node",
         "windows": "winget install OpenJS.NodeJS",
     },
-    "go": {
-        "linux": "sudo apt install golang-go   # or https://go.dev/dl/",
-        "macos": "brew install go",
-        "windows": "winget install GoLang.Go",
-    },
-    "cargo": {
-        "linux": "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
-        "macos": "brew install rust   # or rustup-init from https://rustup.rs/",
-        "windows": "winget install Rustlang.Rustup",
-    },
     "java": {
         "linux": "sudo apt install default-jdk",
         "macos": "brew install openjdk@21",
         "windows": "winget install EclipseAdoptium.Temurin.21.JDK",
-    },
-    "dart": {
-        "linux": "see https://dart.dev/get-dart",
-        "macos": "brew install dart",
-        "windows": "winget install Google.Dart",
     },
     "gh": {
         "linux": "sudo apt install gh   # or https://cli.github.com/",
@@ -137,16 +122,6 @@ INSTALL_RECIPES: dict[str, dict[str, str]] = {
         "linux": "npm install -g prettier",
         "macos": "npm install -g prettier",
         "windows": "npm install -g prettier",
-    },
-    "rustfmt": {
-        "linux": "rustup component add rustfmt",
-        "macos": "rustup component add rustfmt",
-        "windows": "rustup component add rustfmt",
-    },
-    "clang-format": {
-        "linux": "sudo apt install clang-format",
-        "macos": "brew install clang-format",
-        "windows": "see https://releases.llvm.org/   # LLVM Windows installer",
     },
     "shfmt": {
         "linux": "sudo apt install shfmt",
@@ -636,10 +611,7 @@ def probe_xcode_cli() -> CheckResult:
 
 _LANGUAGE_TOOLS = (
     ("node", "Node.js (MCP servers, prettier, npx)"),
-    ("go", "Go toolchain (Go projects, gofmt)"),
-    ("cargo", "Rust toolchain (Cargo projects, rustfmt)"),
     ("java", "Java runtime (Spring Boot / Maven / Gradle)"),
-    ("dart", "Dart / Flutter SDK"),
 )
 
 _SECURITY_TOOLS = (
@@ -652,8 +624,6 @@ _SECURITY_TOOLS = (
 _FORMATTER_TOOLS = (
     ("ruff", "Python format + lint"),
     ("prettier", "JS/TS/CSS/MD format"),
-    ("rustfmt", "Rust format"),
-    ("clang-format", "C/C++ format"),
     ("shellcheck", "shell lint"),
 )
 

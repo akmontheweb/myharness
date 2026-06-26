@@ -960,7 +960,7 @@ class TestScannerExcludeFlagWiring:
         assert "--exclude" not in capture_cmd["cmd"]
 
     @pytest.mark.asyncio
-    async def test_bandit_passes_comma_separated_excludes(
+    async def test_bandit_passes_one_exclude_per_path(
         self, capture_cmd, monkeypatch,
     ):
         # Bandit only runs when .py files are detected; stub that out so
@@ -975,14 +975,19 @@ class TestScannerExcludeFlagWiring:
             exclude_paths=("docs", "product_spec"),
         )
         cmd = capture_cmd["cmd"]
-        # Bandit wants ONE ``-x`` followed by comma-separated absolute
-        # paths. Resolved against /ws so bandit's CWD doesn't matter.
-        assert "-x" in cmd
-        idx = cmd.index("-x")
-        assert cmd[idx + 1] == "/ws/docs,/ws/product_spec"
+        # Bandit now receives one ``--exclude <path>`` per excluded
+        # directory. The previous "comma-joined absolute paths into a
+        # single -x" shape silently dropped paths containing commas and
+        # corrupted Windows ``C:\…`` paths.
+        excludes = [
+            cmd[i + 1] for i, v in enumerate(cmd) if v == "--exclude"
+        ]
+        assert "/ws/docs" in excludes
+        assert "/ws/product_spec" in excludes
+        assert len(excludes) == 2
 
     @pytest.mark.asyncio
-    async def test_bandit_no_excludes_omits_x_flag(
+    async def test_bandit_no_excludes_omits_exclude_flag(
         self, capture_cmd, monkeypatch,
     ):
         from harness import security as sec
@@ -993,6 +998,7 @@ class TestScannerExcludeFlagWiring:
         await run_bandit_scan(
             "/ws", bandit_path="bandit", exclude_paths=(),
         )
+        assert "--exclude" not in capture_cmd["cmd"]
         assert "-x" not in capture_cmd["cmd"]
 
     @pytest.mark.asyncio

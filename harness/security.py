@@ -440,7 +440,7 @@ class CommandValidator:
     Configurable via .harness_config.json:
         {
           "security": {
-            "allowed_commands": ["make", "cargo", "gcc", "g++", "pytest", ...],
+            "allowed_commands": ["make", "pytest", "python", "npm", ...],
             "blocked_patterns": ["curl", "wget", "sudo", ...],
             "allow_all_commands": false,
             "allow_network_in_build": false
@@ -460,14 +460,10 @@ class CommandValidator:
     # inner command is sanitised at the call site.
     DEFAULT_ALLOWED_COMMANDS: set[str] = {
         "make", "cmake", "ninja",
-        "gcc", "g++", "clang", "clang++", "cc", "c++",
-        "rustc", "cargo",
-        "go", "gofmt",
         "python", "python3", "pip", "pip3", "poetry", "uv",
-        "node", "npm", "npx", "yarn", "pnpm",
+        "node", "npm", "npx",
         "javac", "java", "mvn", "gradle",
         "pytest", "unittest", "tox", "nox",
-        "dotnet", "msbuild",
         "echo", "cat", "ls", "cp", "mv", "mkdir", "rm", "chmod", "chown",
         "git", "hg",
         "docker", "docker-compose", "podman",
@@ -508,11 +504,21 @@ class CommandValidator:
         r"\brm\s+-rf\s+/",       # rm -rf / (absolute root)
         r"\bchmod\s+777\s+/",    # chmod 777 on absolute root paths
         r"\b>\/dev\/sd[a-z]\b",  # Writing to raw disk devices
-        r"\b\/dev\/null\b",      # Allowable, but flagging suspicious pipes
+        # NOTE: `/dev/null`, `eval`, and `exec` are NOT hard-blocked any
+        # more — they were breaking ordinary builds (`mvn ... > /dev/null`,
+        # `cmake -E execute_process`, `docker exec`, `kubectl exec`, even
+        # `git exec-path`). The dangerous shapes — `eval $(curl …)`,
+        # `bash -c 'exec …'`, redirecting build output into the network —
+        # are covered by the `wget|sh`, `curl|sh`, and `source <(…)`
+        # patterns below.
         r"\bwget\b.*\|.*sh\b",   # curl | bash pattern
         r"\bcurl\b.*\|.*sh\b",   # curl | bash pattern
-        r"\beval\b",
-        r"\bexec\b",
+        # Match `eval` / `exec` only at shell-builtin position: line
+        # start, after a pipe/semicolon/&&, or directly after `bash -c '`.
+        # This excludes `docker exec`, `kubectl exec`, `git exec-path`,
+        # `cmake -E execute_process`, npm `exec`, etc.
+        r"(?:^|[|;&]\s*|bash\s+-c\s*['\"])\s*eval\s+",
+        r"(?:^|[|;&]\s*|bash\s+-c\s*['\"])\s*exec\s+[^/]",
         r"\bsource\s+<(curl|wget)",  # Process substitution from network
         r"\b\/etc\/passwd\b",
         r"\b\/etc\/shadow\b",
@@ -551,8 +557,17 @@ class CommandValidator:
         command_stripped = command.strip()
 
         # Remove environment variable assignments for token analysis
-        # e.g., "RUSTFLAGS=... cargo build" → "cargo build"
-        clean_for_parsing = re.sub(r'^[A-Za-z_][A-Za-z0-9_]*=[^\s;]*\s+', '', command_stripped)
+        # e.g., "PYTHONPATH=... pytest" → "pytest"
+        # The previous single-shot regex only stripped ONE leading
+        # assignment, so multi-env commands like
+        # "FOO=1 BAR=2 pytest" were rejected by the whitelist because the
+        # basename of "BAR=2" isn't a known command. Strip ALL leading
+        # "KEY=VALUE " pairs in one pass.
+        clean_for_parsing = re.sub(
+            r'^(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;]*\s+)+',
+            '',
+            command_stripped,
+        )
 
         # --- Blocklist check (highest priority) ---
         for i, pattern in enumerate(self._compiled_patterns):
@@ -565,15 +580,23 @@ class CommandValidator:
                 )
 
         # --- Network safety check ---
-        # If network is not explicitly allowed, block any URL/domain patterns
+        # If network is not explicitly allowed, block any URL/domain patterns.
+        # Loopback addresses (127.0.0.1, 0.0.0.0, ::1) are NOT treated as
+        # "network": tests routinely bind to 127.0.0.1, and refusing them
+        # broke many test commands. We require non-loopback IPs (or scheme
+        # URLs that resolve off-host).
         if not self.allow_network_in_build:
+            loopback_ip_re = re.compile(
+                r'\b(?:127\.0\.0\.\d{1,3}|0\.0\.0\.0|::1)\b'
+            )
+            command_no_loopback = loopback_ip_re.sub('', command_stripped)
             url_patterns = [
-                r'https?://[^\s]+',
+                r'https?://(?!(?:localhost|127\.|0\.0\.0\.0))[^\s]+',
                 r'ftp://[^\s]+',
-                r'\b[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?!\.\d)',  # IP addresses
+                r'\b(?!127\.|0\.0\.0\.0)[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(?!\.\d)',
             ]
             for url_pattern in url_patterns:
-                if re.search(url_pattern, command_stripped):
+                if re.search(url_pattern, command_no_loopback):
                     return CommandValidationResult(
                         allowed=False,
                         command=command,
@@ -1022,8 +1045,7 @@ _HARD_SECURITY_CEILING_MULTIPLIER: int = 3
 # doctor share one source of truth.
 SCANNER_INSTALL_HINTS: dict[str, str] = {
     "gitleaks": (
-        "go install github.com/gitleaks/gitleaks/v8@latest"
-        "  # or download from github.com/gitleaks/gitleaks/releases"
+        "download from github.com/gitleaks/gitleaks/releases"
     ),
     "bandit": "pipx install bandit  # or pip install --user bandit",
     "semgrep": "pipx install semgrep  # or pip install --user semgrep",
@@ -1370,12 +1392,13 @@ def _is_harness_owned_path(rel_path: str) -> bool:
 
 
 def _scan_workspace_languages(workspace_path: str) -> tuple[bool, bool, bool]:
-    """Cheap one-pass walk: do any .py / .go / .js|.ts files exist?
+    """Cheap one-pass walk: do any .py / .js|.ts files exist?
 
     Capped at 200 files so a huge tree doesn't slow the gate. Sufficient
-    to decide whether bandit / semgrep are worth invoking at all.
+    to decide whether bandit / semgrep are worth invoking at all. The
+    middle tuple slot is retained as ``False`` for return-shape stability.
     """
-    has_py = has_go = has_js_ts = False
+    has_py = has_js_ts = False
     for root, dirs, files in os.walk(workspace_path):
         dirs[:] = [
             d for d in dirs
@@ -1386,13 +1409,11 @@ def _scan_workspace_languages(workspace_path: str) -> tuple[bool, bool, bool]:
             ext = os.path.splitext(fname)[1].lower()
             if ext in (".py", ".pyi"):
                 has_py = True
-            elif ext == ".go":
-                has_go = True
             elif ext in (".ts", ".tsx", ".js", ".jsx", ".mjs"):
                 has_js_ts = True
-        if has_py and has_go and has_js_ts:
+        if has_py and has_js_ts:
             break
-    return has_py, has_go, has_js_ts
+    return has_py, False, has_js_ts
 
 
 def _parse_bandit_json(stdout: str) -> list[SecurityFinding]:
@@ -1564,14 +1585,19 @@ async def run_bandit_scan(
         return ScannerOutcome(scanner="bandit", status=ScannerStatus.NOT_INSTALLED)
 
     cmd = [resolved, "-r", "-f", "json", "-ll", "-q"]
-    # Bandit's -x flag wants a comma-separated list of paths (absolute
-    # or relative to its CWD). Resolve to absolute against workspace so
-    # bandit never has to guess.
+    # Bandit's -x accepts comma-separated paths AND can be passed
+    # multiple times. Use one --exclude per path so a path containing a
+    # literal comma can't silently corrupt the list, and Windows
+    # ``C:\…`` paths aren't reinterpreted. Skip any path that contains
+    # a comma defensively — bandit treats commas as delimiters even in
+    # the single-arg form so embedded commas would still break.
     abs_excludes = [
-        os.path.join(workspace_path, ex) for ex in exclude_paths if ex
+        os.path.join(workspace_path, ex)
+        for ex in exclude_paths
+        if ex and "," not in ex
     ]
-    if abs_excludes:
-        cmd.extend(["-x", ",".join(abs_excludes)])
+    for ex in abs_excludes:
+        cmd.extend(["--exclude", ex])
     cmd.append(workspace_path)
     exit_code, stdout, stderr = await _run_subprocess_scanner(
         cmd, timeout_seconds=timeout_seconds, label="bandit",
@@ -1605,7 +1631,7 @@ async def run_semgrep_scan(
     timeout_seconds: int = 30,
     exclude_paths: Sequence[str] = (),
 ) -> ScannerOutcome:
-    """Semgrep (universal SAST). Useful for JS/TS/Go and as a
+    """Semgrep (universal SAST). Useful for JS/TS and as a
     cross-language second opinion alongside bandit on Python."""
     resolved = shutil.which(semgrep_path) if semgrep_path else shutil.which("semgrep")
     if not resolved:
@@ -1656,8 +1682,8 @@ async def run_trivy_scan(
 ) -> ScannerOutcome:
     """Trivy filesystem scan for dependency / package vulnerabilities.
 
-    Picks up vulnerable transitive deps (npm, pip, gomod, cargo, etc.)
-    that SAST scanners can't see.
+    Picks up vulnerable transitive deps (npm, pip, maven/gradle) that
+    SAST scanners can't see.
 
     The vulnerability DB is cached under ``~/.harness/cache/trivy`` and
     refreshed at most once every 24 hours; after that, ``--skip-db-update``
@@ -1671,6 +1697,7 @@ async def run_trivy_scan(
 
     cache_dir = os.path.expanduser("~/.harness/cache/trivy")
     skip_db_update = False
+    stamp_path = ""
     try:
         os.makedirs(cache_dir, exist_ok=True)
         stamp_path = os.path.join(cache_dir, ".db_refreshed_at")
@@ -1682,17 +1709,15 @@ async def run_trivy_scan(
                 last = 0.0
             if now - last < 24 * 60 * 60:
                 skip_db_update = True
-        if not skip_db_update:
-            # Touch the stamp BEFORE the scan; if trivy fails mid-download the
-            # next call retries on its own DB-update path, no need to block.
-            try:
-                with open(stamp_path, "w", encoding="utf-8") as _f:
-                    _f.write(str(now))
-            except OSError:
-                pass
+        # Stamp write is DEFERRED until the scan exits cleanly (see
+        # below). The earlier "touch stamp before scan" shape left a
+        # fresh stamp on the disk even when the trivy DB download died
+        # mid-flight; the next call would then see the stamp, pass
+        # --skip-db-update, and quietly use the half-downloaded DB.
     except OSError as exc:
         logger.debug("[security_scan] trivy cache setup skipped: %s", exc)
         cache_dir = ""
+        stamp_path = ""
 
     cmd = [
         resolved, "fs", "--format", "json", "--quiet", "--no-progress",
@@ -1725,6 +1750,18 @@ async def run_trivy_scan(
     findings = _parse_trivy_json(stdout)
     if findings:
         logger.warning("[security_scan] trivy found %d dep-vuln(s).", len(findings))
+    # Only stamp the cache after a successful scan; this prevents a
+    # half-downloaded DB (interrupted mid-download by SIGINT or OOM)
+    # from being treated as fresh on the next call.
+    if stamp_path and not skip_db_update and exit_code == 0:
+        try:
+            with open(stamp_path, "w", encoding="utf-8") as _f:
+                _f.write(str(time.time()))
+        except OSError as stamp_err:
+            logger.debug(
+                "[security_scan] trivy stamp write failed (%s); next call will refresh DB.",
+                stamp_err,
+            )
     return ScannerOutcome(
         scanner="trivy",
         status=ScannerStatus.FOUND if findings else ScannerStatus.OK,

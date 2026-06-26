@@ -797,7 +797,7 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
             # the variant actually produced. Without this, a greenfield
             # run keeps build_command="make build" against the bare
             # ubuntu:22.04 default and every variant exits 127 even when
-            # one wrote a perfectly good Python (or Node, or Rust) project.
+            # one wrote a perfectly good Python (or Node) project.
             # detect_default_build_command + _apply_toolchain_adaptation
             # are idempotent — re-calling them produces the same answer
             # the workspace-time pass picked when the worktree matches.
@@ -853,7 +853,7 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
 
             # Give each variant a private writable cache directory tree.
             # Multiple variants running in parallel would otherwise corrupt
-            # each other's pip / npm / cargo / go / mypy / pytest caches —
+            # each other's pip / npm / mypy / pytest caches —
             # those tools assume single-writer access to their cache dirs.
             #
             # Read-only host cache mounts (~/.cache/pip etc. via the unshare
@@ -901,17 +901,15 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
 
     # --- Cache warm-up pass ---
     # When sandbox.cache_volumes is on, the variants share a writable named
-    # volume per tool (pip/npm/cargo). Without warm-up, all three variants
-    # race to cold-fill the cache in parallel — 3× the network downloads,
-    # cargo flock contention on the registry index. Warm-up runs the install
-    # step once against the workspace (single-writer) so the variants then
-    # fan out against an already-populated cache.
+    # volume per tool (pip/npm). Without warm-up, all variants race to
+    # cold-fill the cache in parallel — N× the network downloads. Warm-up
+    # runs the install step once against the workspace (single-writer) so
+    # the variants then fan out against an already-populated cache.
     #
     # Skip warm-up when:
     #   - cache_volumes is off (no shared cache to fill — variants have
     #     their own per-variant write dirs and host caches are read-only).
-    #   - The build command does no install work (`make build`, plain
-    #     `cargo build` against a vendored crate, etc.).
+    #   - The build command does no install work (`make build`, etc.).
     #   - The workspace has no install markers (greenfield run — the
     #     workspace-time late-bind returned None, so build_command is still
     #     the unresolved default and warming up with it would just exit 127).
@@ -949,8 +947,20 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 — warm-up is best-effort
             logger.debug("[speculative] Warm-up failed: %s", exc)
 
+    # Gate variant compilation behind ``cfg.max_concurrency`` so we don't
+    # spawn N parallel docker containers (or N parallel native compilers)
+    # regardless of operator config. Previously the semaphore was only
+    # consulted in ``run_parallel_agents`` for voting; variant compilation
+    # ignored it and could saturate the host. The cap is normalized to
+    # [1, 10] by the config loader.
+    _compile_sem = asyncio.Semaphore(max(1, cfg.max_concurrency))
+
+    async def _compile_variant_gated(vr: "VariantResult") -> "VariantResult":
+        async with _compile_sem:
+            return await _compile_variant(vr)
+
     variant_results = list(await asyncio.gather(*[
-        _compile_variant(vr) for vr in variant_results
+        _compile_variant_gated(vr) for vr in variant_results
     ]))
 
     # --- Step 5: Select the winning variant ---
@@ -1455,11 +1465,10 @@ def _build_variant_cache_env(
     *writable* cache to a variant-local directory tree.
 
     Without this, parallel variants run concurrent `pip install`,
-    `npm install`, `cargo build`, `go build`, `pytest`, `mypy`, etc.
-    against the same shared per-user cache directories — pip's lock file
-    races, cargo's registry index gets corrupted, mypy's incremental
-    cache gets mixed across branches, and pytest's `.pytest_cache`
-    becomes meaningless.
+    `npm install`, `pytest`, `mypy`, etc. against the same shared
+    per-user cache directories — pip's lock file races, mypy's
+    incremental cache gets mixed across branches, and pytest's
+    `.pytest_cache` becomes meaningless.
 
     Each variant gets ``<worktree>/.harness-cache/<tool>/`` so writes are
     isolated. The host-level read-only cache mounts (configured via
@@ -1467,22 +1476,16 @@ def _build_variant_cache_env(
     these env vars only affect where writes land.
 
     When ``use_shared_package_cache`` is True (``sandbox.cache_volumes`` is
-    on), the **package** caches (pip, npm, yarn, cargo registry, go mods,
-    maven repo) are NOT overridden — they fall through to the tool's
-    default paths inside the container, which the docker backend has
-    bind-mounted to a writable named volume. Build-output / incremental
-    tool caches (__pycache__, mypy, pytest, ruff, gradle, cargo target,
-    go build cache) stay per-variant since different variants produce
+    on), the **package** caches (pip, npm, maven repo) are NOT overridden
+    — they fall through to the tool's default paths inside the container,
+    which the docker backend has bind-mounted to a writable named volume.
+    Build-output / incremental tool caches (__pycache__, mypy, pytest,
+    ruff, gradle) stay per-variant since different variants produce
     different code and must not share build artifacts.
 
     Returned env-var keys (each pointing to a per-variant subdirectory):
       - PIP_CACHE_DIR          (Python pip; omitted when shared cache is on)
       - npm_config_cache       (npm — lowercase is canonical; omitted when shared)
-      - YARN_CACHE_FOLDER      (Yarn; omitted when shared)
-      - CARGO_HOME             (Cargo registry + git + credentials; omitted when shared)
-      - CARGO_TARGET_DIR       (Rust build artifacts — always per-variant)
-      - GOCACHE                (Go build cache — always per-variant)
-      - GOMODCACHE             (Go module download cache; omitted when shared)
       - GRADLE_USER_HOME       (Gradle — always per-variant)
       - MAVEN_OPTS             (-Dmaven.repo.local override; omitted when shared)
       - PYTHONPYCACHEPREFIX    (Python __pycache__ — always per-variant)
@@ -1502,32 +1505,26 @@ def _build_variant_cache_env(
     env: dict[str, str] = {
         # Build outputs + tool incremental state — ALWAYS per-variant,
         # regardless of cache_volumes. Different variants produce different
-        # code; sharing __pycache__, mypy incremental, ruff, pytest, cargo
-        # target, go build cache, or gradle home would mix branches and
-        # corrupt verdicts.
+        # code; sharing __pycache__, mypy incremental, ruff, pytest, or
+        # gradle home would mix branches and corrupt verdicts.
         "PYTHONPYCACHEPREFIX": _sub("pycache"),
         "MYPY_CACHE_DIR": _sub("mypy"),
         "RUFF_CACHE_DIR": _sub("ruff"),
         "PYTEST_ADDOPTS": f"-o cache_dir={_sub('pytest')}",
-        "CARGO_TARGET_DIR": _sub("cargo-target"),
-        "GOCACHE": _sub("go-build"),
         "GRADLE_USER_HOME": _sub("gradle"),
         "XDG_CACHE_HOME": _sub("xdg"),
     }
     if not use_shared_package_cache:
         # Default: per-variant package caches so concurrent writes don't
-        # race (cargo's registry index in particular). With cache_volumes
-        # on, the docker backend bind-mounts a writable named volume at
-        # the container's default tool paths, and the speculative warm-up
-        # pass primes the volume before fan-out — leaving these env vars
-        # unset lets the tools pick up the shared cache.
+        # race. With cache_volumes on, the docker backend bind-mounts a
+        # writable named volume at the container's default tool paths,
+        # and the speculative warm-up pass primes the volume before
+        # fan-out — leaving these env vars unset lets the tools pick up
+        # the shared cache.
         maven_repo = _sub("maven-repo")
         env.update({
             "PIP_CACHE_DIR": _sub("pip"),
             "npm_config_cache": _sub("npm"),
-            "YARN_CACHE_FOLDER": _sub("yarn"),
-            "CARGO_HOME": _sub("cargo-home"),
-            "GOMODCACHE": _sub("go-mod"),
             "MAVEN_OPTS": f"-Dmaven.repo.local={maven_repo}",
         })
     return env

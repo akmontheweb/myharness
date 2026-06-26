@@ -1,5 +1,5 @@
 ---
-applies_to: [html, css, react, vue, angular]
+applies_to: [html, css, react]
 ---
 
 ## Web App — Asset Reference Contract

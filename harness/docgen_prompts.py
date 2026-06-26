@@ -49,6 +49,47 @@ _CACHE: dict[str, str] = {}
 _CACHE_LOCK = threading.Lock()
 
 
+# ---------------------------------------------------------------------------
+# Agile-mode directive substitution for requirements_doc.md
+# ---------------------------------------------------------------------------
+#
+# The shipped ``requirements_doc.md`` skill prompt contains a single
+# ``{AGILE_MODE_DIRECTIVE}`` placeholder near the top that selects between
+# Path A (SAFe/Agile RSD with Gherkin + INVEST) and Path B (ISO 29148
+# default RSD). The harness substitutes one of these two banners based on
+# the resolved ``--agile`` CLI flag (``args.decomposition_enabled`` after
+# ``_resolve_agile_args`` runs). Substitution happens at load time via
+# :func:`apply_agile_directive` so the cache returns the verbatim file
+# body untouched — call sites apply the directive themselves.
+_AGILE_MODE_DIRECTIVE_AGILE = (
+    "**EXECUTION MODE: AGILE.** The `--agile` flag is set for this run. "
+    "Follow **Path A — Agile RSD** below (SAFe Epic → Feature → Story "
+    "hierarchy with Gherkin acceptance criteria, INVEST validation, and "
+    "Enabler Stories for NFRs). Do NOT emit any content from **Path B**; "
+    "treat it as documentation of the alternative format only."
+)
+
+_AGILE_MODE_DIRECTIVE_DEFAULT = (
+    "**EXECUTION MODE: DEFAULT.** The `--agile` flag is not set for this "
+    "run. Follow **Path B — Default RSD** below (ISO/IEC/IEEE 29148:2018 "
+    "structure with numbered sections, `shall`/`should` requirement "
+    "statements, and a flat RTM). Do NOT emit any content from **Path A**; "
+    "treat it as documentation of the alternative format only."
+)
+
+
+def apply_agile_directive(body: str, *, agile: bool) -> str:
+    """Substitute the ``{AGILE_MODE_DIRECTIVE}`` placeholder in a loaded
+    docgen prompt with the agile- or default-mode banner.
+
+    Returns ``body`` unchanged when the placeholder is absent — keeps the
+    call site safe for prompts that don't carry the placeholder (e.g.
+    arch_doc, the discovery prompts).
+    """
+    directive = _AGILE_MODE_DIRECTIVE_AGILE if agile else _AGILE_MODE_DIRECTIVE_DEFAULT
+    return body.replace("{AGILE_MODE_DIRECTIVE}", directive)
+
+
 def load(name: str, workspace_path: Optional[str] = None) -> str:
     """Return the markdown body of the docgen prompt named ``name``.
 

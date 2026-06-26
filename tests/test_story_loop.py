@@ -293,7 +293,10 @@ def test_story_loop_returns_complete_when_all_done(workspace: str):
     assert out["current_story_id"] == ""
     assert out["node_state"]["blocked_count"] == 0
 
-    # Batch was marked complete
+    # batch_commit_node is the sole sealer now — story_loop_node only
+    # signals batch_complete=True so the per-batch verification chain
+    # can run. The batch row stays at its in-flight status (``running``,
+    # whatever batch_planner_node sets) until verification clears it.
     conn = story_state.open_story_db()
     try:
         row = conn.execute(
@@ -301,7 +304,7 @@ def test_story_loop_returns_complete_when_all_done(workspace: str):
         ).fetchone()
     finally:
         conn.close()
-    assert row[0] == "complete"
+    assert row[0] != "complete"
 
 
 def test_story_loop_reports_blocked_count(workspace: str):
@@ -323,6 +326,10 @@ def test_story_loop_reports_blocked_count(workspace: str):
     assert out["node_state"]["batch_complete"] is True
     assert out["node_state"]["blocked_count"] == 1
 
+    # The blocked_count is surfaced via node_state so the verification
+    # chain can seal as "complete_with_blocks" later; story_loop_node
+    # itself no longer writes the batch row (batch_commit_node is the
+    # single sealer).
     conn = story_state.open_story_db()
     try:
         row = conn.execute(
@@ -330,7 +337,8 @@ def test_story_loop_reports_blocked_count(workspace: str):
         ).fetchone()
     finally:
         conn.close()
-    assert row[0] == "complete_with_blocks"
+    assert row[0] != "complete"
+    assert row[0] != "complete_with_blocks"
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +482,8 @@ def test_story_loop_auto_complete_finishes_batch_when_last_story(workspace: str)
     assert out["node_state"]["blocked_count"] == 0
     assert out["current_story_id"] == ""
 
+    # batch_commit_node is the sole sealer now; story_loop_node only
+    # marks batch_complete on node_state so verification can run.
     conn = story_state.open_story_db()
     try:
         row = conn.execute(
@@ -481,7 +491,7 @@ def test_story_loop_auto_complete_finishes_batch_when_last_story(workspace: str)
         ).fetchone()
     finally:
         conn.close()
-    assert row[0] == "complete"
+    assert row[0] != "complete"
 
 
 # ---------------------------------------------------------------------------

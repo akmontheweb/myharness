@@ -1012,7 +1012,15 @@ async def _watch_subprocess(
         logger.warning("[web_state] subprocess wait error for %s: %s",
                        proc.session_id, exc)
         exit_code = -1
-    registry.mark_terminated(proc.session_id, int(exit_code or 0))
+    # Preserve None and -1 distinctly. ``int(exit_code or 0)`` coerced
+    # both None and -1 to 0, silently reporting success on a wait-error
+    # path. Use -1 as the "no real code captured" sentinel so the
+    # dashboard/audit distinguish it from a clean exit.
+    if isinstance(exit_code, int):
+        normalised_exit = exit_code
+    else:
+        normalised_exit = -1
+    registry.mark_terminated(proc.session_id, normalised_exit)
     if audit_db_path:
         try:
             append_audit(

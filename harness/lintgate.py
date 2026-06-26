@@ -3,11 +3,11 @@ Deterministic Patch Verification Layer — Lint & Format Lock.
 
 This module implements:
     - FormatRegistry: Maps file extensions to deterministic auto-formatter commands.
-      Runs hyper-fast local tools (gofmt, black, ruff, prettier, rustfmt, clang-format)
+      Runs hyper-fast local tools (black, ruff, prettier, google-java-format)
       to clean up whitespace, missing brackets, and minor syntax issues automatically.
     - lintgate_node: LangGraph node that runs AFTER patches are applied but BEFORE
       the heavy compiler pipeline. Never calls an LLM — purely deterministic subprocess.
-    - Linter support: Optionally runs lightweight linters (ruff check, eslint, clippy)
+    - Linter support: Optionally runs lightweight linters (ruff check, eslint)
       to catch deeper issues cheaply before the build.
 
 Integration:
@@ -229,20 +229,6 @@ _DEFAULT_FORMATTERS: dict[str, FormatterSpec] = {
         args=["format", "--quiet"],
         install_hint="pip install ruff",
     ),
-    ".go": FormatterSpec(
-        command="gofmt",
-        args=["-w"],
-        linter_command="go",
-        linter_args=["vet", "./..."],
-        install_hint="Install Go from https://go.dev/dl/",
-    ),
-    ".rs": FormatterSpec(
-        command="rustfmt",
-        args=["--edition", "2021"],
-        linter_command="cargo",
-        linter_args=["clippy", "--fix", "--allow-dirty", "--allow-staged"],
-        install_hint="rustup component add rustfmt clippy",
-    ),
     ".ts": FormatterSpec(
         command="prettier",
         args=["--write"],
@@ -295,47 +281,10 @@ _DEFAULT_FORMATTERS: dict[str, FormatterSpec] = {
         args=["--write", "--prose-wrap", "always"],
         install_hint="npm install -g prettier",
     ),
-    ".c": FormatterSpec(
-        command="clang-format",
-        args=["-i"],
-        install_hint="apt install clang-format  # or brew install clang-format",
-    ),
-    ".h": FormatterSpec(
-        command="clang-format",
-        args=["-i"],
-        install_hint="apt install clang-format",
-    ),
-    ".cpp": FormatterSpec(
-        command="clang-format",
-        args=["-i"],
-        install_hint="apt install clang-format",
-    ),
-    ".cc": FormatterSpec(
-        command="clang-format",
-        args=["-i"],
-        install_hint="apt install clang-format",
-    ),
-    ".cxx": FormatterSpec(
-        command="clang-format",
-        args=["-i"],
-        install_hint="apt install clang-format",
-    ),
-    ".hpp": FormatterSpec(
-        command="clang-format",
-        args=["-i"],
-        install_hint="apt install clang-format",
-    ),
     ".java": FormatterSpec(
         command="google-java-format",
         args=["-i"],
         install_hint="Download from https://github.com/google/google-java-format/releases",
-    ),
-    ".dart": FormatterSpec(
-        command="dart",
-        args=["format"],
-        linter_command="dart",
-        linter_args=["analyze"],
-        install_hint="Install Dart/Flutter from https://flutter.dev/docs/get-started/install",
     ),
     ".sh": FormatterSpec(
         command="shfmt",

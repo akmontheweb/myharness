@@ -211,15 +211,109 @@ READ_FILE_SCHEMA: dict[str, Any] = {
 }
 
 
+INSERT_AT_LINE_SCHEMA: dict[str, Any] = {
+    "name": "insert_at_line",
+    "description": (
+        "Insert content BEFORE a specific 1-indexed line in a file. "
+        "Equivalent to <<<INSERT_AT_LINE>>> in the text DSL. Prefer "
+        "edit_file / insert_at_block when you can describe the target "
+        "by content or anchor name; use this when you only have line "
+        "coordinates (e.g. a diagnostic from a scanner)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Workspace-relative path to the file.",
+            },
+            "line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "1-indexed line number; the inserted block lands "
+                    "BEFORE this line. Use ``last_line + 1`` to append."
+                ),
+            },
+            "content": {
+                "type": "string",
+                "description": "Text to insert.",
+            },
+            "expected_file_hash": {
+                "type": "string",
+                "description": (
+                    "Optional sha256 of the file at the time the caller "
+                    "decided on the line number. When set the patcher "
+                    "refuses the patch if the file has drifted. Leave "
+                    "blank to trust the line number unconditionally."
+                ),
+            },
+        },
+        "required": ["file_path", "line", "content"],
+    },
+}
+
+REPLACE_LINE_RANGE_SCHEMA: dict[str, Any] = {
+    "name": "replace_line_range",
+    "description": (
+        "Replace a 1-indexed inclusive line range with new content. "
+        "Equivalent to <<<REPLACE_LINE_RANGE>>> in the text DSL. Empty "
+        "``content`` deletes the range. Use when you only have line "
+        "coordinates (scanner diagnostic, compiler error span)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "file_path": {
+                "type": "string",
+                "description": "Workspace-relative path to the file.",
+            },
+            "line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-indexed first line of the range (inclusive).",
+            },
+            "end_line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "1-indexed last line of the range (inclusive). "
+                    "Must be >= line."
+                ),
+            },
+            "content": {
+                "type": "string",
+                "description": (
+                    "Replacement text. Empty string deletes the range."
+                ),
+            },
+            "expected_file_hash": {
+                "type": "string",
+                "description": (
+                    "Optional sha256 of the file at the time the caller "
+                    "decided on the line range. When set the patcher "
+                    "refuses the patch if the file has drifted."
+                ),
+            },
+        },
+        "required": ["file_path", "line", "end_line", "content"],
+    },
+}
+
+
 # Canonical ordering of tool schemas. Order matters because some
 # providers (notably Anthropic) preserve the order in their UI surfaces;
-# we want the most-used tools first.
+# we want the most-used tools first. The line-coordinate ops sit at the
+# end of the patch tools — they're for the rare cases where the LLM has
+# line numbers but not content/anchor.
 PATCH_TOOLS: list[dict[str, Any]] = [
     READ_FILE_SCHEMA,
     EDIT_FILE_SCHEMA,
     CREATE_FILE_SCHEMA,
     DELETE_BLOCK_SCHEMA,
     INSERT_AT_BLOCK_SCHEMA,
+    INSERT_AT_LINE_SCHEMA,
+    REPLACE_LINE_RANGE_SCHEMA,
 ]
 
 
@@ -309,15 +403,11 @@ def tool_call_to_patch_block(call: dict[str, Any]) -> "PatchBlock | None":
             placement=placement,
             content=str(args.get("content", "")),
         )
-    # Line-coordinate ops. PATCH_TOOLS does not yet expose tool
-    # definitions for these — Layer-2 rule-table autofixes and Layer-1
-    # semgrep ``extra.fix`` patches are constructed directly from
-    # PatchBlock and never round-trip through tool calls. The dispatch
-    # branches are added so that if/when tool definitions are added,
-    # the translator already round-trips correctly and isn't a silent
-    # drop. The same class of dispatch-missing-ops bug burned us in
-    # ``autofix._apply_block`` (2026-06-25 security HITL loop) — this
-    # is the parallel preventive fix.
+    # Line-coordinate ops. Schemas are registered in PATCH_TOOLS so the
+    # LLM can emit these via structured tool-use. Layer-2 rule-table
+    # autofixes and Layer-1 semgrep ``extra.fix`` patches also construct
+    # the same PatchBlock shape directly without going through tool
+    # calls. The dispatch branches handle both paths uniformly.
     if name == "insert_at_line":
         try:
             line_no = int(args.get("line", 0) or 0)

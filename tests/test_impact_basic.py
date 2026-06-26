@@ -240,39 +240,6 @@ class TestTreeSitterDispatch:
         assert ok is False
 
 
-class TestFlutterProjectDetection:
-    """_is_flutter_project decides whether the graph should skip the
-    docker-compose deploy pipeline (M-1 routing)."""
-
-    def test_flutter_scaffold_detected(self):
-        import os
-        from harness.impact import _is_flutter_project
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with open(os.path.join(tmpdir, "pubspec.yaml"), "w") as f:
-                f.write("name: my_app\n")
-            os.makedirs(os.path.join(tmpdir, "lib"))
-            assert _is_flutter_project(tmpdir) is True
-
-    def test_missing_pubspec_not_flutter(self):
-        import os
-        from harness.impact import _is_flutter_project
-        with tempfile.TemporaryDirectory() as tmpdir:
-            os.makedirs(os.path.join(tmpdir, "lib"))
-            assert _is_flutter_project(tmpdir) is False
-
-    def test_missing_lib_not_flutter(self):
-        import os
-        from harness.impact import _is_flutter_project
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with open(os.path.join(tmpdir, "pubspec.yaml"), "w") as f:
-                f.write("name: my_app\n")
-            assert _is_flutter_project(tmpdir) is False
-
-    def test_nonexistent_path_not_flutter(self):
-        from harness.impact import _is_flutter_project
-        assert _is_flutter_project("/nonexistent_xyz_path") is False
-
-
 class TestWorkspaceStackDetector:
     """_detect_workspace_stack drives language-aware skill filtering."""
 
@@ -308,17 +275,6 @@ class TestWorkspaceStackDetector:
             assert "python" in tags
             assert "django" in tags
 
-    def test_flutter_workspace_detected(self):
-        import os
-        from harness.impact import _detect_workspace_stack
-        with tempfile.TemporaryDirectory() as tmp:
-            with open(os.path.join(tmp, "pubspec.yaml"), "w") as f:
-                f.write("name: my_app\n")
-            os.makedirs(os.path.join(tmp, "lib"))
-            tags = _detect_workspace_stack(tmp)
-            assert "flutter" in tags
-            assert "dart" in tags
-
     def test_spring_boot_workspace_detected(self):
         import os
         from harness.impact import _detect_workspace_stack
@@ -351,30 +307,6 @@ class TestWorkspaceStackDetector:
             assert "react" in tags
             assert "vue" not in tags
             assert "angular" not in tags
-
-    def test_angular_workspace_detected(self):
-        import json
-        import os
-        from harness.impact import _detect_workspace_stack
-        with tempfile.TemporaryDirectory() as tmp:
-            pkg = {"dependencies": {"@angular/core": "^17.0.0"}}
-            with open(os.path.join(tmp, "package.json"), "w") as f:
-                json.dump(pkg, f)
-            tags = _detect_workspace_stack(tmp)
-            assert "angular" in tags
-            assert "react" not in tags
-
-    def test_express_with_redis_detected(self):
-        import json
-        import os
-        from harness.impact import _detect_workspace_stack
-        with tempfile.TemporaryDirectory() as tmp:
-            pkg = {"dependencies": {"express": "^4.0.0", "ioredis": "^5.0.0"}}
-            with open(os.path.join(tmp, "package.json"), "w") as f:
-                json.dump(pkg, f)
-            tags = _detect_workspace_stack(tmp)
-            assert "express" in tags
-            assert "redis" in tags
 
     def test_docker_compose_postgres_detected(self):
         import os

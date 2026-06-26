@@ -159,8 +159,6 @@ class TestCacheCorruptionHint:
         "ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE",
         "could not match the hash of foo-1.0-py3-none-any.whl",
         "npm ERR! code EINTEGRITY\nnpm ERR! sha512-deadbeef integrity mismatch",
-        "error: registry index is corrupt at /root/.cargo/registry/index",
-        "the lock file `cargo.lock` is corrupt",
         "cacache: integrity check failed for sha512-",
     ])
     def test_known_signatures_trigger_hint(self, sample):
@@ -191,8 +189,6 @@ class TestVariantCacheEnvSharedPackageCache:
         # Package caches present.
         assert "PIP_CACHE_DIR" in env
         assert "npm_config_cache" in env
-        assert "CARGO_HOME" in env
-        assert "GOMODCACHE" in env
         # Build-output caches present.
         assert "PYTHONPYCACHEPREFIX" in env
         assert "MYPY_CACHE_DIR" in env
@@ -204,12 +200,11 @@ class TestVariantCacheEnvSharedPackageCache:
         )
         # Package caches OMITTED — tools use the shared named volume via
         # container default paths.
-        for key in ("PIP_CACHE_DIR", "npm_config_cache", "YARN_CACHE_FOLDER",
-                    "CARGO_HOME", "GOMODCACHE", "MAVEN_OPTS"):
+        for key in ("PIP_CACHE_DIR", "npm_config_cache", "MAVEN_OPTS"):
             assert key not in env, f"{key} should be omitted when shared cache is on"
         # Build-output caches still per-variant.
         for key in ("PYTHONPYCACHEPREFIX", "MYPY_CACHE_DIR", "RUFF_CACHE_DIR",
-                    "PYTEST_ADDOPTS", "CARGO_TARGET_DIR", "GOCACHE",
+                    "PYTEST_ADDOPTS",
                     "GRADLE_USER_HOME", "XDG_CACHE_HOME"):
             assert key in env, f"{key} must remain per-variant"
 

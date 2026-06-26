@@ -191,7 +191,7 @@ def _build_basename_index(workspace_path: str) -> dict[str, list[str]]:
     Skips common churn dirs to keep this fast on large repos.
     """
     skip_dirs = {"node_modules", ".git", "dist", "build", "coverage",
-                 "__pycache__", ".venv", "venv", "target", ".next", ".nuxt"}
+                 "__pycache__", ".venv", "venv", "target"}
     index: dict[str, list[str]] = {}
     for root, dirs, files in os.walk(workspace_path):
         dirs[:] = [d for d in dirs if d not in skip_dirs]
@@ -264,7 +264,7 @@ def scan_web_asset_references(
         for root, dirs, names in os.walk(workspace_path):
             dirs[:] = [d for d in dirs if d not in {
                 "node_modules", ".git", "dist", "build", "coverage",
-                "__pycache__", ".venv", "venv", "target", ".next", ".nuxt"
+                "__pycache__", ".venv", "venv", "target"
             }]
             for name in names:
                 ext = os.path.splitext(name)[1].lower()

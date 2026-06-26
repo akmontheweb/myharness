@@ -146,13 +146,13 @@ class TestBuildPatcherAllowlist:
         # Regression: Node workspaces used to fail because the static set
         # was Python-only — patches to package.json / tsconfig.json got
         # rejected at workspace root even though the kitchen-sink builder
-        # supports JS. The static set must cover the canonical JS manifests.
+        # supports the locked React + TypeScript + TailwindCSS stack. The
+        # static set must cover the canonical JS/TS manifests for that stack.
         _seed_node_workspace(tmp_path)
         allowlist = _build_patcher_allowlist(str(tmp_path))
         assert allowlist is not None
         for expected in (
             "package.json", "package-lock.json",
-            "yarn.lock", "pnpm-lock.yaml",
             "tsconfig.json", "tsconfig.base.json",
             ".npmrc", ".nvmrc",
         ):
@@ -181,14 +181,17 @@ class TestBuildPatcherAllowlist:
                 f"{expected} missing — runtime scan should have picked it up"
             )
 
-    def test_node_config_files_not_added_when_absent(self, tmp_path):
+    def test_unseeded_node_config_files_not_added_when_absent(self, tmp_path):
         # The runtime scan must not invent allowlist entries for configs
-        # that aren't on disk — the static set already covers canonical
-        # names, and broadening to every *.config.* would weaken the guard.
+        # that aren't on disk AND aren't in the static seed set — the
+        # static set covers canonical filenames the LLM commonly creates
+        # on a fresh greenfield (`.eslintrc.json`, `.prettierrc`, etc.),
+        # but open-ended families like `*.config.{cjs,mjs,ts}` are still
+        # gated on disk presence so broadening doesn't weaken the guard.
         _seed_node_workspace(tmp_path)
         allowlist = _build_patcher_allowlist(str(tmp_path))
         assert allowlist is not None
-        for absent in ("jest.config.cjs", "vite.config.ts", ".eslintrc.json"):
+        for absent in ("jest.config.cjs", "vite.config.ts"):
             assert absent not in allowlist
 
 

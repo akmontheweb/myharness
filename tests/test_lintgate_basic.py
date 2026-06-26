@@ -251,12 +251,3 @@ class TestRegisterFormatter:
         if retrieved is not None:
             assert retrieved.command == "custom_formatter"
 
-    def test_dart_formatter_registered_by_default(self):
-        # Phase C: .dart should be in the default formatter map so Flutter
-        # projects get the same lint+format treatment as Python/JS/Java.
-        spec = get_formatter_for_file("lib/main.dart")
-        assert spec is not None
-        assert spec.command == "dart"
-        assert spec.args == ["format"]
-        assert spec.linter_command == "dart"
-        assert spec.linter_args == ["analyze"]

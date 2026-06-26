@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 # importing impact at module load time would create.
 _NEVER_SOURCE_DIRS: frozenset[str] = frozenset({
     "node_modules", "__pycache__", "dist", "build", "target", "out",
-    ".git", ".tox", ".venv", "venv", ".next", ".nuxt", ".svelte-kit",
+    ".git", ".tox", ".venv", "venv",
     "coverage", "htmlcov", ".pytest_cache", ".mypy_cache", ".ruff_cache",
 })
 
@@ -179,6 +179,44 @@ def scan_workspace_for_broken_imports(
 # JS / TS resolver
 # ---------------------------------------------------------------------------
 
+_JS_LINE_COMMENT_RE = re.compile(r"//[^\n]*")
+_JS_BLOCK_COMMENT_RE = re.compile(r"/\*[\s\S]*?\*/")
+
+
+def _strip_js_comments(body: str) -> str:
+    """Mask out JS line + block comments so they aren't scanned for imports.
+
+    Preserves total length (replaces with spaces) so any positional info
+    a caller might track stays aligned. Does NOT try to be perfect about
+    string-literal content; an ``import`` keyword inside a template
+    literal can still false-match. The bigger win is suppressing
+    commented-out import lines, which are by far the most common source
+    of LINK_BROKEN false positives.
+    """
+    def _blank(match: re.Match[str]) -> str:
+        return " " * (match.end() - match.start())
+    body = _JS_BLOCK_COMMENT_RE.sub(_blank, body)
+    body = _JS_LINE_COMMENT_RE.sub(_blank, body)
+    return body
+
+
+def _detect_vite_root(workspace_path: str) -> str:
+    """Return the directory that should be used as the root for `/`-rooted
+    imports. Looks for ``vite.config.{ts,js,mjs}`` in the workspace and
+    common monorepo client subdirs; falls back to the workspace itself.
+    """
+    candidates = [workspace_path]
+    for sub in ("client", "frontend", "web", "ui"):
+        sub_abs = os.path.join(workspace_path, sub)
+        if os.path.isdir(sub_abs):
+            candidates.append(sub_abs)
+    for cand in candidates:
+        for cfg in ("vite.config.ts", "vite.config.js", "vite.config.mjs"):
+            if os.path.isfile(os.path.join(cand, cfg)):
+                return cand
+    return workspace_path
+
+
 def _scan_js_file(
     src_abs: str, src_rel: str, workspace_path: str,
 ) -> list[BrokenLink]:
@@ -190,9 +228,12 @@ def _scan_js_file(
         logger.debug("[link_check] Could not read %s: %s", src_abs, exc)
         return []
 
+    body = _strip_js_comments(body)
+
     seen_specs: set[str] = set()
     broken: list[BrokenLink] = []
     src_dir = os.path.dirname(src_abs)
+    vite_root = _detect_vite_root(workspace_path)
 
     for pattern in _JS_IMPORT_PATTERNS:
         for match in pattern.finditer(body):
@@ -201,11 +242,12 @@ def _scan_js_file(
                 continue
             seen_specs.add(spec)
             # Resolve the spec relative to the importing file's dir.
-            # An absolute spec ("/x") is rooted in workspace_path — Vite's
-            # default, also what most tsconfig/jsconfig path:'/'-style aliases
-            # produce. v1 keeps it simple: treat / as workspace-relative.
+            # An absolute spec ("/x") is rooted in the Vite project root.
+            # The earlier code rooted at workspace_path unconditionally,
+            # producing false LINK_BROKEN diagnostics in any monorepo
+            # whose Vite root is a subdirectory (client/, frontend/, …).
             if spec.startswith("/"):
-                target_base = os.path.join(workspace_path, spec.lstrip("/"))
+                target_base = os.path.join(vite_root, spec.lstrip("/"))
             else:
                 target_base = os.path.normpath(os.path.join(src_dir, spec))
             candidates = _js_resolution_candidates(target_base)

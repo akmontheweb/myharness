@@ -159,3 +159,54 @@ def test_skills_get_docgen_prompt_routes_externalized_types():
     assert "Architecture Document" in arch_prompt or "Architecture" in arch_prompt
     # readme still comes from the inline dict
     assert "README.md" in readme_prompt
+
+
+def test_requirements_doc_has_agile_mode_placeholder():
+    # `synthesize_requirements` and `generate_documentation` substitute
+    # `{AGILE_MODE_DIRECTIVE}` in the requirements_doc prompt based on the
+    # resolved `--agile` flag. If the placeholder is removed by mistake
+    # the literal `{AGILE_MODE_DIRECTIVE}` would leak into the LLM input
+    # AND both paths would be live simultaneously — guard against drift.
+    body = docgen_prompts.load("requirements_doc")
+    assert "{AGILE_MODE_DIRECTIVE}" in body, (
+        "requirements_doc.md lost its {AGILE_MODE_DIRECTIVE} placeholder; "
+        "synthesize_requirements / generate_documentation rely on it to "
+        "select between Path A (agile) and Path B (default)."
+    )
+    # The two paths must both be documented in the body so the LLM can
+    # apply whichever directive the harness substitutes in.
+    assert "Path A — Agile RSD" in body
+    assert "Path B — Default RSD" in body
+
+
+@pytest.mark.parametrize("agile", [True, False])
+def test_apply_agile_directive_substitutes_placeholder(agile):
+    body = docgen_prompts.load("requirements_doc")
+    rendered = docgen_prompts.apply_agile_directive(body, agile=agile)
+    assert "{AGILE_MODE_DIRECTIVE}" not in rendered, (
+        "apply_agile_directive left the placeholder in place."
+    )
+    expected = "EXECUTION MODE: AGILE" if agile else "EXECUTION MODE: DEFAULT"
+    assert expected in rendered, (
+        f"apply_agile_directive did not inject the '{expected}' banner."
+    )
+
+
+def test_get_docgen_prompt_threads_agile_flag_to_requirements():
+    # The skills.py helper accepts an `agile` kwarg and threads it through
+    # to the requirements_doc loader. Other doc types ignore the flag —
+    # their prompts don't carry the placeholder, so the substitution is
+    # a no-op for them.
+    from harness import skills
+
+    agile_prompt = skills._get_docgen_prompt("requirements", agile=True)
+    default_prompt = skills._get_docgen_prompt("requirements", agile=False)
+
+    assert "EXECUTION MODE: AGILE" in agile_prompt
+    assert "EXECUTION MODE: DEFAULT" not in agile_prompt
+    assert "EXECUTION MODE: DEFAULT" in default_prompt
+    assert "EXECUTION MODE: AGILE" not in default_prompt
+
+    # arch_doc carries no placeholder — flag is inert, no leakage.
+    arch_prompt = skills._get_docgen_prompt("arch_doc", agile=True)
+    assert "{AGILE_MODE_DIRECTIVE}" not in arch_prompt

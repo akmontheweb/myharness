@@ -96,17 +96,31 @@ def lock_exclusive_nonblocking(fh: IO[Any]) -> None:
 def lock_exclusive_blocking(fh: IO[Any], *, timeout_seconds: float = 30.0) -> None:
     """Acquire an exclusive whole-file lock, blocking until acquired.
 
-    Mirrors ``fcntl.flock(fh, LOCK_EX)``. On Windows ``msvcrt.locking``
-    blocks for ~10s per call before raising, so we loop until the
-    overall timeout elapses. Raises ``OSError`` on irrecoverable
-    failure, matching the POSIX call-site exception contract.
+    Honours ``timeout_seconds`` on BOTH platforms. The earlier POSIX
+    branch ignored the timeout (``fcntl.flock`` with ``LOCK_EX`` blocks
+    forever), so a misbehaving sibling could hang the harness. Now POSIX
+    uses ``LOCK_EX | LOCK_NB`` in a sleep loop so the timeout always
+    fires; Windows path is unchanged. Raises ``OSError`` on timeout or
+    irrecoverable failure, matching the call-site exception contract.
     """
     if _HAVE_FCNTL:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        return
-    if _HAVE_MSVCRT:
         deadline = time.monotonic() + timeout_seconds
         last_exc: OSError | None = None
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except (BlockingIOError, OSError) as exc:
+                last_exc = exc
+                if time.monotonic() >= deadline:
+                    raise OSError(
+                        f"could not acquire lock within {timeout_seconds:.1f}s: {exc}"
+                    ) from exc
+                # Brief backoff before retry; matches the Windows shape.
+                time.sleep(0.05)
+    if _HAVE_MSVCRT:
+        deadline = time.monotonic() + timeout_seconds
+        last_exc = None
         while time.monotonic() < deadline:
             try:
                 _msvcrt_lock(fh, msvcrt.LK_LOCK)  # type: ignore[attr-defined, unused-ignore]

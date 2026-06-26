@@ -67,10 +67,9 @@ class FixSuggestion:
     """
     A compiler-emitted machine-applicable fix for a diagnostic.
 
-    Populated by parsers that read structured diagnostic output (e.g. rustc's
-    --error-format=json carries children[].spans[].suggested_replacement;
-    gcc/clang's -fdiagnostics-format=json carries fixits[]). Consumed by
-    harness.autofix to apply the fix without spending an LLM call.
+    Populated by parsers that read structured diagnostic output and lift
+    a machine-applicable replacement span. Consumed by harness.autofix to
+    apply the fix without spending an LLM call.
 
     Spans are 1-indexed (matches the compiler's own coordinate system).
     """
@@ -291,10 +290,10 @@ class UnshareBackend(SandboxBackend):
 
 # Substrings that strongly suggest a writable cache (named volume or host
 # cache) has corrupted entries — pip wheel-hash mismatches, npm cacache
-# integrity failures, cargo registry-index damage. When any of these turn up
-# in the build output we append a one-line "try clearing the cache" hint to
-# the BuildResult so the operator (and any LLM repair loop reading the
-# transcript) doesn't burn a debugging cycle on a recoverable corruption.
+# integrity failures. When any of these turn up in the build output we append
+# a one-line "try clearing the cache" hint to the BuildResult so the operator
+# (and any LLM repair loop reading the transcript) doesn't burn a debugging
+# cycle on a recoverable corruption.
 # Match against lowercased output to be case-tolerant. Over-triggering is
 # safe — a stray hint is one line; missing a real signature wastes minutes.
 _CACHE_CORRUPTION_SIGNATURES: tuple[str, ...] = (
@@ -306,10 +305,6 @@ _CACHE_CORRUPTION_SIGNATURES: tuple[str, ...] = (
     "cacache: integrity check failed",
     "eintegrity",
     "sha512-",  # paired with "eintegrity" usually; weak signal alone but kept conservative below
-    # cargo
-    "registry index is corrupt",
-    "the lock file `cargo.lock` is corrupt",
-    "failed to read `registry`",
 )
 # Tighter set used when the only hit is "sha512-": we require the npm-specific
 # error wrapper to also be present, since sha512- appears in benign output too.
@@ -338,7 +333,7 @@ def _cache_corruption_hint(raw_output: str) -> Optional[str]:
         "(hash mismatch / integrity failure / corrupt registry index). If you "
         "have `sandbox.cache_volumes` enabled, try `teane cache clear` "
         "(optionally `--session-id <id>`) and rerun. If you don't, your host "
-        "cache (~/.cache/pip, ~/.npm, ~/.cargo) may be damaged — clear the "
+        "cache (~/.cache/pip, ~/.npm) may be damaged — clear the "
         "affected tool's cache directory."
     )
 
@@ -352,7 +347,7 @@ def _cache_volume_name(
     name from a read-only cache mount path.
 
     Operators configure ``sandbox.readonly_cache_mounts`` with tool-specific
-    paths (``~/.cache/pip``, ``~/.npm``, ``~/.cargo``). When
+    paths (``~/.cache/pip``, ``~/.npm``). When
     ``sandbox.cache_volumes`` is on, we swap each read-only host bind for a
     writable named volume so the tool can persist downloaded wheels /
     tarballs / crates back across containers. Volume names are derived from
@@ -446,8 +441,8 @@ class DockerBackend(SandboxBackend):
         self.docker_path = docker_path
         # When True, replace the historical read-only host bind-mounts for
         # readonly_cache_mounts with writable named Docker volumes scoped to
-        # cache_volumes_session_id. Tools (pip/npm/cargo) can then persist
-        # downloaded wheels/tarballs/crates between containers in the same
+        # cache_volumes_session_id. Tools (pip/npm) can then persist
+        # downloaded wheels/tarballs between containers in the same
         # session, removing the cold-cache extraction tax on every compile.
         # See _cache_volume_name for the volume-naming convention and
         # _ensure_cache_volumes for idempotent creation.
@@ -462,7 +457,7 @@ class DockerBackend(SandboxBackend):
         # When True (default) the container's root FS is mounted read-only and
         # only /tmp is writable. Setting this to False is required for builds
         # that install packages into system locations (pip install -e .,
-        # npm install -g, cargo install) because pip's --user fallback writes
+        # npm install -g) because pip's --user fallback writes
         # to /root/.local which is *also* on the read-only root FS. The
         # container is --rm so dropping read-only does not leak state.
         self.read_only_root = read_only_root
@@ -674,7 +669,7 @@ class DockerBackend(SandboxBackend):
         if self.read_only_root:
             cmd.append("--read-only")
             if not run_as_host_user:
-                # When the root FS is RO, pip / npm / cargo will try the
+                # When the root FS is RO, pip / npm will try the
                 # per-user fallback (~/.local, ~/.cache, ~/.npm). Without a
                 # writable HOME those installs fail with "Read-only file
                 # system: '/root/...'" *after* downloading every wheel. Give
@@ -798,7 +793,7 @@ class DockerBackend(SandboxBackend):
         """Env vars needed when the container runs as a non-root UID with
         no matching entry in the image's /etc/passwd.
 
-        - ``HOME`` points at the writable /tmp tmpfs so pip / cargo / npm
+        - ``HOME`` points at the writable /tmp tmpfs so pip / npm
           have somewhere to write per-user caches and installed packages.
         - ``PIP_USER=1`` flips ``pip install`` to per-user install mode
           (writes to ``$HOME/.local/lib/...`` instead of
@@ -1101,9 +1096,15 @@ async def _execute_subprocess_with_timeout(
                         await task
                     except asyncio.CancelledError:
                         pass
-        for task in pending:
-            if not task.done():
-                task.cancel()
+        if pending:
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            # Await the cancelled tasks so their CancelledError is
+            # actually consumed; without this, asyncio logs
+            # "Task was destroyed but it is pending!" and the cancel
+            # acknowledgement leaks.
+            await asyncio.gather(*pending, return_exceptions=True)
 
     except FileNotFoundError:
         await streamer.close()
@@ -1574,7 +1575,13 @@ async def run_subprocess_kill_on_timeout(
             pgid = proc.pid
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        return proc.returncode or 0, stdout or b"", stderr or b"", False
+        # ``proc.returncode`` can be None after communicate() returns if
+        # the process closed its pipes while still alive (rare; happens
+        # with double-fork daemons). Coercing None to 0 would silently
+        # report success on that path; use -1 as the "no real code"
+        # sentinel so callers can distinguish.
+        rc = proc.returncode if proc.returncode is not None else -1
+        return rc, stdout or b"", stderr or b"", False
     except asyncio.TimeoutError:
         await _kill_process_group_async(pgid, proc)
         try:
@@ -1665,99 +1672,16 @@ def filter_critical_errors(raw_output: str) -> str:
 # 8. Structured Diagnostic Parsing
 # ---------------------------------------------------------------------------
 
-_STRUCTURED_COMPILER_FLAGS: dict[str, str] = {
-    "rustc": "--error-format=json",
-    "gcc": "-fdiagnostics-format=json",
-    "g++": "-fdiagnostics-format=json",
-    "clang": "-fdiagnostics-format=json",
-    "clang++": "-fdiagnostics-format=json",
-    "cargo": "",
-    "go": "",
-}
+_STRUCTURED_COMPILER_FLAGS: dict[str, str] = {}
 
 
 def _detect_compiler(build_command: str) -> Optional[str]:
     """Heuristically detect which compiler toolchain a build command uses."""
     cmd_lower = build_command.lower()
-    for compiler in ["rustc", "cargo", "gcc", "g++", "clang", "clang++", "go build", "make", "cmake"]:
+    for compiler in ["make", "cmake"]:
         if compiler in cmd_lower:
             return compiler.split()[0]
     return None
-
-
-def _parse_rust_json_diagnostics(raw_output: str) -> list[DiagnosticObject]:
-    """Parse Rust compiler JSON diagnostic output (--error-format=json)."""
-    diagnostics: list[DiagnosticObject] = []
-    for line in raw_output.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        reason = obj.get("reason", "")
-        if reason != "compiler-message":
-            continue
-        msg_data = obj.get("message", {})
-        spans = msg_data.get("spans", [])
-        primary_span = spans[0] if spans else {}
-        diagnostics.append(DiagnosticObject(
-            file=primary_span.get("file_name", ""),
-            line=primary_span.get("line_start", 0),
-            column=primary_span.get("column_start", 0),
-            severity=msg_data.get("level", "error"),
-            error_code=msg_data.get("code", ""),
-            message=msg_data.get("message", ""),
-            semantic_context=msg_data.get("rendered", ""),
-        ))
-    return diagnostics
-
-
-def _parse_gcc_json_diagnostics(raw_output: str) -> list[DiagnosticObject]:
-    """Parse GCC/Clang JSON diagnostic output (-fdiagnostics-format=json)."""
-    diagnostics: list[DiagnosticObject] = []
-    for line in raw_output.splitlines():
-        line = line.strip()
-        if not line.startswith("[") or not line.endswith("]"):
-            continue
-        try:
-            items = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(items, list):
-            for item in items:
-                if isinstance(item, dict):
-                    loc = item.get("locations", [{}])[0]
-                    diagnostics.append(DiagnosticObject(
-                        file=loc.get("caret", {}).get("file", ""),
-                        line=loc.get("caret", {}).get("line", 0),
-                        column=loc.get("caret", {}).get("column", 0),
-                        severity="error" if item.get("kind") == "error" else "warning",
-                        error_code=str(item.get("option", "")),
-                        message=item.get("message", ""),
-                        semantic_context="",
-                    ))
-    return diagnostics
-
-
-def _parse_go_diagnostics(raw_output: str) -> list[DiagnosticObject]:
-    """Parse Go compiler output: filename:line:col: message."""
-    diagnostics: list[DiagnosticObject] = []
-    pattern = re.compile(r'^(.+\.go):(\d+):(\d+):\s+(.+)$')
-    for line in raw_output.splitlines():
-        match = pattern.match(line.strip())
-        if match:
-            diagnostics.append(DiagnosticObject(
-                file=match.group(1),
-                line=int(match.group(2)),
-                column=int(match.group(3)),
-                severity="error",
-                error_code="",
-                message=match.group(4),
-                semantic_context="",
-            ))
-    return diagnostics
 
 
 def _parse_generic_diagnostics(raw_output: str, workspace_path: str) -> list[DiagnosticObject]:
@@ -1786,10 +1710,9 @@ def extract_diagnostics(raw_output: str, build_command: str, workspace_path: str
     """Extract structured diagnostics from compiler output using appropriate parser.
 
     Routes through the parser_registry plugin set first (covers Python/pytest,
-    Java/Maven/Gradle, TypeScript/tsc, Dart, plus rustc/gcc/go) so toolchains
-    beyond the four legacy hard-coded ones produce structured diagnostics
-    instead of an empty list. Falls back to the legacy JSON parsers when
-    the registry returns nothing.
+    Java/Maven/Gradle, TypeScript/tsc) so toolchains beyond the legacy
+    hard-coded ones produce structured diagnostics instead of an empty list.
+    Falls back to the generic regex parser when the registry returns nothing.
     """
     try:
         from harness.parser_registry import detect_and_parse
@@ -1803,13 +1726,6 @@ def extract_diagnostics(raw_output: str, build_command: str, workspace_path: str
     except Exception as exc:  # noqa: BLE001
         logger.debug("[extract_diagnostics] parser_registry failed: %s", exc)
 
-    compiler = _detect_compiler(build_command)
-    if compiler in ("rustc", "cargo"):
-        return _parse_rust_json_diagnostics(raw_output)
-    elif compiler in ("gcc", "g++", "clang", "clang++"):
-        return _parse_gcc_json_diagnostics(raw_output)
-    elif compiler == "go":
-        return _parse_go_diagnostics(raw_output)
     return _parse_generic_diagnostics(raw_output, workspace_path)
 
 

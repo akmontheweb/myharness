@@ -202,39 +202,6 @@ class TestMissingImportTypeScript:
         assert "helper" in content and "from " in content
 
 
-class TestMissingImportRust:
-
-    def test_e0425_emits_use(self, tmp_path):
-        _write(str(tmp_path / "lib.rs"), "pub fn helper() {}\n")
-        offending = tmp_path / "main.rs"
-        _write(str(offending), "fn main() { helper(); }\n")
-        diag = {
-            "file": str(offending),
-            "line": 1,
-            "error_code": "E0425",
-            "message": "cannot find function `helper` in this scope",
-        }
-        block = _try_missing_import(diag, str(tmp_path))
-        assert block is not None
-        assert "use crate::lib::helper" in block.content
-
-
-class TestMissingImportGo:
-
-    def test_undefined_emits_import_path(self, tmp_path):
-        _write(str(tmp_path / "pkg" / "util" / "u.go"), "package util\n\nfunc Helper() {}\n")
-        offending = tmp_path / "main.go"
-        _write(str(offending), "package main\n\nfunc main() { Helper() }\n")
-        diag = {
-            "file": str(offending),
-            "line": 3,
-            "message": "undefined: Helper",
-        }
-        block = _try_missing_import(diag, str(tmp_path))
-        assert block is not None
-        assert 'import "pkg/util"' in block.content
-
-
 class TestMissingImportJava:
 
     def test_cannot_find_symbol_emits_import(self, tmp_path):
@@ -327,8 +294,13 @@ class TestSecurityGitleaks:
         }
         block = _try_security_autofix(diag, str(tmp_path))
         assert block is not None
-        assert block.operation == OperationType.DELETE_BLOCK
-        assert "AKIAIOSFODNN7EXAMPLE" in block.search
+        # Gitleaks now emits REPLACE_LINE_RANGE with empty replace
+        # (line-coordinate based) rather than a substring DELETE_BLOCK —
+        # the old shape left a stray blank line behind and overcounted
+        # when the secret string appeared as a substring of another line.
+        assert block.operation == OperationType.REPLACE_LINE_RANGE
+        assert block.line == 2 and block.end_line == 2
+        assert block.replace == ""
 
 
 class TestSecurityTrivy:
@@ -692,3 +664,106 @@ class TestAutofixSystemMessage:
         assert "[autofix]" in msg
         assert "BANDIT:B201" in msg
         assert "do not re-attempt" in msg.lower()
+
+
+# ---------------------------------------------------------------------------
+# OperationType dispatch coverage
+# ---------------------------------------------------------------------------
+
+class TestOperationTypeDispatchCoverage:
+    """Guard against the 2026-06-25-style HITL loop bug: every
+    ``OperationType`` MUST be handled by both ``autofix._apply_block``
+    AND ``tool_schemas.tool_call_to_patch_block``. If a new op is added
+    to the enum without updating both dispatchers, this test fails fast.
+    """
+
+    @pytest.mark.asyncio
+    async def test_apply_block_covers_every_operation_type(self, tmp_path):
+        """Walk every OperationType through _apply_block and assert the
+        dispatcher never returns 'unknown operation' (which is the
+        catch-all for missing branches)."""
+        from harness.autofix import _apply_block
+        from harness.patcher import (
+            OperationType, PatchBlock, Placement, TextPatcher,
+        )
+
+        patcher = TextPatcher(str(tmp_path))
+        # Build a minimal PatchBlock per op type; we only care that
+        # _apply_block ROUTES it (not whether the patch succeeds — many
+        # fail because the target file doesn't exist).
+        sample_blocks = {
+            OperationType.CREATE_FILE: PatchBlock(
+                operation=OperationType.CREATE_FILE, file="x", content="y",
+            ),
+            OperationType.REPLACE_BLOCK: PatchBlock(
+                operation=OperationType.REPLACE_BLOCK, file="x", search="a", replace="b",
+            ),
+            OperationType.DELETE_BLOCK: PatchBlock(
+                operation=OperationType.DELETE_BLOCK, file="x", search="a",
+            ),
+            OperationType.INSERT_AT_BLOCK: PatchBlock(
+                operation=OperationType.INSERT_AT_BLOCK, file="x",
+                anchor="foo", placement=Placement.AFTER, content="y",
+            ),
+            OperationType.INSERT_AT_LINE: PatchBlock(
+                operation=OperationType.INSERT_AT_LINE, file="x", line=1, content="y",
+            ),
+            OperationType.REPLACE_LINE_RANGE: PatchBlock(
+                operation=OperationType.REPLACE_LINE_RANGE, file="x",
+                line=1, end_line=1, content="y",
+            ),
+        }
+        # Sanity: we wrote a sample for every enum member.
+        assert set(sample_blocks.keys()) == set(OperationType), (
+            "Sample blocks are missing an OperationType. Add it to "
+            "sample_blocks above when extending the enum."
+        )
+        for op, block in sample_blocks.items():
+            result = await _apply_block(patcher, block)
+            assert "unknown operation" not in (result.error or "").lower(), (
+                f"_apply_block has no branch for {op.value!r} — "
+                "this is the same class of bug that caused the "
+                "2026-06-25 security HITL loop."
+            )
+
+    def test_tool_call_to_patch_block_covers_every_patch_op(self):
+        """Every OperationType representable as an LLM tool-use must be
+        round-trippable through tool_call_to_patch_block."""
+        from harness.patcher import OperationType
+        from harness.tool_schemas import tool_call_to_patch_block
+
+        # Maps OperationType → (tool name, minimal valid args dict).
+        # READ_FILE has no OperationType (it's host-resolved), so we
+        # only assert tool-use coverage for the patch ops.
+        tool_inputs = {
+            OperationType.CREATE_FILE: ("create_file", {"file_path": "x", "content": "y"}),
+            OperationType.REPLACE_BLOCK: (
+                "edit_file", {"file_path": "x", "old_string": "a", "new_string": "b"},
+            ),
+            OperationType.DELETE_BLOCK: ("delete_block", {"file_path": "x", "search": "a"}),
+            OperationType.INSERT_AT_BLOCK: (
+                "insert_at_block",
+                {"file_path": "x", "anchor": "f", "placement": "after", "content": "y"},
+            ),
+            OperationType.INSERT_AT_LINE: (
+                "insert_at_line", {"file_path": "x", "line": 1, "content": "y"},
+            ),
+            OperationType.REPLACE_LINE_RANGE: (
+                "replace_line_range",
+                {"file_path": "x", "line": 1, "end_line": 1, "content": "y"},
+            ),
+        }
+        assert set(tool_inputs.keys()) == set(OperationType), (
+            "tool_inputs missing an OperationType. Add a tool-name "
+            "binding when extending the enum."
+        )
+        for op, (name, args) in tool_inputs.items():
+            block = tool_call_to_patch_block({"name": name, "input": args})
+            assert block is not None, (
+                f"tool_call_to_patch_block returned None for {name!r} — "
+                f"dispatch branch missing for {op.value!r}."
+            )
+            assert block.operation == op, (
+                f"{name!r} produced operation={block.operation.value!r}, "
+                f"expected {op.value!r}."
+            )

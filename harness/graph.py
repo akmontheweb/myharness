@@ -225,8 +225,8 @@ class AgentState(TypedDict, total=False):
     # (matches the new operator-autonomous baseline).
     cd_discovery: bool
     # End-of-run installation-doc synthesis toggle. When True,
-    # installation_doc_node fires at the terminal success edges (Flutter
-    # short-circuit, --deploy-dev=false clean security scan, and after
+    # installation_doc_node fires at the terminal success edges
+    # (--deploy-dev=false clean security scan, and after
     # deployment_node health-check success) and writes
     # docs/INSTALLATION.md from workspace telemetry + manifests +
     # SPEC_ARCHITECTURE.md §7 (+ the deployment blueprint when present).
@@ -383,6 +383,7 @@ def create_initial_state(
     story_repair_cap: int = 3,
     flow: str = FLOW_BUILD,
     generate_specs: bool = False,
+    config: Optional[dict[str, Any]] = None,
 ) -> AgentState:
     """
     Construct the initial graph state with anchored system prompt at messages[0]
@@ -408,7 +409,7 @@ def create_initial_state(
         system_prompt = (
             spec_override
             + "\n\n---\n\n"
-            + _build_and_emit_system_prompt(workspace_path, build_command)
+            + _build_and_emit_system_prompt(workspace_path, build_command, config=config)
         )
         # When a user-approved spec already exists (from the pre-flight
         # product_spec_dir refinement), skip the graph's discovery
@@ -417,7 +418,7 @@ def create_initial_state(
         # conversation-history compilation.
         skip_discovery = True
     else:
-        system_prompt = _build_and_emit_system_prompt(workspace_path, build_command)
+        system_prompt = _build_and_emit_system_prompt(workspace_path, build_command, config=config)
     return AgentState(
         workspace_path=workspace_path,
         messages=[
@@ -589,12 +590,12 @@ _ROOT_ALLOWLIST_FILES: frozenset[str] = frozenset({
     # / compiler_node. GNU make recognises all three casings.
     "Makefile", "makefile", "GNUmakefile",
     # Node / TypeScript root manifests — the kitchen-sink builder image
-    # supports JS stacks (vendor/Dockerfile.builder), and the React/Vue/
-    # Angular/Node skills expect these at the workspace root. Without
-    # them in the static set, every LLM patch to package.json or
-    # tsconfig.json was rejected before the build could repair.
+    # supports JS stacks (vendor/Dockerfile.builder), and the React skill
+    # expects these at the workspace root. Without them in the static
+    # set, every LLM patch to package.json or tsconfig.json was rejected
+    # before the build could repair.
     "package.json", "package-lock.json",
-    "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json",
+    "npm-shrinkwrap.json",
     "tsconfig.json", "tsconfig.base.json",
     ".npmrc", ".nvmrc", ".node-version",
     # Container deployment — Dockerfile and docker-compose files must be
@@ -602,7 +603,21 @@ _ROOT_ALLOWLIST_FILES: frozenset[str] = frozenset({
     # The deployment phase may generate or modify these, and repair nodes
     # may need to adjust them for build fixes.
     "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
-    "Caddyfile",
+    "Caddyfile", ".dockerignore",
+    # Common dev-experience dotfiles. The runtime root scan only picks
+    # these up when they already exist on disk, so a fresh greenfield
+    # rejected the LLM's first attempt to CREATE them ("[patcher] Skill
+    # allowlist rejected patch to .eslintrc.json / .prettierrc /
+    # .env.example"). Seeding them statically lets the LLM author
+    # idiomatic configs on round 1.
+    ".env.example", ".env.sample", ".env.template",
+    ".eslintrc", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs",
+    ".eslintrc.yaml", ".eslintrc.yml", ".eslintignore",
+    ".prettierrc", ".prettierrc.json", ".prettierrc.js",
+    ".prettierrc.yaml", ".prettierrc.yml", ".prettierignore",
+    ".babelrc", ".babelrc.json", ".babelrc.js",
+    ".editorconfig", ".gitattributes",
+    ".browserslistrc",
 })
 
 
@@ -1213,7 +1228,121 @@ def _format_root_files_guidance(root_files: list[str]) -> str:
     )
 
 
-def _build_system_prompt(workspace_path: str, build_command: str) -> str:
+def _render_core_languages_directive(config: Optional[dict[str, Any]] = None) -> str:
+    """Render the locked core-technology stack directive injected at the
+    top of every system prompt.
+
+    The harness is intentionally bounded to a small, opinionated set:
+    Python or Java for backend, React + TypeScript + TailwindCSS (built
+    with Vite) for web. The directive tells the LLM exactly which stacks
+    are in-bounds, which are explicitly off-limits, and how to refuse a
+    user request that strays outside the box. ``config`` lets the caller
+    pin a specific backend choice; when omitted, both options are listed.
+    """
+    backend_choice: Optional[str] = None
+    web_extras: list[str] = []
+    if isinstance(config, dict):
+        try:
+            from harness.cli import (
+                resolve_core_languages,
+                _REQUIRED_WEB_LANGUAGES,
+            )
+            resolved = resolve_core_languages(config)
+            backend_choice = resolved.get("backend_language")
+            web_list = resolved.get("web_language") or []
+            web_extras = [
+                item for item in web_list
+                if isinstance(item, str) and item not in _REQUIRED_WEB_LANGUAGES
+            ]
+        except Exception:  # noqa: BLE001 — fall back to the dual presentation
+            backend_choice = None
+            web_extras = []
+
+    if backend_choice == "Python":
+        backend_block = (
+            "- **Selected backend:** Python (FastAPI or Flask). Spring Boot "
+            "is the alternative when an operator picks Java in "
+            "`core_languages.backend_language`, but THIS run is Python."
+        )
+    elif backend_choice == "Java":
+        backend_block = (
+            "- **Selected backend:** Java with Spring Boot. Python "
+            "(FastAPI / Flask) is the alternative when an operator picks "
+            "Python in `core_languages.backend_language`, but THIS run is "
+            "Java."
+        )
+    else:
+        backend_block = (
+            "- **Option A:** Python (FastAPI or Flask).\n"
+            "- **Option B:** Java with Spring Boot.\n"
+            "Pick exactly ONE option per project based on the spec."
+        )
+
+    extras_block = ""
+    if web_extras:
+        extras_block = (
+            "- **Operator-enabled extras:** " + ", ".join(web_extras) +
+            ". Use these libraries when they are the natural fit — for "
+            "example, prefer Radix UI primitives over hand-rolled "
+            "dropdowns / dialogs / popovers and style them with "
+            "Tailwind utility classes.\n"
+        )
+
+    return (
+        "## Locked Core Technology Stack (MANDATORY)\n"
+        "This harness only supports the technology stack below. Do NOT "
+        "introduce any other framework, language, or build tool — the "
+        "patcher, sandbox, skills, and style guides have been shaped "
+        "exclusively around this matrix.\n"
+        "\n"
+        "### 1. Frontend Stack (mandatory)\n"
+        "- **Library:** React (functional components + hooks; no class "
+        "components).\n"
+        "- **Language:** TypeScript with `strict` mode enabled in "
+        "`tsconfig.json`.\n"
+        "- **Styling:** Tailwind CSS (no styled-components, no Emotion, "
+        "no global CSS overrides beyond the Tailwind entry file).\n"
+        "- **Build Tool:** Vite.\n"
+        f"{extras_block}"
+        "- **Forbidden:** Next.js, Vue, Svelte, Angular, Nuxt, SvelteKit, "
+        "Remix, plain JavaScript, jQuery, Bootstrap, Bulma, Material UI "
+        "as a styling layer.\n"
+        "\n"
+        "### 2. Backend Stack (select ONE based on requirements)\n"
+        f"{backend_block}\n"
+        "- **Forbidden:** Node.js / Express / Fastify / NestJS, Ruby / "
+        "Rails, Go, PHP / Laravel, .NET / C#, Rust, Elixir, Scala, "
+        "Kotlin (server), Deno, Bun.\n"
+        "\n"
+        "### Agentic Behaviour & Rules\n"
+        "1. **Bounding Box.** If the user (or the spec) asks for a "
+        "technology outside this stack (e.g. \"Build a Ruby on Rails "
+        "app\", \"Use Vue.js\", \"Write the API in Go\"), POLITELY "
+        "REFUSE and explicitly state that this harness only supports "
+        "Python or Java backends and React + TypeScript + Tailwind "
+        "frontends. Propose the closest in-stack equivalent (e.g. "
+        "\"I can build the same app with FastAPI + React instead\") "
+        "and stop until the operator confirms.\n"
+        "2. **API-First Communication.** Frontend and backend MUST be "
+        "decoupled. The frontend communicates with the backend "
+        "exclusively over RESTful HTTP/JSON APIs. No server-rendered "
+        "HTML, no GraphQL by default, no shared in-process calls.\n"
+        "3. **Type Safety.** Every JSON shape returned by the backend "
+        "MUST have a matching TypeScript interface on the frontend; "
+        "when a backend response schema changes, the frontend interface "
+        "MUST change in the same patch.\n"
+        "4. **No Placeholders.** Generate complete, functional code. "
+        "Do NOT emit generic placeholders like `// Add logic here`, "
+        "`pass  # implement me`, or `throw new Error('not implemented')` "
+        "unless the operator explicitly asked for a partial scaffold.\n"
+    )
+
+
+def _build_system_prompt(
+    workspace_path: str,
+    build_command: str,
+    config: Optional[dict[str, Any]] = None,
+) -> str:
     """
     Construct the static, immutable system prompt anchored at messages[0].
     This prompt is never mutated or truncated — it maximizes prefix caching
@@ -1233,7 +1362,7 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
 
     # --- Two-Tier Skills System (language-aware filtering) ---
     # Detect the workspace's stack so we only inject skills the LLM will
-    # actually use. A pure FastAPI project doesn't need the Angular skill
+    # actually use. A pure FastAPI project doesn't need the React skill
     # in its system prompt; trimming saves ~2-3 KB per call and reduces
     # noise in the prompt.
     from harness.impact import _detect_workspace_stack, _detect_source_roots
@@ -1315,9 +1444,9 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
             f"root or in any other top-level directory.\n\n"
             f"When you create a file, choose the root whose existing code is "
             f"the closest match. As rough guidance: front-end / UI code "
-            f"(React, Vue, Angular, browser bundles) belongs in the "
-            f"client-side root; HTTP handlers, models, and background "
-            f"workers belong in the server-side root. When the choice is "
+            f"(React + TypeScript + Tailwind, Vite-built browser bundles) "
+            f"belongs in the client-side root; HTTP handlers, models, and "
+            f"background workers belong in the server-side root. When the choice is "
             f"ambiguous, prefer `{primary}/` (the largest existing root).\n\n"
             f"Tests follow the convention of the root they exercise. JS / TS "
             f"tests are typically co-located next to source as "
@@ -1347,8 +1476,11 @@ def _build_system_prompt(workspace_path: str, build_command: str) -> str:
             f"{PLANNING_INVENTORY_INSTRUCTION}\n"
         )
 
+    core_languages_directive = _render_core_languages_directive(config)
+
     return f"""You are an expert software engineer with deep knowledge of the codebase below.
 
+{core_languages_directive}
 ## Repository Root
 {workspace_path}
 
@@ -1371,10 +1503,12 @@ Audit the build command before writing any manifest:
     command invokes them).
   - `pip install -e '.[dev]' && pytest`  → `pytest` must live under
     `[project.optional-dependencies].dev` in `pyproject.toml`.
-  - `npm install && npm test`  → the test runner referenced by the `test`
-    script must be in `package.json` `devDependencies`.
-  - `cargo build && cargo test`  → cargo bundles the runner; no extra dep.
-  - `go build ./... && go test ./...`  → go bundles the runner; no extra dep.
+  - `npm install && npm run build && npm test`  → the test runner referenced
+    by the `test` script (Vitest) must be in `package.json` `devDependencies`.
+  - `mvn -B test`  → Maven Surefire runs JUnit automatically; declare JUnit
+    Jupiter and any extra test deps under `<scope>test</scope>` in `pom.xml`.
+  - `./gradlew test` / `gradle test`  → declare JUnit Jupiter under
+    `testImplementation` in `build.gradle`.
 
 When you generate or amend a manifest, include every tool the build needs.
 A clean separation between runtime and dev dependencies is fine, but BOTH
@@ -1555,7 +1689,11 @@ content:
 """
 
 
-def _build_and_emit_system_prompt(workspace_path: str, build_command: str) -> str:
+def _build_and_emit_system_prompt(
+    workspace_path: str,
+    build_command: str,
+    config: Optional[dict[str, Any]] = None,
+) -> str:
     """Wrap :func:`_build_system_prompt` so callers get the same prompt but
     a ``system_prompt_built`` observability event also lands in the log.
 
@@ -1563,7 +1701,7 @@ def _build_and_emit_system_prompt(workspace_path: str, build_command: str) -> st
     about prompt content (the majority) stay synchronous and don't have to
     stub out observability.
     """
-    prompt = _build_system_prompt(workspace_path, build_command)
+    prompt = _build_system_prompt(workspace_path, build_command, config=config)
     try:
         from harness.observability import emit_event
         tree_lines = prompt.split("## Directory Structure", 1)
@@ -1588,7 +1726,7 @@ _TREE_NOISE_DIRS = frozenset({
     # real source. These directories carry vendored artefacts, caches,
     # or generated output — useful to operators, noise for the LLM.
     ".venv", "venv", "env", ".tox", ".pytest_cache", ".mypy_cache",
-    ".ruff_cache", ".idea", ".vscode", ".gradle", ".next", ".nuxt",
+    ".ruff_cache", ".idea", ".vscode", ".gradle",
     "coverage", "htmlcov", ".cache", "vendor",
 })
 
@@ -3634,23 +3772,31 @@ Generate your patches NOW. Only the blocks above. No other text."""
             ),
         )
 
-        # Zero-patch tripwires. Two counters, split by mode, so the
-        # story-mode auto-advance (Layer 2) and the monolithic-mode HITL
-        # escalation (Layer 1) don't fight each other.
+        # Zero-patch tripwires. Both counters bump in lock-step now so
+        # Layer 1 (global HITL at ≥2 consecutive_zero) and Layer 2
+        # (story-level auto-advance at STORY_ZERO_PATCH_CAP) are both
+        # live regardless of mode:
         #
-        # - Story mode (``current_story_id`` set): increment a per-story
-        #   counter in ``story_zero_patch_rounds[story_key]``. The
-        #   story_loop_node consults this counter at the start of its
-        #   next visit; at ≥ STORY_ZERO_PATCH_CAP (3) it marks the story
-        #   ``done`` and advances the cursor — vacuous / mis-identified
-        #   stories should not stall the batch. The global counter is
-        #   NOT touched so the batch can carry on past a few bad stories
-        #   without tripping the system-wide HITL guard.
-        # - Monolithic mode: bump the global
-        #   ``consecutive_zero_patch_rounds``. ``route_after_patching``
-        #   reads it and escalates to ``human_intervention_node`` at ≥ 2
-        #   (mirrors the existing repair_node guard threshold).
+        # - Story mode (``current_story_id`` set): bump the per-story
+        #   counter in ``story_zero_patch_rounds[story_key]`` AND the
+        #   global ``consecutive_zero_patch_rounds``. Layer 2 (story
+        #   auto-advance at ≥STORY_ZERO_PATCH_CAP=3) usually catches
+        #   the stall first; Layer 1 is the system-wide safety net for
+        #   the case where the same story keeps getting re-picked (or
+        #   adjacent stories all stall identically) — without it, story
+        #   mode could spin indefinitely between the patcher and
+        #   story_loop_node when every story is vacuous.
+        # - Monolithic mode: only the global counter exists.
+        #
+        # Both counters reset on a successful patch round to avoid
+        # false escalations triggered by a long-tail single-story stall.
         current_story_id = state.get("current_story_id") or ""
+        if success_count == 0:
+            loop_counter["consecutive_zero_patch_rounds"] = (
+                loop_counter.get("consecutive_zero_patch_rounds", 0) + 1
+            )
+        else:
+            loop_counter["consecutive_zero_patch_rounds"] = 0
         if current_story_id:
             sz = dict(loop_counter.get("story_zero_patch_rounds", {}) or {})
             if success_count == 0:
@@ -3660,12 +3806,6 @@ Generate your patches NOW. Only the blocks above. No other text."""
             loop_counter["story_zero_patch_rounds"] = sz
             zero_rounds_for_log = sz[current_story_id]
         else:
-            if success_count == 0:
-                loop_counter["consecutive_zero_patch_rounds"] = (
-                    loop_counter.get("consecutive_zero_patch_rounds", 0) + 1
-                )
-            else:
-                loop_counter["consecutive_zero_patch_rounds"] = 0
             zero_rounds_for_log = loop_counter["consecutive_zero_patch_rounds"]
 
         logger.info(
@@ -3718,8 +3858,8 @@ def _toolchain_image_for(build_command: str) -> Optional[str]:
 
     The harness now ships a single kitchen-sink image
     (``harness/vendor/Dockerfile.builder``) that bakes Python + pip,
-    Java JDK + Maven + Gradle, Node + npm/yarn/pnpm, SQLite, Playwright +
-    Chromium, and the make/gcc/git glue all into one container. So there
+    Java JDK + Maven + Gradle, Node + npm, SQLite, Playwright +
+    Chromium, and the make/git glue all into one container. So there
     is no longer any per-command image dispatch — every supported stack's
     toolchain is already present.
 
@@ -3744,11 +3884,11 @@ def _command_is_make(build_command: str) -> bool:
 
 def _build_command_needs_network(build_command: str) -> bool:
     """True when the build command performs a package install that needs
-    to reach a registry (pip/npm/yarn/pnpm/cargo/go) — OR invokes ``make``.
+    to reach a registry (pip/npm) — OR invokes ``make``.
 
     The ``make`` clause exists because the LLM-generated ``Makefile`` (per
     ``harness/skills/makefile_python.md``) conventionally puts
-    ``pip install -r requirements.txt`` (or ``npm install``, etc.) INSIDE
+    ``pip install -r requirements.txt`` (or ``npm install``) INSIDE
     the target's recipe lines. The command string the harness invokes is
     just ``"make build"`` — the ``pip install`` substring lives in the
     Makefile, not in the outer command, so the install-token heuristic
@@ -3760,9 +3900,8 @@ def _build_command_needs_network(build_command: str) -> bool:
     if _command_is_make(build_command):
         return True
     return any(token in cmd for token in (
-        "pip install", "pip3 install", "npm install", "yarn install",
-        "pnpm install", "cargo build", "cargo test", "go mod",
-        "go get", "poetry install",
+        "pip install", "pip3 install", "npm install",
+        "poetry install",
     ))
 
 
@@ -3781,8 +3920,8 @@ def _build_command_needs_network(build_command: str) -> bool:
 #     dep outside the test/lint tool set short-circuited to HITL.
 #   - Shell `command not found` → repairable only when the command is a
 #     known pip-installable Python tool (pytest, ruff, mypy, ...). For
-#     anything else (npm, cargo, go, docker) the container needs a
-#     different base image, which only the operator can change.
+#     anything else (npm, docker) the container needs a different base
+#     image, which only the operator can change.
 _PYTHON_MODULE_MISS_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Python: "/usr/local/bin/python3: No module named pytest"
     # Dotted names (e.g. 'api.database') are excluded — those signal a
@@ -3794,7 +3933,7 @@ _PYTHON_MODULE_MISS_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _SHELL_COMMAND_MISS_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # Shell-style "<cmd>: command not found" (covers npm, cargo, go, etc.)
+    # Shell-style "<cmd>: command not found" (covers npm, etc.)
     re.compile(r"(?m)^(?:/bin/sh: \d+: )?(?P<sym>[\w.\-+]+): command not found\s*$"),
     re.compile(r"(?m)^(?:bash: )?(?P<sym>[\w.\-+]+): command not found\s*$"),
     # Dash / busybox shells say "X: not found" (no "command"). The
@@ -3809,7 +3948,7 @@ _SHELL_COMMAND_MISS_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"executable file not found in \$?PATH: (?P<sym>\S+)"),
     re.compile(r'exec: "(?P<sym>[^"]+)": executable file not found'),
     # Node: "node: not found" or "npm: not found"
-    re.compile(r"(?m)^(?P<sym>node|npm|yarn|pnpm): not found\s*$"),
+    re.compile(r"(?m)^(?P<sym>node|npm): not found\s*$"),
 )
 
 # Node/npm-side missing dependency. Distinct from _PYTHON_MODULE_MISS_*
@@ -3871,7 +4010,7 @@ def _is_env_misconfig(
         to HITL for no good reason — they're as fixable as ``pytest``.
       - ``"shell"`` → repairable only when the symbol matches
         ``_PIP_INSTALLABLE_SYMBOLS`` (pytest, ruff, ...). Everything else
-        (npm, cargo, go, docker) needs a different base image and the
+        (npm, docker) needs a different base image and the
         repair LLM can't fix it from inside the sandbox.
 
     When ``workspace_path`` is supplied and the matched symbol corresponds
@@ -4153,8 +4292,8 @@ def _slice_build_output_for_repair(
 ) -> str:
     """Return a head+tail slice of ``raw_output`` for the repair LLM.
 
-    Long build logs (C++ template explosions, Java dependency stacks, Cargo
-    compilation walls) tend to put the root-cause error near the START and
+    Long build logs (Java dependency stacks, npm install walls) tend to
+    put the root-cause error near the START and
     cascading downstream errors near the END. A pure tail slice (the old
     behaviour) shows the repair LLM only the cascade, hiding the underlying
     cause. Slicing both ends gives the model both the original failure and
@@ -4230,7 +4369,7 @@ def _collect_manifest_snippets_for_repair(
         preferred = ["pyproject.toml", "setup.py", "setup.cfg"]
     elif "requirements" in build_cmd:
         preferred = ["requirements.txt", "requirements-dev.txt"]
-    elif "npm install" in build_cmd or "yarn" in build_cmd or "pnpm" in build_cmd:
+    elif "npm install" in build_cmd:
         preferred = ["package.json"]
     candidates = preferred or list(_DEP_MANIFEST_CANDIDATES)
 
@@ -5507,9 +5646,9 @@ def _workspace_has_source_files(workspace_path: str) -> bool:
 # Pip-installable test / lint tools. When `_is_env_misconfig` flags one
 # of these as missing, the LLM repair loop CAN fix it by appending the
 # package to the workspace's dependency manifest — no image swap needed.
-# Contrast with non-installable symbols (npm, node, cargo, go, rustc,
-# docker) where the base image itself is wrong and only a config change
-# can unblock the run; those still short-circuit to HITL.
+# Contrast with non-installable symbols (npm, node, docker) where the
+# base image itself is wrong and only a config change can unblock the
+# run; those still short-circuit to HITL.
 _PIP_INSTALLABLE_SYMBOLS: frozenset[str] = frozenset({
     "pytest", "pytest-asyncio", "pytest-cov", "pytest-mock", "pytest-xdist",
     "ruff", "mypy", "black", "isort", "flake8", "pylint",
@@ -5549,19 +5688,9 @@ def _env_misconfig_hint(symbol: str, build_command: str) -> str:
     py_symbols = {"pytest", "ruff", "mypy", "black", "poetry", "tox", "nox"}
     if symbol.lower() in py_symbols or "python" in symbol.lower():
         installer = f"pip install {symbol}"
-    elif symbol in {"npm", "node", "yarn", "pnpm"}:
+    elif symbol in {"npm", "node"}:
         installer = (
             f"use a node-bearing docker_image (e.g. node:20-slim) — "
-            f"'{symbol}' is not installable from inside the container"
-        )
-    elif symbol in {"cargo", "rustc"}:
-        installer = (
-            f"use a rust-bearing docker_image (e.g. rust:1.79-slim) — "
-            f"'{symbol}' is not installable from inside the container"
-        )
-    elif symbol in {"go"}:
-        installer = (
-            f"use a go-bearing docker_image (e.g. golang:1.22) — "
             f"'{symbol}' is not installable from inside the container"
         )
     else:
@@ -5672,7 +5801,7 @@ def _apply_toolchain_adaptation(
                 build_command,
             )
 
-    # Install commands (pip install -e ., npm install -g, cargo install)
+    # Install commands (pip install -e ., npm install -g)
     # write to system locations the --read-only root FS makes unreachable.
     # Pip's `--user` fallback also fails because /root sits on the RO root.
     # Auto-flip read_only_root → False so the install can land, unless the
@@ -5809,7 +5938,7 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     if ro_root_was_adapted:
         logger.info(
             "[compiler_node] Adapting sandbox.read_only_root from True to False "
-            "because build command installs packages (pip/npm/cargo/go) into "
+            "because build command installs packages (pip/npm) into "
             "system locations the read-only root FS would block: %s",
             build_cmd,
         )
@@ -5953,7 +6082,7 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     #     repair LLM CAN fix it by amending the workspace's dep manifest.
     #     Emit a MISSING_DEP diagnostic and let normal routing take over so
     #     repair_node gets the diagnostic as context.
-    #   - Everything else (npm/node/cargo/go/docker, single-segment local
+    #   - Everything else (npm/node/docker, single-segment local
     #     modules): the image itself is wrong / the LLM cannot help from
     #     inside the sandbox. Short-circuit to HITL as before.
     # pip ResolutionImpossible — emit a distinct diagnostic so autofix R5
@@ -6005,8 +6134,8 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             # packages (@scope/pkg) and sub-paths (pkg/sub) included.
             # Shell `command not found` is only repairable when the symbol
             # is a pip-installable Python tool listed in
-            # ``_PIP_INSTALLABLE_SYMBOLS``; everything else (cargo, go,
-            # docker, etc.) needs an operator-side image swap.
+            # ``_PIP_INSTALLABLE_SYMBOLS``; everything else (docker, etc.)
+            # needs an operator-side image swap.
             env_misconfig_is_repairable = (
                 miss_kind in ("python", "node")
                 or env_misconfig_symbol.lower() in _PIP_INSTALLABLE_SYMBOLS
@@ -7986,20 +8115,8 @@ def _format_diagnostics_for_repair(
         # F821 et al. already enjoy. Add new prefixes here as you add
         # parser support; sourced from observed compiler/linter output
         # rather than allowlist guesses.
-        # Rust — rustc (E0xxx absence codes)
-        "E0405", "E0412", "E0422", "E0423", "E0425", "E0432", "E0433",
-        # Go — go build / go vet markers
-        "GO:UNDEFINED", "GO:CANNOT_FIND_PACKAGE", "GO:UNDEFINED_SYMBOL",
         # Java — javac
         "JAVA:CANNOT_FIND_SYMBOL", "JAVA:PACKAGE_DOES_NOT_EXIST",
-        # Kotlin — kotlinc
-        "KOTLIN:UNRESOLVED_REFERENCE",
-        # C / C++ — gcc/clang
-        "GCC:UNDECLARED", "CLANG:UNDECLARED", "GCC:FATAL_FILE_NOT_FOUND",
-        # C# / dotnet — Roslyn
-        "CS0103", "CS0234", "CS0246",
-        # Swift — swiftc
-        "SWIFT:CANNOT_FIND_IN_SCOPE", "SWIFT:NO_SUCH_MODULE",
         # Generic miss markers from the harness's own parsers / runners
         "MISSING_DEP", "MISSING_IMPORT", "IMPORTERROR", "MODULENOTFOUND",
         "SYNTAXERR", "TEST_FAILURE:IMPORTERROR",
@@ -8622,13 +8739,12 @@ _REVERSE_ENGINEER_MAX_BYTES: int = 100_000
 _REVERSE_ENGINEER_PRIORITY_BASENAMES: tuple[str, ...] = (
     "main.py", "app.py", "wsgi.py", "asgi.py", "manage.py",
     "index.ts", "index.js", "server.ts", "server.js",
-    "main.go", "main.rs", "Main.java", "lib.rs",
-    "pyproject.toml", "package.json", "go.mod", "Cargo.toml", "pom.xml", "build.gradle",
+    "Main.java",
+    "pyproject.toml", "package.json", "pom.xml", "build.gradle",
     "Makefile", "README.md",
 )
 _REVERSE_ENGINEER_SOURCE_EXTENSIONS: frozenset[str] = frozenset({
-    ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".kt",
-    ".rb", ".dart", ".cs", ".cpp", ".c", ".h", ".hpp", ".swift",
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".java",
     ".sql", ".proto", ".yaml", ".yml", ".toml",
 })
 
@@ -11529,9 +11645,6 @@ def route_after_security_scan(state: AgentState) -> Literal[
     Conditional edge router executed after security_scan_node completes.
 
     Decision matrix:
-        No security findings AND Flutter project       → END (mobile builds don't
-                                                          fit the docker-compose
-                                                          deploy pipeline)
         No security findings AND dev_deployment=False  → END (operator opt-in gate)
         No security findings AND dev_deployment=True
           AND cd_discovery=True                        → deployment_discovery_node
@@ -11655,19 +11768,6 @@ def route_after_security_scan(state: AgentState) -> Literal[
             )
             return "installation_doc_node"
 
-        # Mobile short-circuit (M-1): Flutter projects don't fit the
-        # docker-compose deployment model. Skip deployment_* and end after
-        # the security scan passes. iOS builds need macOS anyway and would
-        # fail in the Linux sandbox; Android artifacts live in
-        # build/app/outputs/ for the user to pick up.
-        from harness.impact import _is_flutter_project
-        workspace_path = state.get("workspace_path", "")
-        if workspace_path and _is_flutter_project(workspace_path):
-            logger.info(
-                "[router] Flutter project detected. Skipping deploy pipeline "
-                "(M-1). Routing to installation_doc_node before END."
-            )
-            return "installation_doc_node"
         # Operator opt-in gate (--deploy-dev). When the flag is false the
         # harness stops after a clean security scan; the operator can
         # inspect the generated code, then re-run with --deploy-dev true
@@ -11791,19 +11891,14 @@ def _resolve_post_eos_destination(state: AgentState) -> str:
     ``route_after_security_scan`` so the deployment-vs-doc routing is
     consistent regardless of which gate cleared last. Same precedence:
 
-    1. Flutter project → ``installation_doc_node`` (M-1 short-circuit).
-    2. ``deployment_node`` has already run this session → ``installation_doc_node``
+    1. ``deployment_node`` has already run this session → ``installation_doc_node``
        (guard against the 951f102f re-entry loop — kept for parity even
        though regression-then-deploy ordering makes a second deploy hop
        very unlikely).
-    3. ``dev_deployment`` is False → ``installation_doc_node``.
-    4. ``cd_discovery`` is False → ``deployment_node`` (telemetry-only blueprint).
-    5. otherwise → ``deployment_discovery_node`` (LLM-driven blueprint).
+    2. ``dev_deployment`` is False → ``installation_doc_node``.
+    3. ``cd_discovery`` is False → ``deployment_node`` (telemetry-only blueprint).
+    4. otherwise → ``deployment_discovery_node`` (LLM-driven blueprint).
     """
-    from harness.impact import _is_flutter_project
-    workspace = state.get("workspace_path", "")
-    if workspace and _is_flutter_project(workspace):
-        return "installation_doc_node"
     ns = state.get("node_state") or {}
     if isinstance(ns, dict) and isinstance(ns.get("deployment"), dict):
         return "installation_doc_node"
@@ -12511,7 +12606,7 @@ def build_graph() -> Any:
     graph.add_edge("installation_doc_node", END)
 
     # Route security_scan clean → deployment discovery (or installation_doc
-    # for Flutter / --deploy-dev=false success exits); findings → repair_node
+    # for --deploy-dev=false success exits); findings → repair_node
     # so security fixes go through the same _format_diagnostics_for_repair +
     # escalation path as compile errors.
     graph.add_conditional_edges(
@@ -12792,6 +12887,7 @@ async def run_graph(
     llm_dispatch_config: Optional[dict[str, Any]] = None,
     flow: str = FLOW_BUILD,
     generate_specs: bool = False,
+    full_config: Optional[dict[str, Any]] = None,
 ) -> AgentState:
     """
     Execute the full agent graph from start to finish.
@@ -12846,6 +12942,7 @@ async def run_graph(
         story_repair_cap=story_repair_cap,
         flow=flow,
         generate_specs=generate_specs,
+        config=full_config,
     )
 
     # Per-node config sections — read by lintgate_node and deployment_node

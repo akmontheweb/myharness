@@ -3,13 +3,10 @@
 
 from harness.parser_registry import (
     _strip_ansi,
-    RustParser,
-    GoParser,
     GenericParser,
     JavaParser,
     PythonParser,
     TypeScriptParser,
-    DartParser,
     detect_and_parse,
     get_parser,
 )
@@ -50,23 +47,6 @@ class TestStripAnsi:
 
 class TestParserDiagnostics:
     """Test parser diagnostics methods."""
-
-    def test_rust_parser_parse_diagnostics(self):
-        """RustParser should have parse_diagnostics static method."""
-        output = "error[E0425]: cannot find value"
-        diagnostics = RustParser.parse_diagnostics(output)
-        assert isinstance(diagnostics, list)
-
-    def test_rust_parser_empty_output(self):
-        """Empty output should return empty list."""
-        diagnostics = RustParser.parse_diagnostics("")
-        assert diagnostics == [] or isinstance(diagnostics, list)
-
-    def test_go_parser_parse_diagnostics(self):
-        """GoParser should have parse_diagnostics static method."""
-        output = "./main.go:10:5: undefined: SomeFunc"
-        diagnostics = GoParser.parse_diagnostics(output)
-        assert isinstance(diagnostics, list)
 
     def test_generic_parser_parse_diagnostics(self):
         """GenericParser should have parse_diagnostics static method."""
@@ -149,43 +129,6 @@ class TestTypeScriptParser:
         assert diags == []
 
 
-class TestDartParser:
-    """Cover the dart analyze / flutter analyze bullet form."""
-
-    def test_dart_analyze_error_extracted(self):
-        output = (
-            "error • Undefined name 'bar' • lib/services/foo.dart:42:17 • undefined_identifier\n"
-        )
-        diags = DartParser.parse_diagnostics(output)
-        assert len(diags) == 1
-        d = diags[0]
-        assert d.file == "lib/services/foo.dart"
-        assert d.line == 42
-        assert d.column == 17
-        assert d.error_code == "undefined_identifier"
-        assert d.severity == "error"
-        assert "Undefined name" in d.message
-
-    def test_dart_analyze_warning(self):
-        output = (
-            "warning • Unused import: 'package:foo/foo.dart' • lib/main.dart:3:8 • unused_import\n"
-        )
-        diags = DartParser.parse_diagnostics(output)
-        assert len(diags) == 1
-        assert diags[0].severity == "warning"
-
-    def test_dart_info_collapses_to_warning(self):
-        output = "info • Prefer const constructors • lib/widget.dart:10:5 • prefer_const_constructors\n"
-        diags = DartParser.parse_diagnostics(output)
-        assert len(diags) == 1
-        # info/hint collapse to "warning" for downstream simplicity.
-        assert diags[0].severity == "warning"
-
-    def test_no_match_returns_empty(self):
-        diags = DartParser.parse_diagnostics("No issues found!\n")
-        assert diags == []
-
-
 class TestParserDispatch:
     """detect_and_parse should pick the right parser from build_command."""
 
@@ -197,11 +140,6 @@ class TestParserDispatch:
     def test_tsc_routes_to_typescript_parser(self):
         assert get_parser("tsc") is TypeScriptParser
         assert get_parser("vite") is TypeScriptParser
-        assert get_parser("next") is TypeScriptParser
-
-    def test_dart_flutter_routes_to_dart_parser(self):
-        assert get_parser("dart") is DartParser
-        assert get_parser("flutter") is DartParser
 
     def test_detect_and_parse_uses_java_on_mvn_command(self):
         output = "[ERROR] /repo/Foo.java:[5,1] cannot find symbol\n"
@@ -215,12 +153,6 @@ class TestParserDispatch:
         diags = detect_and_parse(output, build_command="tsc --noEmit")
         assert len(diags) == 1
         assert diags[0].error_code == "TS1005"
-
-    def test_detect_and_parse_uses_dart_on_flutter_command(self):
-        output = "error • bad name • lib/a.dart:1:1 • bad_name\n"
-        diags = detect_and_parse(output, build_command="flutter analyze")
-        assert len(diags) == 1
-        assert diags[0].file == "lib/a.dart"
 
     def test_output_signature_sniff_finds_tsc_under_npm_wrapper(self):
         """Regression for the ciod build: ``npm install && npm run build``
@@ -245,21 +177,6 @@ class TestParserDispatch:
         assert len(diags) == 3
         assert all(d.file == "src/db/seed.ts" for d in diags)
         assert {d.error_code for d in diags} == {"TS1109", "TS1005"}
-
-    def test_output_signature_sniff_finds_go_under_make_wrapper(self):
-        """Same hazard for ``make build`` wrapping ``go build`` — neither
-        ``make`` nor ``build`` is a registry key, but the output carries
-        the unambiguous ``path:line:col: msg`` GoParser signature."""
-        output = (
-            "make[1]: Entering directory '/repo'\n"
-            "cmd/server/main.go:42:13: undefined: foo.Bar\n"
-            "make: *** [build] Error 1\n"
-        )
-        diags = detect_and_parse(output, build_command="make build")
-        assert len(diags) == 1
-        assert diags[0].file.endswith("main.go")
-        assert diags[0].line == 42
-
 
 class TestPythonParserAssertionBody:
     """Verify pytest plain-`assert` failures keep their message body so the

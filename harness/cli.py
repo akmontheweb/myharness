@@ -257,10 +257,12 @@ def _acquire_workspace_lock(workspace_path: str, *, force: bool = False) -> Any:
 #
 # The harness reads ONE config file and only one: <teane_root>/config/config.json.
 # There are no fallbacks, no per-workspace overrides, no auto-generated files.
-# Per-project differences (build command, docker image, network) are handled
-# by the harness's existing auto-detection (graph._toolchain_image_for,
-# graph._build_command_needs_network, cli._detect_default_build_command) plus
-# the existing CLI flags (--build-cmd, --budget, --allow-network).
+# Per-project differences (docker image, network) are handled by the
+# harness's auto-detection (graph._toolchain_image_for,
+# graph._build_command_needs_network). The build command itself is
+# auto-wired from workspace markers (cli._detect_default_build_command)
+# under the locked core_languages stack — there is no CLI override.
+# The only build-shape CLI flags are --budget and --allow-network.
 #
 # Validation is STRICT — see validate_config_strict() below. Unknown keys,
 # missing required fields, wrong types, or cross-reference errors raise
@@ -432,7 +434,7 @@ def _warn_if_legacy_workspace_config(workspace_path: str) -> None:
 # user-provided config is almost certainly a typo (e.g. "model_routin").
 # Add new keys here when wiring new config sections.
 _KNOWN_TOP_LEVEL_KEYS = frozenset({
-    "build_command", "allow_network", "sandbox", "token_budget",
+    "allow_network", "sandbox", "token_budget",
     "node_throttle", "models", "model_routing", "persistence",
     "redaction", "security", "skills", "deployment",
     "speculative", "impact", "lintgate", "logging", "languages",
@@ -503,6 +505,12 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     # Resolution precedence: hard-coded default < this section. Only
     # consulted when agile mode is engaged.
     "agile_defaults",
+    # Locked core technology selection. backend_language must be
+    # "Python" or "Java"; web_language must be exactly the list
+    # ["React", "TypeScript", "TailwindCSS"]. Blank values are
+    # auto-defaulted (Python / React+TS+Tailwind). Any other value
+    # is a configuration error and the harness refuses to start.
+    "core_languages",
 })
 
 # Per-section known keys. Used to detect typos like
@@ -748,6 +756,12 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     "agile_defaults": frozenset({
         "batch_size", "commit_on_story", "repair_cap",
     }),
+    # Locked core technology selection. Allowed values enforced by the
+    # validator in this file — backend_language ∈ {"Python", "Java"};
+    # web_language MUST equal {"React", "TypeScript", "TailwindCSS"}.
+    "core_languages": frozenset({
+        "backend_language", "web_language",
+    }),
 }
 
 
@@ -756,7 +770,6 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
 # the listed tuple; bool is excluded from int matches via an explicit check
 # because Python's bool is a subclass of int.
 _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
-    "build_command": (str,),
     "allow_network": (bool,),
     "product_spec_dir": (str,),
     "change_requests_dir": (str,),
@@ -932,6 +945,8 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "agile_defaults.batch_size": (int,),
     "agile_defaults.commit_on_story": (bool,),
     "agile_defaults.repair_cap": (int,),
+    "core_languages.backend_language": (str,),
+    "core_languages.web_language": (list,),
 }
 
 # model_routing fields that must reference an entry in `models` when
@@ -962,6 +977,63 @@ _VALID_SELECTION_STRATEGIES: frozenset[str] = frozenset({
 # Providers that DON'T need an API key env var (run locally / on-host).
 # Anything else is treated as remote and gated on {PROVIDER}_API_KEY.
 _LOCAL_PROVIDERS: frozenset[str] = frozenset({"ollama"})
+
+
+# Locked core technology selection. Backend may be Python or Java
+# (Spring Boot). The web stack is anchored on the React + TypeScript +
+# TailwindCSS trio: all three MUST be present in
+# ``core_languages.web_language``, and entries OUTSIDE the trio + a
+# small allowlist of permitted React-ecosystem libraries are rejected
+# at config-load time with a polite refusal message. These constants
+# are the single source of truth for what the harness will accept —
+# the validator, prompt scaffolds, and stack detectors all read from
+# here.
+_ALLOWED_BACKEND_LANGUAGES: tuple[str, ...] = ("Python", "Java")
+
+# The three web entries that are mandatory in every supported web
+# stack. The validator rejects any web_language list that omits one
+# of these.
+_REQUIRED_WEB_LANGUAGES: tuple[str, ...] = ("React", "TypeScript", "TailwindCSS")
+
+# Additional React-ecosystem libraries the operator may opt into by
+# adding the string to ``core_languages.web_language`` alongside the
+# trio above. Grow this list cautiously — each entry implies the
+# harness ships skills, style guides, and prompt scaffolds for that
+# library. radix-ui is the unstyled-primitive component library
+# Tailwind UI / shadcn-style stacks layer on top of TailwindCSS; it
+# composes cleanly with the locked trio.
+_OPTIONAL_WEB_LANGUAGES: tuple[str, ...] = ("radix-ui",)
+
+# Every web_language value the validator considers in-bounds — the
+# required trio plus the optional extras. Operators trying to add
+# something outside this set get an exit-code-2 with a polite
+# refusal message.
+_ALLOWED_WEB_LANGUAGES: tuple[str, ...] = tuple(
+    list(_REQUIRED_WEB_LANGUAGES) + list(_OPTIONAL_WEB_LANGUAGES)
+)
+
+_DEFAULT_BACKEND_LANGUAGE: str = "Python"
+_DEFAULT_WEB_LANGUAGES: tuple[str, ...] = _REQUIRED_WEB_LANGUAGES
+
+
+def resolve_core_languages(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the resolved ``core_languages`` block.
+
+    Blank / missing values are replaced with the locked defaults
+    (Python backend; React+TypeScript+TailwindCSS web). Any other
+    value is left as-is for :func:`validate_config_strict` to flag.
+    Callers (graph.py prompt scaffolds, impact.py stack filter, etc.)
+    should always go through this helper so behaviour is consistent.
+    """
+    raw = config.get("core_languages") if isinstance(config, dict) else None
+    block: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    backend = block.get("backend_language")
+    if not isinstance(backend, str) or not backend.strip():
+        backend = _DEFAULT_BACKEND_LANGUAGE
+    web = block.get("web_language")
+    if not isinstance(web, list) or not web:
+        web = list(_DEFAULT_WEB_LANGUAGES)
+    return {"backend_language": backend, "web_language": web}
 
 
 def find_missing_api_keys(config: dict[str, Any]) -> dict[str, list[str]]:
@@ -1277,6 +1349,88 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
                         f"Valid: {sorted(valid_role_names)}"
                     )
 
+    # --- 4b. Locked core-technology selection ---
+    # Backend may be Python or Java (Spring Boot). Web is fixed to the
+    # React + TypeScript + TailwindCSS trio. Blanks are auto-defaulted
+    # via resolve_core_languages(); anything else is a hard error so the
+    # operator can't silently smuggle in Go / Vue / Angular / Flutter
+    # workloads the harness no longer ships skills for.
+    raw_lang_block = config.get("core_languages")
+    lang_block: dict[str, Any] = (
+        raw_lang_block if isinstance(raw_lang_block, dict) else {}
+    )
+    backend_lang = lang_block.get("backend_language")
+    if backend_lang is None or (isinstance(backend_lang, str) and not backend_lang.strip()):
+        pass  # blank → resolve_core_languages() will default to Python
+    elif not isinstance(backend_lang, str):
+        errors.append(
+            f"'core_languages.backend_language' must be a string, got "
+            f"{type(backend_lang).__name__}. Please set it to one of: "
+            f"{list(_ALLOWED_BACKEND_LANGUAGES)} — or leave it blank to "
+            f"accept the default ({_DEFAULT_BACKEND_LANGUAGE!r})."
+        )
+    elif backend_lang not in _ALLOWED_BACKEND_LANGUAGES:
+        errors.append(
+            f"'core_languages.backend_language' is set to {backend_lang!r}, "
+            f"which is not a supported backend language. This harness only "
+            f"supports {list(_ALLOWED_BACKEND_LANGUAGES)} for backend work "
+            f"(Java implies Spring Boot). Please update config.json to one "
+            f"of the supported values, or leave the field blank to accept "
+            f"the default ({_DEFAULT_BACKEND_LANGUAGE!r})."
+        )
+
+    web_lang = lang_block.get("web_language")
+    if web_lang is None or (isinstance(web_lang, list) and not web_lang):
+        pass  # blank → resolve_core_languages() will default to the trio
+    elif not isinstance(web_lang, list):
+        errors.append(
+            f"'core_languages.web_language' must be a list, got "
+            f"{type(web_lang).__name__}. Please set it to "
+            f"{list(_ALLOWED_WEB_LANGUAGES)} — or leave it blank to accept "
+            f"the default ({list(_DEFAULT_WEB_LANGUAGES)})."
+        )
+    else:
+        # Order-insensitive set comparison. The React + TypeScript +
+        # TailwindCSS trio MUST be present; additional entries are
+        # allowed only when they appear in _OPTIONAL_WEB_LANGUAGES.
+        # Anything else is rejected at load time so an operator can't
+        # silently smuggle in Vue / Angular / Svelte / etc.
+        try:
+            web_set = {item for item in web_lang if isinstance(item, str)}
+        except TypeError:
+            web_set = set()
+        required_set = set(_REQUIRED_WEB_LANGUAGES)
+        allowed_set = set(_ALLOWED_WEB_LANGUAGES)
+        non_string = [item for item in web_lang if not isinstance(item, str)]
+        if non_string:
+            errors.append(
+                f"'core_languages.web_language' must contain only strings, "
+                f"got non-string entries {non_string!r}. Required entries: "
+                f"{list(_REQUIRED_WEB_LANGUAGES)}; optional extras: "
+                f"{list(_OPTIONAL_WEB_LANGUAGES)}."
+            )
+        else:
+            missing = sorted(required_set - web_set)
+            extra = sorted(web_set - allowed_set)
+            if missing:
+                errors.append(
+                    f"'core_languages.web_language' is missing required "
+                    f"entries {missing}. The web stack must include the "
+                    f"full trio {list(_REQUIRED_WEB_LANGUAGES)} — please "
+                    f"add the missing entries, or leave the field blank "
+                    f"to accept the trio as the default."
+                )
+            if extra:
+                errors.append(
+                    f"'core_languages.web_language' contains unsupported "
+                    f"entries {extra}. This harness only supports the "
+                    f"React + TypeScript + TailwindCSS trio plus the "
+                    f"optional extras {list(_OPTIONAL_WEB_LANGUAGES)} for "
+                    f"web work — please remove the unsupported entries, "
+                    f"or leave the field blank to accept the default "
+                    f"({list(_DEFAULT_WEB_LANGUAGES)})."
+                )
+
     # --- 5. Env var presence for every model referenced by routing ---
     referenced_models: set[str] = set()
     for field in (*_REQUIRED_ROUTING_FIELDS, *_OPTIONAL_ROUTING_FIELDS):
@@ -1373,15 +1527,21 @@ def _makefile_has_target(workspace_path: str, target: str) -> bool:
 
 
 def _detect_default_build_command(workspace_path: str) -> Optional[str]:
-    """Pick a sensible build command by sniffing workspace markers.
+    """Pick a build command by sniffing workspace markers for the locked
+    core stack.
 
-    Returns None when the workspace gives no hint — caller falls back to
-    the historical default. Probed in priority order so a polyglot repo
-    with a Makefile (that actually declares a ``build:`` target) still
-    uses it. A Makefile present but missing the ``build:`` target is
+    Only Python / Java / React+TypeScript+TailwindCSS+Vite are
+    supported. Probed in priority order so a polyglot repo with a
+    Makefile (that actually declares a ``build:`` target) still uses
+    it. A Makefile present but missing the ``build:`` target is
     treated as if it weren't there — we fall through to manifest-based
     detection so the operator gets an actionable build command instead
     of an instant exit-127 in a make-less sandbox image.
+
+    Returns ``None`` only when the workspace truly contains no marker
+    for any supported stack — that case is treated as a brand-new
+    Python scaffold (the harness's default) and the caller seeds a
+    pip+pytest bootstrap command.
     """
     if not workspace_path or not os.path.isdir(workspace_path):
         return None
@@ -1391,23 +1551,27 @@ def _detect_default_build_command(workspace_path: str) -> Optional[str]:
 
     if _makefile_has_target(workspace_path, "build"):
         return "make build"
+    # Python — pyproject.toml > requirements.txt > any .py file.
     if has("pyproject.toml"):
         return "python3 -m pip install -e . && python3 -m pytest -q"
     if has("requirements.txt"):
         return "python3 -m pip install -r requirements.txt && python3 -m pytest -q"
+    # Java — Maven first, then Gradle (wrapper if present).
+    if has("pom.xml"):
+        return "mvn -B test"
+    if has("gradlew"):
+        return "./gradlew test"
+    if has("build.gradle") or has("build.gradle.kts"):
+        return "gradle test"
+    # Web (React + TypeScript + TailwindCSS, Vite-built). package.json
+    # is the only allowed Node manifest — any other Node framework is
+    # outside the supported stack.
     if has("package.json"):
-        return "npm install && npm test"
-    if has("Cargo.toml"):
-        return "cargo build && cargo test"
-    if has("go.mod"):
-        return "go build ./... && go test ./..."
-    # Last-chance heuristic: any .py file (top level OR one level deep,
-    # e.g. ``app/__init__.py`` after LLM scaffolds a package) → bootstrap
-    # pytest. The branch previously returned a bare ``python3 -m pytest -q``
-    # with no install step, so freshly-scaffolded workspaces hit exit 1
-    # ("pytest not installed") and the repair LLM kept editing manifests
-    # that the build_command never honoured. Install pytest explicitly so
-    # the first build can actually succeed.
+        return "npm install && npm run build && npm test"
+    # Last-chance Python heuristic: any .py file (top level OR one
+    # level deep, e.g. ``app/__init__.py`` after LLM scaffolds a
+    # package) → bootstrap pytest. Install pytest explicitly so the
+    # first build can actually succeed.
     try:
         for entry in os.listdir(workspace_path):
             if entry.endswith(".py"):
@@ -1425,32 +1589,45 @@ def _detect_default_build_command(workspace_path: str) -> Optional[str]:
 
 
 def resolve_build_command(
-    cli_build_cmd: Optional[str],
     config: dict[str, Any],
     workspace_path: Optional[str] = None,
 ) -> str:
+    """Auto-wire the build command from the workspace and the locked
+    core-language selection.
+
+    Since the harness's supported stacks are fixed (Python / Java /
+    React+TypeScript+TailwindCSS), the operator no longer chooses a
+    build command — the workspace + ``core_languages.backend_language``
+    fully determine it. Order of preference:
+
+      1. Existing build markers — manifest sniff in
+         :func:`_detect_default_build_command` (lets ``teane patch``
+         reuse whatever build wiring the workspace already has).
+      2. Greenfield seed — when no marker exists yet, fall back to a
+         pip+pytest bootstrap for Python backends, ``mvn -B test`` for
+         Java backends (so the very first compile in a fresh workspace
+         doesn't exit-127 before the patcher writes the manifest).
     """
-    Resolve the build command using hierarchical discovery:
-        1. CLI flag --build-cmd (if provided)
-        2. .harness_config.json 'build_command' key
-        3. Workspace sniff (Makefile / pyproject.toml / package.json / etc.)
-        4. Default 'make build'
-    """
-    if cli_build_cmd:
-        logger.info("[cli] Using build command from CLI flag: %s", cli_build_cmd)
-        return cli_build_cmd
-    config_cmd = config.get("build_command", "")
-    if config_cmd:
-        logger.info("[cli] Using build command from config: %s", config_cmd)
-        return config_cmd
     if workspace_path:
         detected = _detect_default_build_command(workspace_path)
         if detected:
-            logger.info("[cli] Detected build command from workspace markers: %s", detected)
+            logger.info(
+                "[cli] Auto-wired build command from workspace markers: %s",
+                detected,
+            )
             return detected
-    fallback = "make build"
-    logger.info("[cli] No build command configured. Using default: %s", fallback)
-    return fallback
+    backend = resolve_core_languages(config)["backend_language"]
+    seed = (
+        "mvn -B test"
+        if backend == "Java"
+        else "python3 -m pip install pytest && python3 -m pytest -q"
+    )
+    logger.info(
+        "[cli] Workspace has no build markers yet; seeding build command "
+        "for %s backend: %s",
+        backend, seed,
+    )
+    return seed
 
 
 # ---------------------------------------------------------------------------
@@ -2175,13 +2352,17 @@ def _refresh_session_config_into_state(state: dict[str, Any]) -> None:
             changed_keys,
         )
 
-    new_build_cmd = fresh_config.get("build_command")
+    # build_command is no longer config-driven; the workspace + locked
+    # core_languages selection fully determine it. Re-auto-wire from
+    # the current workspace so HITL pickups still adapt to new manifests
+    # (e.g. operator dropped a pom.xml into a fresh workspace).
+    refreshed_build_cmd = resolve_build_command(fresh_config, workspace_path)
     old_build_cmd = state.get("build_command")
-    if isinstance(new_build_cmd, str) and new_build_cmd and new_build_cmd != old_build_cmd:
-        state["build_command"] = new_build_cmd
+    if refreshed_build_cmd and refreshed_build_cmd != old_build_cmd:
+        state["build_command"] = refreshed_build_cmd
         logger.info(
-            "[HITL] build_command refreshed from disk: %r -> %r",
-            old_build_cmd, new_build_cmd,
+            "[HITL] build_command auto-rewired from workspace: %r -> %r",
+            old_build_cmd, refreshed_build_cmd,
         )
 
     new_allow_network = fresh_config.get("allow_network")
@@ -2445,53 +2626,44 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
 # 2b. Requirement Refinement Layer (Pre-Flight Specification Gate)
 # ---------------------------------------------------------------------------
 
-_REQUIREMENTS_SYNTHESIS_PROMPT = """You are a Principal Systems Architect and Technical Product Manager.
-Transform the following raw notes into a comprehensive, professionally structured
-SPEC_REQUIREMENTS.md document.
+# Trailer appended to the user message that carries the raw product notes.
+# The skill file at ``harness/skills/docgen/requirements_doc.md`` is the
+# system prompt; this trailer asks the LLM to apply that contract to the
+# notes supplied below. Kept here (not in the skill file) so the skill
+# remains a pure specification of the artifact rather than a chat turn.
+_REQUIREMENTS_USER_TRAILER = (
+    "\n\n## Instructions\n"
+    "Apply the **Requirements Specification** skill instructions above to "
+    "the raw product notes that follow. Emit the RSD as Markdown — no "
+    "preamble, no postscript, no outer code fence. Begin with the "
+    "machine-readable `<!-- RSD-META: ... -->` header described in §Output "
+    "format rules.\n\n"
+    "## Raw Product Notes\n{raw_notes}\n"
+)
 
-## Output Sections
 
-### 1. Executive Summary
-- One paragraph describing the system's purpose and business value.
+def _load_requirements_doc_prompt(*, agile: bool, workspace_path: Optional[str] = None) -> str:
+    """Resolve the requirements_doc system prompt with the agile-mode
+    directive substituted in.
 
-### 2. Functional Requirements (FR)
-- **FR-XXX**: Title
-  - Description: What the system must do.
-  - Priority: Must Have / Should Have / Could Have.
-  - Acceptance Criteria: Given/When/Then format.
-
-### 3. System Scope
-- In-scope features and modules.
-- Out-of-scope items explicitly excluded.
-
-### 4. Technical Constraints
-- Language, framework, database, and infrastructure requirements.
-- Performance targets (latency, throughput).
-- Security requirements.
-
-### 5. Explicit Edge Cases
-- Error states: what happens when things go wrong.
-- Boundary conditions: maximum/minimum values, concurrency limits.
-- Recovery scenarios: retry logic, fallback behavior.
-
-### 6. Non-Functional Requirements
-- Reliability, scalability, observability.
-
-## Raw Notes
-{raw_notes}
-
-## Formatting
-Output as clean, well-structured Markdown. Use proper headings, bullet points,
-and code blocks where appropriate. Do not include any text outside the document.
-Do NOT wrap the whole document in an outer ```markdown … ``` fence — emit the
-Markdown body directly, starting with the first heading. Fences are reserved
-for code blocks INSIDE the document."""
+    The shipped prompt lives at ``harness/skills/docgen/requirements_doc.md``;
+    a workspace can ship an override at ``{workspace_path}/skills/docgen/
+    requirements_doc.md`` and the loader picks it first. The
+    ``{AGILE_MODE_DIRECTIVE}`` placeholder is replaced based on the
+    ``agile`` flag — see ``docgen_prompts.apply_agile_directive``.
+    """
+    from harness import docgen_prompts
+    body = docgen_prompts.load("requirements_doc", workspace_path)
+    return docgen_prompts.apply_agile_directive(body, agile=agile)
 
 
 async def synthesize_requirements(
     manifest_path: str,
     output_dir: str,
     gateway: Any,
+    *,
+    agile: bool = False,
+    workspace_path: Optional[str] = None,
 ) -> str:
     """
     Read raw notes from a manifest file, route to LLM for synthesis,
@@ -2501,6 +2673,16 @@ async def synthesize_requirements(
         manifest_path: Path to the raw notes/text file.
         output_dir: Directory to write SPEC_REQUIREMENTS.md.
         gateway: Initialized LLM Gateway instance.
+        agile: Resolved value of the ``--agile`` CLI flag (mirrored to
+            ``args.decomposition_enabled`` by ``_resolve_agile_args``).
+            True selects **Path A — Agile RSD** in the
+            ``requirements_doc.md`` skill (SAFe Epic → Feature → Story
+            hierarchy with Gherkin AC and INVEST validation). False
+            selects **Path B — Default RSD** (ISO/IEC/IEEE 29148:2018).
+        workspace_path: When supplied, a per-workspace prompt override
+            at ``{workspace_path}/skills/docgen/requirements_doc.md`` is
+            consulted first by the loader. Pass ``None`` (the default)
+            for callers that have no workspace context yet.
 
     Returns:
         Absolute path to the generated SPEC_REQUIREMENTS.md file.
@@ -2525,13 +2707,17 @@ async def synthesize_requirements(
     if not raw_notes.strip():
         raise RuntimeError("Manifest file is empty.")
 
-    logger.info("[requirements] Synthesizing SPEC_REQUIREMENTS.md from %d chars of raw notes...", len(raw_notes))
+    logger.info(
+        "[requirements] Synthesizing SPEC_REQUIREMENTS.md from %d chars of raw notes (agile=%s)...",
+        len(raw_notes), agile,
+    )
 
     from harness.gateway import NodeRole
-    prompt = _REQUIREMENTS_SYNTHESIS_PROMPT.format(raw_notes=raw_notes)
+    system_prompt = _load_requirements_doc_prompt(agile=agile, workspace_path=workspace_path)
+    user_prompt = _REQUIREMENTS_USER_TRAILER.format(raw_notes=raw_notes)
     messages = [
-        {"role": "system", "content": "You are a technical documentation expert. Output clean, structured Markdown."},
-        {"role": "user", "content": prompt},
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
     ]
 
     try:
@@ -4317,7 +4503,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         # opt into --force-lock. Refuse to proceed.
         return 1
 
-    build_command = resolve_build_command(args.build_cmd, config, workspace_path)
+    build_command = resolve_build_command(config, workspace_path)
 
     # --- Change-request mode validation (before resource allocation) ---
     # Validate BEFORE initializing checkpointer/gateway/MCP, so early returns
@@ -4645,6 +4831,15 @@ async def cmd_run(args: argparse.Namespace) -> int:
                 manifest_path=manifest_path,
                 output_dir=output_dir,
                 gateway=gateway,
+                # `_resolve_agile_args` already collapsed the --agile
+                # tri-state down to a single bool stored on
+                # `decomposition_enabled` (CLI flag > workspace detect >
+                # config["agile"] > False). Forward it so the
+                # `requirements_doc.md` skill switches to Path A (SAFe +
+                # Gherkin) when agile is active and stays on Path B
+                # (ISO 29148) otherwise.
+                agile=bool(getattr(args, "decomposition_enabled", False)),
+                workspace_path=workspace_path,
             )
             # Pre-flight spec review: fire whenever doc_reviewer_primary is
             # configured, regardless of whether --spec-discovery was passed.
@@ -4945,6 +5140,10 @@ async def cmd_run(args: argparse.Namespace) -> int:
             # before the planner. Resolved by cmd_patch from the
             # --generate-specs tri-state. False on every other flow.
             generate_specs=getattr(args, "generate_specs", False),
+            # Full resolved config — threaded so the system-prompt builder
+            # can pin the right backend block of the locked stack directive
+            # based on core_languages.backend_language.
+            full_config=config,
         )
     except Exception:
         logger.exception("Graph execution failed with unhandled exception.")
@@ -5267,7 +5466,7 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     from harness.observability import set_active_session_id
     set_active_session_id(args.session_id)
 
-    build_command = resolve_build_command(args.build_cmd, config, workspace_path)
+    build_command = resolve_build_command(config, workspace_path)
     token_budget = config.get("token_budget", {})
     budget_usd = token_budget.get("hard_cap_usd", 2.00)
     # --allow-network is a real bool (default true). Drop the
@@ -7788,11 +7987,6 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         p.add_argument(
-            "--build-cmd",
-            default=None,
-            help="Override the build command (e.g., 'make build').",
-        )
-        p.add_argument(
             "--session-id",
             default=None,
             help="Human-readable session identifier. UUIDv4 if omitted.",
@@ -8013,11 +8207,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--prompt", "-p",
         default=None,
         help="Optional additional prompt to append to the resumed session.",
-    )
-    resume_parser.add_argument(
-        "--build-cmd",
-        default=None,
-        help="Override the build command.",
     )
     resume_parser.add_argument(
         "--allow-network",

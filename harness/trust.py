@@ -746,8 +746,14 @@ def validate_mcp_server_command(
 # Private helpers
 # ---------------------------------------------------------------------------
 
-def _strip_code_fences(text: str) -> str:
-    """Remove leading/trailing markdown code fences (```json ... ```)."""
+def strip_code_fences(text: str) -> str:
+    """Remove leading/trailing markdown code fences (```json ... ```).
+
+    This is the canonical implementation. Other modules previously
+    hand-rolled their own (``decomposition.strip_json_fence``, inline
+    regexes in ``graph.py`` / ``deploy.py``); prefer this one for any
+    new caller and migrate old sites incrementally.
+    """
     text = text.strip()
     if text.startswith("```"):
         lines = text.splitlines()
@@ -757,3 +763,9 @@ def _strip_code_fences(text: str) -> str:
             end = -1
         text = "\n".join(lines[start:end])
     return text
+
+
+# Backwards-compatible private alias. Existing call sites in this module
+# (and the explicit import in graph.py) continue to work; new code should
+# import the public ``strip_code_fences`` name.
+_strip_code_fences = strip_code_fences

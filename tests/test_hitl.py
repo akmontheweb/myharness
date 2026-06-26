@@ -562,8 +562,13 @@ class TestFileChannelEdgeCases:
             assert ch.notes("second prompt") == "b"
             assert ch.notes("third prompt") == "c"
 
-    def test_file_channel_raises_on_unmatched_prompt_second_time(self):
-        """FileChannel should raise when same prompt is re-used (not pre-recorded twice)."""
+    def test_file_channel_replays_on_repeated_prompt(self):
+        """FileChannel REPLAYS the recorded answer when the same prompt
+        substring fires a second time. Earlier behaviour was one-shot
+        (raise RuntimeError on the second hit) which broke scripts that
+        legitimately re-encounter the same gate (e.g. two batches both
+        hitting STORIES). The contract is now: prefer an unused entry,
+        but fall back to replaying a used one rather than failing closed."""
         with tempfile.TemporaryDirectory() as td:
             response_file = os.path.join(td, "answers.json")
             with open(response_file, "w") as f:
@@ -572,6 +577,19 @@ class TestFileChannelEdgeCases:
                 ], f)
             ch = FileChannel(response_file)
             assert ch.prompt("choose action", ["a", "b"]) == "a"
-            # Second call to same prompt should fail (not pre-recorded twice)
+            # Second call to a prompt matching the SAME substring replays.
+            assert ch.prompt("choose again", ["a", "b"]) == "a"
+
+    def test_file_channel_raises_on_unmatched_prompt(self):
+        """Unmatched prompts (no recorded entry shares a substring) still
+        raise RuntimeError — fail-closed remains the contract for prompts
+        the operator never anticipated."""
+        with tempfile.TemporaryDirectory() as td:
+            response_file = os.path.join(td, "answers.json")
+            with open(response_file, "w") as f:
+                json.dump([
+                    {"prompt": "choose", "answer": "a"},
+                ], f)
+            ch = FileChannel(response_file)
             with pytest.raises(RuntimeError, match="No pre-recorded answer"):
-                ch.prompt("choose again", ["a", "b"])
+                ch.prompt("unrelated prompt", ["a", "b"])

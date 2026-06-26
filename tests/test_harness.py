@@ -913,15 +913,6 @@ class TestTreeSitterPatcher:
         selected = patcher._select_patcher("module.py")
         assert selected is patcher._ast_patcher
 
-    def test_ast_path_selected_for_rust(self, tmp_path):
-        from harness.patcher import HybridPatcher
-        patcher = HybridPatcher(str(tmp_path))
-        if patcher._ast_patcher is None:
-            import pytest
-            pytest.skip("tree-sitter not loaded; covered by init test")
-        selected = patcher._select_patcher("lib.rs")
-        assert selected is patcher._ast_patcher
-
     def test_ast_path_selected_for_typescript(self, tmp_path):
         from harness.patcher import HybridPatcher
         patcher = HybridPatcher(str(tmp_path))
@@ -1617,16 +1608,6 @@ class TestSandboxBackend:
 
 class TestDiagnosticParsing:
 
-    def test_parse_go_diagnostics(self):
-        from harness.sandbox import _parse_go_diagnostics
-        output = "src/main.go:10:5: undefined: xyz\nother.go:3:1: syntax error\n"
-        diags = _parse_go_diagnostics(output)
-        assert len(diags) == 2
-        assert diags[0].file == "src/main.go"
-        assert diags[0].line == 10
-        assert diags[0].column == 5
-        assert "undefined" in diags[0].message
-
     def test_parse_generic_diagnostics(self):
         from harness.sandbox import _parse_generic_diagnostics
         output = "src/main.c:10:5: error: expected ';' before '}'\n"
@@ -2098,12 +2079,6 @@ class TestLintGate:
         spec = get_formatter_for_file("test.py")
         assert spec is not None
         assert spec.command == "ruff"
-
-    def test_get_formatter_go(self):
-        from harness.lintgate import get_formatter_for_file
-        spec = get_formatter_for_file("main.go")
-        assert spec is not None
-        assert spec.command == "gofmt"
 
     def test_get_formatter_unknown(self):
         from harness.lintgate import get_formatter_for_file
@@ -3650,15 +3625,21 @@ class TestAgentState:
         # so operator edits (e.g. sandbox.docker_image) reach the live
         # state. Without this the next iteration runs against whatever
         # sandbox_config was checkpointed at run_graph start.
+        # build_command is no longer driven by config — the function
+        # auto-rewires from the workspace's markers + locked
+        # core_languages selection.
         from harness import cli as cli_module
         # Stub discover_config so we don't depend on the real config
         # discovery walking up directories — keeps the test hermetic.
         fresh = {
             "sandbox": {"docker_image": "python:3.12-slim", "backend": "auto"},
-            "build_command": "python3 -m pytest -q",
             "allow_network": True,
         }
         monkeypatch.setattr(cli_module, "discover_config", lambda _ws: fresh)
+
+        # Seed a requirements.txt so resolve_build_command sniffs a
+        # python build command from the workspace.
+        (tmp_path / "requirements.txt").write_text("fastapi\n")
 
         state: dict = {
             "workspace_path": str(tmp_path),
@@ -3668,7 +3649,9 @@ class TestAgentState:
         }
         cli_module._refresh_session_config_into_state(state)
         assert state["sandbox_config"]["docker_image"] == "python:3.12-slim"
-        assert state["build_command"] == "python3 -m pytest -q"
+        # Workspace-sniffed build command (Python markers).
+        assert "pip install" in state["build_command"]
+        assert "pytest" in state["build_command"]
         assert state["allow_network"] is True
 
     def test_refresh_session_config_into_state_is_noop_without_workspace(self, monkeypatch):
@@ -3909,26 +3892,6 @@ class TestMakefileSkills:
         )
         assert "Node.js / TypeScript Makefile" in body
 
-    def test_makefile_rust_skill_loads_for_rust_workspace(self):
-        from harness.graph import _load_skills_markdown
-        body = _load_skills_markdown(
-            self._skills_dir(),
-            max_file_chars=8000,
-            workspace_tags={"rust"},
-        )
-        assert "Rust Makefile" in body
-        assert "Python Makefile" not in body
-
-    def test_makefile_go_skill_loads_for_go_workspace(self):
-        from harness.graph import _load_skills_markdown
-        body = _load_skills_markdown(
-            self._skills_dir(),
-            max_file_chars=8000,
-            workspace_tags={"go"},
-        )
-        assert "Go Makefile" in body
-        assert "Java Makefile" not in body
-
     def test_makefile_java_skill_loads_for_java_workspace(self):
         from harness.graph import _load_skills_markdown
         body = _load_skills_markdown(
@@ -3937,15 +3900,6 @@ class TestMakefileSkills:
             workspace_tags={"java"},
         )
         assert "Java Makefile" in body
-
-    def test_makefile_dart_skill_loads_for_flutter_workspace(self):
-        from harness.graph import _load_skills_markdown
-        body = _load_skills_markdown(
-            self._skills_dir(),
-            max_file_chars=8000,
-            workspace_tags={"flutter", "dart"},
-        )
-        assert "Dart / Flutter Makefile" in body
 
     def test_no_makefile_skill_for_unknown_stack(self):
         # A stack the harness doesn't recognize (e.g., elixir) shouldn't
@@ -3957,8 +3911,7 @@ class TestMakefileSkills:
             workspace_tags={"elixir"},
         )
         for stack in ("Python Makefile", "Node.js / TypeScript Makefile",
-                      "Rust Makefile", "Go Makefile", "Java Makefile",
-                      "Dart / Flutter Makefile"):
+                      "Java Makefile"):
             assert stack not in body, f"{stack} should not load for unknown stack"
 
     def test_makefile_in_root_allowlist(self):
@@ -3971,13 +3924,13 @@ class TestMakefileSkills:
         assert "GNUmakefile" in _ROOT_ALLOWLIST_FILES
 
     def test_node_manifests_in_root_allowlist(self):
-        # The kitchen-sink builder image supports JS stacks; the patcher
-        # must accept patches to the canonical Node/TS root manifests for
-        # the same reason it accepts Makefile and pyproject.toml.
+        # The kitchen-sink builder image supports the locked React +
+        # TypeScript + TailwindCSS stack; the patcher must accept patches
+        # to the canonical Node/TS root manifests for the same reason it
+        # accepts Makefile and pyproject.toml.
         from harness.graph import _ROOT_ALLOWLIST_FILES
         for name in (
             "package.json", "package-lock.json",
-            "yarn.lock", "pnpm-lock.yaml",
             "tsconfig.json",
         ):
             assert name in _ROOT_ALLOWLIST_FILES, (
@@ -4734,7 +4687,10 @@ class TestClaudeCodeStyleEditPipeline:
     def test_b6_patch_tools_have_canonical_names(self):
         from harness.tool_schemas import PATCH_TOOLS
         names = [t["name"] for t in PATCH_TOOLS]
-        assert names == ["read_file", "edit_file", "create_file", "delete_block", "insert_at_block"]
+        assert names == [
+            "read_file", "edit_file", "create_file", "delete_block",
+            "insert_at_block", "insert_at_line", "replace_line_range",
+        ]
 
     def test_b6_anthropic_shape_keeps_input_schema(self):
         from harness.tool_schemas import to_anthropic_tools
@@ -6174,7 +6130,7 @@ class TestImpactAnalyzer:
 class TestParserRegistry:
 
     def test_register_parser(self):
-        from harness.parser_registry import register_parser, get_parser
+        from harness.parser_registry import register_parser, get_parser, _PARSER_REGISTRY
         from harness.sandbox import BaseLanguageParser, DiagnosticObject
 
         class TestParser(BaseLanguageParser):
@@ -6183,10 +6139,15 @@ class TestParserRegistry:
                 return [DiagnosticObject(file="test.txt", message="test")]
 
         register_parser("testc", TestParser)
-        retrieved = get_parser("testc")
-        assert retrieved is not None
-        diags = retrieved.parse_diagnostics("")
-        assert len(diags) == 1
+        try:
+            retrieved = get_parser("testc")
+            assert retrieved is not None
+            diags = retrieved.parse_diagnostics("")
+            assert len(diags) == 1
+        finally:
+            # Clean up to avoid output-signature pollution in later tests
+            # (TestParser unconditionally returns 1 diag for any input).
+            _PARSER_REGISTRY.pop("testc", None)
 
     def test_get_parser_unknown(self):
         from harness.parser_registry import get_parser
@@ -6202,22 +6163,18 @@ class TestParserRegistry:
         assert _strip_ansi("\x1b]8;;file:///x\x07click\x1b]8;;\x07") == "click"
 
     def test_detect_and_parse_strips_ansi_before_dispatching(self):
-        # Regression: cargo/rustc/etc emit \x1b[31m... when CARGO_TERM_COLOR=always
-        # is set in the env; the colorized diagnostic line never matched any
-        # regex and was silently dropped.
+        # Regression: tooling emits \x1b[31m... when color output is on;
+        # the colorized diagnostic line used to never match any regex and
+        # got silently dropped. The generic parser keys off the
+        # ``file:line:col: error: …`` shape after ANSI stripping.
         from harness.parser_registry import detect_and_parse
-        colored = "\x1b[1;31merror\x1b[0m: \x1b[1msrc/main.go:10:5: undefined: xyz\x1b[0m\n"
-        diags = detect_and_parse(colored, build_command="go build", workspace_path="/x")
+        colored = (
+            "\x1b[1;31mmain.c:10:5: error: undefined reference to xyz\x1b[0m\n"
+        )
+        diags = detect_and_parse(colored, build_command="make build", workspace_path="/x")
         # Must extract at least one diagnostic from the colorized output
         assert len(diags) >= 1
-        assert any("xyz" in d.message or "main.go" in d.file for d in diags)
-
-    def test_detect_and_parse_go(self):
-        from harness.parser_registry import detect_and_parse
-        output = "main.go:5:10: undefined: xyz\n"
-        diags = detect_and_parse(output, build_command="go build")
-        assert len(diags) == 1
-        assert "main.go" in diags[0].file
+        assert any("xyz" in d.message or "main.c" in d.file for d in diags)
 
     def test_detect_and_parse_python(self):
         from harness.parser_registry import detect_and_parse
@@ -6226,25 +6183,6 @@ class TestParserRegistry:
 ZeroDivisionError: division by zero"""
         diags = detect_and_parse(output, build_command="python test.py")
         assert len(diags) >= 0
-
-    def test_generic_parser_captures_rust_span_context(self):
-        # Regression: Rust ` --> file:line | code | ^^^ ` annotation blocks
-        # under a primary error used to be silently dropped. semantic_context
-        # should now contain the full multi-line span so the repair node has
-        # the same view the developer would.
-        from harness.parser_registry import GenericParser
-        output = """src/main.rs:10:5: error: cannot find type `Foo` in this scope
-  --> src/main.rs:10:5
-   |
-10 |     let x: Foo = bar();
-   |            ^^^ not found in this scope
-   |
-   = help: consider importing this struct"""
-        diags = GenericParser.parse_diagnostics(output)
-        assert len(diags) == 1
-        ctx = diags[0].semantic_context
-        assert "let x: Foo" in ctx, f"missing source snippet in context: {ctx}"
-        assert "help:" in ctx, f"missing help hint in context: {ctx}"
 
     def test_generic_parser_captures_gcc_note_followon(self):
         from harness.parser_registry import GenericParser
@@ -6263,21 +6201,6 @@ main.c:8:1: warning: unused variable"""
         # swallowed into the first one's context.
         assert "unused variable" in diags[1].message
 
-    def test_go_parser_captures_indented_context(self):
-        # Go's `cannot use X as Y` errors emit a couple of tab-indented
-        # `have ... / want ...` lines under the primary.
-        from harness.parser_registry import GoParser
-        output = """cmd/main.go:42:10: cannot use x (type int) as type string in argument
-\thave int
-\twant string
-cmd/other.go:5:1: undefined: foo"""
-        diags = GoParser.parse_diagnostics(output)
-        assert len(diags) == 2
-        assert "have int" in diags[0].semantic_context
-        assert "want string" in diags[0].semantic_context
-        # Second diag must not have the first one's context.
-        assert "have int" not in diags[1].semantic_context
-
     def test_context_collection_does_not_swallow_next_primary(self):
         # Defense: two back-to-back primary diagnostics with no context
         # between them must both be parsed cleanly, not merged.
@@ -6294,7 +6217,10 @@ b.c:2:2: error: second"""
         result = list_registered_parsers()
         assert "compiler" in result
         assert "extension" in result
-        assert "rustc" in result["compiler"]
+        # Locked stack registers python + java + tsc-family parsers.
+        assert "python" in result["compiler"]
+        assert "javac" in result["compiler"]
+        assert "tsc" in result["compiler"]
 
 
 # ===========================================================================
@@ -6365,20 +6291,21 @@ class TestCLI:
         assert out["build_command"] == "make"
         assert out["sandbox"]["backend"] == "auto"
 
-    def test_resolve_build_command_cli(self):
+    def test_resolve_build_command_default_python(self):
+        # No workspace markers + locked default backend (Python) → the
+        # pip+pytest bootstrap seed wins.
         from harness.cli import resolve_build_command
-        result = resolve_build_command("custom build", {"build_command": "make build"})
-        assert result == "custom build"
+        result = resolve_build_command({}, None)
+        assert "pip install" in result
+        assert "pytest" in result
 
-    def test_resolve_build_command_config(self):
+    def test_resolve_build_command_default_java(self):
+        # backend_language=Java + no markers → mvn -B test seed.
         from harness.cli import resolve_build_command
-        result = resolve_build_command(None, {"build_command": "cmake build"})
-        assert result == "cmake build"
-
-    def test_resolve_build_command_default(self):
-        from harness.cli import resolve_build_command
-        result = resolve_build_command(None, {})
-        assert result == "make build"
+        result = resolve_build_command(
+            {"core_languages": {"backend_language": "Java"}}, None,
+        )
+        assert result == "mvn -B test"
 
     def test_detect_build_command_makefile_wins(self):
         from harness.cli import _detect_default_build_command
@@ -6409,7 +6336,9 @@ class TestCLI:
         from harness.cli import _detect_default_build_command
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "package.json").write_text('{"name":"x"}')
-            assert _detect_default_build_command(tmpdir) == "npm install && npm test"
+            assert _detect_default_build_command(tmpdir) == (
+                "npm install && npm run build && npm test"
+            )
 
     def test_detect_build_command_loose_python_files(self):
         # Fix 2a: the bare-.py fallback must prepend a pip install step.
@@ -6431,12 +6360,12 @@ class TestCLI:
             assert _detect_default_build_command(tmpdir) is None
 
     def test_resolve_build_command_uses_workspace_detection(self):
-        # Regression: when no CLI flag and no config build_command, the
-        # resolver must sniff the workspace before falling back to make.
+        # The resolver must sniff the workspace before falling back to
+        # the per-backend bootstrap seed.
         from harness.cli import resolve_build_command
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "requirements.txt").write_text("fastapi\n")
-            cmd = resolve_build_command(None, {}, tmpdir)
+            cmd = resolve_build_command({}, tmpdir)
             assert "pip install" in cmd
             assert "pytest" in cmd
             assert cmd != "make build"
@@ -6687,6 +6616,88 @@ class TestCLI:
 
 
 # ===========================================================================
+# CORE LANGUAGES (locked stack) TESTS
+# ===========================================================================
+
+class TestCoreLanguages:
+    """The harness's tech stack is locked to Python|Java backend +
+    React+TypeScript+TailwindCSS web. ``resolve_core_languages`` returns
+    the resolved block (filling blanks with the locked defaults), and
+    ``validate_config_strict`` rejects any other backend/web choice with a
+    polite, operator-actionable message."""
+
+    def test_resolve_core_languages_blank_defaults_to_python_and_trio(self):
+        from harness.cli import resolve_core_languages
+        # Empty config → defaults to Python + the React+TypeScript+TailwindCSS trio.
+        resolved = resolve_core_languages({})
+        assert resolved["backend_language"] == "Python"
+        assert set(resolved["web_language"]) == {"React", "TypeScript", "TailwindCSS"}
+
+        # Explicit blanks must default the same way.
+        resolved = resolve_core_languages(
+            {"core_languages": {"backend_language": "", "web_language": []}},
+        )
+        assert resolved["backend_language"] == "Python"
+        assert set(resolved["web_language"]) == {"React", "TypeScript", "TailwindCSS"}
+
+        # Whitespace-only string also counts as blank.
+        resolved = resolve_core_languages(
+            {"core_languages": {"backend_language": "   "}},
+        )
+        assert resolved["backend_language"] == "Python"
+
+    def test_validate_config_strict_rejects_go_backend(self):
+        import pytest as _pytest
+        from harness.cli import validate_config_strict, ConfigError
+        bad = {
+            "models": {"m": {"provider": "openai", "model_name": "x"}},
+            "model_routing": {
+                "planning_primary": "m",
+                "patching_primary": "m",
+                "repair_primary": "m",
+            },
+            "core_languages": {"backend_language": "Go"},
+            "persistence": {"db_path": "/tmp/x.db"},
+            "token_budget": {"hard_cap_usd": 1.0},
+            "sandbox": {"backend": "bare"},
+        }
+        import os as _os
+        _os.environ.setdefault("OPENAI_API_KEY", "sk-test-stub")
+        with _pytest.raises(ConfigError) as exc:
+            validate_config_strict(bad, source="/fake/config.json")
+        msg = str(exc.value)
+        # Polite, operator-actionable message naming the unsupported value
+        # and the allowed alternatives.
+        assert "'Go'" in msg or "'Go'," in msg or "Go" in msg
+        assert "backend_language" in msg
+        assert "Python" in msg and "Java" in msg
+
+    def test_validate_config_strict_rejects_vue_web_language(self):
+        import pytest as _pytest
+        from harness.cli import validate_config_strict, ConfigError
+        bad = {
+            "models": {"m": {"provider": "openai", "model_name": "x"}},
+            "model_routing": {
+                "planning_primary": "m",
+                "patching_primary": "m",
+                "repair_primary": "m",
+            },
+            "core_languages": {"web_language": ["Vue"]},
+            "persistence": {"db_path": "/tmp/x.db"},
+            "token_budget": {"hard_cap_usd": 1.0},
+            "sandbox": {"backend": "bare"},
+        }
+        import os as _os
+        _os.environ.setdefault("OPENAI_API_KEY", "sk-test-stub")
+        with _pytest.raises(ConfigError) as exc:
+            validate_config_strict(bad, source="/fake/config.json")
+        msg = str(exc.value)
+        # Polite, operator-actionable message about the web stack.
+        assert "web_language" in msg
+        assert "React" in msg and "TypeScript" in msg and "TailwindCSS" in msg
+
+
+# ===========================================================================
 # SKILLS TESTS
 # ===========================================================================
 
@@ -6828,15 +6839,15 @@ class TestSpeculative:
 
     def test_variant_cache_env_creates_isolated_dirs(self):
         # Regression: parallel variants used to share host cache dirs
-        # (~/.cache/pip, ~/.cargo/registry etc.) and would race on writes.
-        # Each variant now gets its own .harness-cache/<tool>/ directory tree.
+        # (~/.cache/pip etc.) and would race on writes. Each variant now
+        # gets its own .harness-cache/<tool>/ directory tree.
         from harness.speculative import _build_variant_cache_env
         with tempfile.TemporaryDirectory() as worktree:
             env = _build_variant_cache_env(worktree)
-            # Cover the main package managers and incremental caches
+            # Cover the package managers + incremental caches for the
+            # locked stack (Python / Java / React+TypeScript+TailwindCSS).
             required = {
-                "PIP_CACHE_DIR", "npm_config_cache", "YARN_CACHE_FOLDER",
-                "CARGO_HOME", "CARGO_TARGET_DIR", "GOCACHE", "GOMODCACHE",
+                "PIP_CACHE_DIR", "npm_config_cache",
                 "GRADLE_USER_HOME", "MYPY_CACHE_DIR", "RUFF_CACHE_DIR",
                 "XDG_CACHE_HOME",
             }
@@ -6857,8 +6868,8 @@ class TestSpeculative:
             env1 = _build_variant_cache_env(v1)
             env2 = _build_variant_cache_env(v2)
             assert env1["PIP_CACHE_DIR"] != env2["PIP_CACHE_DIR"]
-            assert env1["CARGO_HOME"] != env2["CARGO_HOME"]
-            assert env1["GOCACHE"] != env2["GOCACHE"]
+            assert env1["npm_config_cache"] != env2["npm_config_cache"]
+            assert env1["GRADLE_USER_HOME"] != env2["GRADLE_USER_HOME"]
 
     def test_variant_cache_env_pytest_addopts_format(self):
         # PYTEST_ADDOPTS must be a valid pytest CLI flag string, not a dir path.

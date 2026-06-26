@@ -1239,7 +1239,6 @@ def _minimal_valid_config_dict() -> dict:
     by the stale-write tests so the writer's atomic-write path actually
     reaches the mtime comparison instead of bouncing off validation."""
     return {
-        "build_command": "make",
         "allow_network": False,
         "product_spec_dir": "p",
         "sandbox": {"backend": "auto", "docker_image": "x:1",

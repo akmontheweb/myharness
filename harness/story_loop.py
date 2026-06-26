@@ -407,13 +407,16 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
                 "AND s.status = 'blocked'",
                 (batch_id, workspace),
             ).fetchone()[0]
-            story_state.complete_batch(
-                conn,
-                batch_id,
-                status="complete" if blocked_count == 0 else "complete_with_blocks",
-            )
+            # NOTE: we DO NOT call story_state.complete_batch() here. The
+            # per-batch verification chain (speculative_node →
+            # code_review_node → batch_commit_node) hasn't run yet; sealing
+            # the batch row now would let external readers (dashboard,
+            # traceability) see a "complete" batch that hasn't been
+            # verified. batch_commit_node is the single source of truth
+            # for the final batch state and writes it atomically via
+            # seal_batch_atomically.
             logger.info(
-                "[story_loop] batch %d complete (%d blocked).",
+                "[story_loop] batch %d ready for verification (%d blocked stories).",
                 batch_id, blocked_count,
             )
             return {
@@ -434,11 +437,17 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
         if moved == 0:
             # Either the row vanished (race with another process) or
             # the story landed in a terminal state we don't recognise.
-            # Skip the story rather than continue with stale in_progress
-            # semantics.
+            # Route back to story_loop_node (NOT patching_node): the
+            # earlier fail-open shape routed to patching with
+            # current_story_id="" which spun the patcher with no scope
+            # and could loop indefinitely. Treating this as
+            # batch_complete=True hands control to the verification
+            # chain — if it really is the last unprocessable story, the
+            # chain seals the batch as complete_with_blocks; otherwise
+            # the next pass through story_loop_node will retry.
             logger.warning(
                 "[story_loop] mark_in_progress matched 0 rows for %s; "
-                "skipping this story.",
+                "ending batch loop and handing to verification chain.",
                 nxt["story_key"],
             )
             return {
@@ -447,7 +456,8 @@ def story_loop_node(state: dict[str, Any]) -> dict[str, Any]:
                 "loop_counter": loop_counter,
                 "node_state": {
                     "current_node": "story_loop",
-                    "batch_complete": False,
+                    "batch_complete": True,
+                    "batch_id": batch_id,
                     "skipped": True,
                     "reason": "mark_in_progress_no_rows",
                     "story_key": nxt["story_key"],

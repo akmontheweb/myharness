@@ -139,21 +139,6 @@ class TestBuildSystemPromptIntegration:
             # Universal skill always loads
             assert "Agent Standards" in prompt
 
-    def test_flutter_workspace_only_loads_flutter_skill(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with open(os.path.join(tmp, "pubspec.yaml"), "w") as f:
-                f.write("name: my_app\n")
-            os.makedirs(os.path.join(tmp, "lib"))
-
-            prompt = _build_system_prompt(tmp, "flutter test")
-            assert "Mobile — Flutter" in prompt
-            # No backend frameworks should appear
-            assert "Python — FastAPI" not in prompt
-            assert "Java — Spring Boot" not in prompt
-            assert "Node.js — Express" not in prompt
-            # Universal still loads
-            assert "Agent Standards" in prompt
-
     def test_react_workspace_only_loads_react_skill(self):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "package.json"), "w") as f:

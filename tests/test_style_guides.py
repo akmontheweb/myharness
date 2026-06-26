@@ -201,18 +201,15 @@ class TestShippedStyleGuides:
 
     # Focused single-source guides: each distills one authoritative source
     # into ~3 KB of bullets. Cap at 4 KB to keep budgets predictable.
+    # Stack is locked to Python|Java backend + React+TypeScript+TailwindCSS
+    # web, so vue/angular/flutter/mobile-* guides have been removed.
     FOCUSED_FILES = {
         "python.md", "java.md", "nodejs.md", "javascript.md", "typescript.md",
-        "react.md", "vue.md", "angular.md", "html.md", "css.md", "sql.md",
-        "flutter.md",
+        "react.md", "html.md", "css.md", "sql.md",
     }
-    # Extended platform guides: distill a comprehensive platform standard
-    # (Apple HIG, Material 3) — these are larger than focused guides
-    # because the source itself is platform-wide, not a single style
-    # treatise. Cap at 8 KB.
-    EXTENDED_FILES = {
-        "mobile-ios.md", "mobile-android.md",
-    }
+    # No extended platform guides ship now that mobile platforms are out
+    # of the supported stack.
+    EXTENDED_FILES: set[str] = set()
     # Composite multi-source design-system specs: one file synthesizes
     # several authoritative sources into an in-depth spec (palette,
     # typography, components, states, framework config). Larger cap is
@@ -353,82 +350,6 @@ class TestStackDetectorNewTags:
         assert "android" not in tags
 
 
-class TestMobilePlatformDetection:
-    """Regression tests for the ios / android target-platform tags."""
-
-    def test_flutter_with_both_platform_dirs_tags_both(self, workspace):
-        from harness.impact import _detect_workspace_stack
-        with open(os.path.join(workspace, "pubspec.yaml"), "w") as f:
-            f.write("name: app\n")
-        os.makedirs(os.path.join(workspace, "lib"))
-        os.makedirs(os.path.join(workspace, "ios"))
-        os.makedirs(os.path.join(workspace, "android"))
-        tags = _detect_workspace_stack(workspace)
-        assert "flutter" in tags
-        assert "ios" in tags
-        assert "android" in tags
-
-    def test_flutter_with_only_ios_dir_skips_android_tag(self, workspace):
-        from harness.impact import _detect_workspace_stack
-        with open(os.path.join(workspace, "pubspec.yaml"), "w") as f:
-            f.write("name: app\n")
-        os.makedirs(os.path.join(workspace, "lib"))
-        os.makedirs(os.path.join(workspace, "ios"))
-        tags = _detect_workspace_stack(workspace)
-        assert "ios" in tags
-        assert "android" not in tags
-
-    def test_native_ios_via_podfile_and_xcodeproj(self, workspace):
-        from harness.impact import _detect_workspace_stack
-        with open(os.path.join(workspace, "Podfile"), "w") as f:
-            f.write("platform :ios, '15.0'\n")
-        os.makedirs(os.path.join(workspace, "MyApp.xcodeproj"))
-        tags = _detect_workspace_stack(workspace)
-        assert "ios" in tags
-        assert "android" not in tags
-
-    def test_native_android_via_gradle_plugin(self, workspace):
-        from harness.impact import _detect_workspace_stack
-        with open(os.path.join(workspace, "build.gradle"), "w") as f:
-            f.write("plugins {\n  id 'com.android.application'\n}\n")
-        tags = _detect_workspace_stack(workspace)
-        assert "android" in tags
-        assert "ios" not in tags
-
-    def test_native_android_via_app_build_gradle(self, workspace):
-        from harness.impact import _detect_workspace_stack
-        os.makedirs(os.path.join(workspace, "app"))
-        with open(os.path.join(workspace, "app/build.gradle"), "w") as f:
-            f.write("apply plugin: 'com.android.application'\n")
-        tags = _detect_workspace_stack(workspace)
-        assert "android" in tags
-
-    def test_react_native_tags_both_platforms(self, workspace):
-        from harness.impact import _detect_workspace_stack
-        with open(os.path.join(workspace, "package.json"), "w") as f:
-            f.write('{"dependencies": {"react-native": "^0.74"}}')
-        tags = _detect_workspace_stack(workspace)
-        assert "ios" in tags
-        assert "android" in tags
-
-    def test_expo_tags_both_platforms(self, workspace):
-        from harness.impact import _detect_workspace_stack
-        with open(os.path.join(workspace, "package.json"), "w") as f:
-            f.write('{"dependencies": {"expo": "~50.0.0"}}')
-        tags = _detect_workspace_stack(workspace)
-        assert "ios" in tags
-        assert "android" in tags
-
-    def test_pure_web_react_does_not_tag_mobile(self, workspace):
-        from harness.impact import _detect_workspace_stack
-        with open(os.path.join(workspace, "package.json"), "w") as f:
-            f.write('{"dependencies": {"react": "^18"}}')
-        tags = _detect_workspace_stack(workspace)
-        assert "react" in tags
-        assert "ios" not in tags
-        assert "android" not in tags
-
-
 class TestArchitectureSpecAugmentation:
     """Regression tests for the SPEC_ARCHITECTURE.md tag-augmentation path.
 
@@ -457,13 +378,13 @@ class TestArchitectureSpecAugmentation:
             '```json',
             '{"workspace_layout": {"roots": ['
             '{"path": "server", "purpose": "api", "stack": "fastapi"},'
-            '{"path": "client", "purpose": "web", "stack": "vue"}'
+            '{"path": "client", "purpose": "web", "stack": "react"}'
             '], "test_placement": "co-located", "root_files": []}}',
             '```',
         ]))
         tags = _detect_workspace_stack(workspace)
-        # Frontend root → vue + transitive html/css/node
-        assert "vue" in tags
+        # Frontend root → react + transitive html/css/node
+        assert "react" in tags
         assert "html" in tags
         assert "css" in tags
         # Backend root → fastapi + python
@@ -491,19 +412,6 @@ class TestArchitectureSpecAugmentation:
         assert "css" not in tags
         assert "react" not in tags
         assert "vue" not in tags
-
-    def test_spec_augmentation_is_additive_does_not_override_manifest(
-        self, workspace,
-    ):
-        from harness.impact import _detect_workspace_stack
-        # Manifest says React; spec mentions Vue. Both should appear —
-        # augmentation never strips the manifest-derived tag.
-        with open(os.path.join(workspace, "package.json"), "w") as f:
-            f.write('{"dependencies": {"react": "^18"}}')
-        self._write_spec(workspace, "We will use Vue 3 for the SPA.")
-        tags = _detect_workspace_stack(workspace)
-        assert "react" in tags
-        assert "vue" in tags
 
     def test_spec_passing_mention_without_context_does_not_fire(
         self, workspace,
@@ -565,14 +473,6 @@ class TestSystemPromptInjection:
         prompt = _build_system_prompt(workspace, "make build")
         assert "## Coding Style Guides" not in prompt
 
-    def test_flutter_workspace_gets_flutter_guide(self, workspace):
-        from harness.graph import _build_system_prompt
-        with open(os.path.join(workspace, "pubspec.yaml"), "w") as f:
-            f.write("name: app\nenvironment:\n  sdk: '>=3.0.0'\n")
-        os.makedirs(os.path.join(workspace, "lib"))
-        prompt = _build_system_prompt(workspace, "flutter test")
-        assert "Flutter Style Guide" in prompt
-
     def test_web_workspace_gets_composite_design_system(self, workspace):
         # The composite web-design-system.md is the harness default
         # whenever the workspace is identified as web frontend work.
@@ -599,70 +499,6 @@ class TestSystemPromptInjection:
             f.write("flask==2.0\n")
         prompt = _build_system_prompt(workspace, "pytest")
         assert "Composite Web Design System" not in prompt
-
-    def test_flutter_with_both_platforms_gets_both_mobile_guides(self, workspace):
-        # A Flutter project that retains both ios/ and android/ platform
-        # folders (the default) must surface both HIG and M3 guides.
-        from harness.graph import _build_system_prompt
-        with open(os.path.join(workspace, "pubspec.yaml"), "w") as f:
-            f.write("name: app\nenvironment:\n  sdk: '>=3.0.0'\n")
-        os.makedirs(os.path.join(workspace, "lib"))
-        os.makedirs(os.path.join(workspace, "ios"))
-        os.makedirs(os.path.join(workspace, "android"))
-        prompt = _build_system_prompt(workspace, "flutter test")
-        assert "iOS Style Guide" in prompt
-        assert "Apple Human Interface Guidelines" in prompt
-        assert "Android Style Guide" in prompt
-        assert "Material Design 3" in prompt
-        # Flutter base guidance still loads alongside.
-        assert "Flutter Style Guide" in prompt
-
-    def test_flutter_ios_only_skips_android_guide(self, workspace):
-        # A Flutter project with android/ removed targets iOS only; the
-        # M3 guide is irrelevant there.
-        from harness.graph import _build_system_prompt
-        with open(os.path.join(workspace, "pubspec.yaml"), "w") as f:
-            f.write("name: app\nenvironment:\n  sdk: '>=3.0.0'\n")
-        os.makedirs(os.path.join(workspace, "lib"))
-        os.makedirs(os.path.join(workspace, "ios"))
-        prompt = _build_system_prompt(workspace, "flutter test")
-        assert "iOS Style Guide" in prompt
-        assert "Android Style Guide" not in prompt
-        assert "Material Design 3" not in prompt
-
-    def test_native_ios_only_workspace_gets_hig_guide(self, workspace):
-        # A native Swift/UIKit/SwiftUI project (no Flutter) — detected via
-        # Podfile + *.xcodeproj — must still get the HIG guide.
-        from harness.graph import _build_system_prompt
-        with open(os.path.join(workspace, "Podfile"), "w") as f:
-            f.write("platform :ios, '15.0'\n")
-        os.makedirs(os.path.join(workspace, "MyApp.xcodeproj"))
-        prompt = _build_system_prompt(workspace, "xcodebuild test")
-        assert "iOS Style Guide" in prompt
-        assert "Apple Human Interface Guidelines" in prompt
-        assert "Android Style Guide" not in prompt
-
-    def test_native_android_only_workspace_gets_m3_guide(self, workspace):
-        # A native Kotlin/Android project — detected via build.gradle with
-        # com.android.application plugin — must get the M3 guide and not
-        # the iOS one.
-        from harness.graph import _build_system_prompt
-        with open(os.path.join(workspace, "build.gradle"), "w") as f:
-            f.write("plugins {\n  id 'com.android.application'\n}\n")
-        prompt = _build_system_prompt(workspace, "./gradlew test")
-        assert "Android Style Guide" in prompt
-        assert "Material Design 3" in prompt
-        assert "iOS Style Guide" not in prompt
-
-    def test_react_native_workspace_gets_both_mobile_guides(self, workspace):
-        # React Native targets both iOS and Android by default — both
-        # platform guides must load. Expo apps too.
-        from harness.graph import _build_system_prompt
-        with open(os.path.join(workspace, "package.json"), "w") as f:
-            f.write('{"dependencies": {"react": "^18", "react-native": "^0.74"}}')
-        prompt = _build_system_prompt(workspace, "npm test")
-        assert "iOS Style Guide" in prompt
-        assert "Android Style Guide" in prompt
 
     def test_pure_web_workspace_skips_mobile_guides(self, workspace):
         # A standard React-web project (no react-native, no platform

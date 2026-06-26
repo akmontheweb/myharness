@@ -133,7 +133,7 @@ class CheckpointSummary:
     budget_remaining_usd: float = 0.0
     total_cost_usd: float = 0.0
     modified_files: list[str] = field(default_factory=list)
-    loop_counters: dict[str, int] = field(default_factory=dict)
+    loop_counters: dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
     is_active: bool = False
@@ -431,20 +431,24 @@ class HarnessAsyncSqliteSaver(_OfficialAsyncSqliteSaver):
                 # No usable ts: either truly corrupted (cannot be resumed)
                 # or the blob decoded to a dict that lacks a `ts` field.
                 # Probe with strict mode — if the decoder genuinely cannot
-                # read the blob, the row is unrecoverable and we delete it
-                # rather than let it accumulate forever (audit §5.4).
-                # A blob that decodes cleanly but lacks `ts` is left alone
-                # (might be a transient LangGraph format change).
+                # read the blob, we PRESERVE the thread (do not delete).
+                # The earlier behaviour ("delete on undecodable") wiped
+                # the WHOLE thread including prior valid checkpoints
+                # whenever the latest row was bad, losing forensics. A
+                # surviving undecodable thread will sit until an operator
+                # manually drops it; that beats silently destroying
+                # potentially-resumable earlier history.
                 try:
                     _deserialize_checkpoint_blob(blob, strict=True)
                     continue
                 except CheckpointCorruptedError:
                     logger.warning(
-                        "[storage] GC: marking thread %s for deletion "
-                        "(checkpoint blob is undecodable).",
+                        "[storage] GC: thread %s has an undecodable "
+                        "latest checkpoint. Preserving the thread; an "
+                        "earlier checkpoint may still be resumable. "
+                        "Manual cleanup may be required.",
                         thread_id,
                     )
-                    expired_threads.append(thread_id)
                     continue
             try:
                 dt = datetime.fromisoformat(ts_value.replace("Z", "+00:00"))
@@ -769,6 +773,44 @@ def _format_checkpoint_ts(ts_value: Any) -> str:
         return "(unknown)"
 
 
+_STALE_ACTIVE_AGE_SECONDS = 24 * 60 * 60  # 24 hours
+
+
+def _compute_is_active(exit_code: Any, current_node: str, updated_fmt: str) -> bool:
+    """Decide ``is_active`` for a session row.
+
+    A session is active when it has no recorded exit code, OR exit_code
+    is -1 and it never reached a terminal node. The extra "stale" guard
+    catches greenfield sessions that died before compiler_node ran (so
+    they sit at exit_code=-1, current_node=""); without the guard the
+    row stays "active" forever and blocks new-session checks.
+    """
+    if exit_code is None:
+        return True
+    if exit_code != -1:
+        return False
+    if current_node in ("END", "human_intervention_node"):
+        return False
+    # exit_code == -1 with non-terminal current_node — usually a live
+    # session. But if current_node is empty AND the row hasn't been
+    # touched in 24h, treat as inactive (silently abandoned).
+    if not current_node and updated_fmt and updated_fmt != "(unknown)":
+        try:
+            from datetime import datetime, timezone
+            # updated_fmt is local-formatted "YYYY-MM-DD HH:MM:SS"; parse
+            # back without a tz, compare to local now. Cheap heuristic —
+            # exact age is unimportant, the cutoff is "long enough that
+            # no live session could plausibly be paused this long".
+            dt = datetime.strptime(updated_fmt, "%Y-%m-%d %H:%M:%S")
+            now_local = datetime.now()
+            age_sec = (now_local - dt).total_seconds()
+            if age_sec > _STALE_ACTIVE_AGE_SECONDS:
+                return False
+        except (ValueError, TypeError):
+            pass
+    return True
+
+
 async def inspect_session(
     db_path: str,
     thread_id: str,
@@ -835,10 +877,16 @@ async def inspect_session(
             modified_files = modified_files.get("value", [])
 
         loop_counters = state.get("loop_counter", {})
-        if isinstance(loop_counters, dict) and not any(isinstance(v, dict) for v in loop_counters.values()):
-            pass
-        elif isinstance(loop_counters, dict):
-            loop_counters = loop_counters.get("value", {})
+        if isinstance(loop_counters, dict):
+            # LangGraph wraps channel state as {"value": <actual>} with no
+            # other keys. Detect that shape explicitly. The previous heuristic
+            # ("if any nested value is a dict, unwrap") misfired in story
+            # mode, where loop_counter legitimately contains dict-valued
+            # entries (story_zero_patch_rounds, progress_tracker), and
+            # silently erased every counter from the dashboard.
+            inner = loop_counters.get("value")
+            if isinstance(inner, dict) and len(loop_counters) == 1 and "value" in loop_counters:
+                loop_counters = inner
 
         node_state = state.get("node_state", {})
         current_node = ""
@@ -879,7 +927,13 @@ async def inspect_session(
             # dashboard. Now: active when there's no recorded exit code OR
             # the recorded value is -1 AND we've never built (current_node
             # isn't a terminal node). Audit §5.3 (BREAKING).
-            is_active=(exit_code is None) or (exit_code == -1 and current_node not in ("END", "human_intervention_node")),
+            #
+            # Additionally treat a session with empty ``current_node`` and
+            # stale ``updated_at`` (> 24 hours) as INACTIVE. Greenfield
+            # sessions that died before compiler_node ran leave both as
+            # empty/-1, which used to stick at "active" forever and block
+            # the new-run guard from accepting a fresh session.
+            is_active=_compute_is_active(exit_code, current_node, updated_fmt),
             workspace_path=workspace_path,
         )
 

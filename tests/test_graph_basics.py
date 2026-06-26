@@ -589,25 +589,14 @@ class TestPhase3Hardening:
         out = _format_diagnostics_for_repair(errors)
         assert out.find("TS2304") < out.find("TS2741")
 
-    def test_3c_rust_upstream_codes_recognised(self):
-        errors = [
-            self._err("E9999", "irrelevant"),
-            self._err("E0432", "Unresolved import 'foo'"),  # Rust upstream
-        ]
-        out = _format_diagnostics_for_repair(errors)
-        assert out.find("E0432") < out.find("E9999")
-
-    def test_3c_java_kotlin_csharp_upstream_codes(self):
+    def test_3c_java_upstream_codes(self):
         errors = [
             self._err("CUSTOM_ERR_X", "irrelevant"),
             self._err("JAVA:CANNOT_FIND_SYMBOL", "cannot find symbol 'foo'"),
-            self._err("KOTLIN:UNRESOLVED_REFERENCE", "unresolved 'bar'"),
-            self._err("CS0103", "name 'baz' does not exist"),
         ]
         out = _format_diagnostics_for_repair(errors)
         custom_pos = out.find("CUSTOM_ERR_X")
-        for code in ("JAVA:CANNOT_FIND_SYMBOL", "KOTLIN:UNRESOLVED_REFERENCE", "CS0103"):
-            assert out.find(code) < custom_pos
+        assert out.find("JAVA:CANNOT_FIND_SYMBOL") < custom_pos
 
     def test_3b_prefix_diff_finds_first_divergence(self):
         from harness.gateway import _summarize_prefix_diff
@@ -1049,24 +1038,18 @@ class TestRouteAfterSecurityScan:
         return state
 
     def test_clean_scan_ends_when_dev_deployment_false(self, monkeypatch):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         # Clean + no --deploy-dev now routes through installation_doc_node;
         # the node's only outgoing edge is END, so this is still a
         # terminal path (the doc may be a no-op if install_doc=False).
         assert route_after_security_scan(self._clean_state()) == "installation_doc_node"
 
     def test_clean_scan_enters_discovery_when_dev_deployment_and_cd_discovery_true(self, monkeypatch):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         # The classic flow: --deploy-dev true + --cd-discovery true → run
         # the LLM-driven blueprint pipeline.
         state = self._clean_state(dev_deployment=True, cd_discovery=True)
         assert route_after_security_scan(state) == "deployment_discovery_node"
 
     def test_clean_scan_skips_discovery_when_cd_discovery_false(self, monkeypatch):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         # The new fast-path: --deploy-dev true + --cd-discovery false →
         # straight to deployment_node, which synthesises the blueprint
         # from workspace telemetry alone (plus any deployment_defaults
@@ -1075,8 +1058,6 @@ class TestRouteAfterSecurityScan:
         assert route_after_security_scan(state) == "deployment_node"
 
     def test_clean_scan_ends_when_cd_discovery_true_but_dev_deployment_false(self, monkeypatch):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         # cd_discovery alone (no dev_deployment) is meaningless — the
         # security-scan-clean terminal path still wins because no deploy
         # was requested. After the installation_doc_node insertion the
@@ -1084,20 +1065,7 @@ class TestRouteAfterSecurityScan:
         state = self._clean_state(dev_deployment=False, cd_discovery=True)
         assert route_after_security_scan(state) == "installation_doc_node"
 
-    def test_flutter_short_circuits_regardless_of_dev_deployment(self, monkeypatch):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: True)
-        # With dev_deployment=True the Flutter early-return must still win;
-        # Flutter and the opt-in flag are independent skip reasons. The
-        # terminal hop now goes via installation_doc_node (which edges
-        # to END), not __end__ directly — Flutter projects still get
-        # docs/INSTALLATION.md when --install-doc is on.
-        state = self._clean_state(dev_deployment=True)
-        assert route_after_security_scan(state) == "installation_doc_node"
-
     def test_security_findings_route_to_repair(self, monkeypatch):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         state = self._clean_state(
             compiler_errors=[
                 {
@@ -1116,8 +1084,6 @@ class TestRouteAfterSecurityScan:
 
     # Audit #18 — pre-exit verify
     def test_pre_exit_verify_routes_to_compiler_when_mutations_pending(self, monkeypatch):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         # Clean scan + opt-in flag + pending mutations → re-verify.
         state = self._clean_state(
             pre_exit_verify=True,
@@ -1126,8 +1092,6 @@ class TestRouteAfterSecurityScan:
         assert route_after_security_scan(state) == "compiler_node"
 
     def test_pre_exit_verify_off_keeps_normal_terminal_route(self, monkeypatch):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         # Pending mutations exist but flag is off — defaults still hold.
         state = self._clean_state(
             pre_exit_verify=False,
@@ -1136,8 +1100,6 @@ class TestRouteAfterSecurityScan:
         assert route_after_security_scan(state) == "installation_doc_node"
 
     def test_pre_exit_verify_skipped_when_no_mutations(self, monkeypatch):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         # Flag is on but nothing changed since last green compile.
         state = self._clean_state(
             pre_exit_verify=True,
@@ -1146,8 +1108,6 @@ class TestRouteAfterSecurityScan:
         assert route_after_security_scan(state) == "installation_doc_node"
 
     def test_pre_exit_verify_one_shot_cap(self, monkeypatch):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         # Cap consumed → don't loop even if mutations are still flagged.
         state = self._clean_state(
             pre_exit_verify=True,
@@ -1162,8 +1122,6 @@ class TestRouteAfterSecurityScan:
     # — success / skipped / failure), a subsequent clean scan must NOT
     # re-enter the discovery pipeline.
     def test_post_deploy_clean_scan_terminates_when_success(self, monkeypatch):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         state = self._clean_state(
             dev_deployment=True, cd_discovery=True,
             node_state={"deployment": {"success": True}},
@@ -1173,8 +1131,6 @@ class TestRouteAfterSecurityScan:
         assert route_after_security_scan(state) == "installation_doc_node"
 
     def test_post_deploy_clean_scan_terminates_when_skipped(self, monkeypatch):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         state = self._clean_state(
             dev_deployment=True, cd_discovery=True,
             node_state={
@@ -1190,8 +1146,6 @@ class TestRouteAfterSecurityScan:
         assert route_after_security_scan(state) == "installation_doc_node"
 
     def test_post_deploy_clean_scan_terminates_when_phase_only(self, monkeypatch):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         # ``deployment_node`` failure paths set only ``phase`` (e.g.
         # synthesis_failed) — the guard must still fire because
         # node_state.deployment is present as a dict.
@@ -1204,8 +1158,6 @@ class TestRouteAfterSecurityScan:
     def test_first_clean_scan_without_deployment_still_enters_discovery(
         self, monkeypatch,
     ):
-        import harness.impact as impact_mod
-        monkeypatch.setattr(impact_mod, "_is_flutter_project", lambda p: False)
         # node_state has no ``deployment`` key — we have NOT been through
         # deployment_node yet. Existing dev_deployment/cd_discovery
         # routing must still apply (regression guard).

@@ -6,7 +6,7 @@
 
 ## 1. Executive Summary
 
-Teane is a production-grade, model-agnostic autonomous coding agent built on LangGraph. It accepts natural language engineering tasks (greenfield) OR a folder of `change_requests/*.txt` files (brownfield), generates precise code patches via LLMs, verifies them through sandboxed builds, and OPTIONALLY brings the app up locally as a docker-compose dev environment (gated by `--deploy-dev`; off by default so operators can take the generated code to their own deployment pipeline). It runs under budget guardrails, security scanning, and git lifecycle management. The system supports exhaustive multi-phase discovery (requirements → architecture → deployment) with per-question Enter-to-accept defaults and an optional org-wide `deployment_defaults` section in `config.json`, one-shot reverse-engineering of `SPEC_ARCHITECTURE.md` on first contact with brownfield repos, human-in-the-loop intervention points, checkpoint-based crash recovery, cross-model speculative repair escalation, and stack-aware multi-language workflows across Python / Java / Node / Go / Rust / Dart / Flutter — all built on a single kitchen-sink builder image so polyglot workspaces share one container.
+Teane is a production-grade, model-agnostic autonomous coding agent built on LangGraph. It accepts natural language engineering tasks (greenfield) OR a folder of `change_requests/*.txt` files (brownfield), generates precise code patches via LLMs, verifies them through sandboxed builds, and OPTIONALLY brings the app up locally as a docker-compose dev environment (gated by `--deploy-dev`; off by default so operators can take the generated code to their own deployment pipeline). It runs under budget guardrails, security scanning, and git lifecycle management. The system supports exhaustive multi-phase discovery (requirements → architecture → deployment) with per-question Enter-to-accept defaults and an optional org-wide `deployment_defaults` section in `config.json`, one-shot reverse-engineering of `SPEC_ARCHITECTURE.md` on first contact with brownfield repos, human-in-the-loop intervention points, checkpoint-based crash recovery, and cross-model speculative repair escalation. The supported stack is locked: backend is Python (FastAPI / Flask / Django) OR Java (Spring Boot); web is React + TypeScript + TailwindCSS, Vite-built. Any other stack is rejected at config-load time.
 
 ---
 
@@ -43,6 +43,16 @@ Teane is a production-grade, model-agnostic autonomous coding agent built on Lan
   - Given no workspace config, `~/.harness/config.json` values are used.
   - Given neither, `harness/cli.json` hardcoded defaults are used.
 
+**Locked stack via `core_languages`.** The merged config MUST contain a `core_languages` block enforcing the supported stack:
+
+```yaml
+core_languages:
+  backend_language: "Python"   # or "Java"; blank → "Python"
+  web_language: ["React", "TypeScript", "TailwindCSS"]   # exact set; blank → defaults
+```
+
+Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`) cause the harness to exit with code 2 at config-load time, before any logging, lock acquisition, or LLM-gateway initialisation. Blank values resolve to the documented defaults (`Python` for backend; the React+TypeScript+TailwindCSS triple for web). The `build_command` config key and `--build-cmd` CLI flag have been REMOVED — the harness auto-wires the build command from workspace markers (`pyproject.toml` → `pytest`, `pom.xml` → `mvn -B test`, `package.json` → `npm install && npm run build && npm test`).
+
 ### FR-005: Code Patch Generation and Application
 - **Description:** The system MUST generate code patches in a strict SEARCH/REPLACE block syntax and apply them to workspace files via a hybrid patcher (AST-aware + text fallback).
 - **Priority:** Must Have
@@ -52,11 +62,11 @@ Teane is a production-grade, model-agnostic autonomous coding agent built on Lan
   - Given a REPLACE_BLOCK where the SEARCH text doesn't match, the patcher logs a failure.
 
 ### FR-006: Sandboxed Build Verification
-- **Description:** The system MUST execute the project's build command inside an isolated sandbox. Auto-detect priority is Docker → unshare (Linux namespaces) → bare (opt-in via `HARNESS_ALLOW_UNSAFE_SANDBOX=true`). Build output MUST be parsed for structured diagnostics.
+- **Description:** The system MUST execute the project's build command inside an isolated sandbox. Auto-detect priority is Docker → unshare (Linux namespaces) → bare (opt-in via `HARNESS_ALLOW_UNSAFE_SANDBOX=true`). The build command is auto-wired from workspace markers (`pyproject.toml` → `pytest`, `pom.xml` → `mvn -B test`, `package.json` → `npm install && npm run build && npm test`); there is no `build_command` config key or `--build-cmd` CLI flag. Build output MUST be parsed for structured diagnostics.
 - **Priority:** Must Have
 - **Acceptance Criteria:**
-  - Given `build_command: "make build"`, the command runs inside a sandbox and returns exit code + diagnostics.
-  - Given a compilation error in Rust / GCC-Clang / Go / Python / Java / TypeScript / Dart / generic format, structured `DiagnosticObject` dicts are extracted.
+  - Given a workspace with `pyproject.toml`, the harness auto-wires `pytest` and runs it inside a sandbox, returning exit code + diagnostics.
+  - Given a compilation error in Python / Java / TypeScript / generic format, structured `DiagnosticObject` dicts are extracted.
   - Given a timeout of 300 seconds, builds exceeding the limit are killed with PGID-based process group termination.
   - Given no available backend and no opt-in, the harness raises `RuntimeError` and emits a `sandbox_start_failed` event.
 
@@ -158,11 +168,11 @@ Teane is a production-grade, model-agnostic autonomous coding agent built on Lan
   - Given a session whose log file cannot be removed (permissions, race), the checkpoint deletion still completes and the failure is logged at WARNING.
 
 ### FR-019: Lint Gate (Deterministic Format Verification)
-- **Description:** Before each build, modified files MUST be auto-formatted and linted using language-specific tools. Lintgate ships specs for `.py` / `.pyi` (ruff), `.go` (gofmt), `.rs` (rustfmt + clippy), `.ts` / `.tsx` / `.js` / `.jsx` / `.css` / `.html` / `.json` / `.yaml` / `.yml` / `.md` (prettier), `.c` / `.h` / `.cpp` / `.cc` / `.cxx` / `.hpp` (clang-format), `.java` (google-java-format), `.dart` (`dart format`), `.sh` / `.bash` (shfmt), and `.sql` (sqlfluff). Lint errors are surfaced in the build output. By default, formatting only runs on files actually patched this session (`lintgate.format_modified_files=false`); linters run on all modified files.
+- **Description:** Before each build, modified files MUST be auto-formatted and linted using language-specific tools. Lintgate ships specs for `.py` / `.pyi` (ruff), `.ts` / `.tsx` / `.js` / `.jsx` / `.css` / `.html` / `.json` / `.yaml` / `.yml` / `.md` (prettier), and `.java` (google-java-format). Lint errors are surfaced in the build output. By default, formatting only runs on files actually patched this session (`lintgate.format_modified_files=false`); linters run on all modified files.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
   - Given modified `.py` files, ruff format + ruff check are executed.
-  - Given modified `.dart` files, `dart format` runs.
+  - Given modified `.tsx` files, prettier runs.
   - Given no matching formatter for a file extension, it is skipped.
 
 ### FR-020: Multi-Variant Speculative Execution
@@ -217,25 +227,27 @@ Teane is a production-grade, model-agnostic autonomous coding agent built on Lan
   - Given a typoed nested config key, the `config parse` check reports WARN with the fuzzy-match suggestion.
 
 ### FR-026: Multi-Stack Tree-Sitter Coverage
-- **Description:** The patcher, impact analyzer, and diagnostic parsers MUST cover Python, Java, JavaScript/TypeScript, Dart (Flutter), Rust, Go, and C/C++ uniformly. Grammars MUST come from a single bundled wheel (`tree-sitter-language-pack`) to avoid the dependency churn of upgrading six individual grammar packages.
+- **Description:** The patcher, impact analyzer, and diagnostic parsers MUST cover the locked stack: Python, Java, and JavaScript/TypeScript (React + Tailwind, Vite-built). Grammars MUST come from a single bundled wheel (`tree-sitter-language-pack`) to avoid per-language dependency churn.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given a `.dart` file, `DartParser` extracts diagnostics in Dart's compiler format.
   - Given a Java compilation error, `JavaParser` parses it; given TypeScript, `TypeScriptParser`.
+  - Given a Python traceback, `PythonParser` extracts file / line / message.
   - Given an unknown extension, parsing falls back to `GenericParser` (regex on `file:line:col: severity: message`).
 
 ### FR-027: Stack-Aware Skill Filtering
-- **Description:** Skill files in `harness/skills/` MAY declare an `applies_to: [tag1, tag2]` YAML frontmatter. At graph assembly, the workspace is fingerprinted into a tag set; skill files with a non-overlapping `applies_to` set MUST be excluded from the LLM prompt. Skill files with no frontmatter MUST always load (universal skills).
+- **Description:** Skill files in `harness/skills/` MAY declare an `applies_to: [tag1, tag2]` YAML frontmatter. At graph assembly, the workspace is fingerprinted into a tag set drawn from the locked stack (`python`, `java`, `spring`, `fastapi`, `flask`, `django`, `react`, `typescript`, `tailwind`); skill files with a non-overlapping `applies_to` set MUST be excluded from the LLM prompt. Skill files with no frontmatter MUST always load (universal skills).
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given a Flutter workspace (tags include `flutter`, `dart`), `flutter.md` loads and `python_fastapi.md` does not.
+  - Given a Spring Boot workspace (tags include `java`, `spring`), `spring_boot.md` loads and `python_fastapi.md` does not.
   - Given a workspace tag set that doesn't intersect any `applies_to` declaration, only frontmatter-free skills load.
 
-### FR-028: Flutter / Mobile Routing Short-Circuit
-- **Description:** Flutter projects don't fit the docker-compose-up deploy model (the artifact is a mobile binary). On a clean security scan, if the workspace is detected as a Flutter project, the graph MUST route directly to END instead of through the deployment pipeline.
-- **Priority:** Should Have
+### FR-028: Stack-Lock Enforcement at Config Load
+- **Description:** The harness MUST refuse any workspace whose detected stack falls outside the locked set: backend in {Python, Java}, web exactly {React, TypeScript, TailwindCSS}. The `core_languages` config block enforces this; unsupported values exit with code 2 at config-load time. There is no Flutter / mobile path: greenfield deployment requires the supported web stack, otherwise the run ends at the security-scan boundary like any non-deployed run.
+- **Priority:** Must Have
 - **Acceptance Criteria:**
-  - Given a workspace with `pubspec.yaml` declaring a Flutter SDK dep and a clean security scan, the deploy pipeline is skipped and the graph terminates.
+  - Given `core_languages.backend_language: "Go"`, the harness exits with code 2 at config-load time naming the offending field.
+  - Given `core_languages.web_language: ["Vue", "TypeScript", "TailwindCSS"]`, the harness exits with code 2.
+  - Given a blank `core_languages.backend_language`, the harness defaults to `Python` and proceeds.
 
 ### FR-029: Structured Failure-Event Catalogue
 - **Description:** Failure sites MUST emit structured events via `harness.observability.log_failure(name, **fields)` (ERROR-level mirror of the existing `emit_event` helper). Each event MUST carry a snake_case `event` field so failures are grep-able from the per-session JSONL log by name instead of by string fragment. Initial catalogue: `sandbox_start_failed`, `token_budget_exhausted`, `hitl_gate_blocked`.
@@ -341,7 +353,7 @@ Teane is a production-grade, model-agnostic autonomous coding agent built on Lan
 - **Description:** The harness MUST NOT automatically enable `allow_network=True` on detected pip/npm install commands unless `sandbox.auto_enable_network_for_install: true` is set. When detection fires with the opt-in off, the function MUST log a WARNING pointing the operator at the config key. The opt-in MUST be whitelisted in the `sandbox` section of `_KNOWN_NESTED_KEYS`.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given `build_command: "pip install -e ."` and `auto_enable_network_for_install: false` (default), the sandbox does NOT auto-enable network.
+  - Given an auto-wired build command containing `pip install -e .` and `auto_enable_network_for_install: false` (default), the sandbox does NOT auto-enable network.
   - Given the same build command and the opt-in `true`, network IS auto-enabled.
 
 ### FR-043: Hard Cap on Discovery Loop
@@ -352,12 +364,11 @@ Teane is a production-grade, model-agnostic autonomous coding agent built on Lan
   - Given a value outside `[1, 30]`, it is clamped at load and logged.
 
 ### FR-044: Opt-In Deployment Phase (`--deploy-dev`)
-- **Description:** The deployment phase (optional deployment discovery → `DEPLOYMENT_BLUEPRINT.md` → gatekeeper approval → `docker compose up`) MUST be off by default. `teane run` MUST accept `--deploy-dev true|false` (default `false`) on `run_parser` and thread it through `run_graph(dev_deployment=...)` into `AgentState["dev_deployment"]`. `route_after_security_scan` MUST consult the flag: with a clean scan and `dev_deployment=False`, the router MUST return `"__end__"`; with `dev_deployment=True` it MUST return `"deployment_discovery_node"` (when `--cd-discovery true`) or `"deployment_node"` (when `--cd-discovery false`, reading `deployment.json` directly). The Flutter short-circuit (FR-028) MUST run before the flag check so mobile builds end regardless of the flag. The existing `deployment.enabled` config switch is a NARROWER gate that only short-circuits the docker step inside `deployment_node` once the phase is already running.
+- **Description:** The deployment phase (optional deployment discovery → `DEPLOYMENT_BLUEPRINT.md` → gatekeeper approval → `docker compose up`) MUST be off by default. `teane run` MUST accept `--deploy-dev true|false` (default `false`) on `run_parser` and thread it through `run_graph(dev_deployment=...)` into `AgentState["dev_deployment"]`. `route_after_security_scan` MUST consult the flag: with a clean scan and `dev_deployment=False`, the router MUST return `"__end__"`; with `dev_deployment=True` it MUST return `"deployment_discovery_node"` (when `--cd-discovery true`) or `"deployment_node"` (when `--cd-discovery false`, reading `deployment.json` directly). The existing `deployment.enabled` config switch is a NARROWER gate that only short-circuits the docker step inside `deployment_node` once the phase is already running.
 - **Priority:** Must Have
 - **Acceptance Criteria:**
   - Given `teane run` with no `--deploy-dev`, after a clean security scan the run ends with no Dockerfile / compose / containers produced and `[cli] Code generated at <path>. Deployment phase skipped.` is logged.
   - Given `teane run --deploy-dev true --cd-discovery true` and a clean security scan, the router enters `deployment_discovery_node`.
-  - Given a Flutter project with `--deploy-dev`, the run still ends at the Flutter short-circuit (mobile build, no docker-compose).
   - Given `--deploy-dev` AND `deployment.enabled: false` in config, the phase enters discovery and writes `DEPLOYMENT_BLUEPRINT.md`, but `deployment_node` skips the docker step with `{"skipped": True, "reason": "disabled"}`.
 
 ### FR-045: Change-Request Folder Mode
@@ -370,7 +381,7 @@ Teane is a production-grade, model-agnostic autonomous coding agent built on Lan
   - Given `CR-7` is assigned, the LLM's first user message references it inside a `# === CR-7: feature-x.txt ===` block; downstream specs, source comments, tests, and the commit trailer carry the `CR-7` marker so `grep -rn "CR-7" .` returns all linked artifacts.
 
 ### FR-046: Reverse-Engineer Architecture on First Contact
-- **Description:** When a change-request session opens against a repo with NO `docs/SPEC_ARCHITECTURE.md`, `reverse_engineer_architecture_node` MUST run once to synthesize a baseline architecture spec from a representative file sample (≤30 files / ≤100 KB cumulative), biased toward entry-point basenames (`main.py`, `app.py`, `pyproject.toml`, `package.json`, `index.ts`, `go.mod`) and skipping noise dirs (`.git`, `node_modules`, `__pycache__`, `dist`, `build`, `.venv`). The node MUST be gated by `change_requests.reverse_engineer_budget_usd` (default `$0.50`) and skip with an INFO log when the remaining session budget is below the cap (downstream delta-mode discovery still runs). On subsequent change-request sessions the file already exists and the node is a no-op.
+- **Description:** When a change-request session opens against a repo with NO `docs/SPEC_ARCHITECTURE.md`, `reverse_engineer_architecture_node` MUST run once to synthesize a baseline architecture spec from a representative file sample (≤30 files / ≤100 KB cumulative), biased toward entry-point basenames (`main.py`, `app.py`, `pyproject.toml`, `package.json`, `pom.xml`, `index.ts`) and skipping noise dirs (`.git`, `node_modules`, `__pycache__`, `dist`, `build`, `.venv`). The node MUST be gated by `change_requests.reverse_engineer_budget_usd` (default `$0.50`) and skip with an INFO log when the remaining session budget is below the cap (downstream delta-mode discovery still runs). On subsequent change-request sessions the file already exists and the node is a no-op.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
   - Given no prior `docs/SPEC_ARCHITECTURE.md` and `budget_remaining_usd > 0.50`, the node fires one planning-role LLM call and writes the file.
@@ -402,11 +413,11 @@ Teane is a production-grade, model-agnostic autonomous coding agent built on Lan
   - Given `--git false` and a HITL abandon, no rollback is attempted and the workspace is left as the LLM left it.
 
 ### FR-050: Kitchen-Sink Builder Sandbox Image
-- **Description:** The harness MUST ship a single multi-stack Docker image (`harness/vendor/Dockerfile.builder`) that contains Python, Node.js, Go, Java, Rust, Dart, and Make toolchains plus a slim base. The graph MUST stop dispatching a per-command Docker image (the old "per-build-command" lookup is retired); compiler/lintgate/test-generation nodes all run inside the same builder image. Slim toolchain images (`python:3.12-slim`, `node:20-slim`, etc.) MUST still be honoured as swappable bases when the operator pins one in `sandbox.docker_image`, but `make`-based builds MUST always have `make` available (bootstrap-installed by the sandbox layer if missing).
+- **Description:** The harness MUST ship a single multi-stack Docker image (`harness/vendor/Dockerfile.builder`) that contains Python, Java, and Node.js (for the React + TypeScript + TailwindCSS web build) toolchains plus a slim base. The graph MUST stop dispatching a per-command Docker image (the old "per-build-command" lookup is retired); compiler/lintgate/test-generation nodes all run inside the same builder image. The build command itself is auto-wired from workspace markers (`pyproject.toml` → `pytest`, `pom.xml` → `mvn -B test`, `package.json` → `npm install && npm run build && npm test`) — there is no `build_command` config key or `--build-cmd` CLI flag. Slim toolchain images (`python:3.12-slim`, `node:20-slim`, `eclipse-temurin:21-jdk`) MUST still be honoured as swappable bases when the operator pins one in `sandbox.docker_image`.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given the default config and a polyglot workspace (Python + Node), both stacks build inside the same container without per-command image dispatch.
-  - Given `sandbox.docker_image: "python:3.12-slim"` and a `make build` command, the sandbox layer ensures `make` is available before invoking the build.
+  - Given the default config and a polyglot workspace (Python backend + React/TS frontend), both stacks build inside the same container without per-command image dispatch.
+  - Given a workspace with `pyproject.toml`, the auto-wired build command runs `pytest` inside the sandbox.
   - Given a `sh: 1: <cmd>: not found` error in build output, the parser surfaces the missing tool without the `/bin/` prefix mismatch.
 
 ### FR-051: MCP (Model Context Protocol) Client
@@ -472,7 +483,7 @@ Teane is a production-grade, model-agnostic autonomous coding agent built on Lan
 - **Acceptance Criteria:**
   - Given a `teane chat -r /repo --budget 1.00` invocation, the REPL accepts a prompt, dispatches through the gateway, and surfaces the response in the terminal.
   - Given the assistant emits patch blocks, `/apply` invokes `process_llm_patch_output` against the workspace with a per-session HITL confirmation.
-  - Given `/build`, the configured `build_command` runs in the sandbox and the first 80 lines of output surface in the REPL.
+  - Given `/build`, the auto-wired build command runs in the sandbox and the first 80 lines of output surface in the REPL.
 
 ### FR-059: Coverage Reporting
 - **Description:** The harness MUST ship a `make coverage` target driven by `pytest-cov`. The target MUST emit a terminal summary, an HTML report under `htmlcov/`, and an XML report at `coverage.xml`. No CI gate on the coverage number is required in v1 — the metric is for visibility.
@@ -589,7 +600,7 @@ Teane is a production-grade, model-agnostic autonomous coding agent built on Lan
 - Hierarchical JSON configuration with deep merge + recursive typo detection
 - SEARCH/REPLACE patch application with AST-aware fallback
 - Sandboxed build execution (Docker → unshare → bare, in auto-detect priority)
-- Structured diagnostic parsing for Rust, GCC/Clang, Go, Python, Java, TypeScript, Dart, and a generic fallback
+- Structured diagnostic parsing for Python, Java, TypeScript (React + Tailwind, Vite-built), and a generic fallback
 - Cross-model speculative repair escalation (cheap → expensive)
 - Human-in-the-loop interactive menu with 7 actions, pluggable transport (stdin / file / HTTP webhook)
 - Zero-knowledge secret redaction before all API calls
@@ -604,19 +615,19 @@ Teane is a production-grade, model-agnostic autonomous coding agent built on Lan
 - fcntl-based workspace lock (`.harness_session.lock`) preventing concurrent sessions on the same workspace; `--force-lock` for stale-lock recovery
 - Pre-flight LLM-budget refusal (`BudgetTooLowError`), empty-response retry with `EmptyLLMResponseError` route-to-HITL short-circuit, and a rate-limit circuit breaker that diverts to local Ollama after 3 hits in 5 min
 - Structured failure-event catalogue (`log_failure(name, **fields)`)
-- Lint gate with auto-detected formatters per language (Python, Java, JS/TS, Dart, Go, Rust, C/C++, shell, SQL, markdown, YAML, JSON, HTML, CSS)
+- Lint gate with auto-detected formatters per language (Python, Java, JS/TS, markdown, YAML, JSON, HTML, CSS)
 - Multi-variant speculative compilation in parallel git worktrees
-- Container deployment pipeline (telemetry → blueprint → Dockerfile → docker compose v2 → health check); **opt-in via `--deploy-dev`** (off by default — clean security scan ends the run otherwise); short-circuits to END for Flutter / mobile projects regardless of the flag
+- Container deployment pipeline (telemetry → blueprint → Dockerfile → docker compose v2 → health check); **opt-in via `--deploy-dev`** (off by default — clean security scan ends the run otherwise)
 - Change-request folder mode (`change_requests/*.txt` → monotonic CR-N IDs → marker propagation through specs / source / tests / commits → `applied/<session-id>/` archive with `manifest.json`) for incremental work against existing repos
 - One-shot reverse-engineer of `SPEC_ARCHITECTURE.md` on first contact with a brownfield repo, gated by `change_requests.reverse_engineer_budget_usd` ($0.50 default)
 - Interactive setup wizard on bare `teane run` (new-vs-resume → workspace → prompt → `--git` → `--new-build` → `--spec-discovery`)
 - Per-question Enter-to-accept defaults during discovery + optional org-wide `deployment_defaults` section in `config.json` (schema documented inline in `config/config.json`) that pre-resolves deployment-discovery answers
 - Workspace git-awareness toggle (`--git true|false`, default `false`); when `false`, every git-aware step is a no-op so non-git workspaces still work
-- Single kitchen-sink builder image (`harness/vendor/Dockerfile.builder`, Python + Node + Go + Java + Rust + Dart + Make) shared by compiler / lintgate / test-generation nodes; per-command image dispatch retired
-- Per-stack Makefile skills (`harness/skills/makefile_python.md`, `makefile_node.md`, `makefile_go.md`, `makefile_java.md`, `makefile_rust.md`, `makefile_dart.md`) so the LLM emits a real `Makefile` for each stack
+- Single kitchen-sink builder image (`harness/vendor/Dockerfile.builder`, Python + Java + Node — for the React/TS/Tailwind web build) shared by compiler / lintgate / test-generation nodes; per-command image dispatch retired; build command auto-wired from workspace markers (no `build_command` config key, no `--build-cmd` CLI flag)
+- Per-stack Makefile skills (`harness/skills/makefile_python.md`, `makefile_java.md`, `makefile_node.md`) so the LLM emits a real `Makefile` for each supported stack
 - Post-build security scanning (gitleaks + bandit/semgrep)
 - Conversation memory cleanse for prefix-cache optimization
-- Dependency graph impact analysis backed by tree-sitter grammars for Python, Java, JS/TS, Dart, Rust, Go, and C/C++
+- Dependency graph impact analysis backed by tree-sitter grammars for the locked stack (Python, Java, JavaScript/TypeScript)
 - Two-tier skills system (harness-level + project-level markdown conventions) with stack-aware filtering via `applies_to:` frontmatter
 - Patcher symlink guard (`O_NOFOLLOW` + `os.path.islink`) and a conservative fallback allowlist when the source root cannot be auto-detected
 - Discovery JSON trust guards: 1 MB byte-size cap + depth-10 recursion guard in `trust.validate_discovery_json`
@@ -654,7 +665,7 @@ Teane is a production-grade, model-agnostic autonomous coding agent built on Lan
 | langgraph-checkpoint-sqlite | 2.0.0 | SQLite persistence backend |
 | aiofiles | 24.0.0 | Async file I/O |
 | tree-sitter | 0.23.0 | AST-aware code manipulation |
-| tree-sitter-language-pack | 1.8.0 | Bundled grammars for 165+ languages (Python / Java / JS / TS / TSX / Dart / Rust / Go / Swift / …). Replaces six individual `tree-sitter-*` grammar packages. |
+| tree-sitter-language-pack | 1.8.0 | Bundled grammars for the locked stack (Python / Java / JS / TS / TSX). |
 | httpx | 0.28.0 | Async HTTP client for LLM API calls |
 | uuid7 | 0.1.0 | Time-sortable UUID generation |
 | typing-extensions | 4.12.0 | TypedDict and type hint backports |

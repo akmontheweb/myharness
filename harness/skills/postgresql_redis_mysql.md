@@ -23,10 +23,7 @@ The workspace's manifest or config references one of:
 | Django | Django migrations | `manage.py makemigrations` → `manage.py migrate` |
 | Spring Boot | Flyway | drop `V<n>__name.sql` into `src/main/resources/db/migration/` |
 | Spring Boot | Liquibase | edit `db.changelog-master.xml` |
-| Node + Prisma | Prisma Migrate | `npx prisma migrate dev --name msg` (dev), `npx prisma migrate deploy` (prod) |
-| Node + Drizzle | Drizzle Kit | `drizzle-kit generate` → `drizzle-kit migrate` |
-| Node + Knex | Knex | `knex migrate:make name` → `knex migrate:latest` |
-| Flutter + Drift | drift_dev | `dart run drift_dev` |
+| React backend (Node API consumed by frontend) | n/a — backend MUST be Python or Java | Migrate via the chosen backend's tooling above |
 
 ### pgvector specifics (PostgreSQL only)
 - Requires `CREATE EXTENSION vector;` once per database.

@@ -35,7 +35,6 @@ def _min_valid_config() -> dict:
     """Smallest config that passes validate_config_strict (assuming the
     matching env vars are exported by the test fixture)."""
     return {
-        "build_command": "make build",
         "allow_network": True,
         "product_spec_dir": "product_spec",
         "sandbox": {"backend": "auto"},
@@ -504,24 +503,15 @@ class TestLegacyWorkspaceConfig:
 
 
 # ---------------------------------------------------------------------------
-# resolve_build_command — unchanged behavior, kept under coverage
+# resolve_build_command — auto-wires from workspace + core_languages.
+# Operator no longer passes a CLI override (Python/Java/React+TS stacks
+# fully determine the build command).
 # ---------------------------------------------------------------------------
 
 class TestResolveBuildCommand:
 
-    def test_cli_overrides_config(self):
-        cli_cmd = "python build.py"
-        config = {"build_command": "make"}
-        result = resolve_build_command(cli_cmd, config)
-        assert result == cli_cmd
-
-    def test_uses_config_when_no_cli(self):
-        config = {"build_command": "cargo build"}
-        result = resolve_build_command(None, config)
-        assert isinstance(result, str)
-
     def test_fallback_when_missing(self):
-        result = resolve_build_command(None, {})
+        result = resolve_build_command({})
         assert isinstance(result, str)
         assert len(result) > 0
 
@@ -1115,7 +1105,7 @@ class TestResolveHitlFlags:
         # dict and falls through to the True default.
         from harness.cli import _resolve_hitl_flags
         args = self._args()
-        out = _resolve_hitl_flags(args, {"build_command": "make"})
+        out = _resolve_hitl_flags(args, {"allow_network": True})
         assert out["architecture"] is True
 
     def test_non_dict_hitl_block_is_ignored(self):

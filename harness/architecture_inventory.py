@@ -545,7 +545,7 @@ create source code under. Use a **single-segment** directory name (e.g. \
 implicitly covered by the `client` root.
   * `purpose` is a short human description (≤8 words). `stack` is a tech \
 hint the system prompt uses to guide new-file placement in later turns \
-(`react`, `vue`, `express`, `fastapi`, `flask`, `next`, etc.).
+(`react`, `fastapi`, `flask`, `spring-boot`, etc.).
   * `test_placement` is one of `"co-located"` (tests next to source, e.g. \
 `Foo.test.jsx` beside `Foo.jsx`), `"centralized"` (tests in a top-level \
 `tests/` / `test/` / `__tests__/` directory), or `"mixed"`. The harness \

@@ -163,7 +163,7 @@ harness/
 │   ├── route_after_compiler()    # Conditional: repair / HITL (short-circuits on llm_silent) / security_scan
 │   ├── route_after_discovery()   # Conditional: write_spec / discovery loop (capped at max_discovery_iterations, FR-043)
 │   ├── route_after_gatekeeper()  # Conditional: next phase / refinement loop
-│   ├── route_after_security_scan() # Conditional: repair / HITL / END (Flutter, FR-028) / END (no --deploy-dev, FR-044) / deployment_discovery (--cd-discovery true) / deployment_node (--cd-discovery false)
+│   ├── route_after_security_scan() # Conditional: repair / HITL / END (no --deploy-dev, FR-044) / deployment_discovery (--cd-discovery true) / deployment_node (--cd-discovery false)
 │   ├── route_after_hitl()        # Conditional: compiler / END
 │   ├── _build_patcher_allowlist()# Conservative fallback when source root unclear (FR-041); includes Node-JS allowlist
 │   ├── _apply_toolchain_adaptation() # pip/npm network auto-enable gated by config opt-in (FR-042)
@@ -278,13 +278,9 @@ harness/
 │   ├── format_human / format_table / format_prometheus
 │   └── write_atomic()    # <dest>.tmp → fsync → os.replace, atomic from a scraper's POV
 ├── parser_registry.py    # Diagnostic parser plugins (FR-026)
-│   ├── RustParser        # --error-format=json
-│   ├── GccClangParser    # -fdiagnostics-format=json
-│   ├── GoParser          # file:line:col: message
 │   ├── PythonParser      # Traceback extraction
 │   ├── JavaParser        # javac / maven / gradle diagnostic shapes
-│   ├── TypeScriptParser  # tsc / eslint
-│   ├── DartParser        # dart analyze / flutter build
+│   ├── TypeScriptParser  # tsc / eslint (React + Tailwind, Vite-built)
 │   ├── GenericParser     # file:line:col: severity: message
 │   ├── register_parser / register_extension_parser
 │   ├── get_parser / get_parser_for_extension / list_registered_parsers
@@ -443,10 +439,10 @@ harness/
 9. speculate_node → N LLM calls (temp>0) → parallel worktrees → select winner
                   │
                   ▼
-10. lintgate_node → ruff/gofmt/prettier/rustfmt on modified files
+10. lintgate_node → ruff / prettier / google-java-format on modified files
                   │
                   ▼
-11. compiler_node → SandboxExecutor → backend.run(build_command)
+11. compiler_node → SandboxExecutor → backend.run(auto-wired build command)
                   │
            ┌──────┴──────┐
            │ exit 0       │ exit ≠ 0
@@ -466,10 +462,7 @@ harness/
     │                          │                 └── [abandon] → END
     │                          │
     ▼                          │
-14. Flutter detected? ─yes─▶ [END]  (FR-028 — mobile builds bypass docker compose)
-    │ no                       │
-    ▼                          │
-14b. --deploy-dev true? ─no─▶ [END]  (FR-044 — deployment phase is opt-in)
+14. --deploy-dev true? ─no─▶ [END]  (FR-044 — deployment phase is opt-in)
     │ yes                      │
     ▼                          │
 15. deployment_discovery_node │
@@ -546,7 +539,7 @@ AgentState fields and which nodes write to them:
 | **Language** | Python 3.11+ (CI: 3.11 / 3.12 / 3.13) | TypedDict, asyncio improvements, `None`-aware operators |
 | **Persistence** | aiosqlite + WAL mode | Crash-safe, zero-config, survives reboots; WAL for concurrent reads |
 | **File I/O** | aiofiles ≥ 24.0 | Non-blocking disk ops with sync fallback for missing dep |
-| **AST Parsing** | tree-sitter + tree-sitter-language-pack ≥ 1.8 | Single wheel covering 165+ grammars (Python / Java / JS / TS / TSX / Dart / Rust / Go / Swift / …); replaces six individual grammar packages and gives us Dart coverage that has no standalone PyPI distribution |
+| **AST Parsing** | tree-sitter + tree-sitter-language-pack ≥ 1.8 | Single wheel covering the locked stack (Python / Java / JS / TS / TSX) plus surrounding grammars used by the patcher; replaces individual grammar packages with one dependency line. |
 | **HTTP Client** | httpx ≥ 0.28 | Async HTTP/2 with connection pooling and timeout management |
 | **Config** | JSON (discovered hierarchically) | Workspace `.harness_config.json` → `~/.harness/config.json` → `cli.json` |
 | **Testing** | pytest + pytest-asyncio | Async test support, fixture injection, coverage |
@@ -599,7 +592,7 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 **Decision**: Stream build output to NamedTemporaryFiles on disk rather than accumulating in memory.
 
-**Rationale**: Large builds (C++, Rust) can produce gigabytes of output. Disk-buffered mode keeps RAM usage constant. The `DiskLogStreamer` enforces a 500MB max size limit, writes stdout/stderr to separate temp files, and reads back via line-by-line iteration. Temp files are auto-cleaned after execution.
+**Rationale**: Large builds (heavy Java / multi-package npm) can produce gigabytes of output. Disk-buffered mode keeps RAM usage constant. The `DiskLogStreamer` enforces a 500MB max size limit, writes stdout/stderr to separate temp files, and reads back via line-by-line iteration. Temp files are auto-cleaned after execution.
 
 **Trade-off**: Slightly higher latency for small builds due to disk I/O. In-memory `MemoryLogStreamer` is available as an alternative via `log_buffer_mode: "memory"`.
 
@@ -701,27 +694,27 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 ### 5.17 Multi-Stack Coverage via `tree-sitter-language-pack`
 
-**Decision**: Replace six individual `tree-sitter-*` grammar packages with the single `tree-sitter-language-pack` wheel, which bundles 165+ grammars including Python, Java, JS/TS/TSX, Dart, Rust, Go, and Swift. Patcher, impact analyzer, and the new `JavaParser` / `TypeScriptParser` / `DartParser` all read from the same registry.
+**Decision**: Use the single `tree-sitter-language-pack` wheel covering the locked stack (Python, Java, JS/TS/TSX). Patcher, impact analyzer, and the `JavaParser` / `TypeScriptParser` all read from the same registry.
 
-**Rationale**: Six grammar packages meant six upgrade cadences, six release-note streams, and one of them (Dart) had no standalone PyPI distribution at all. Consolidating to one wheel buys us Dart coverage and amortizes the grammar churn into a single dependency line. Adding a new language is now "register a parser" instead of "add a new dependency."
+**Rationale**: One bundled wheel means one upgrade cadence, one release-note stream, and one dependency line. Adding a new parser inside the locked stack is now "register a parser" instead of "add a new dependency."
 
 **Trade-off**: Slightly larger install footprint (~15 MB of bundled grammars). The footprint is paid once at install time, not per-run.
 
 ### 5.18 Stack-Aware Skill Filtering
 
-**Decision**: Skill files in `harness/skills/` may declare an `applies_to: [tag1, tag2]` YAML frontmatter (parsed by `graph.py:_parse_skill_frontmatter`). At graph assembly, the workspace is fingerprinted to a tag set (`python`, `flutter`, `spring`, `react`, …); skill files whose `applies_to` doesn't intersect the workspace tags are excluded from the LLM prompt. Files without frontmatter always load (universal skills).
+**Decision**: Skill files in `harness/skills/` may declare an `applies_to: [tag1, tag2]` YAML frontmatter (parsed by `graph.py:_parse_skill_frontmatter`). At graph assembly, the workspace is fingerprinted to a tag set drawn from the locked stack (`python`, `java`, `spring`, `fastapi`, `flask`, `django`, `react`, `typescript`, `tailwind`); skill files whose `applies_to` doesn't intersect the workspace tags are excluded from the LLM prompt. Files without frontmatter always load (universal skills).
 
-**Rationale**: A user working on a Flutter app should not see a 4000-character Django Channels skill in their prompt. Filtering at the frontmatter level keeps the prompt budget small without forcing the harness to "guess" relevance from filename pattern matching.
+**Rationale**: A user working on a Spring Boot service should not see a 4000-character Django Channels skill in their prompt. Filtering at the frontmatter level keeps the prompt budget small without forcing the harness to "guess" relevance from filename pattern matching.
 
 **Trade-off**: Skill authors have to remember to add the frontmatter — but the failure mode is permissive (no frontmatter → always load), so the worst case is a too-large prompt, not a missing skill.
 
-### 5.19 Flutter / Mobile Routing Short-Circuit
+### 5.19 Locked Stack Enforcement at Config Load
 
-**Decision**: On a clean security scan, if the workspace looks like a Flutter project (`pubspec.yaml` with `flutter:` SDK dep, detected by `impact._is_flutter_project`), the graph routes directly to END instead of through the docker compose deploy pipeline.
+**Decision**: A `core_languages` block in `config/config.json` enforces the supported stack: `backend_language` ∈ {`Python`, `Java`} (blank → `Python`) and `web_language` exactly `["React", "TypeScript", "TailwindCSS"]` (blank → defaults). Unsupported values cause the harness to exit with code 2 at config-load time, before any logging, lock, or LLM-gateway initialisation. The `build_command` config key and `--build-cmd` CLI flag are REMOVED — the harness auto-wires the build command from workspace markers (`pyproject.toml` → `pytest`, `pom.xml` → `mvn -B test`, `package.json` → `npm install && npm run build && npm test`).
 
-**Rationale**: Flutter's artifact is a mobile binary (APK / AAB / IPA / web bundle), not a docker compose service stack. Running the deploy pipeline on a Flutter project would produce an unrunnable Dockerfile and waste budget on a synthesize-architecture LLM call. Short-circuiting matches the user's mental model — "build and stop."
+**Rationale**: A small, well-supported stack is easier to reason about end-to-end (skills, parsers, lint specs, sandbox images, deploy templates). The lock turns "which Dockerfile does this workspace get?" from a heuristic into a config-validated invariant.
 
-**Trade-off**: Flutter projects don't get the deploy-blueprint HITL gate. That's correct for v1.x; if users ask for cloud-build wiring we can add a `flutter:` deploy backend.
+**Trade-off**: Operators with workspaces outside the locked set must port them or use a different tool — there is no opt-out flag.
 
 ### 5.20 Structured Failure-Event Catalogue
 
@@ -848,7 +841,7 @@ msgpack>=1.0.0          # storage GC regression test; runtime falls back to JSON
 
 ### 5.35 Single Kitchen-Sink Builder Image (FR-050)
 
-**Decision**: `harness/vendor/Dockerfile.builder` ships a multi-stack base image (Python + Node + Go + Java + Rust + Dart + Make). The old per-build-command image dispatch in `harness/graph.py` is retired — compiler, lintgate, and test-generation nodes all run inside the same container. Slim toolchain images (`python:3.12-slim`, `node:20-slim`, …) are still honoured as swappable bases when pinned in `sandbox.docker_image`; the sandbox layer bootstrap-installs `make` if the chosen image doesn't ship it.
+**Decision**: `harness/vendor/Dockerfile.builder` ships a multi-stack base image covering the locked stack (Python + Java + Node — Node is present so the React + TypeScript + TailwindCSS web build runs in the same container). The old per-build-command image dispatch in `harness/graph.py` is retired — compiler, lintgate, and test-generation nodes all run inside the same container. The build command itself is auto-wired from workspace markers (`pyproject.toml` → `pytest`, `pom.xml` → `mvn -B test`, `package.json` → `npm install && npm run build && npm test`); there is no `build_command` config key or `--build-cmd` CLI flag. Slim toolchain images (`python:3.12-slim`, `node:20-slim`, `eclipse-temurin:21-jdk`) are still honoured as swappable bases when pinned in `sandbox.docker_image`.
 
 **Rationale**: Per-command image dispatch was a constant source of cache thrash — a polyglot workspace (Python service + React frontend) needed two images, each with its own pip / npm cache, and the dispatch logic in graph.py grew an exception for every new stack. A single kitchen-sink image collapses the matrix, lets the prefix cache stay hot across compile / lint / test, and removes the dispatch code path entirely.
 
@@ -1086,7 +1079,7 @@ AgentState
 │   └── per_model: dict[str, dict]   # Per-model breakdown
 ├── loop_counter: dict[str, int]     # {patching, repair, compiler, total_repairs, security, deployment}
 ├── allow_network: bool
-├── build_command: str               # e.g., "make build"
+├── build_command: str               # Auto-wired from workspace markers (no config key, no CLI flag)
 ├── budget_remaining_usd: float
 ├── session_id: str                  # UUIDv4 or user-provided
 ├── exit_code: int                   # Last compiler exit code
@@ -1267,14 +1260,8 @@ schedule.db
 - **bandit**: Python SAST (`-r -f json -ll -q`)
 - **semgrep**: Universal SAST (`scan --config=auto --json --quiet`)
 - **ruff**: Python formatting (`format --quiet`) and linting (`check --fix --quiet`)
-- **gofmt**: Go formatting (`-w`)
-- **prettier**: JS / TS / TSX / JSX / CSS / HTML / JSON / YAML / Markdown formatting (`--write`)
-- **rustfmt** + **clippy**: Rust formatting + lint
-- **clang-format**: C / C++ formatting (`-i`)
+- **prettier**: JS / TS / TSX / JSX / CSS / HTML / JSON / YAML / Markdown formatting (`--write`) — covers the React + TypeScript + TailwindCSS web stack
 - **google-java-format**: Java formatting
-- **dart format**: Dart formatting (Flutter / Dart projects)
-- **shfmt**: shell-script formatting
-- **sqlfluff**: SQL linting + formatting
 - **docker compose** (V2 — no hyphen): Container orchestration (`up --build -d`, `down`). The legacy `docker-compose` V1 binary is no longer probed.
 
 ---
@@ -1300,7 +1287,7 @@ schedule.db
 | `requirements-prod.txt` | Repo root | Exact transitive pins for reproducible pilot installs (`pip install -e . --constraint requirements-prod.txt`) |
 | `LICENSE` | Repo root | MIT license; referenced from `pyproject.toml` so wheels ship it |
 
-**Top-level config sections**: `build_command`, `allow_network`, `sandbox`, `token_budget`, `node_throttle`, `models`, `model_routing`, `persistence`, `logging`, `lintgate`, `deployment`, `test_generation`, `metrics`, `change_requests`, `speculative`, `compiler`.
+**Top-level config sections**: `core_languages`, `allow_network`, `sandbox`, `token_budget`, `node_throttle`, `models`, `model_routing`, `persistence`, `logging`, `lintgate`, `deployment`, `test_generation`, `metrics`, `change_requests`, `speculative`, `compiler`. The `build_command` key was removed — the build command is auto-wired from workspace markers.
 
 **Key recent additions** (since the prior spec snapshot):
 - `change_requests.reverse_engineer_budget_usd` (default `$0.50`) — budget cap for the first-contact architecture reverse-engineer LLM call (FR-046).

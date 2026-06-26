@@ -259,15 +259,20 @@ def apply_rule(
         return None
 
     # Idempotency — if the rule's "fix already in place" pattern matches
-    # ANY line, do nothing. Lets one rule cover both freshly-built
-    # Dockerfiles and ones a prior round already patched.
-    if rule.idempotency_regex is not None and rule.idempotency_regex.search(body):
-        logger.info(
-            "[security_fix_rules] %s/%s: idempotency check matched %s; "
-            "no patch emitted.",
-            rule.scanner, rule.rule_id, rel_file,
-        )
-        return None
+    # an EFFECTIVE (non-comment) line, do nothing. Lets one rule cover
+    # both freshly-built Dockerfiles and ones a prior round already
+    # patched. The "skip comments" step matters: a markdown snippet or
+    # `# WORKDIR /app — TODO` line inside the same file would otherwise
+    # make the rule report itself already-applied.
+    if rule.idempotency_regex is not None:
+        effective_body = _strip_comment_lines(body)
+        if rule.idempotency_regex.search(effective_body):
+            logger.info(
+                "[security_fix_rules] %s/%s: idempotency check matched %s; "
+                "no patch emitted.",
+                rule.scanner, rule.rule_id, rel_file,
+            )
+            return None
 
     insert_line = _resolve_insert_line(body, rule)
     if insert_line is None:
@@ -285,6 +290,28 @@ def apply_rule(
         content=rule.content,
         expected_file_hash=file_hash,
     )
+
+
+_COMMENT_LINE_RE = re.compile(r"^\s*#")
+
+
+def _strip_comment_lines(body: str) -> str:
+    """Return ``body`` with full-line ``#`` comments masked out.
+
+    Used by the idempotency check so a ``# WORKDIR /app — TODO`` comment
+    or a markdown-fenced Dockerfile snippet ("```dockerfile\n#WORKDIR
+    /app\n```") inside the file doesn't false-positive as "fix already
+    in place". Preserves line offsets so any line-based regex still
+    points at the right line if it matches a real instruction.
+    """
+    out: list[str] = []
+    for line in body.splitlines(keepends=True):
+        if _COMMENT_LINE_RE.match(line):
+            # Keep just the trailing newline (or empty) so line counts stay aligned.
+            out.append("\n" if line.endswith("\n") else "")
+        else:
+            out.append(line)
+    return "".join(out)
 
 
 def _resolve_insert_line(body: str, rule: Rule) -> Optional[int]:

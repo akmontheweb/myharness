@@ -27,22 +27,17 @@ logger = logging.getLogger(__name__)
 # Matched after we've already located a primary diagnostic; whatever follows
 # until the next primary line / blank break / unrelated stanza is folded
 # into the primary's semantic_context field so downstream repair prompts
-# see e.g. "src/x.rs:10:5: cannot find type `Foo`" *plus* "  --> 10 |
-# let y: Foo = ...".
+# see the full annotated source snippet alongside the headline message.
 #
 # Patterns covered:
 #   - Indented continuation lines (compilers emit leading whitespace for
 #     source-code carets, snippets, and tree-style hint output)
-#   - `note: ...`, `help: ...`, `info:`, `hint:` — GCC/clang/Rust sub-notes
-#   - Rust span markers: `-->`, ` = `, `   |`, `   ^`, `   ~`
-#   - GCC carets and "In file included from" lines
+#   - `note: ...`, `help: ...`, `info:`, `hint:` — javac/tsc sub-notes
+#   - Bare caret / tilde underline rows
 _CONTEXT_LINE_RE = re.compile(
     r"^("
     r"\s+\S"                               # any indented continuation
     r"|note:|help:|info:|hint:"            # named sub-notes (no leading ws)
-    r"|\s*(?:-->|\.\.\.|=|--|\|)\s"        # Rust span markers
-    r"|\s*\d+\s*\|"                        # Rust source-snippet line ("10 | ...")
-    r"|In file included from\b"            # GCC include chain
     r"|\s*[\^~]+\s*$"                      # bare caret / tilde underline
     r")"
 )
@@ -92,208 +87,36 @@ def _collect_context_lines(
 
 
 # CSI / SGR (color/style) and OSC escape sequences emitted by modern
-# compilers when stdout is a TTY (cargo, rustc, gcc, clang, go test).
-# Sandbox builds capture pipe output so these usually don't appear, but
-# some toolchains force-color via env vars (CARGO_TERM_COLOR=always,
-# CLICOLOR_FORCE=1) and break our diagnostic regexes if not stripped.
+# compilers when stdout is a TTY. Sandbox builds capture pipe output so
+# these usually don't appear, but some toolchains force-color via env vars
+# (e.g. CLICOLOR_FORCE=1) and break our diagnostic regexes if not stripped.
 _ANSI_ESCAPE_RE = re.compile(
     r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))"
 )
 
 
+_ANSI_INPUT_CAP_BYTES = 2 * 1024 * 1024  # 2 MB
+
+
 def _strip_ansi(text: str) -> str:
-    """Remove ANSI color/style escape sequences from compiler output."""
+    """Remove ANSI color/style escape sequences from compiler output.
+
+    Caps input at 2 MB before stripping. The OSC branch in the regex
+    matches ``\\x1b]<body>(\\x07|\\x1b\\\\)``; on a multi-megabyte stdout
+    with an unterminated OSC, backtracking can run pathologically.
+    Compiler diagnostics never need more than a few hundred KB of
+    output to be parsed, so capping is safe.
+    """
+    if len(text) > _ANSI_INPUT_CAP_BYTES:
+        # Keep the tail (where the most recent diagnostics live) rather
+        # than the head (build banners).
+        text = text[-_ANSI_INPUT_CAP_BYTES:]
     return _ANSI_ESCAPE_RE.sub("", text)
 
 
 # ---------------------------------------------------------------------------
 # Built-in Language Parsers
 # ---------------------------------------------------------------------------
-
-class RustParser(BaseLanguageParser):
-    """
-    Parses Rust compiler JSON diagnostic output (--error-format=json).
-
-    Extracts one JSON object per line; filters to compiler-message diagnostic
-    entries containing spans with file/line/column/message/code information.
-
-    When a child-diagnostic carries a ``suggested_replacement`` span, the
-    suggestion is hoisted onto the primary DiagnosticObject as a
-    FixSuggestion so harness.autofix can apply machine-applicable fixes
-    without an LLM round-trip.
-    """
-
-    @staticmethod
-    def _extract_suggestion(msg_data: dict[str, Any]) -> Optional[FixSuggestion]:
-        """Walk children[].spans[] for the first span carrying a replacement.
-
-        Rust may emit multiple child notes/hints; we take the first one
-        that has a concrete ``suggested_replacement`` and a ``suggestion_applicability``.
-        Maybe-incorrect and unspecified suggestions are still surfaced —
-        autofix is what filters by applicability.
-        """
-        for child in msg_data.get("children", []) or []:
-            if not isinstance(child, dict):
-                continue
-            for span in child.get("spans", []) or []:
-                if not isinstance(span, dict):
-                    continue
-                replacement = span.get("suggested_replacement")
-                if replacement is None:
-                    continue
-                return FixSuggestion(
-                    replacement=str(replacement),
-                    span_start_line=int(span.get("line_start", 0) or 0),
-                    span_start_col=int(span.get("column_start", 0) or 0),
-                    span_end_line=int(span.get("line_end", 0) or 0),
-                    span_end_col=int(span.get("column_end", 0) or 0),
-                    applicability=str(
-                        span.get("suggestion_applicability", "unspecified")
-                    ).lower().replace("_", "-"),
-                )
-        return None
-
-    @staticmethod
-    def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
-        diagnostics: list[DiagnosticObject] = []
-        for line in raw_output.splitlines():
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            reason = obj.get("reason", "")
-            if reason != "compiler-message":
-                continue
-            msg_data = obj.get("message", {})
-            spans = msg_data.get("spans", [])
-            primary_span = spans[0] if spans else {}
-            diagnostics.append(DiagnosticObject(
-                file=primary_span.get("file_name", ""),
-                line=primary_span.get("line_start", 0),
-                column=primary_span.get("column_start", 0),
-                severity=msg_data.get("level", "error"),
-                error_code=msg_data.get("code", ""),
-                message=msg_data.get("message", ""),
-                semantic_context=msg_data.get("rendered", ""),
-                suggested_fix=RustParser._extract_suggestion(msg_data),
-            ))
-        return diagnostics
-
-
-class GccClangParser(BaseLanguageParser):
-    """
-    Parses GCC/Clang JSON diagnostic output (-fdiagnostics-format=json).
-
-    Expects one JSON array per diagnostic line. Each array contains diagnostic
-    items with location (caret) and message fields.
-
-    When a diagnostic carries a ``fixits[]`` entry, the first fixit is
-    hoisted onto the DiagnosticObject as a FixSuggestion so harness.autofix
-    can apply it without an LLM round-trip. GCC/clang only emit fixits when
-    they're confident, so applicability defaults to ``"machine-applicable"``.
-    """
-
-    @staticmethod
-    def _extract_suggestion(item: dict[str, Any]) -> Optional[FixSuggestion]:
-        """Lift the first fixit on a GCC/clang diagnostic to a FixSuggestion.
-
-        GCC/clang fixit shape:
-            {"start": {"file": ..., "line": L, "column": C},
-             "next":  {"file": ..., "line": L2, "column": C2},
-             "string": "<replacement>"}
-        ``next`` is the exclusive end position of the span to replace.
-        """
-        fixits = item.get("fixits")
-        if not isinstance(fixits, list) or not fixits:
-            return None
-        for fix in fixits:
-            if not isinstance(fix, dict):
-                continue
-            start_val = fix.get("start")
-            start: dict[str, Any] = start_val if isinstance(start_val, dict) else {}
-            nxt_val = fix.get("next")
-            nxt: dict[str, Any] = nxt_val if isinstance(nxt_val, dict) else {}
-            if "string" not in fix:
-                continue
-            return FixSuggestion(
-                replacement=str(fix.get("string", "")),
-                span_start_line=int(start.get("line", 0) or 0),
-                span_start_col=int(start.get("column", 0) or 0),
-                span_end_line=int(nxt.get("line", 0) or 0),
-                span_end_col=int(nxt.get("column", 0) or 0),
-                # GCC/clang only emit fixits when they're confident — they
-                # are equivalent to rustc's "machine-applicable".
-                applicability="machine-applicable",
-            )
-        return None
-
-    @staticmethod
-    def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
-        diagnostics: list[DiagnosticObject] = []
-        for line in raw_output.splitlines():
-            line = line.strip()
-            if not line.startswith("[") or not line.endswith("]"):
-                continue
-            try:
-                items = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(items, list):
-                for item in items:
-                    if isinstance(item, dict):
-                        loc = item.get("locations", [{}])[0]
-                        diagnostics.append(DiagnosticObject(
-                            file=loc.get("caret", {}).get("file", ""),
-                            line=loc.get("caret", {}).get("line", 0),
-                            column=loc.get("caret", {}).get("column", 0),
-                            severity="error" if item.get("kind") == "error" else "warning",
-                            error_code=str(item.get("option", "")),
-                            message=item.get("message", ""),
-                            semantic_context="",
-                            suggested_fix=GccClangParser._extract_suggestion(item),
-                        ))
-        return diagnostics
-
-
-class GoParser(BaseLanguageParser):
-    """
-    Parses Go compiler output in the standard format:
-        path/to/file.go:line:column: message
-    """
-
-    _PATTERN = re.compile(r'^(.+\.go):(\d+):(\d+):\s+(.+)$')
-
-    @staticmethod
-    def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
-        diagnostics: list[DiagnosticObject] = []
-        lines = raw_output.splitlines()
-        i = 0
-        while i < len(lines):
-            match = GoParser._PATTERN.match(lines[i].strip())
-            if not match:
-                i += 1
-                continue
-            # Found a primary; collect any indented context lines that follow
-            # (Go's `cannot use X (type Y) as ...` blocks often span several
-            # indented lines under the primary error).
-            context, next_i = _collect_context_lines(
-                lines, i + 1, GoParser._PATTERN,
-            )
-            diagnostics.append(DiagnosticObject(
-                file=match.group(1),
-                line=int(match.group(2)),
-                column=int(match.group(3)),
-                severity="error",
-                error_code="",
-                message=match.group(4),
-                semantic_context=context,
-            ))
-            i = next_i
-        return diagnostics
-
 
 class PythonParser(BaseLanguageParser):
     """
@@ -703,52 +526,6 @@ class TypeScriptParser(BaseLanguageParser):
         return diagnostics
 
 
-class DartParser(BaseLanguageParser):
-    """
-    Parses ``dart analyze`` and ``flutter analyze`` output.
-
-    Dart uses a bullet-separated form that no other parser handles:
-        error • Undefined name 'bar' • lib/foo.dart:42:17 • undefined_identifier
-        warning • Unused import: 'package:foo' • lib/foo.dart:3:8 • unused_import
-
-    The ordering of fields is ``severity • message • file:L:C • rule_name``.
-    Also handles ``flutter test`` failure lines:
-        00:01 +5 -1: ExampleTest.shouldDoX [E]
-            Test failed. See exception logs above.
-    """
-
-    _ANALYZE_PATTERN = re.compile(
-        r'^\s*(?P<sev>error|warning|info|hint)\s*•\s*(?P<msg>.+?)\s*•\s*'
-        r'(?P<file>[^•]+?\.dart):(?P<line>\d+):(?P<col>\d+)\s*•\s*(?P<code>\S+)\s*$'
-    )
-
-    @staticmethod
-    def parse_diagnostics(raw_output: str) -> list[DiagnosticObject]:
-        diagnostics: list[DiagnosticObject] = []
-        for line in raw_output.splitlines():
-            m = DartParser._ANALYZE_PATTERN.match(line)
-            if not m:
-                continue
-            sev_raw = m.group("sev").lower()
-            # Dart's "hint"/"info" are non-fatal; collapse to "warning" so
-            # downstream code only ever sees error/warning. Anything else
-            # (rare) drops to error to surface it loudly.
-            if sev_raw in ("warning", "info", "hint"):
-                severity = "warning"
-            else:
-                severity = "error"
-            diagnostics.append(DiagnosticObject(
-                file=m.group("file").strip(),
-                line=int(m.group("line")),
-                column=int(m.group("col")),
-                severity=severity,
-                error_code=m.group("code"),
-                message=m.group("msg").strip(),
-                semantic_context="",
-            ))
-        return diagnostics
-
-
 class GenericParser(BaseLanguageParser):
     """
     Fallback generic diagnostic parser for compilers without structured output.
@@ -771,10 +548,10 @@ class GenericParser(BaseLanguageParser):
             if not match:
                 i += 1
                 continue
-            # Collect attached context: GCC/clang `note:` follow-ons, Rust
-            # ` --> file:line | code | ^^^ ` span annotations, caret lines.
-            # Without this the LLM repair prompt only sees the headline
-            # error and misses what the compiler explained underneath.
+            # Collect attached context: javac/tsc `note:` follow-ons and
+            # caret lines. Without this the LLM repair prompt only sees the
+            # headline error and misses what the compiler explained
+            # underneath.
             context, next_i = _collect_context_lines(
                 lines, i + 1, GenericParser._PATTERN,
             )
@@ -800,13 +577,6 @@ class GenericParser(BaseLanguageParser):
 # but longer/more specific names should win over shorter ones (e.g.
 # "ts-node" before "ts" — handled by exclusive prefixes here).
 _PARSER_REGISTRY: dict[str, type[BaseLanguageParser]] = {
-    "rustc": RustParser,
-    "cargo": RustParser,
-    "gcc": GccClangParser,
-    "g++": GccClangParser,
-    "clang": GccClangParser,
-    "clang++": GccClangParser,
-    "go": GoParser,
     "python": PythonParser,
     "pytest": PythonParser,
     # Java toolchain — Maven, Gradle, javac all share JavaParser since it
@@ -820,29 +590,16 @@ _PARSER_REGISTRY: dict[str, type[BaseLanguageParser]] = {
     "tsc": TypeScriptParser,
     "ts-node": TypeScriptParser,
     "vite": TypeScriptParser,
-    "next": TypeScriptParser,
     "tsx": TypeScriptParser,
-    # Dart / Flutter — analyzer output is identical between the two.
-    "dart": DartParser,
-    "flutter": DartParser,
 }
 
 # Maps file extensions to parser classes
 _EXTENSION_PARSER_MAP: dict[str, type[BaseLanguageParser]] = {
-    ".rs": RustParser,
-    ".c": GccClangParser,
-    ".cpp": GccClangParser,
-    ".cc": GccClangParser,
-    ".cxx": GccClangParser,
-    ".h": GccClangParser,
-    ".hpp": GccClangParser,
-    ".go": GoParser,
     ".py": PythonParser,
     ".pyi": PythonParser,
     ".java": JavaParser,
     ".ts": TypeScriptParser,
     ".tsx": TypeScriptParser,
-    ".dart": DartParser,
 }
 
 
@@ -851,7 +608,7 @@ def register_parser(compiler_name: str, parser_cls: type[BaseLanguageParser]) ->
     Register a new language parser plugin for a given compiler name.
 
     Args:
-        compiler_name: The compiler tool name (e.g., 'rustc', 'gcc', 'swiftc').
+        compiler_name: The compiler tool name (e.g., 'tsc', 'javac', 'python').
         parser_cls: A BaseLanguageParser subclass implementing parse_diagnostics.
     """
     _PARSER_REGISTRY[compiler_name] = parser_cls
@@ -863,7 +620,7 @@ def register_extension_parser(extension: str, parser_cls: type[BaseLanguageParse
     Register a parser to be used for files with a given extension.
 
     Args:
-        extension: File extension including dot (e.g., '.swift', '.kt').
+        extension: File extension including dot (e.g., '.ts', '.tsx').
         parser_cls: A BaseLanguageParser subclass.
     """
     _EXTENSION_PARSER_MAP[extension] = parser_cls
@@ -875,7 +632,7 @@ def get_parser(compiler_name: str) -> Optional[type[BaseLanguageParser]]:
     Look up a registered parser by compiler name.
 
     Args:
-        compiler_name: The compiler name (e.g., 'rustc', 'cargo').
+        compiler_name: The compiler name (e.g., 'tsc', 'javac').
 
     Returns:
         The parser class, or None if no parser is registered.
@@ -888,7 +645,7 @@ def get_parser_for_extension(extension: str) -> Optional[type[BaseLanguageParser
     Look up a registered parser by file extension.
 
     Args:
-        extension: File extension including dot (e.g., '.rs', '.go').
+        extension: File extension including dot (e.g., '.py', '.ts').
 
     Returns:
         The parser class, or None if no parser is registered.
@@ -923,14 +680,14 @@ def detect_and_parse(
     Auto-detect the appropriate parser and extract structured diagnostics.
 
     Detection order:
-        1. By compiler name inferred from build_command (e.g., 'cargo', 'gcc')
-        2. By file extension (e.g., '.rs' → rustc, '.py' → python)
+        1. By compiler name inferred from build_command (e.g., 'tsc', 'javac')
+        2. By file extension (e.g., '.py' → python, '.ts' → tsc)
         3. By output signature — every registered parser is run against
            the raw output and the one extracting the most diagnostics
            wins. Catches the common case where the build command is a
-           generic wrapper (``npm run build``, ``make``, ``yarn test``)
+           generic wrapper (``npm run build``, ``make``)
            whose name doesn't appear in :data:`_PARSER_REGISTRY` but
-           whose internals call ``tsc`` / ``jest`` / ``cargo`` / etc.
+           whose internals call ``tsc`` / ``jest`` / etc.
            and emit recognisable diagnostic formats.
         4. Falls back to GenericParser.
 
@@ -945,8 +702,8 @@ def detect_and_parse(
     """
     # Strip ANSI color escape sequences once at the entry point so every
     # downstream regex sees clean text. Modern compilers emit \x1b[31m...
-    # when CARGO_TERM_COLOR=always or CLICOLOR_FORCE=1 is set, which
-    # would otherwise silently drop every diagnostic.
+    # when CLICOLOR_FORCE=1 is set, which would otherwise silently drop
+    # every diagnostic.
     raw_output = _strip_ansi(raw_output)
 
     # Try compiler detection first

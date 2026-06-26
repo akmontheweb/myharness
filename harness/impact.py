@@ -438,12 +438,20 @@ class DependencyGraph:
 
         imp_normalized = imp.replace("/", ".").replace("\\", ".")
         suffix_path = "/" + imp_normalized.replace(".", "/")
+        # Use the LAST component of the import as the stem we'll compare
+        # against each candidate file's stem. The previous endswith-stem
+        # check matched `foo` against any file whose basename ended in
+        # `foo` (e.g. `bigfoo.py`), so a single import polluted the
+        # reverse-dependency index with unrelated files and produced
+        # bogus "may be impacted" warnings.
+        imp_last = imp_normalized.rsplit(".", 1)[-1]
         for key, vals in module_to_files.items():
             if key.endswith("." + imp_normalized) or key.endswith(suffix_path):
                 out.update(vals)
                 continue
             for val in vals:
-                if imp_normalized.endswith(os.path.splitext(os.path.basename(val))[0]):
+                val_stem = os.path.splitext(os.path.basename(val))[0]
+                if val_stem and val_stem == imp_last:
                     out.add(val)
 
         return out
@@ -473,8 +481,22 @@ class DependencyGraph:
                 file_rel = os.path.relpath(resolved, self.workspace_path)
                 # Find any file that imports this file's relative path or module name
                 file_module = file_rel.replace("/", ".").replace("\\", ".")
+                # Use whole-segment matching to avoid polluting the reverse
+                # index. The earlier `file_rel in imp_key` / `file_module in
+                # imp_key` substring checks matched `auth.py` against any
+                # import of `oauth` / `authentication`, leaking false
+                # impact warnings to the LLM.
+                file_module_segments = file_module.split(".")
+                file_module_last = file_module_segments[-1] if file_module_segments else ""
                 for imp_key, dep_files in self._dependents.items():
-                    if file_rel in imp_key or file_module in imp_key or imp_key.endswith(file_module):
+                    imp_key_segments = imp_key.split(".")
+                    matches = (
+                        imp_key == file_rel
+                        or imp_key == file_module
+                        or imp_key.endswith("." + file_module)
+                        or (file_module_last and imp_key_segments and imp_key_segments[-1] == file_module_last)
+                    )
+                    if matches:
                         for df in dep_files:
                             if df != resolved:
                                 impacted.setdefault(df, set()).add(os.path.basename(resolved))
@@ -705,28 +727,6 @@ class ImpactAnalyzer:
 # or skip it (mobile / pure library projects).
 # ---------------------------------------------------------------------------
 
-def _is_flutter_project(workspace_path: str) -> bool:
-    """Return True when the workspace looks like a Flutter project.
-
-    Heuristic: ``pubspec.yaml`` at the root AND a ``lib/`` directory. The
-    Flutter scaffolding always produces both. Pure Dart server projects
-    also have these, which is fine — the deploy pipeline doesn't fit
-    them either.
-
-    Used by ``harness.graph.route_after_compiler`` to send Flutter
-    builds straight to END after a successful test run instead of
-    routing them through ``security_scan_node`` → ``deployment_node``,
-    which would try to ``docker compose up`` a mobile artifact and fail.
-    """
-    try:
-        return (
-            os.path.isfile(os.path.join(workspace_path, "pubspec.yaml"))
-            and os.path.isdir(os.path.join(workspace_path, "lib"))
-        )
-    except (OSError, TypeError):
-        return False
-
-
 def _detect_workspace_stack(workspace_path: str) -> set[str]:
     """Return the set of stack tags applicable to this workspace.
 
@@ -735,18 +735,23 @@ def _detect_workspace_stack(workspace_path: str) -> set[str]:
     system prompt only includes stack-relevant guidance.
 
     Detection scans manifest files and their declared dependencies. The
-    returned tag taxonomy:
-        Languages:           python, node, typescript, java, dart, go, rust
-        Backend frameworks:  fastapi, django, spring, express, nest, fastify
-        Frontend frameworks: react, vue, angular
+    returned tag taxonomy mirrors the locked core-language matrix
+    (``core_languages`` in config.json):
+
+        Languages:           python, java, node, typescript
+        Backend frameworks:  fastapi, django, spring     (Flask folds
+                             into ``python``)
+        Frontend framework:  react        (the only supported web
+                             library)
         Markup / style:      html, css, tailwind
-        Mobile platforms:    ios, android   (target-platform tags — set
-                             whenever the workspace builds for that
-                             platform via Flutter, React Native, or
-                             native Swift/Kotlin)
-        Mobile frameworks:   flutter
         Databases:           postgres, redis, mysql
         Build tools:         maven, gradle
+
+    Vue, Angular, Svelte, Express, NestJS, Fastify, Go, Rust, Dart,
+    Flutter, iOS, and Android are NOT supported. Their manifest
+    markers are deliberately not scanned — operators who try to use
+    them get an empty tag set and the planner refuses through the
+    locked stack directive in the system prompt.
 
     Detection is best-effort and silent — unparseable manifests just
     don't contribute tags. Returns an empty set for non-directory
@@ -768,22 +773,11 @@ def _detect_workspace_stack(workspace_path: str) -> set[str]:
     def _exists(relpath: str) -> bool:
         return os.path.isfile(os.path.join(workspace_path, relpath))
 
-    # Flutter (pubspec.yaml + lib/) — also tagged dart for the Dart skill.
-    if _is_flutter_project(workspace_path):
-        tags.update({"flutter", "dart"})
-    elif _exists("pubspec.yaml"):
-        # Pure Dart project (server-side, CLI tool, etc.)
-        tags.add("dart")
-
     # Django — manage.py is the canonical signal.
     if _exists("manage.py"):
         tags.update({"python", "django"})
 
-    # Go / Rust / Java build tools.
-    if _exists("go.mod"):
-        tags.add("go")
-    if _exists("Cargo.toml"):
-        tags.add("rust")
+    # Java build tools.
     if _exists("pom.xml"):
         tags.update({"java", "maven"})
     if _exists("build.gradle") or _exists("build.gradle.kts"):
@@ -812,7 +806,9 @@ def _detect_workspace_stack(workspace_path: str) -> set[str]:
         if any(pkg in py_blob for pkg in ("pymysql", "mysql-connector", "mysqlclient", "aiomysql")):
             tags.add("mysql")
 
-    # Node.js — parse package.json declared deps.
+    # Node.js — parse package.json for the supported web stack only
+    # (React + TypeScript + TailwindCSS). Vue/Angular/Express/Nest/
+    # Fastify are intentionally NOT detected.
     pkg_content = _read("package.json")
     if pkg_content:
         tags.add("node")
@@ -822,32 +818,12 @@ def _detect_workspace_stack(workspace_path: str) -> set[str]:
             for key in ("dependencies", "devDependencies", "peerDependencies"):
                 if isinstance(data.get(key), dict):
                     deps.update(data[key])
-            if "react" in deps or "next" in deps:
+            if "react" in deps:
                 tags.add("react")
-            if "vue" in deps or "nuxt" in deps:
-                tags.add("vue")
-            if "@angular/core" in deps:
-                tags.add("angular")
-            if "express" in deps:
-                tags.add("express")
-            if "@nestjs/core" in deps:
-                tags.add("nest")
-            if "fastify" in deps:
-                tags.add("fastify")
-            # TypeScript — declared dep is the strongest signal; the
-            # tsconfig.json fallback below catches projects that consume
-            # TS only via a build tool (vite, esbuild) without a direct dep.
             if "typescript" in deps:
                 tags.add("typescript")
-            # Tailwind — declared dep covers the common case; the
-            # tailwind.config.* fallback below catches projects that
-            # vendor the CLI or pull it transitively.
             if "tailwindcss" in deps:
                 tags.add("tailwind")
-            # React Native targets BOTH iOS and Android by default.
-            # Expo apps too — they pull react-native transitively.
-            if "react-native" in deps or "expo" in deps:
-                tags.update({"ios", "android"})
             # DB clients
             if "pg" in deps or "postgres" in deps or "@vercel/postgres" in deps:
                 tags.add("postgres")
@@ -873,11 +849,11 @@ def _detect_workspace_stack(workspace_path: str) -> set[str]:
     ):
         tags.add("tailwind")
 
-    # HTML / CSS — any frontend framework workspace produces and consumes
-    # both, so style guidance for HTML semantics and CSS layout always
-    # applies. Standalone .html / .css at the workspace root catches plain
+    # HTML / CSS — React workspaces produce and consume both, so style
+    # guidance for HTML semantics and CSS layout always applies.
+    # Standalone .html / .css at the workspace root catches plain
     # static sites with no JS framework.
-    if tags & {"react", "vue", "angular"}:
+    if "react" in tags:
         tags.update({"html", "css"})
     else:
         try:
@@ -889,55 +865,6 @@ def _detect_workspace_stack(workspace_path: str) -> set[str]:
                     tags.add("css")
         except OSError:
             pass
-
-    # Mobile target platforms — set whenever the workspace builds for
-    # iOS and/or Android. Sources:
-    #   * Flutter projects always create ios/ and android/ sub-projects
-    #     unless the team explicitly removed one (rare).
-    #   * Native iOS: Podfile + *.xcodeproj / *.xcworkspace at the root.
-    #     Swift Package Manager projects with iOS deployment targets are
-    #     also iOS, but distinguishing those from server-side Swift
-    #     packages requires reading Package.swift content — defer for now.
-    #   * Native Android: settings.gradle with an `:app` include, or a
-    #     root build.gradle whose content references com.android.application.
-    #     AndroidManifest.xml in the tree is the irrefutable signal.
-    def _isdir(relpath: str) -> bool:
-        return os.path.isdir(os.path.join(workspace_path, relpath))
-
-    if "flutter" in tags:
-        # Flutter project — check which platform folders were kept.
-        if _isdir("ios"):
-            tags.add("ios")
-        if _isdir("android"):
-            tags.add("android")
-
-    # Native iOS markers (works for non-Flutter SwiftUI / UIKit apps too).
-    if _exists("Podfile") or _exists("ios/Podfile"):
-        tags.add("ios")
-    try:
-        for entry in os.listdir(workspace_path):
-            if entry.endswith(".xcodeproj") or entry.endswith(".xcworkspace"):
-                tags.add("ios")
-                break
-    except OSError:
-        pass
-
-    # Native Android markers.
-    if _exists("AndroidManifest.xml") or _exists("app/AndroidManifest.xml"):
-        tags.add("android")
-    if _exists("app/build.gradle") or _exists("app/build.gradle.kts"):
-        tags.add("android")
-    settings_gradle = _read("settings.gradle") + _read("settings.gradle.kts")
-    if "':app'" in settings_gradle or '":app"' in settings_gradle:
-        tags.add("android")
-    root_gradle_blob = "\n".join(
-        _read(f) for f in ("build.gradle", "build.gradle.kts", "app/build.gradle", "app/build.gradle.kts")
-    )
-    if (
-        "com.android.application" in root_gradle_blob
-        or "com.android.library" in root_gradle_blob
-    ):
-        tags.add("android")
 
     # Java/Spring — scan pom.xml or build.gradle for spring-boot deps.
     java_blob = "\n".join(_read(f) for f in ("pom.xml", "build.gradle", "build.gradle.kts"))
@@ -975,31 +902,16 @@ def _detect_workspace_stack(workspace_path: str) -> set[str]:
 
 # Bare-name → (canonical_tag, transitive_tags) map used when the
 # architect explicitly declares a stack in ``workspace_layout.roots[].stack``.
-# The value is a one-word framework name, so the keyword scan's
-# context-word requirement (which exists to avoid false positives in
-# free prose) doesn't apply. Frontend frameworks pull html/css/node
-# because the web-app file-manifest contract in graph.py:1049 keys off
-# "html"; backend frameworks pull their language tag so the planner
-# loads the right style guide.
+# Only the supported core stacks appear here: React + TypeScript +
+# TailwindCSS for web (with Vite as the build tool), FastAPI / Django /
+# Flask on Python for backend, Spring Boot on Java for backend, and the
+# three supported databases. React pulls html/css/node/typescript/tailwind
+# because the web stack is locked to that exact trio.
 _BARE_STACK_TAG_MAP: dict[str, tuple[str, ...]] = {
-    "react":       ("react", "html", "css", "node"),
-    "next":        ("react", "html", "css", "node"),
-    "nextjs":      ("react", "html", "css", "node"),
-    "vue":         ("vue", "html", "css", "node"),
-    "vuejs":       ("vue", "html", "css", "node"),
-    "nuxt":        ("vue", "html", "css", "node"),
-    "nuxtjs":      ("vue", "html", "css", "node"),
-    "angular":     ("angular", "html", "css", "node", "typescript"),
-    "svelte":      ("html", "css", "node"),
-    "sveltekit":   ("html", "css", "node"),
+    "react":       ("react", "html", "css", "node", "typescript", "tailwind"),
     "fastapi":     ("fastapi", "python"),
     "django":      ("django", "python"),
     "flask":       ("python",),
-    "express":     ("express", "node"),
-    "expressjs":   ("express", "node"),
-    "nest":        ("nest", "node", "typescript"),
-    "nestjs":      ("nest", "node", "typescript"),
-    "fastify":     ("fastify", "node"),
     "spring":      ("spring", "java"),
     "springboot":  ("spring", "java"),
     "spring-boot": ("spring", "java"),
@@ -1009,36 +921,35 @@ _BARE_STACK_TAG_MAP: dict[str, tuple[str, ...]] = {
     "mysql":       ("mysql",),
     "mariadb":     ("mysql",),
     "typescript":  ("typescript",),
+    "tailwind":    ("tailwind", "html", "css"),
+    "tailwindcss": ("tailwind", "html", "css"),
+    "vite":        ("react", "node", "typescript", "tailwind", "html", "css"),
 }
 
 
 # Free-text keyword scan patterns. Anchored on framework name PLUS a
 # context word (or a version number) so passing mentions like
-# "React-style hooks" or "vue of the system" don't trigger false tags.
-# Each entry pairs a regex with the bare framework name to look up in
-# :data:`_BARE_STACK_TAG_MAP` — keeping the tag mapping single-sourced.
+# "React-style hooks" don't trigger false tags. Only patterns for
+# supported core technologies are scanned — mentions of unsupported
+# frameworks (Vue, Angular, Svelte, Express, NestJS, Fastify, Go,
+# Rust, etc.) deliberately contribute no tags so the planner refuses
+# them via the locked stack directive instead.
 _SPEC_STACK_KEYWORDS: tuple[tuple[re.Pattern[str], str], ...] = (
-    # Frontend frameworks.
-    (re.compile(r"\breact\s*(?:1[0-9]|2[0-9]|spa|frontend|app|router|native|ts|typescript)\b", re.IGNORECASE), "react"),
-    (re.compile(r"\bnext\.?js\b", re.IGNORECASE), "nextjs"),
-    (re.compile(r"\bvue\s*(?:[2-9]|spa|frontend|app|router|js)\b", re.IGNORECASE), "vue"),
-    (re.compile(r"\bnuxt(?:\.?js)?\b", re.IGNORECASE), "nuxt"),
-    (re.compile(r"\bangular\s*(?:1[0-9]|2[0-9]|frontend|spa|app|router|cli)\b", re.IGNORECASE), "angular"),
-    (re.compile(r"\bsveltekit\b", re.IGNORECASE), "sveltekit"),
-    # Backend frameworks. Most are unambiguous on their own.
+    # Frontend — only React + TypeScript + TailwindCSS + Vite.
+    (re.compile(r"\breact\s*(?:1[0-9]|2[0-9]|spa|frontend|app|router|ts|typescript)\b", re.IGNORECASE), "react"),
+    (re.compile(r"\bvite\b", re.IGNORECASE), "vite"),
+    (re.compile(r"\btailwind(?:\s*css)?\b", re.IGNORECASE), "tailwind"),
+    # Backend frameworks. Python: FastAPI / Django / Flask.
     (re.compile(r"\bfastapi\b", re.IGNORECASE), "fastapi"),
     (re.compile(r"\bdjango\b", re.IGNORECASE), "django"),
     (re.compile(r"\bflask\b", re.IGNORECASE), "flask"),
-    (re.compile(r"\bexpress\.?js\b", re.IGNORECASE), "express"),
-    (re.compile(r"\bnest\.?js\b", re.IGNORECASE), "nestjs"),
-    (re.compile(r"\bfastify\b", re.IGNORECASE), "fastify"),
+    # Backend: Java Spring Boot.
     (re.compile(r"\bspring\s*boot\b", re.IGNORECASE), "spring-boot"),
     # Databases.
     (re.compile(r"\bpostgres(?:ql)?\b|\bpgvector\b", re.IGNORECASE), "postgres"),
     (re.compile(r"\bredis\b", re.IGNORECASE), "redis"),
     (re.compile(r"\bmy\s*sql\b|\bmariadb\b", re.IGNORECASE), "mysql"),
-    # TypeScript — explicit spec callouts; frontend keywords above
-    # already imply typescript transitively for Angular.
+    # TypeScript — explicit spec callouts.
     (re.compile(r"\btypescript\b|\bts\s*config\b", re.IGNORECASE), "typescript"),
 )
 

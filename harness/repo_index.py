@@ -67,9 +67,7 @@ _DEFAULT_EXCLUDE_GLOBS = (
 )
 _DEFAULT_TEXT_EXTENSIONS = (
     ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
-    ".java", ".kt", ".go", ".rs", ".rb", ".php",
-    ".dart", ".swift", ".m", ".mm",
-    ".c", ".cc", ".cpp", ".h", ".hh", ".hpp", ".cs",
+    ".java",
     ".sh", ".bash", ".zsh",
     ".html", ".css", ".scss",
     ".md", ".rst", ".txt",
@@ -94,6 +92,9 @@ class RepoIndexConfig:
     # OpenAI backend params
     openai_model: str = "text-embedding-3-small"
     openai_api_base: str = "https://api.openai.com/v1"
+    # TLS verification toggle for the embeddings backend. Defaults True;
+    # callers behind an MITM corporate proxy can flip via config.
+    ssl_verify: bool = True
 
     @classmethod
     def from_config(cls, config: Optional[dict[str, Any]]) -> "RepoIndexConfig":
@@ -111,6 +112,7 @@ class RepoIndexConfig:
             max_file_bytes=int(section.get("max_file_bytes", _DEFAULT_MAX_FILE_BYTES)),
             openai_model=str(section.get("openai_model", "text-embedding-3-small")),
             openai_api_base=str(section.get("openai_api_base", "https://api.openai.com/v1")),
+            ssl_verify=bool(section.get("ssl_verify", True)),
         )
 
 
@@ -411,13 +413,27 @@ class OpenAIEmbeddingsBackend(IndexBackend):
         ) as client:
             for batch_start in range(0, len(chunks), self._BATCH_SIZE):
                 batch = chunks[batch_start : batch_start + self._BATCH_SIZE]
-                inputs = [c.content[:8000] for c in batch if c.content and c.content.strip()]
+                # Track which batch positions were blank so we can place
+                # API embeddings back at their ORIGINAL positions. The
+                # previous "filter inputs, append result, backfill at end"
+                # shape misaligned vectors when blank chunks were
+                # interleaved (not just trailing): vec_C would land at
+                # batch slot 1 (chunk B's slot) and chunk C's slot got
+                # the "[]" backfill. Result: every chunk after the first
+                # blank held the wrong vector and retrieval scored the
+                # wrong neighbours.
+                non_blank_positions: list[int] = []
+                inputs: list[str] = []
+                for pos, c in enumerate(batch):
+                    if c.content and c.content.strip():
+                        non_blank_positions.append(pos)
+                        inputs.append(c.content[:8000])
+
+                # Pre-allocate this batch's slot in the output, blank by
+                # default; we'll overwrite the non-blank positions below.
+                batch_vectors: list[str] = ["[]"] * len(batch)
                 if not inputs:
-                    # Every chunk in this batch was blank — emit empty
-                    # vectors so the position alignment with `chunks`
-                    # holds for the caller's index build.
-                    for _ in batch:
-                        vectors_json.append("[]")
+                    vectors_json.extend(batch_vectors)
                     continue
                 payload = {"model": self.cfg.openai_model, "input": inputs}
                 # Bounded retry loop (audit §4.10) — small embedding
@@ -440,14 +456,30 @@ class OpenAIEmbeddingsBackend(IndexBackend):
                         last_exc = exc
                     _time.sleep(min(60.0, 1.0 * (2 ** attempt)))
                 else:
+                    # Retries exhausted without a successful break. Raise
+                    # whatever we caught last; if we never caught anything
+                    # (defensive), raise a synthetic error rather than
+                    # silently emitting blank embeddings for this batch.
                     if last_exc is not None:
                         raise last_exc
-                data = response.json() if response is not None else {}
-                for item in data.get("data", []):
-                    vectors_json.append(json.dumps(item.get("embedding", []), ensure_ascii=False))
-                # Backfill empties for any blank chunks we filtered out.
-                while len(vectors_json) < batch_start + len(batch):
-                    vectors_json.append("[]")
+                    raise RuntimeError(
+                        "OpenAI embeddings: retries exhausted with no captured exception."
+                    )
+                # response must be non-None here (else branch above would have raised).
+                assert response is not None
+                data = response.json()
+                items = data.get("data", []) or []
+                # Bind each API embedding to its ORIGINAL batch position.
+                # If the API returned fewer items than inputs (shouldn't
+                # happen but defend), trailing positions stay blank.
+                for src_idx, item in enumerate(items):
+                    if src_idx >= len(non_blank_positions):
+                        break
+                    dest_pos = non_blank_positions[src_idx]
+                    batch_vectors[dest_pos] = json.dumps(
+                        item.get("embedding", []), ensure_ascii=False,
+                    )
+                vectors_json.extend(batch_vectors)
         return vectors_json
 
     def vectorize_query(self, query: str) -> str:
@@ -536,7 +568,20 @@ def _db_path(cfg: RepoIndexConfig) -> str:
 
 
 def _open_db(cfg: RepoIndexConfig) -> sqlite3.Connection:
-    conn = sqlite3.connect(_db_path(cfg))
+    conn = sqlite3.connect(_db_path(cfg), timeout=10.0)
+    # WAL + busy_timeout mirror the harness.storage / harness.web_state
+    # pragma set so a concurrent planner + update_index_for_files run
+    # against different workspaces (or the same one across two teane
+    # processes) doesn't hit "database is locked".
+    try:
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
+    except sqlite3.DatabaseError:
+        # On some platforms/filesystems WAL is unsupported (network
+        # mounts, ramdisks). Fall back silently — correctness still
+        # holds with the default journal.
+        pass
     conn.executescript(_SCHEMA_SQL)
     return conn
 

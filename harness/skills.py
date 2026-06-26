@@ -381,17 +381,28 @@ _DOCGEN_EXTERNAL_PROMPTS = {
 }
 
 
-def _get_docgen_prompt(doc_type: str) -> str:
+def _get_docgen_prompt(doc_type: str, *, agile: bool = False) -> str:
     """Resolve the system prompt for a docgen doc_type.
 
     Externalized types (arch_doc, requirements) load from disk so the
     prompt can be edited without touching code. Other types fall back to
     the inline ``_DOCGEN_SYSTEM_PROMPTS`` dict; an unknown type falls all
     the way back to the readme prompt (matches prior behavior).
+
+    Args:
+        doc_type: One of ``arch_doc``, ``functional_spec``, ``requirements``,
+            ``api_doc``, ``readme``.
+        agile: When ``doc_type == "requirements"``, selects Path A (Agile
+            SAFe/Gherkin) over Path B (ISO 29148 default) in the shipped
+            ``requirements_doc.md`` skill prompt. Ignored for other types
+            because their prompts don't carry the ``{AGILE_MODE_DIRECTIVE}``
+            placeholder — :func:`docgen_prompts.apply_agile_directive` is
+            a no-op in that case.
     """
     if doc_type in _DOCGEN_EXTERNAL_PROMPTS:
         from harness import docgen_prompts
-        return docgen_prompts.load(_DOCGEN_EXTERNAL_PROMPTS[doc_type])
+        body = docgen_prompts.load(_DOCGEN_EXTERNAL_PROMPTS[doc_type])
+        return docgen_prompts.apply_agile_directive(body, agile=agile)
     return _DOCGEN_SYSTEM_PROMPTS.get(doc_type, _DOCGEN_SYSTEM_PROMPTS["readme"])
 
 
@@ -456,6 +467,8 @@ async def generate_documentation(
     task_description: str = "",
     output_file: str = "",
     model_override: str = "",
+    *,
+    agile: bool = False,
 ) -> dict[str, Any]:
     """
     Generate a documentation document for the project.
@@ -466,6 +479,14 @@ async def generate_documentation(
         task_description: Additional context/requirements for the document.
         output_file: Where to write the generated document.
         model_override: Specific model to use.
+        agile: Only meaningful for ``doc_type == "requirements"``. When
+            true, the shipped ``requirements_doc.md`` skill prompt is
+            executed in **Path A (Agile RSD)** mode — SAFe Epic → Feature →
+            Story hierarchy with Gherkin acceptance criteria, INVEST
+            validation, and Enabler Stories for NFRs. When false (the
+            default), **Path B (ISO/IEC/IEEE 29148:2018)** is selected.
+            The flag is mirrored to ``args.decomposition_enabled`` after
+            the ``_resolve_agile_args`` CLI resolution.
 
     Returns:
         Result dict with success, file path, and metadata.
@@ -476,7 +497,7 @@ async def generate_documentation(
     if gateway is None:
         return {"success": False, "error": "No gateway configured. Cannot generate documentation."}
 
-    system_prompt = _get_docgen_prompt(doc_type)
+    system_prompt = _get_docgen_prompt(doc_type, agile=agile)
 
     # Build directory snapshot for context
     tree = await _build_dir_snapshot(workspace_path)

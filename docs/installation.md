@@ -90,8 +90,8 @@ Sections of the report, in order:
 
 - **REQUIRED** — Python 3.11+, git, home / temp writable, disk space, outbound HTTPS, plus per-OS items (Windows long-paths registry; macOS Xcode CLI tools).
 - **SANDBOX** — Docker Desktop (or `unshare` on Linux; `taskkill` on Windows for the cross-platform tree-kill).
-- **RECOMMENDED** — POSIX `sh` on Windows (Git Bash for schedule hooks), security scanners (gitleaks / bandit / semgrep / trivy), formatters (ruff / prettier / rustfmt / clang-format / shellcheck).
-- **OPTIONAL** — `gh` CLI, language toolchains (Node / Go / Rust / Java / Dart) for stacks the LLM may target.
+- **RECOMMENDED** — POSIX `sh` on Windows (Git Bash for schedule hooks), security scanners (gitleaks / bandit / semgrep / trivy), formatters (ruff / prettier / google-java-format / shellcheck).
+- **OPTIONAL** — `gh` CLI, language toolchains (Python / Java / Node — the locked stack) for the stacks the LLM may target.
 - **ENV** — informational; which provider API key env vars are set on this machine.
 
 Once `pre-flight` reports green REQUIRED, follow §5 to install the harness package, then `teane doctor -r <workspace>` for the workspace-bound checks.
@@ -172,7 +172,7 @@ The `sandbox.backend` key in `config.json` accepts `auto` (default), `docker`, `
 
 - **macOS**: install [Docker Desktop](https://www.docker.com/products/docker-desktop/). Start it once and let it finish initializing.
 - **Windows + WSL2**: install Docker Desktop on the Windows host, then in **Settings → Resources → WSL Integration** enable integration for your Ubuntu-22.04 distro.
-- **Windows native**: install Docker Desktop. Confirm it's running in **Linux containers** mode (right-click the tray icon → "Switch to Linux containers" if needed). The default sandbox image is `harness-builder:latest`; the compiler node auto-swaps to a stack-specific image (`python:3.12-slim`, `node:20-slim`, `golang:1.22`, `rust:1.79-slim`, `eclipse-temurin:21-jdk`, `dart:stable`, …) based on tokens it recognises in `build_command`.
+- **Windows native**: install Docker Desktop. Confirm it's running in **Linux containers** mode (right-click the tray icon → "Switch to Linux containers" if needed). The default sandbox image is `harness-builder:latest`; the compiler node auto-swaps to a stack-specific image (`python:3.12-slim`, `node:20-slim`, `eclipse-temurin:21-jdk`) based on tokens it recognises in the auto-wired build command.
 
 ### unshare
 
@@ -321,10 +321,8 @@ If `gitleaks` is missing, the harness falls back to a regex-based Python secret 
 | Tool | Install |
 |------|---------|
 | `ruff` (Python) | `pip install ruff` — works on every platform |
-| `prettier` (JS / TS / JSON / MD) | `npm install -g prettier` |
-| `gofmt` (Go) | bundled with Go (`brew install go`, apt, or [go.dev](https://go.dev/dl/)) |
-| `rustfmt` (Rust) | `rustup component add rustfmt` |
-| `clang-format` (C / C++) | `apt install clang-format`, `brew install clang-format`, or [LLVM Windows installer](https://releases.llvm.org/) |
+| `prettier` (JS / TS / TSX / JSON / MD — covers React + Tailwind) | `npm install -g prettier` |
+| `google-java-format` (Java) | download the jar from [google/google-java-format releases](https://github.com/google/google-java-format/releases) |
 
 ### GitHub CLI (optional — required for `teane gh` subcommands)
 
@@ -396,7 +394,10 @@ A minimal `config/config.json` body:
 ```json
 {
   "product_spec_dir": "product_spec",
-  "build_command": "make build",
+  "core_languages": {
+    "backend_language": "Python",
+    "web_language": ["React", "TypeScript", "TailwindCSS"]
+  },
   "allow_network": true,
   "models": {
     "anthropic:claude-sonnet-4": {
@@ -426,6 +427,10 @@ A minimal `config/config.json` body:
 
 The shipped `config/config.json` in the repo is annotated: every section has a sibling `_<section>_comment` string that documents every leaf field. `_*` keys are stripped at load time, so comment fields ship in the file but never reach the validator.
 
+**Mandatory `core_languages` (locked stack).** Backend is Python (FastAPI / Flask / Django) OR Java (Spring Boot). Web is exactly React + TypeScript + TailwindCSS, Vite-built. Blank `backend_language` resolves to `Python`; blank `web_language` resolves to the documented triple. Any other value (e.g. `backend_language: "Go"`, `web_language: ["Vue", "TypeScript", "TailwindCSS"]`) causes the harness to exit with code 2 at config-load time before any logging or LLM-gateway init.
+
+**Build command is auto-wired from workspace markers.** The legacy `build_command` config key and the `--build-cmd` CLI flag have been REMOVED. The harness now picks the build command at runtime from what it finds in the workspace: `pyproject.toml` → `pytest`, `pom.xml` → `mvn -B test`, `package.json` → `npm install && npm run build && npm test`.
+
 **Mandatory `product_spec_dir`.** The value is a bare folder name (no path separators, no `..`, no absolute paths) that lives at the workspace root. The harness consolidates every `.txt` file in alphabetical order and feeds the result to the planning LLM. `teane doctor` checks the value is well-formed AND the folder exists with ≥1 `.txt` file.
 
 **Model registry vs routing.**
@@ -445,7 +450,7 @@ The full schema — every field of `sandbox`, `token_budget`, `node_throttle`, `
 - `llm_dispatch.prompt_cache_enabled` (default `true`) — emits Anthropic `cache_control` markers on the system block and runs prefix-stability drift detection. Flip to false only if a provider API change rejects the payload shape.
 - `compiler.run_prod_import_smoke_check` (default `true`) — compiler_node imports every production module inside the sandbox before running the build, so module-level errors surface as `[prod-import]` diagnostics ahead of any cascade-amplified test failures.
 - `debug.dump_llm_calls` (default `true`) — every LLM dispatch is written to `~/.harness/debug/*.txt`; `debug.dump_max_files` caps the directory (oldest by mtime pruned). Useful for post-mortem; turn off in production-style runs.
-- `sandbox.cache_volumes` (default `false`) — swap each `readonly_cache_mounts` entry for a writable Docker named volume scoped to the session id. Pip / npm / cargo persist downloads across containers in the session. Clean up with `teane cache clear`.
+- `sandbox.cache_volumes` (default `false`) — swap each `readonly_cache_mounts` entry for a writable Docker named volume scoped to the session id. Pip / npm / maven downloads persist across containers in the session. Clean up with `teane cache clear`.
 - `node_throttle.max_patch_repair_iterations` (default `3`, can be raised) — repair loop ceiling. After this many failing rebuilds the run routes to HITL.
 
 **WSL2 only**: put your workspaces under the WSL filesystem (`~/...`), **not** `/mnt/c/...`. Windows-mount paths have order-of-magnitude slower I/O.
@@ -464,7 +469,7 @@ teane run -w <workspace> -p "<prompt>" --force-lock
 
 After every patching round, the harness writes stack-canonical unit tests for the modified source files and runs them deterministically in the sandbox before lintgate. The node — `harness/test_generation.py` — sits in the graph between `speculative_node` and `lintgate_node`.
 
-**What it does.** Detects the workspace stack via `_detect_workspace_stack`, loads the matching `harness/test_guides/<lang>.md` into the LLM prompt, asks for `CREATE_FILE` / `INSERT_AT_BLOCK` patch blocks for the corresponding test files, applies them, then invokes a stack-canonical test command in the sandbox. **The guides instruct the LLM to write tests that exercise the real code — no mocks.** When a side effect can't be invoked directly, the tests use the test runner's built-in fakes (pytest `monkeypatch` / `tmp_path`, Go `httptest.NewServer`, JUnit `@TempDir`, etc.).
+**What it does.** Detects the workspace stack via `_detect_workspace_stack`, loads the matching `harness/test_guides/<lang>.md` into the LLM prompt, asks for `CREATE_FILE` / `INSERT_AT_BLOCK` patch blocks for the corresponding test files, applies them, then invokes a stack-canonical test command in the sandbox. **The guides instruct the LLM to write tests that exercise the real code — no mocks.** When a side effect can't be invoked directly, the tests use the test runner's built-in fakes (pytest `monkeypatch` / `tmp_path`, JUnit `@TempDir`, Jest fake-timers, etc.).
 
 **Config defaults.** Shipped in `config/config.json` under `test_generation`. Defaults are `enabled: true` and `max_iterations: 3`. To disable, edit the same file:
 
@@ -474,28 +479,23 @@ After every patching round, the harness writes stack-canonical unit tests for th
 
 **LLM API key is required.** Without a configured gateway the node synthesises an `env_misconfig:llm_api_key` diagnostic and routes the session to HITL. See §6 — provisioning at least one provider key is no longer optional when test generation is on.
 
-**Per-stack test runner.** Stack-canonical guides ship at `harness/test_guides/*.md` for `python`, `javascript`, `typescript`, `go`, `java`, `rust`, and `dart`. The deterministic command the sandbox runs per detected stack:
+**Per-stack test runner.** Stack-canonical guides ship at `harness/test_guides/*.md` for `python`, `java`, and `typescript` (covering the React + Tailwind web build). The deterministic command the sandbox runs per detected stack:
 
 | Stack | Deterministic command |
 |-------|------------------------|
 | Python | `pip install -q pytest && python3 -m pytest -q` |
-| Node / JavaScript | `npm install --no-save --silent jest && npx jest --silent` |
-| TypeScript | `npm install --no-save --silent jest ts-jest typescript && npx jest --silent` |
-| Go | `go test ./...` |
 | Java | `mvn -q test` |
-| Rust | `cargo test --quiet` |
-| Dart | `dart test` |
+| TypeScript (React + Tailwind) | `npm install --no-save --silent jest ts-jest typescript && npx jest --silent` |
 
-`pip install` / `npm install` tokens trigger the harness's existing `_build_command_needs_network` heuristic, so the sandbox auto-enables outbound network for the test run — no manual `allow_network: true` required.
+`pip install` / `npm install` / `mvn` tokens trigger the harness's existing install-network heuristic, so the sandbox auto-enables outbound network for the test run — no manual `allow_network: true` required.
 
-**Sandbox image caveat (read this).** The deterministic test runner re-uses whichever `sandbox.docker_image` the build_command auto-adapter picked. That adapter keys off `build_command` only — if your `build_command` is, say, `make build` but the workspace is Python, the image stays `ubuntu:22.04` and `pip install pytest` will fail with `pip: command not found`. Two workarounds:
+**Sandbox image caveat (read this).** The deterministic test runner re-uses whichever `sandbox.docker_image` the auto-adapter picked for the build command. The adapter keys off the auto-wired build command — if your workspace markers don't unambiguously imply a stack, set `sandbox.docker_image` explicitly in `config/config.json`:
 
-1. Include a stack-implying token in `build_command` so the existing adapter picks the right image, e.g. `make build && python3 --version`.
-2. Or set `sandbox.docker_image` explicitly in `config/config.json`:
-   ```json
-   "sandbox": { "docker_image": "python:3.12-slim" }
-   ```
-   Per-stack images that ship the toolchain: `python:3.12-slim`, `node:20-slim`, `golang:1.22`, `rust:1.79-slim`, `eclipse-temurin:21-jdk` (Java), `dart:stable` (Dart).
+```json
+"sandbox": { "docker_image": "python:3.12-slim" }
+```
+
+Per-stack images that ship the toolchain: `python:3.12-slim`, `eclipse-temurin:21-jdk` (Java), `node:20-slim` (React + TypeScript + Tailwind web).
 
 **Project-level test conventions.** Drop your own files under `<workspace>/test_guides/<lang>.md` with frontmatter `applies_to: [<stack-tag>]`. The loader prefers project files over the shipped defaults, so a workspace can tighten the conventions the LLM is given without forking the harness.
 
@@ -720,10 +720,10 @@ These show up in the HITL banner as `Trigger: <name>` and mean the harness short
 
 | Trigger | Meaning | Fix |
 |---------|---------|-----|
-| `env_misconfig:<symbol>` (e.g. `env_misconfig:pytest`) | Sandbox build exited with "No module named X" / "command not found" / Docker `exec: "X": executable file not found`. The runtime is missing inside the container. | Either prepend an install step to `build_command` (e.g. `pip install <symbol> && <original-cmd>`) or set `sandbox.docker_image` to one that ships `<symbol>`. |
+| `env_misconfig:<symbol>` (e.g. `env_misconfig:pytest`) | Sandbox build exited with "No module named X" / "command not found" / Docker `exec: "X": executable file not found`. The runtime is missing inside the container. | Set `sandbox.docker_image` to one that ships `<symbol>` (`python:3.12-slim`, `eclipse-temurin:21-jdk`, `node:20-slim`), or add the dependency to the workspace's `pyproject.toml` / `pom.xml` / `package.json` so the auto-wired build command installs it. |
 | `env_misconfig:llm_api_key` | test_generation cannot run because no LLM gateway is configured. | Set the matching `*_API_KEY` env var (see §6), or set `test_generation.enabled: false` in `config/config.json`. |
 | `llm_silent` (HITL fires immediately) | Three consecutive empty responses from the LLM provider (`EmptyLLMResponseError`). | Check the provider's status page; retry, or route the affected node to a different model via `model_routing`. |
-| `Auto-test run fails with "pip: command not found" / "npx: not found"` | The deterministic test runner from §8.5 is executing in a docker image that doesn't carry the stack toolchain. | See the [§8.5 sandbox-image caveat](#85-test-generation-new) — fix by adjusting `build_command` or pinning `sandbox.docker_image` explicitly. |
+| `Auto-test run fails with "pip: command not found" / "npx: not found"` | The deterministic test runner from §8.5 is executing in a docker image that doesn't carry the stack toolchain. | See the [§8.5 sandbox-image caveat](#85-test-generation-new) — pin `sandbox.docker_image` explicitly to a per-stack image. |
 | `[FAIL] api keys (live)` despite a key being set | Doctor checks env vars AND the `models["<key>"].api_key` config field. The FAIL detail line names which location is empty and what the live ping returned (`HTTP 401`, `HTTP 404`, …). | Set the key in `{PROVIDER}_API_KEY` env var (preferred) or in `config/config.json` under `models."<key>".api_key`. |
 | `lock held by PID <n>` at startup | A prior `teane run` exited hard and left `<workspace>/.harness_session.lock` stale, or another live session is using the workspace. | Verify the PID is gone (`ps -p <n>`); then `teane run ... --force-lock` to release and reacquire. See `docs/RUNBOOK.md` § 4. |
 
@@ -761,4 +761,4 @@ These show up in the HITL banner as `Trigger: <name>` and mean the harness short
 - [docs/RUNBOOK.md](RUNBOOK.md) — mid-session failure recipes for operators.
 - [docs/EDGE_CASE_AUDIT.md](EDGE_CASE_AUDIT.md) — known edge cases and their handling.
 - `harness/style_guides/*.md` and `harness/test_guides/*.md` — shipped per-language guidance the LLM sees during code and test generation. Drop your own overrides under `<workspace>/style_guides/` or `<workspace>/test_guides/` (same filenames win on collision).
-- `harness/skills/*.md` — stack scaffolds the planner uses for greenfield projects (Django, FastAPI, Flutter, React, Vue, Angular, Spring Boot, Express, …).
+- `harness/skills/*.md` — stack scaffolds the planner uses for greenfield projects in the locked stack (Django, FastAPI, Flask, Spring Boot, React + TypeScript + TailwindCSS).

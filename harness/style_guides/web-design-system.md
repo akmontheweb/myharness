@@ -1,5 +1,5 @@
 ---
-applies_to: [react, vue, angular, html, css, tailwind]
+applies_to: [react, html, css, tailwind]
 ---
 
 ## Composite Web Design System (Premium Light Mode)

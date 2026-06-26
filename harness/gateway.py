@@ -2477,6 +2477,7 @@ class Gateway:
         # the cost-per-call slipped past the local budget enforcer.
         accumulated_cost = float(getattr(response.usage, "cost_usd", 0.0) or 0.0)
         empty_retry_attempts = 2
+        last_retry_exc: Optional[BaseException] = None
         while _is_empty(response) and empty_retry_attempts > 0:
             logger.warning(
                 "[gateway] Provider returned empty content (model=%s role=%s). "
@@ -2492,7 +2493,14 @@ class Gateway:
                     rate_limit_observer=self._record_rate_limit_failure,
                 )
                 accumulated_cost += float(getattr(response.usage, "cost_usd", 0.0) or 0.0)
-            except Exception:  # noqa: BLE001 — let the empty path below raise cleanly
+            except Exception as exc:  # noqa: BLE001 — captured below so the
+                # operator sees the real failure (rate-limit / 5xx) rather
+                # than the downstream "empty content" symptom that masked it.
+                last_retry_exc = exc
+                logger.warning(
+                    "[gateway] Empty-retry call raised %s: %s — falling through to empty handler.",
+                    type(exc).__name__, exc,
+                )
                 break
 
         if _is_empty(response):
@@ -2502,9 +2510,20 @@ class Gateway:
                     "llm_empty_response",
                     role=role.value if hasattr(role, "value") else str(role),
                     model=getattr(response, "model", ""),
+                    underlying_error=type(last_retry_exc).__name__ if last_retry_exc else "",
                 )
             except Exception:  # noqa: BLE001
                 pass
+            if last_retry_exc is not None:
+                # Surface the actual transport / rate-limit failure
+                # rather than the downstream "empty content" symptom.
+                # Chaining preserves the symptom for debugging while
+                # presenting the real cause as the proximate exception.
+                raise EmptyLLMResponseError(
+                    f"Provider returned empty content for role={role.value} "
+                    f"after retry raised {type(last_retry_exc).__name__}: "
+                    f"{last_retry_exc}. Surface to HITL rather than looping."
+                ) from last_retry_exc
             raise EmptyLLMResponseError(
                 f"Provider returned empty content for role={role.value} model="
                 f"{getattr(response, 'model', '?')} after empty-retry exhaustion. "
@@ -2515,9 +2534,12 @@ class Gateway:
 
         # Deduct cost from budget — use the accumulated sum across any
         # empty-retries (audit §4.4) so the operator's hard cap isn't
-        # silently breached by partial-failure tails.
+        # silently breached by partial-failure tails. Clamp the post-call
+        # budget at zero rather than letting it go negative — negative
+        # values used to surface in the dashboard as a negative dollar
+        # figure even though the next dispatch correctly refuses at <=0.
         cost = accumulated_cost or response.usage.cost_usd
-        new_budget = budget_remaining_usd - cost
+        new_budget = max(0.0, budget_remaining_usd - cost)
         elapsed_ms = round((_time.monotonic() - _dispatch_start) * 1000)
 
         logger.info(

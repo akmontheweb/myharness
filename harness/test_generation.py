@@ -58,21 +58,17 @@ _STACK_TEST_COMMANDS: dict[str, str] = {
     "node": "npm install --no-save --silent jest && npx jest --silent",
     "javascript": "npm install --no-save --silent jest && npx jest --silent",
     "typescript": "npm install --no-save --silent jest ts-jest typescript && npx jest --silent",
-    "go": "go test ./...",
     "java": "mvn -q test",
-    "rust": "cargo test --quiet",
-    "dart": "dart test",
-    "flutter": "flutter test",
 }
 
 
 # Stack-tag priority: when _detect_workspace_stack returns multiple tags, pick
 # the first hit in this list as the primary language for prompt + test runner
-# selection. Frontend frameworks (react/vue/angular) imply javascript/typescript,
-# so they don't appear here directly.
+# selection. Frontend framework (react) implies typescript, so it doesn't
+# appear here directly.
 _PRIMARY_STACK_PRIORITY: tuple[str, ...] = (
-    "flutter", "dart", "rust", "go", "java", "typescript",
-    "node", "javascript", "python",
+    "java", "typescript",
+    "javascript", "python",
 )
 
 
@@ -83,10 +79,7 @@ _SOURCE_EXTENSIONS: dict[str, str] = {
     ".py": "python", ".pyi": "python",
     ".js": "javascript", ".mjs": "javascript", ".jsx": "javascript",
     ".ts": "typescript", ".tsx": "typescript",
-    ".go": "go",
     ".java": "java",
-    ".rs": "rust",
-    ".dart": "dart",
 }
 
 
@@ -95,13 +88,11 @@ _SOURCE_EXTENSIONS: dict[str, str] = {
 _TEST_FILE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(^|/)test_[^/]+\.py$"),
     re.compile(r"(^|/)tests?(/|$)"),
-    re.compile(r"_test\.go$"),
     re.compile(r"\.test\.(js|jsx|ts|tsx|mjs)$"),
     re.compile(r"\.spec\.(js|jsx|ts|tsx|mjs)$"),
     re.compile(r"__tests__/"),
     re.compile(r"src/test/"),
     re.compile(r"Test\.java$"),
-    re.compile(r"_test\.dart$"),
 )
 
 
@@ -683,7 +674,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # The test command always contains a package-install token for stacks
     # that need one, so the sandbox auto-network heuristic kicks in. We
     # also lift it explicitly here so the SandboxExecutor sees it.
-    if any(tok in test_cmd for tok in ("pip install", "npm install", "go get", "cargo")):
+    if any(tok in test_cmd for tok in ("pip install", "npm install")):
         allow_network = True
 
     # Adapt the sandbox image and root-FS writability to match the test
@@ -701,7 +692,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             desired_image, test_cmd,
         )
         sandbox_cfg["docker_image"] = desired_image
-    # Pip / npm / cargo / go install steps write into system locations the
+    # Pip / npm install steps write into system locations the
     # read-only root FS would block; flip the flag when the test command
     # has an install step.
     if _build_command_needs_network(test_cmd) and sandbox_cfg.get("read_only_root", True):

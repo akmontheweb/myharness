@@ -148,13 +148,8 @@ async def _prompt_deploy_approval(preview: str) -> bool:
 # Package manifest files to detect by language
 _PACKAGE_MANIFESTS: dict[str, list[str]] = {
     "python": ["requirements.txt", "pyproject.toml", "setup.py", "setup.cfg", "Pipfile", "poetry.lock"],
-    "node": ["package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"],
-    "go": ["go.mod", "go.sum"],
-    "rust": ["Cargo.toml", "Cargo.lock"],
-    "java": ["pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle"],
-    "ruby": ["Gemfile", "Gemfile.lock"],
-    "php": ["composer.json", "composer.lock"],
-    "dotnet": ["*.csproj", "*.fsproj", "*.sln"],
+    "node": ["package.json", "package-lock.json"],
+    "java": ["pom.xml", "build.gradle", "settings.gradle"],
 }
 
 # Service/technology anchor keywords to search for in configs and source
@@ -177,12 +172,8 @@ _FRAMEWORK_SIGNATURES: dict[str, list[str]] = {
     "django": ["manage.py"],
     "flask": ["app.py", "wsgi.py"],
     "fastapi": ["main.py"],  # heuristic — may also be flask
-    "nextjs": ["next.config.js", "next.config.mjs", "next.config.ts"],
     "react": ["src/App.tsx", "src/App.jsx", "src/App.js"],
-    "express": ["app.js", "server.js"],
-    "rails": ["config/routes.rb", "app/controllers"],
     "spring": ["src/main/java", "src/main/resources/application.properties"],
-    "laravel": ["artisan", "app/Http/Controllers"],
 }
 
 
@@ -221,7 +212,7 @@ def _find_dirs(workspace: Path, patterns: list[str]) -> list[str]:
 def _search_anchors_in_files(workspace: Path, keywords: list[str]) -> bool:
     """Search source/config files for service anchor keywords. Returns True if any found."""
     config_files = []
-    for ext in ("*.env", "*.env.*", "*.yml", "*.yaml", "*.toml", "*.json", "*.py", "*.ts", "*.js", "*.go"):
+    for ext in ("*.env", "*.env.*", "*.yml", "*.yaml", "*.toml", "*.json", "*.py", "*.ts", "*.js"):
         config_files.extend(list(workspace.rglob(ext)))
 
     scanned = 0
@@ -280,7 +271,7 @@ def scan_workspace_telemetry(workspace_path: str) -> dict[str, Any]:
         - Database/service anchors (redis, postgres, mysql, etc.)
         - Web server frameworks (nginx, caddy)
         - Auth services (keycloak)
-        - Framework signatures (django, nextjs, react, etc.)
+        - Framework signatures (django, flask, fastapi, react, spring)
         - Source directory structure
         - Port hints from .env and compose files
 
@@ -586,8 +577,6 @@ def _fallback_blueprint(telemetry: dict[str, Any]) -> dict[str, Any]:
         base_images = {
             "python": "python:3.12-slim",
             "node": "node:20-alpine",
-            "go": "golang:1.22-alpine",
-            "rust": "rust:1.78-slim",
             "java": "eclipse-temurin:21-jre-alpine",
         }
         image = base_images.get(lang, "alpine:3.20")
@@ -689,36 +678,6 @@ COPY --from=deps /app/node_modules ./node_modules
 ENV NODE_ENV=production
 {healthcheck}
 CMD ["node", "dist/index.js"]
-""",
-
-    "go": """# Multi-stage Go Dockerfile
-FROM golang:1.22-alpine AS builder
-WORKDIR /app
-COPY {build_context}/go.mod {build_context}/go.sum* ./
-RUN go mod download
-COPY {build_context}/ .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /app/server .
-
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
-WORKDIR /app
-COPY --from=builder /app/server .
-{healthcheck}
-CMD ["./server"]
-""",
-
-    "rust": """# Multi-stage Rust Dockerfile
-FROM rust:1.78-slim AS builder
-WORKDIR /app
-COPY {build_context}/ .
-RUN cargo build --release
-
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-WORKDIR /app
-COPY --from=builder /app/target/release/* /app/server
-{healthcheck}
-CMD ["./server"]
 """,
 
     "java": """# Multi-stage Java Dockerfile

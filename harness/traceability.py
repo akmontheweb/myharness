@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 _NEVER_SOURCE_DIRS: frozenset[str] = frozenset({
     "node_modules", "__pycache__", "dist", "build", "target", "out",
-    ".git", ".tox", ".venv", "venv", ".next", ".nuxt", ".svelte-kit",
+    ".git", ".tox", ".venv", "venv",
     "coverage", "htmlcov", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".harness", ".teane",
 })
@@ -51,8 +51,7 @@ _NEVER_SOURCE_DIRS: frozenset[str] = frozenset({
 # binary files are skipped.
 _SOURCE_EXTS: tuple[str, ...] = (
     ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
-    ".go", ".rs", ".java", ".kt", ".swift",
-    ".rb", ".php", ".cs", ".dart", ".scala", ".clj",
+    ".java",
     ".md", ".rst", ".txt", ".sql", ".yaml", ".yml", ".toml",
 )
 

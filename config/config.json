@@ -1,7 +1,10 @@
 {
     "_comment": "Teane \u2014 canonical configuration. This is the SOLE config source. The harness reads this file (and ONLY this file) at startup; there are no fallbacks, no per-workspace overrides, no auto-generated files. Validation is strict: unknown keys, typos, wrong types, missing required fields, or missing API key env vars all cause the harness to exit with code 2 BEFORE any LLM call. Comment fields (keys starting with '_') are stripped at load time and exist for operator documentation only.",
-    "_build_command_comment": "Default shell command the sandbox runs to compile / test the workspace. The compiler_node auto-adapts this per-workspace (e.g. 'make build' \u2192 'python3 -m pytest -q' when no Makefile is present and pyproject.toml exists). Operators can override per-run via the --build-cmd CLI flag.",
-    "build_command": "make build",
+    "_core_languages_comment": "Locked core technology selection. The harness ONLY supports Python or Java (with Spring Boot) for backend, and the React + TypeScript + TailwindCSS trio (plus a small allowlist of optional React-ecosystem extras) for web. This restriction is enforced at config-load time \u2014 any other value causes the harness to exit with code 2 BEFORE any LLM call, with a polite message telling the operator which values are allowed. Blank values are auto-filled with the defaults below (backend_language=\"Python\", web_language=[\"React\",\"TypeScript\",\"TailwindCSS\"]). Allowed values: backend_language \u2208 {\"Python\", \"Java\"}. web_language MUST include every entry of the trio [\"React\", \"TypeScript\", \"TailwindCSS\"] (order-insensitive, no omissions); operators MAY additionally add any subset of the optional allowlist {\"radix-ui\"}. Anything outside that union is rejected. Rationale: a small, fixed surface lets the harness ship deep skill files, build recipes, and prompt scaffolds for every supported combination instead of spreading thin across every framework.",
+    "core_languages": {
+        "backend_language": "Python",
+        "web_language": ["React", "TypeScript", "TailwindCSS", "radix-ui"]
+    },
     "_allow_network_comment": "Default for whether the build sandbox is allowed network access. compiler_node automatically flips this to true when the build command contains a 'pip install', 'npm install', etc. Override per-run via --allow-network.",
     "allow_network": true,
     "_product_spec_dir_comment": "MANDATORY. NAME of the folder at the workspace root that holds the product specification .txt files. Must be a bare folder name \u2014 no path separators, no absolute paths, no `..`. The folder MUST live at the workspace root (`<workspace>/<product_spec_dir>/`). The harness reads every .txt file in this folder (alphabetical order) and consolidates them into one specification before LLM synthesis. Both `teane run` and `teane doctor` REFUSE to start when this key is missing, malformed, or when the named folder is missing / empty at the workspace root.",
@@ -18,11 +21,8 @@
             "~/.npm",
             "~/.cache/yarn",
             "~/.pnpm-store",
-            "~/.cache/go-build",
-            "~/.cargo/registry",
             "~/.m2",
-            "~/.gradle",
-            "~/.pub-cache"
+            "~/.gradle"
         ],
         "cache_volumes": false,
         "cache_volumes_prefix": "harness",

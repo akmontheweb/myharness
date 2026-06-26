@@ -719,7 +719,7 @@ The docstring claims "Called inside patching_node and repair_node after process_
 
 Any non-zero exit triggers repair. Tools that emit advisory non-zero (e.g. `terraform validate` on benign drift) loop the LLM endlessly. `_BUILD_OUTPUT_NOISE_PATTERNS` only filters the LLM's view, not the routing decision.
 
-**Recommendation:** Allow operators to declare "advisory" non-zero exit codes per `build_command`; surface them as warnings, not failures.
+**Recommendation:** Allow operators to declare "advisory" non-zero exit codes per workspace-marker-derived build command; surface them as warnings, not failures.
 
 ### 6.9 [Medium] `_strip_build_output_noise` only strips single-line deprecation warnings
 **File:** `harness/graph.py:2606-2623`

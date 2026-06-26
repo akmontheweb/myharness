@@ -1,5 +1,5 @@
 ---
-applies_to: [node, react, vue, angular]
+applies_to: [node, react]
 ---
 
 ## JavaScript Style Guide

@@ -133,10 +133,6 @@ class TestHelpers:
         assert _is_test_file("__tests__/foo.spec.js") is True
         assert _is_test_file("src/foo.ts") is False
 
-    def test_is_test_file_go(self):
-        assert _is_test_file("pkg/x/foo_test.go") is True
-        assert _is_test_file("pkg/x/foo.go") is False
-
     def test_is_test_file_java(self):
         assert _is_test_file("src/test/java/com/x/FooTest.java") is True
         assert _is_test_file("src/main/java/com/x/Foo.java") is False

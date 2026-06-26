@@ -1,5 +1,5 @@
 ---
-applies_to: [react, vue, angular, css, tailwind]
+applies_to: [react, css, tailwind]
 ---
 
 ## CSS Style Guide

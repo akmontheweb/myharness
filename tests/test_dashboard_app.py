@@ -66,7 +66,6 @@ def _writeable_config(tmp_path) -> str:
     """Write a minimal valid config.json the dashboard can save back to."""
     cfg_path = tmp_path / "config.json"
     cfg = {
-        "build_command": "make build",
         "allow_network": False,
         "product_spec_dir": "product_spec",
         "sandbox": {"backend": "auto", "docker_image": "harness-builder:latest",
