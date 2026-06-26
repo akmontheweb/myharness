@@ -31,6 +31,7 @@ from typing_extensions import TypedDict
 
 from harness import _platform
 from harness.sandbox import BUILDER_IMAGE
+from harness.spec_files import list_spec_files, read_spec_file
 
 logger = logging.getLogger(__name__)
 
@@ -8665,7 +8666,11 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
 # external trackers (Jira ticket IDs, etc.) can map 1:1; collisions with
 # already-archived CR IDs cause the ingest node to abort with a clear
 # error so the operator can rename and retry.
-_CR_FILENAME_PREFIX = re.compile(r"^CR-(\d+)(?:[-_].*)?\.txt$", re.IGNORECASE)
+# Extension alternation matches harness.spec_files.SPEC_FILE_EXTS — keep
+# the two in lockstep when adding a new spec extension.
+_CR_FILENAME_PREFIX = re.compile(
+    r"^CR-(\d+)(?:[-_].*)?\.(?:txt|md|pdf)$", re.IGNORECASE,
+)
 
 
 def _scan_archived_cr_ids(archive_root: str) -> set[int]:
@@ -8703,8 +8708,8 @@ def _assign_change_request_ids(
 ) -> list[dict[str, Any]]:
     """Assign CR-N IDs to ``pending_filenames`` in sorted order.
 
-    - A filename matching ``CR-<N>-*`` or ``CR-<N>.txt`` keeps its
-      operator-supplied ``N``.
+    - A filename matching ``CR-<N>-*`` or ``CR-<N>.{txt,md,pdf}`` keeps
+      its operator-supplied ``N``.
     - Otherwise, the next sequential ID is allocated from
       ``max(used) + 1`` (used = archived IDs ∪ already-assigned IDs in
       this batch). First-ever assignment starts at 1.
@@ -9041,23 +9046,12 @@ async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
         return {}
 
     archive_root = os.path.join(cr_dir, "applied")
-    try:
-        entries = sorted(os.listdir(cr_dir))
-    except OSError as exc:
-        logger.error("[change_requests] Could not list %s: %s", cr_dir, exc)
-        return {}
-
-    pending = [
-        e for e in entries
-        if e != "applied"
-        and e.endswith(".txt")
-        and os.path.isfile(os.path.join(cr_dir, e))
-    ]
+    pending = list_spec_files(cr_dir, exclude=frozenset({"applied"}))
 
     if not pending:
         logger.error(
-            "[change_requests] No pending .txt files under %s — cmd_run "
-            "should have rejected this earlier.", cr_dir,
+            "[change_requests] No pending spec files (.txt / .md / .pdf) "
+            "under %s — cmd_run should have rejected this earlier.", cr_dir,
         )
         return {}
 
@@ -9094,9 +9088,8 @@ async def ingest_change_requests_node(state: AgentState) -> dict[str, Any]:
     ]
     for rec in records:
         try:
-            with open(rec["abs_path"], "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except OSError as exc:
+            content = read_spec_file(rec["abs_path"])
+        except (OSError, ValueError) as exc:
             logger.warning(
                 "[change_requests] Could not read %s: %s — skipping.",
                 rec["abs_path"], exc,

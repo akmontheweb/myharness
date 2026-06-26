@@ -131,16 +131,18 @@ class TestListPendingChangeRequestFiles:
     def test_empty_when_missing(self, tmp_path):
         assert _list_pending_change_request_files(str(tmp_path / "absent")) == []
 
-    def test_lists_txt_sorted_skipping_applied_and_other_extensions(self, tmp_path):
+    def test_lists_spec_files_sorted_skipping_applied(self, tmp_path):
         cr_dir = tmp_path / "change_requests"
         cr_dir.mkdir()
         (cr_dir / "zeta.txt").write_text("x")
         (cr_dir / "alpha.txt").write_text("x")
-        (cr_dir / "notes.md").write_text("x")          # wrong extension
+        (cr_dir / "notes.md").write_text("x")          # .md is allowed
+        (cr_dir / "ignored.json").write_text("x")      # wrong extension
         (cr_dir / "applied").mkdir()                    # archive subdir
         (cr_dir / "applied" / "CR-1-old.txt").write_text("x")
         result = _list_pending_change_request_files(str(cr_dir))
-        assert result == ["alpha.txt", "zeta.txt"]
+        # .txt + .md picked up; .json + applied/ skipped; alphabetical.
+        assert result == ["alpha.txt", "notes.md", "zeta.txt"]
 
 
 class TestResolveChangeRequestsDir:
@@ -219,6 +221,30 @@ class TestIngestChangeRequestsNode:
         assert "second request body" in body
         # Seed prompt must be replaced (not appended).
         assert "placeholder seed prompt" not in body
+
+    def test_ingest_consolidates_md_alongside_txt(self, tmp_path):
+        # Operators can drop a Markdown change request alongside a .txt
+        # one and the ingest node treats both as first-class inputs —
+        # bodies are concatenated under CR-N headers and ID assignment
+        # is alphabetical across all spec extensions.
+        cr_dir = tmp_path / "change_requests"
+        cr_dir.mkdir()
+        (cr_dir / "alpha.txt").write_text("plain-text body")
+        (cr_dir / "beta.md").write_text("# Markdown body\n\nWith a list.")
+
+        result = asyncio.run(
+            ingest_change_requests_node(_initial_state_for_ingest(str(cr_dir)))
+        )
+
+        records = result["change_request_files"]
+        by_name = {r["original_name"]: r["cr_id"] for r in records}
+        assert by_name == {"alpha.txt": 1, "beta.md": 2}
+
+        body = result["messages"][1]["content"]
+        assert "CR-1: alpha.txt" in body
+        assert "CR-2: beta.md" in body
+        assert "plain-text body" in body
+        assert "# Markdown body" in body
 
     def test_respects_operator_supplied_cr_ids(self, tmp_path):
         cr_dir = tmp_path / "change_requests"
@@ -308,6 +334,33 @@ class TestArchiveConsumedChangeRequests:
         # CR-42-pinned.txt → CR-42-pinned.txt (not CR-42-CR-42-pinned.txt).
         assert (archive / "CR-42-pinned.txt").exists()
         assert not (archive / "CR-42-CR-42-pinned.txt").exists()
+
+    def test_preserves_md_and_pdf_extensions(self, tmp_path):
+        # The archive helper must not coerce .md / .pdf into .txt when
+        # stripping an existing CR-N prefix — the operator's file shape
+        # has to survive round-trip into change_requests/applied/.
+        cr_dir = tmp_path / "change_requests"
+        cr_dir.mkdir()
+        md_src = cr_dir / "CR-7-rewrite.md"
+        md_src.write_text("# markdown body")
+        pdf_src = cr_dir / "design.pdf"
+        pdf_src.write_bytes(b"%PDF-1.4\n%dummy\n")  # bytes preserved verbatim
+        archive = cr_dir / "applied" / "session-xyz"
+
+        _archive_consumed_change_requests(
+            [
+                {"cr_id": 7, "original_name": "CR-7-rewrite.md", "abs_path": str(md_src)},
+                {"cr_id": 8, "original_name": "design.pdf", "abs_path": str(pdf_src)},
+            ],
+            str(archive),
+            session_id="session-xyz",
+            status="success",
+            modified_files=[],
+        )
+
+        # .md keeps its extension; .pdf bytes are moved untouched.
+        assert (archive / "CR-7-rewrite.md").read_text() == "# markdown body"
+        assert (archive / "CR-8-design.pdf").read_bytes() == b"%PDF-1.4\n%dummy\n"
 
     def test_tolerates_missing_source(self, tmp_path):
         cr_dir = tmp_path / "change_requests"

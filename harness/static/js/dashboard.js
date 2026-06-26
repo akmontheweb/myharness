@@ -1185,8 +1185,8 @@
       var f = fileInput.files && fileInput.files[0];
       if (!f) return;
       var lower = f.name.toLowerCase();
-      if (!(lower.endsWith(".txt") || lower.endsWith(".md"))) {
-        toast("Only .txt or .md files are accepted.", "error");
+      if (!(lower.endsWith(".txt") || lower.endsWith(".md") || lower.endsWith(".pdf"))) {
+        toast("Only .txt, .md, or .pdf files are accepted.", "error");
         fileInput.value = "";
         return;
       }

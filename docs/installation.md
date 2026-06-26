@@ -47,8 +47,8 @@ On Windows, **WSL2 is recommended** because the harness was developed Linux-firs
 The biggest operator-facing changes since the layered-config era:
 
 - **Single canonical config** — the harness now reads exactly one file: `<repo>/config/config.json`. There is no `~/.harness/config.json`, no per-workspace `.harness_config.json`, no shipped `harness/cli.json` defaults. Strict validation rejects unknown keys, wrong types, missing required fields, and missing API key env vars at startup — before any LLM call. A legacy `.harness_config.json` left in a workspace logs one INFO line and is otherwise ignored. See §8.
-- **Mandatory `product_spec_dir`** — every run must point at a workspace-root folder of `.txt` files describing the product to build. `teane doctor` and `teane run` both refuse to start when the key is missing, malformed, or the folder is empty.
-- **Greenfield-vs-change-request modes** — `teane run --new-build true` wipes the workspace (except `product_spec/` and `.git/`) and resets to a clean base branch; `--new-build false` (the default) reads `.txt` files from `change_requests/` for steady-state work. Pair with `--yes` for unattended automation.
+- **Mandatory `product_spec_dir`** — every run must point at a workspace-root folder of spec files (`.txt`, `.md`, `.pdf`) describing the product to build. `.pdf` bodies are extracted via `pypdf`. `teane doctor` and `teane run` both refuse to start when the key is missing, malformed, or the folder is empty.
+- **Greenfield-vs-change-request modes** — `teane run --new-build true` wipes the workspace (except `product_spec/` and `.git/`) and resets to a clean base branch; `--new-build false` (the default) reads spec files (`.txt`, `.md`, `.pdf`) from `change_requests/` for steady-state work. Pair with `--yes` for unattended automation.
 - **Interactive wizard on bare `teane run`** — invoking `teane run` with no flags drops the operator into a wizard that resolves API keys, workspace, prompt, and mode. The wizard never writes to disk; each bare run re-asks.
 - **Deterministic autofix** — compiler-suggested fixes (rustc / gcc / clang fixits), missing-import insertion, and a small set of known-safe security autofixes (e.g. Bandit `B201` `debug=True → False`, Trivy version bumps with `FixedVersion`) now land **without** an LLM call. Surfaces in logs as `[autofix]` lines.
 - **Env-misconfig short-circuit** — when the sandbox build fails because a runtime is missing (`pytest` not installed in `python:3.12-slim`, `npm: command not found`), the router now exits to HITL on the **first** compile with a focused message instead of burning 3 LLM repair iterations. See §13 → Troubleshooting → HITL triggers.
@@ -431,7 +431,7 @@ The shipped `config/config.json` in the repo is annotated: every section has a s
 
 **Build command is auto-wired from workspace markers.** The legacy `build_command` config key and the `--build-cmd` CLI flag have been REMOVED. The harness now picks the build command at runtime from what it finds in the workspace: `pyproject.toml` → `pytest`, `pom.xml` → `mvn -B test`, `package.json` → `npm install && npm run build && npm test`.
 
-**Mandatory `product_spec_dir`.** The value is a bare folder name (no path separators, no `..`, no absolute paths) that lives at the workspace root. The harness consolidates every `.txt` file in alphabetical order and feeds the result to the planning LLM. `teane doctor` checks the value is well-formed AND the folder exists with ≥1 `.txt` file.
+**Mandatory `product_spec_dir`.** The value is a bare folder name (no path separators, no `..`, no absolute paths) that lives at the workspace root. The harness consolidates every spec file in alphabetical order — `.txt` and `.md` read as UTF-8, `.pdf` bodies extracted via `pypdf` — and feeds the result to the planning LLM. `teane doctor` checks the value is well-formed AND the folder exists with ≥1 spec file (`.txt`, `.md`, or `.pdf`).
 
 **Model registry vs routing.**
 - `models` is the registry — every LLM the gateway can dispatch to must be declared here with `provider`, `model_id`, `context_window`, `input_cost_per_1m`, `output_cost_per_1m`, `api_base_url`, `supports_thinking`, `supports_cache`, and an empty `api_key` slot. The key (e.g. `anthropic:claude-sonnet-4`) is the routing handle.
@@ -513,7 +513,7 @@ Expected output: a banner with the resolved canonical config path, then a row pe
 |-------|------------------|---------------|
 | `config` | `<repo>/config/config.json` exists, parses as JSON, and passes strict validation | Fix the multi-line error printed under this row; doctor refuses to run downstream checks until config is clean |
 | `git repo` | Workspace is a git repo with at least one commit | `git init` + first commit, or pass `-r <other-workspace>` |
-| `product spec` | `product_spec_dir` is a valid workspace-root folder name AND the folder has ≥1 `.txt` file | Create `<workspace>/<product_spec_dir>/` and drop the spec text in |
+| `product spec` | `product_spec_dir` is a valid workspace-root folder name AND the folder has ≥1 spec file (`.txt`, `.md`, or `.pdf`) | Create `<workspace>/<product_spec_dir>/` and drop the spec text in |
 | `api keys (live)` | Every provider referenced in `model_routing` has a key in `{PROVIDER}_API_KEY` (or the `models[].api_key` field), AND each passes a one-token live ping that confirms the key authenticates against the configured model | Set the missing key, fix an `HTTP 401 — API key rejected`, or set `HARNESS_DOCTOR_SKIP_LIVE=true` (CI / outbound-blocked hosts) |
 | `tree-sitter` | The `tree-sitter` import works and at least one bundled grammar parses a sample buffer | `pip install -U tree-sitter tree-sitter-language-pack`; without it, `patcher` and `impact` silently degrade to regex extraction |
 | `sandbox backend` | Resolves `sandbox.backend`: `docker` probes `docker info`; `unshare` probes `unshare --user echo ok`; `auto` tries docker → unshare in order; `bare` warns (no isolation) | Re-do §4 for your platform |
@@ -554,7 +554,7 @@ The harness will:
 
 1. Acquire an exclusive lock on `./sample/.harness_session.lock` (`fcntl.flock` on POSIX, `msvcrt.locking` on Windows native).
 2. Create `~/.harness/checkpoints.db` (or `%USERPROFILE%\.harness\checkpoints.db` on Windows native) and `~/.harness/logs/<session-id>.jsonl` (rotated at 10 MB × 5 backups by default).
-3. Consolidate every `.txt` file in `product_spec/`, then run the planning → patching → compile → lintgate loop, checkpointing each step.
+3. Consolidate every spec file (`.txt`, `.md`, `.pdf`) in `product_spec/`, then run the planning → patching → compile → lintgate loop, checkpointing each step.
 4. Append a session note under `~/.harness/memory/<repo_id>.md` if `memory.enabled: true` (the default).
 
 A successful smoke test exits 0. Inspect the run with `teane status --session-id <id>` or by tailing the JSONL log file. After the run, `teane metrics --session-id <id>` shows cost, burn rate, and projected exhaustion against your `token_budget.hard_cap_usd`.

@@ -33,6 +33,13 @@ dependencies = [
     # short-circuits to the LLM repair loop. The dep is small, stable,
     # and ubiquitous; not worth the maintenance overhead of a parser.
     "pyyaml>=6.0",
+    # PDF text extraction for product-spec and change-request files —
+    # operators can drop `.pdf` exports of design docs into
+    # product_spec/ or change_requests/ and the consolidator will
+    # extract the text via harness.spec_files.read_spec_file. pypdf is
+    # pure Python, small, and stable; bundling it by default means a
+    # PDF spec doesn't require a separate install step.
+    "pypdf>=4.0.0",
 ]
 
 [project.optional-dependencies]

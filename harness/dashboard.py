@@ -254,7 +254,9 @@ def _serve_static(cfg: DashboardConfig, relpath: str) -> tuple[int, str, bytes]:
 # ---------------------------------------------------------------------------
 
 _PRODUCT_SPEC_DIR_NAME = "product_spec"
-_SPEC_ALLOWED_EXTS = frozenset({".txt", ".md"})
+# Mirror harness.spec_files.SPEC_FILE_EXTS — the dashboard upload
+# accepts the same set the CLI consolidator will read on disk.
+_SPEC_ALLOWED_EXTS = frozenset({".txt", ".md", ".pdf"})
 _SKILL_ALLOWED_EXT = ".py"
 _MAX_SKILL_BYTES = 256 * 1024  # individual skill source files stay small
 _MEMORY_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,63}$")
@@ -366,7 +368,8 @@ def _persist_product_spec(
 ) -> tuple[str, Optional[str]]:
     """Write an uploaded spec file to ``<workspace>/product_spec/`` and
     return ``(saved_path, error)``. The workspace must exist and the
-    filename must end in ``.txt`` or ``.md``."""
+    filename must end in one of :data:`_SPEC_ALLOWED_EXTS` (.txt / .md
+    / .pdf)."""
     base = _safe_basename(filename)
     if not base:
         return "", "unsafe filename"
@@ -2000,9 +2003,9 @@ def _render_run_harness(cfg: DashboardConfig) -> str:
       <div class='field'>
         <label class='bx--label' for='prompt'>Product Requirement</label>
         <textarea class='bx--text-area' id='prompt' name='prompt' rows='4'
-                  placeholder='Enter your production specification here or upload a product specification document (in .txt or .md format)'></textarea>
+                  placeholder='Enter your production specification here or upload a product specification document (in .txt, .md, or .pdf format)'></textarea>
         <div class='spec-upload mt-2'>
-          <input type='file' id='spec-file' accept='.txt,.md' class='hidden'>
+          <input type='file' id='spec-file' accept='.txt,.md,.pdf' class='hidden'>
           <button type='button' class='bx--btn bx--btn--tertiary spec-upload__btn'
                   id='spec-upload-btn'>
             {_icon("upload")}Upload product specification

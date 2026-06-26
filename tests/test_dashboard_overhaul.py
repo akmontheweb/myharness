@@ -113,6 +113,17 @@ def test_persist_product_spec_rejects_disallowed_extension(tmp_path):
     assert err and "only" in err.lower()
 
 
+def test_persist_product_spec_accepts_pdf(tmp_path):
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    pdf_bytes = b"%PDF-1.4\nbinary-payload\n%%EOF\n"
+    saved, err = _persist_product_spec(str(workspace), "design.pdf", pdf_bytes)
+    assert err is None
+    assert saved == str(workspace / "product_spec" / "design.pdf")
+    # Bytes round-trip unchanged — the upload path must not transcode PDFs.
+    assert (workspace / "product_spec" / "design.pdf").read_bytes() == pdf_bytes
+
+
 def test_persist_product_spec_rejects_path_traversal(tmp_path):
     workspace = tmp_path / "repo"
     workspace.mkdir()

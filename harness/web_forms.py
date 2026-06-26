@@ -64,8 +64,8 @@ _FIELD_DESCRIPTIONS: dict[str, str] = {
     # Top-level scalars.
     "build_command": "Shell command the harness runs after applying patches to verify the build.",
     "allow_network": "Whether the sandbox may reach the network. Off by default for security.",
-    "product_spec_dir": "Folder name (relative to the workspace) containing the product spec the planner reads.",
-    "change_requests_dir": "Folder name (relative to the workspace) where the harness drops change-request markdown files.",
+    "product_spec_dir": "Folder name (relative to the workspace) containing the product spec files (.txt / .md / .pdf) the planner reads.",
+    "change_requests_dir": "Folder name (relative to the workspace) holding change-request files (.txt / .md / .pdf) for brownfield runs.",
     # Sandbox.
     "sandbox.backend": "Sandbox engine. 'auto' picks the best available on this host.",
     "sandbox.docker_image": "Docker image used when backend is 'docker'.",

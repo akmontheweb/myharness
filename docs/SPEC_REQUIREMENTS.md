@@ -372,12 +372,12 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
   - Given `--deploy-dev` AND `deployment.enabled: false` in config, the phase enters discovery and writes `DEPLOYMENT_BLUEPRINT.md`, but `deployment_node` skips the docker step with `{"skipped": True, "reason": "disabled"}`.
 
 ### FR-045: Change-Request Folder Mode
-- **Description:** The harness MUST support a `change_requests/` folder at the workspace root containing one or more `.txt` files, each a self-contained ask. `cmd_run` MUST detect the folder (or be told via the wizard) and route through `ingest_change_requests_node` instead of the bare-prompt path. The ingest node MUST (1) walk only the top-level `.txt` files, skipping `applied/`; (2) assign monotonic `CR-N` IDs starting at `max(applied/**/CR-*.txt) + 1`; (3) respect operator-supplied IDs in filenames matching `CR-<N>-<rest>.txt`, aborting on collisions with archived IDs; (4) concatenate file contents under `# === CR-N: <relative-path> ===` separators and inject the result as the first user message. At session end, consumed files MUST be moved into `change_requests/applied/<session-id>/` with a `manifest.json` recording the status (`success` / `cancelled` / `failed-build`). When both `-p "..."` and a populated folder are supplied, the folder wins and the prompt is dropped with a WARNING.
+- **Description:** The harness MUST support a `change_requests/` folder at the workspace root containing one or more spec files (`.txt`, `.md`, `.pdf`), each a self-contained ask. `cmd_run` MUST detect the folder (or be told via the wizard) and route through `ingest_change_requests_node` instead of the bare-prompt path. The ingest node MUST (1) walk only the top-level spec files, skipping `applied/`; (2) assign monotonic `CR-N` IDs starting at `max(applied/**/CR-*) + 1`; (3) respect operator-supplied IDs in filenames matching `CR-<N>-<rest>.{txt,md,pdf}`, aborting on collisions with archived IDs; (4) extract file contents — `.txt`/`.md` as UTF-8, `.pdf` via `pypdf` — concatenate them under `# === CR-N: <relative-path> ===` separators and inject the result as the first user message. At session end, consumed files MUST be moved into `change_requests/applied/<session-id>/` (extension preserved) with a `manifest.json` recording the status (`success` / `cancelled` / `failed-build`). When both `-p "..."` and a populated folder are supplied, the folder wins and the prompt is dropped with a WARNING.
 - **Priority:** Should Have
 - **Acceptance Criteria:**
-  - Given an empty `change_requests/` folder under `--new-build false`, the CLI exits with a clear error directing the operator to add at least one `.txt` file.
-  - Given files `feature-x.txt` + `CR-12-bugfix.txt` and prior archive `applied/abcd/CR-3-old.txt`, the new IDs are CR-4 (feature-x) and CR-12 (bugfix); a collision with CR-3 aborts.
-  - Given a successful run, the consumed `.txt` files land under `change_requests/applied/<session-id>/` with `manifest.json` recording `status: "success"`.
+  - Given an empty `change_requests/` folder under `--new-build false`, the CLI exits with a clear error directing the operator to add at least one spec file (`.txt`, `.md`, or `.pdf`).
+  - Given files `feature-x.txt` + `CR-12-bugfix.md` and prior archive `applied/abcd/CR-3-old.txt`, the new IDs are CR-4 (feature-x) and CR-12 (bugfix); a collision with CR-3 aborts.
+  - Given a successful run, the consumed spec files land under `change_requests/applied/<session-id>/` (extension preserved) with `manifest.json` recording `status: "success"`.
   - Given `CR-7` is assigned, the LLM's first user message references it inside a `# === CR-7: feature-x.txt ===` block; downstream specs, source comments, tests, and the commit trailer carry the `CR-7` marker so `grep -rn "CR-7" .` returns all linked artifacts.
 
 ### FR-046: Reverse-Engineer Architecture on First Contact
@@ -618,7 +618,7 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
 - Lint gate with auto-detected formatters per language (Python, Java, JS/TS, markdown, YAML, JSON, HTML, CSS)
 - Multi-variant speculative compilation in parallel git worktrees
 - Container deployment pipeline (telemetry → blueprint → Dockerfile → docker compose v2 → health check); **opt-in via `--deploy-dev`** (off by default — clean security scan ends the run otherwise)
-- Change-request folder mode (`change_requests/*.txt` → monotonic CR-N IDs → marker propagation through specs / source / tests / commits → `applied/<session-id>/` archive with `manifest.json`) for incremental work against existing repos
+- Change-request folder mode (`change_requests/*.{txt,md,pdf}` → monotonic CR-N IDs → marker propagation through specs / source / tests / commits → `applied/<session-id>/` archive with `manifest.json`) for incremental work against existing repos
 - One-shot reverse-engineer of `SPEC_ARCHITECTURE.md` on first contact with a brownfield repo, gated by `change_requests.reverse_engineer_budget_usd` ($0.50 default)
 - Interactive setup wizard on bare `teane run` (new-vs-resume → workspace → prompt → `--git` → `--new-build` → `--spec-discovery`)
 - Per-question Enter-to-accept defaults during discovery + optional org-wide `deployment_defaults` section in `config.json` (schema documented inline in `config/config.json`) that pre-resolves deployment-discovery answers
@@ -735,8 +735,8 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
 - **msgpack module missing:** `_deserialize_checkpoint_blob()` falls back to JSON text decoding for legacy rows.
 - **`teane doctor` failure:** Non-zero exit with a one-line summary listing failed checks; warnings (e.g. only-Ollama routing) do not block exit 0.
 - **`teane metrics` with no logs:** `--all` exits 1; `--session-id <id>` against a missing session exits 1 so cron detects regression.
-- **`change_requests/` folder empty under `--new-build false`:** CLI exits 1 with a clear error telling the operator to add at least one `.txt` file; there is no implicit "use the prior product_spec" fallback.
-- **Change-request ID collision with archive:** A filename `CR-<N>-<rest>.txt` whose `N` clashes with an existing `change_requests/applied/**/CR-<N>-*.txt` aborts the session so the operator can rename and retry.
+- **`change_requests/` folder empty under `--new-build false`:** CLI exits 1 with a clear error telling the operator to add at least one spec file (`.txt`, `.md`, or `.pdf`); there is no implicit "use the prior product_spec" fallback.
+- **Change-request ID collision with archive:** A filename `CR-<N>-<rest>.{txt,md,pdf}` whose `N` clashes with an existing `change_requests/applied/**/CR-<N>-*` aborts the session so the operator can rename and retry.
 - **Both `-p "..."` and a populated `change_requests/` folder supplied:** The folder wins and the seed prompt is dropped with a WARNING log line; the folder is the single source of truth.
 - **Bare `teane run` with no flags:** Drops the operator into the setup wizard; supplying any of `-r`, `-p`, or `--manifest` bypasses the wizard.
 - **`--deploy-dev` not set + clean security scan:** Graph ends at the security-scan boundary; no Dockerfile / compose / `docker compose up` is produced. A `[cli] Code generated at <path>. Deployment phase skipped.` line is logged.
@@ -797,7 +797,7 @@ Unsupported values (e.g. `backend_language: "Go"`, `web_language: ["Vue", ...]`)
 - **Default `--hitl-requirement` / `--hitl-architecture` / `--hitl-repair` / `--hitl-deployment` / `--hitl-layout-divergence`:** resolved as CLI flag (when explicitly passed) > `config.json`'s `hitl.*` block > `true` (gates prompt unless the operator opts out at either tier). Auto-approve fallbacks (CI=true, HARNESS_AUTO_APPROVE=true, non-TTY stdin) still override on top — those force auto-approve regardless of the resolved value.
 - **Default `--allow-network`:** true (sandbox has network unless `--allow-network false`)
 - **Reverse-engineer architecture budget cap:** $0.50 USD (`change_requests.reverse_engineer_budget_usd`)
-- **Change-request file scan:** `change_requests/` top-level `.txt` files only; `applied/` archive subdirectory is skipped
+- **Change-request file scan:** `change_requests/` top-level spec files (`.txt`, `.md`, `.pdf`); `applied/` archive subdirectory is skipped
 - **MCP tool-call timeout:** 30s (default; `mcp.tool_call_timeout_seconds`)
 - **MCP result payload cap:** 200 KB (default; `mcp.result_max_bytes`)
 - **Web tools per-fetch byte cap:** 200 KB (default; `web_tools.max_bytes`)

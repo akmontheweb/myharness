@@ -18,6 +18,45 @@ import subprocess
 import pytest
 
 
+def _make_minimal_pdf_with_text(text: str) -> bytes:
+    """Build the smallest PDF that renders ``text`` on a single page.
+
+    The hand-rolled bytes follow the layout in the PDF 1.4 reference:
+    catalog → pages → single page → /Contents stream with a text-show
+    operator. The xref table is built last so byte offsets are exact —
+    pypdf rejects misaligned xref entries. Used by the PDF spec-file
+    regression test to avoid pulling in reportlab just to round-trip
+    one literal.
+    """
+    body = f"BT /F1 12 Tf 50 100 Td ({text}) Tj ET".encode("latin-1")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        (
+            b"<< /Type /Page /Parent 2 0 R "
+            b"/Resources << /Font << /F1 4 0 R >> >> "
+            b"/MediaBox [0 0 200 200] /Contents 5 0 R >>"
+        ),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(body)).encode() + b" >>\nstream\n" + body + b"\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for i, obj in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{i} 0 obj\n".encode() + obj + b"\nendobj\n"
+    xref_offset = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n"
+    ).encode()
+    return bytes(out)
+
+
 # ---------------------------------------------------------------------------
 # Path resolution + workspace-top-level helpers
 # ---------------------------------------------------------------------------
@@ -113,7 +152,7 @@ class TestLoadConsolidatedProductSpec:
         result = _load_consolidated_product_spec(str(tmp_path), str(spec_dir))
         assert result is None
         err = capsys.readouterr().err
-        assert "no .txt files" in err
+        assert "no spec files" in err
 
     def test_single_txt_file_returns_consolidated_content(self, tmp_path):
         from harness.cli import _load_consolidated_product_spec
@@ -142,17 +181,49 @@ class TestLoadConsolidatedProductSpec:
         assert a_pos < m_pos < z_pos
         assert "consolidated from 3 file(s)" in result
 
-    def test_non_txt_files_ignored(self, tmp_path):
+    def test_md_files_consolidated_alongside_txt(self, tmp_path):
         from harness.cli import _load_consolidated_product_spec
         spec_dir = tmp_path / "product_spec"
         spec_dir.mkdir()
         (spec_dir / "main.txt").write_text("Real content.")
-        (spec_dir / "ignored.md").write_text("Markdown skipped")
+        (spec_dir / "extras.md").write_text("Markdown content.")
+        result = _load_consolidated_product_spec(str(tmp_path), str(spec_dir))
+        assert result is not None
+        assert "Real content." in result
+        assert "Markdown content." in result
+        assert "consolidated from 2 file(s)" in result
+
+    def test_pdf_files_text_extracted(self, tmp_path):
+        # Round-trips a minimal hand-rolled PDF through pypdf's text
+        # extractor to prove read_spec_file plumbs PDF content into the
+        # consolidator. The hand-rolled bytes keep the test independent
+        # of any heavyweight PDF generator (reportlab etc.).
+        from harness.cli import _load_consolidated_product_spec
+
+        spec_dir = tmp_path / "product_spec"
+        spec_dir.mkdir()
+        (spec_dir / "main.txt").write_text("Plain content.")
+
+        (spec_dir / "design.pdf").write_bytes(
+            _make_minimal_pdf_with_text("PDF body text.")
+        )
+
+        result = _load_consolidated_product_spec(str(tmp_path), str(spec_dir))
+        assert result is not None
+        assert "Plain content." in result
+        assert "PDF body text." in result
+        # Both files appear in the source-files listing.
+        assert "main.txt" in result and "design.pdf" in result
+
+    def test_unsupported_extension_ignored(self, tmp_path):
+        from harness.cli import _load_consolidated_product_spec
+        spec_dir = tmp_path / "product_spec"
+        spec_dir.mkdir()
+        (spec_dir / "main.txt").write_text("Real content.")
         (spec_dir / "also_ignored.json").write_text('{"foo": "bar"}')
         result = _load_consolidated_product_spec(str(tmp_path), str(spec_dir))
         assert result is not None
         assert "Real content." in result
-        assert "Markdown skipped" not in result
         assert '"foo"' not in result
 
     # External-spec test removed: product_spec_dir is now mandated to live

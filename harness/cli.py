@@ -26,6 +26,11 @@ import sys
 from typing import Any, Optional
 
 from harness import _platform
+from harness.spec_files import (
+    SPEC_FILE_EXTS,
+    list_spec_files,
+    read_spec_file,
+)
 
 # Configure logging for the CLI
 logging.basicConfig(
@@ -440,13 +445,15 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset({
     "speculative", "impact", "lintgate", "logging", "languages",
     "test_generation", "metrics", "llm_dispatch",
     # Operator-configurable name of the folder at the workspace root that
-    # holds the product spec .txt files. Mandatory in config.json — the
-    # harness refuses to start without it. See _load_consolidated_product_spec.
+    # holds the product spec files (.txt / .md / .pdf). Mandatory in
+    # config.json — the harness refuses to start without it.
+    # See _load_consolidated_product_spec.
     "product_spec_dir",
     # Operator-configurable name of the folder at the workspace root that
-    # holds change-request .txt files for non-greenfield runs. Optional;
-    # defaults to "change_requests". When --new-build false the folder
-    # MUST contain at least one .txt — see _load_consolidated_change_requests.
+    # holds change-request files (.txt / .md / .pdf) for non-greenfield
+    # runs. Optional; defaults to "change_requests". When --new-build
+    # false the folder MUST contain at least one spec file —
+    # see _load_consolidated_change_requests.
     "change_requests_dir",
     # Observability + debugging knobs. See _dump_repair_prompt_to_disk and
     # the compiler.run_prod_import_smoke_check flag.
@@ -1144,22 +1151,23 @@ def validate_config_strict(config: dict[str, Any], source: str) -> None:
             )
 
     # --- 4. Required fields ---
-    # product_spec_dir is mandatory: the harness mandates a folder of .txt
-    # files describing the product, and that folder MUST live at the
-    # workspace root. We enforce both presence and the bare-folder-name
-    # rule here so the operator gets an exit-2 at config-load time
-    # (before lock acquisition, gateway init, GitGuardian, etc.) instead
-    # of a softer runtime failure later. The folder-exists + non-empty
-    # .txt-file check is separate (cmd_run does it after workspace_path
-    # is known).
+    # product_spec_dir is mandatory: the harness mandates a folder of
+    # spec files (.txt / .md / .pdf) describing the product, and that
+    # folder MUST live at the workspace root. We enforce both presence
+    # and the bare-folder-name rule here so the operator gets an exit-2
+    # at config-load time (before lock acquisition, gateway init,
+    # GitGuardian, etc.) instead of a softer runtime failure later.
+    # The folder-exists + non-empty-spec-file check is separate (cmd_run
+    # does it after workspace_path is known).
     spec_dir = config.get("product_spec_dir")
     if spec_dir is None:
         errors.append(
             "'product_spec_dir' is required. Set a top-level string key in "
             "config.json with the NAME of a folder at the workspace root "
-            "that holds the product-specification .txt files. The name must "
-            "be a bare folder name — no path separators, no absolute paths, "
-            "no `..`. Example: \"product_spec_dir\": \"product_spec\"."
+            "that holds the product-specification files (.txt / .md / "
+            ".pdf). The name must be a bare folder name — no path "
+            "separators, no absolute paths, no `..`. Example: "
+            "\"product_spec_dir\": \"product_spec\"."
         )
     else:
         name_error = _validate_product_spec_dir_name(spec_dir)
@@ -3491,18 +3499,21 @@ def _load_consolidated_product_spec(
     ``resolved_spec_dir`` is the absolute path produced by
     :func:`_resolve_product_spec_dir` — it may live anywhere on disk, not
     necessarily inside ``workspace_path``. The folder must exist and
-    contain one or more ``.txt`` files. Reading order is alphabetical;
-    each file's body is prefixed with a ``## <filename>`` section header
-    so the synthesis LLM can see file boundaries.
+    contain one or more spec files (.txt / .md / .pdf —
+    see :data:`harness.spec_files.SPEC_FILE_EXTS`). Reading order is
+    alphabetical; each file's body is prefixed with a ``## <filename>``
+    section header so the synthesis LLM can see file boundaries.
 
     Returns the consolidated content as a single string on success.
     Returns ``None`` and prints a clear, user-facing error to stderr on
     any of these failure modes:
 
     - configured folder missing.
-    - configured folder exists but contains no ``.txt`` files.
+    - configured folder exists but contains no spec files (``.txt`` /
+      ``.md`` / ``.pdf`` — see :data:`harness.spec_files.SPEC_FILE_EXTS`).
     """
     product_spec_dir = resolved_spec_dir
+    allowed_exts_str = ", ".join(SPEC_FILE_EXTS)
 
     def _fail(headline: str, body: str) -> None:
         print(file=sys.stderr)
@@ -3521,42 +3532,39 @@ def _load_consolidated_product_spec(
                 f"  {product_spec_dir}\n\n"
                 "but it does not exist. `product_spec_dir` in config.json\n"
                 "points there. Either create the directory and add one or\n"
-                "more `.txt` files describing the product, OR update\n"
-                "`product_spec_dir` to a directory that does exist. The\n"
-                "config value can be an absolute path (anywhere on the\n"
-                "filesystem) or a path relative to the workspace."
+                f"more spec files ({allowed_exts_str}) describing the\n"
+                "product, OR update `product_spec_dir` to a directory that\n"
+                "does exist. The config value can be an absolute path\n"
+                "(anywhere on the filesystem) or a path relative to the\n"
+                "workspace."
             ),
         )
         return None
 
-    txt_files = sorted(
-        f for f in os.listdir(product_spec_dir)
-        if f.endswith(".txt") and os.path.isfile(os.path.join(product_spec_dir, f))
-    )
-    if not txt_files:
+    spec_files = list_spec_files(product_spec_dir)
+    if not spec_files:
         _fail(
-            "Configured product_spec_dir contains no .txt files",
+            f"Configured product_spec_dir contains no spec files ({allowed_exts_str})",
             (
-                f"`{product_spec_dir}` exists but holds no `.txt` files. Add\n"
-                "at least one `.txt` file with the product specification and\n"
-                "re-run."
+                f"`{product_spec_dir}` exists but holds no spec files. Add\n"
+                f"at least one {allowed_exts_str} file with the product\n"
+                "specification and re-run."
             ),
         )
         return None
 
     sections: list[str] = [
-        f"# Product Specification (consolidated from {len(txt_files)} file(s))",
+        f"# Product Specification (consolidated from {len(spec_files)} file(s))",
         "",
         "Source files:",
-        *(f"  - {f}" for f in txt_files),
+        *(f"  - {f}" for f in spec_files),
         "",
     ]
-    for fname in txt_files:
+    for fname in spec_files:
         fpath = os.path.join(product_spec_dir, fname)
         try:
-            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except OSError as exc:
+            content = read_spec_file(fpath)
+        except (OSError, ValueError) as exc:
             logger.warning(
                 "[product_spec] Could not read %s: %s — skipping.", fpath, exc,
             )
@@ -3569,7 +3577,7 @@ def _load_consolidated_product_spec(
     consolidated = "\n".join(sections)
     logger.info(
         "[product_spec] Consolidated %d file(s) from %s (%d chars).",
-        len(txt_files), product_spec_dir, len(consolidated),
+        len(spec_files), product_spec_dir, len(consolidated),
     )
     return consolidated
 
@@ -3580,7 +3588,11 @@ _CHANGE_REQUESTS_ARCHIVE_SUBDIR = "applied"
 # avoid a cli → graph import dependency at module load (graph imports cli
 # helpers in places). A single source of truth would require a small
 # shared helpers module; the duplication is cheap and the regex is stable.
-_CR_FILENAME_PREFIX = re.compile(r"^CR-(\d+)(?:[-_].*)?\.txt$", re.IGNORECASE)
+# Extension alternation matches harness.spec_files.SPEC_FILE_EXTS — keep
+# the two in lockstep when adding a new spec extension.
+_CR_FILENAME_PREFIX = re.compile(
+    r"^CR-(\d+)(?:[-_].*)?\.(?:txt|md|pdf)$", re.IGNORECASE,
+)
 
 
 def _resolve_change_requests_dir(workspace_path: str, config_value: Optional[str]) -> str:
@@ -3592,28 +3604,19 @@ def _resolve_change_requests_dir(workspace_path: str, config_value: Optional[str
 
 
 def _list_pending_change_request_files(change_requests_dir: str) -> list[str]:
-    """Return the sorted list of `.txt` filenames at the top of
+    """Return the sorted list of spec filenames at the top of
     ``change_requests_dir`` (excluding the ``applied/`` archive). Returns
     an empty list when the directory is missing.
 
     Files are returned as basenames; callers join with ``change_requests_dir``
     to get absolute paths. Sorted alphabetically — the same order the
-    ingest node uses to assign sequential CR-N IDs.
+    ingest node uses to assign sequential CR-N IDs. Allowed extensions:
+    see :data:`harness.spec_files.SPEC_FILE_EXTS`.
     """
-    if not os.path.isdir(change_requests_dir):
-        return []
-    try:
-        entries = os.listdir(change_requests_dir)
-    except OSError:
-        return []
-    pending: list[str] = []
-    for entry in sorted(entries):
-        full = os.path.join(change_requests_dir, entry)
-        if entry == _CHANGE_REQUESTS_ARCHIVE_SUBDIR:
-            continue
-        if entry.endswith(".txt") and os.path.isfile(full):
-            pending.append(entry)
-    return pending
+    return list_spec_files(
+        change_requests_dir,
+        exclude=frozenset({_CHANGE_REQUESTS_ARCHIVE_SUBDIR}),
+    )
 
 
 def _archive_consumed_change_requests(
@@ -3652,12 +3655,12 @@ def _archive_consumed_change_requests(
         original_name = rec.get("original_name", "")
         # Drop any existing CR-N prefix from the original filename so we
         # don't end up with CR-7-CR-7-foo.txt on operator-supplied IDs.
+        # The regex requires a known spec extension, so `tail` always
+        # keeps the original extension (.txt/.md/.pdf) — no rewriting.
         m = _CR_FILENAME_PREFIX.match(original_name) if original_name else None
         if m is not None:
-            tail = original_name[m.end(1):].lstrip("-_") or ".txt"
-            if not tail.endswith(".txt"):
-                tail = tail + ".txt"
-            base_name = tail
+            tail = original_name[m.end(1):].lstrip("-_")
+            base_name = tail if tail else original_name
         else:
             base_name = original_name
         dst = os.path.join(archive_target_dir, f"CR-{cr_id}-{base_name}")
@@ -4522,14 +4525,14 @@ async def cmd_run(args: argparse.Namespace) -> int:
         )
         print("=" * 72, file=sys.stderr)
         print(
-            "The harness needs at least one `.txt` file under:\n\n"
+            "The harness needs at least one spec file (.txt / .md / .pdf) under:\n\n"
             f"  {cr_dir_abs}\n\n"
             "describing the bug to fix or feature to add. Each file becomes\n"
             "a numbered Change Request (CR-N) that flows through the\n"
             "gatekeeper review and is archived after the session terminates.\n\n"
             "To proceed:\n"
             "  1. Create the folder if it does not exist.\n"
-            "  2. Add one or more `.txt` files describing the changes.\n"
+            "  2. Add one or more .txt / .md / .pdf files describing the changes.\n"
             "  3. Re-run `teane run`.\n\n"
             "If you are starting a fresh build, pass --new-build true\n"
             "instead — that flow uses `product_spec_dir` and skips this\n"
@@ -4672,7 +4675,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
         print(
             "The harness requires a top-level `product_spec_dir` key in\n"
             "config.json with the NAME of a folder at the workspace root\n"
-            "that holds the product-specification .txt files.\n\n"
+            "that holds the product-specification files (.txt / .md / .pdf).\n\n"
             f"Problem: {name_error or 'is required.'}\n\n"
             "Example:\n"
             "  \"product_spec_dir\": \"product_spec\"\n\n"
@@ -4686,7 +4689,8 @@ async def cmd_run(args: argparse.Namespace) -> int:
     spec_dirname = spec_dirname_raw.strip()
     resolved_spec_dir = _resolve_product_spec_dir(workspace_path, spec_dirname)
 
-    # Validate the folder exists AND contains at least one .txt file.
+    # Validate the folder exists AND contains at least one spec file
+    # (.txt / .md / .pdf).
     # product_spec_dir is the SOLE source for the product spec on greenfield
     # runs — the harness no longer accepts a --manifest override. We preload
     # the consolidated content here so the requirement-refinement step below
@@ -5230,7 +5234,7 @@ async def cmd_run(args: argparse.Namespace) -> int:
     logger.info("  Session ID:     %s", session_id)
     logger.info("=" * 60)
 
-    # Archive consumed change-request .txt files into
+    # Archive consumed change-request files (.txt / .md / .pdf) into
     # <change_requests_dir>/applied/<session-id>/ along with a manifest.json.
     # Suspend (HITL Save & Quit) is exempted — the session will resume and
     # the files must still be readable from the original folder. Abandon
@@ -6382,7 +6386,8 @@ def _doctor_check_product_spec(
 ) -> tuple[str, str]:
     """Mandatory: `product_spec_dir` is a valid workspace-root folder
     name AND the folder exists at the workspace root with at least one
-    ``.txt`` file.
+    spec file (.txt / .md / .pdf —
+    see :data:`harness.spec_files.SPEC_FILE_EXTS`).
 
     The value must be a bare folder name (no path separators, no
     absolute paths, no `..`). The harness mandates the spec folder lives
@@ -6403,28 +6408,26 @@ def _doctor_check_product_spec(
     if name_error is not None:
         return ("fail", f"product_spec_dir {name_error}")
     resolved = _resolve_product_spec_dir(workspace_path, spec_dirname)
+    allowed_exts_str = ", ".join(SPEC_FILE_EXTS)
     if not os.path.isdir(resolved):
         return (
             "fail",
             f"`{spec_dirname.strip()}/` folder not found at workspace "
             f"root — expected at {resolved!r}. Create it and add one or "
-            f"more .txt files",
+            f"more spec files ({allowed_exts_str})",
         )
-    txt_files = [
-        f for f in os.listdir(resolved)
-        if f.endswith(".txt") and os.path.isfile(os.path.join(resolved, f))
-    ]
-    if not txt_files:
+    spec_files = list_spec_files(resolved)
+    if not spec_files:
         return (
             "fail",
-            f"`{spec_dirname.strip()}/` exists but contains no .txt "
-            "files — add at least one .txt file with the product "
-            "specification",
+            f"`{spec_dirname.strip()}/` exists but contains no spec "
+            f"files ({allowed_exts_str}) — add at least one with the "
+            "product specification",
         )
     return (
         "pass",
         f"`{spec_dirname.strip()}/` at workspace root contains "
-        f"{len(txt_files)} .txt file(s)",
+        f"{len(spec_files)} spec file(s)",
     )
 
 
@@ -8089,7 +8092,7 @@ def build_parser() -> argparse.ArgumentParser:
         "patch",
         help=(
             "Incremental patch: read the existing code + specs + any "
-            "change_requests/*.txt, reconcile against the spec."
+            "change_requests/* files (.txt / .md / .pdf), reconcile against the spec."
         ),
     )
     _add_runlike_common(patch_parser)

@@ -745,7 +745,7 @@ python -m json.tool <teane_root>/config/config.json > /dev/null
 - **Missing `product_spec_dir`:** add a top-level
   `"product_spec_dir": "product_spec"` (or whatever folder name you
   use), create the folder at your workspace root, and drop at least
-  one `.txt` file in.
+  one spec file (`.txt`, `.md`, or `.pdf`) in.
 
 The dashboard's Configure Harness page runs the same validator and
 shows the same error inline, so non-CLI operators can fix and save
