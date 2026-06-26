@@ -177,6 +177,31 @@ class TestRouteAfterStart:
         state = {"change_request_mode": False, "skip_discovery": False}
         assert route_after_start(state) == "requirements_discovery_node"
 
+    def test_skip_discovery_plus_agile_routes_to_decomposition(self):
+        """`--agile=true` MUST engage the per-batch pipeline even when
+        discovery is skipped (the common case: specs synthesised in
+        cmd_run before the graph starts). Without this branch
+        ``route_after_start`` falls through to ``patching_node`` and
+        the agile flag silently degrades to monolithic patching."""
+        state = {
+            "change_request_mode": False,
+            "skip_discovery": True,
+            "decomposition_enabled": True,
+        }
+        assert route_after_start(state) == "decomposition_node"
+
+    def test_skip_discovery_no_agile_still_routes_to_patching(self):
+        """Regression guard: agile mode is opt-in. Without
+        ``decomposition_enabled``, ``skip_discovery=True`` keeps its
+        legacy monolithic behavior so existing non-agile callers and
+        tests stay byte-identical."""
+        state = {
+            "change_request_mode": False,
+            "skip_discovery": True,
+            "decomposition_enabled": False,
+        }
+        assert route_after_start(state) == "patching_node"
+
 
 # ---------------------------------------------------------------------------
 # Ingest node

@@ -344,10 +344,13 @@ Setup
 Scenario 1 — greenfield, single batch (3 stories)
 --------------------------------------------------
     cd /tmp/teane-h1 && rm -rf .teane workspace && mkdir workspace
-    teane run --workspace workspace \\
-              --prompt 'Build a small CLI that prints hello.' \\
-              --stories --story-batch-size 3 --commit-on-story \\
-              --budget-usd 3.0
+    # Per-batch knobs (batch_size, commit_on_story, repair_cap) now live
+    # in ~/.harness/config.json under "agile_defaults"; there are no
+    # longer dedicated CLI flags for them.
+    teane build --workspace workspace \\
+                --prompt 'Build a small CLI that prints hello.' \\
+                --agile true \\
+                --budget-usd 3.0
 
 Expected log evidence:
   - decomposition_node creates 3 stories
@@ -363,10 +366,10 @@ Expected log evidence:
 
 Scenario 2 — greenfield, multi-batch (~8 stories with deps)
 -----------------------------------------------------------
-    teane run --workspace workspace \\
-              --prompt 'Build a TODO app with auth, persistence, and a CLI.' \\
-              --stories --story-batch-size 3 --commit-on-story \\
-              --budget-usd 8.0
+    teane build --workspace workspace \\
+                --prompt 'Build a TODO app with auth, persistence, and a CLI.' \\
+                --agile true \\
+                --budget-usd 8.0
 
 Expected: batch_planner_node fires 3+ times (one per batch); each batch
 runs the per-batch verification chain once; batch_commit emits BATCH-N
@@ -376,7 +379,7 @@ Scenario 3 — brownfield change request
 ---------------------------------------
     mkdir change_requests
     echo 'Add a --version flag that prints the build SHA.' > change_requests/CR-1.txt
-    teane run --workspace existing_project --stories --budget-usd 2.0
+    teane patch --workspace existing_project --agile true --budget-usd 2.0
 
 Expected: ingest_change_requests_node consumes CR-1.txt;
 decomposition writes CR-derived stories; per-batch flow runs as
@@ -387,9 +390,9 @@ Scenario 4 — failure injection
 -------------------------------
     # Pre-seed a workspace with a failing test:
     echo 'def test_fail(): assert False' > workspace/tests/test_fail.py
-    teane run --workspace workspace \\
-              --prompt 'Add a docstring to main.py.' \\
-              --stories --budget-usd 1.5
+    teane build --workspace workspace \\
+                --prompt 'Add a docstring to main.py.' \\
+                --agile true --budget-usd 1.5
 
 Expected:
   - Per-batch test_loop fails → repair_node runs (3 cycles)

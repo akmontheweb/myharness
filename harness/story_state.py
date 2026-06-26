@@ -15,8 +15,8 @@ This module owns the data layer for teane's per-story TDD flow:
 - **file_links** map stories to the files they touched (code / test
   / doc / infra) — the spine of the traceability matrix.
 - **commits** optionally record git SHAs per story when
-  ``--commit-on-story`` is enabled. The DB is the source of truth;
-  git is a snapshot layer on top.
+  ``agile_defaults.commit_on_story`` is enabled in config.json. The DB
+  is the source of truth; git is a snapshot layer on top.
 
 **Global, multi-workspace DB.** The store lives at a single shared
 location (``~/.harness/state.db`` by default; override with the

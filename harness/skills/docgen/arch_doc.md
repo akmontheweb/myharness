@@ -5,7 +5,7 @@ You are a Principal Software Architect for the **teane** code-generation harness
 ## Role in the teane pipeline
 
 ```
-Intake           CLI / wizard parses --prompt, --stories, --agile, --change-requests/, ~/.harness/config.json
+Intake           CLI / wizard parses --prompt, --agile, --change-requests/, ~/.harness/config.json
 Requirements     requirements_discovery_node → requirements_doc_generator → docs/SPEC_REQUIREMENTS.md
 Architecture   ← THIS SKILL
                  architecture_discovery_node → arch_doc_generator → docs/SPEC_ARCHITECTURE.md
@@ -55,7 +55,7 @@ Headless projects (CLI tool, library, batch worker, MCP server) set `frontend: n
 | `config.db_engine`             | resolved config                                 | `postgres`, `mysql`, `sqlite`, or `none`                                   |
 | `config.auth`                  | resolved config                                 | `jwt`, `session`, `oauth2`, or `none`                                      |
 | `config.frontend`              | resolved config                                 | `react` or `none`                                                          |
-| `args.decomposition_enabled`   | CLI `--agile` / `--stories`                     | Selects RSD ID scheme — Path A (Gherkin STORY/FEAT) vs Path B (FR-N)       |
+| `args.decomposition_enabled`   | CLI `--agile`                                   | Selects RSD ID scheme — Path A (Gherkin STORY/FEAT) vs Path B (FR-N)       |
 | `args.change_request_mode`     | presence of `change_requests/*.txt`             | Brownfield path; existing modules + IDs must be respected                  |
 | `docs/SPEC_REQUIREMENTS.md`    | Phase 2 artifact                                | Required input — read in full before drafting                              |
 | Discovery answers              | `architecture_discovery_node` interview state   | Operator-supplied resolutions for any sector you would otherwise default   |

@@ -1534,6 +1534,53 @@ def _makefile_has_target(workspace_path: str, target: str) -> bool:
     return False
 
 
+_SUBDIR_BUILD_SKIP = frozenset({
+    "node_modules", "__pycache__", ".git", "build", "dist", "venv", ".venv",
+    "env", "target", "out", "docs", "product_spec", "change_requests",
+})
+
+
+def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
+    """Probe first-level subdirectories for a recognised manifest when
+    the workspace root has none. Returns a ``cd <subdir> && ...`` form
+    that installs deps and runs the test command, or ``None`` if no
+    subdir manifest is found.
+
+    Monorepo layouts (``server/requirements.txt`` + ``client/package.json``)
+    are the canonical case — the LLM puts the backend in one subdir
+    and the frontend in another. We prefer the FIRST subdir with a
+    Python or Java manifest (backend tests are the smoke target);
+    pure-frontend repos fall back to the existing root-level
+    ``package.json`` branch. Probed alphabetically for determinism.
+    """
+    try:
+        entries = sorted(os.listdir(workspace_path))
+    except OSError:
+        return None
+    for entry in entries:
+        if entry.startswith(".") or entry in _SUBDIR_BUILD_SKIP:
+            continue
+        full = os.path.join(workspace_path, entry)
+        if not os.path.isdir(full):
+            continue
+        # Probe order mirrors the root probe: pyproject > requirements
+        # > Maven > Gradle. Node is intentionally NOT probed here — a
+        # subdir-only ``package.json`` typically means the frontend,
+        # and the backend smoke check is what unblocks prod-imports.
+        if os.path.isfile(os.path.join(full, "pyproject.toml")):
+            return f"cd {entry} && python3 -m pip install -e . && python3 -m pytest -q"
+        if os.path.isfile(os.path.join(full, "requirements.txt")):
+            return f"cd {entry} && python3 -m pip install -r requirements.txt && python3 -m pytest -q"
+        if os.path.isfile(os.path.join(full, "pom.xml")):
+            return f"cd {entry} && mvn -B test"
+        if os.path.isfile(os.path.join(full, "gradlew")):
+            return f"cd {entry} && ./gradlew test"
+        if (os.path.isfile(os.path.join(full, "build.gradle"))
+                or os.path.isfile(os.path.join(full, "build.gradle.kts"))):
+            return f"cd {entry} && gradle test"
+    return None
+
+
 def _detect_default_build_command(workspace_path: str) -> Optional[str]:
     """Pick a build command by sniffing workspace markers for the locked
     core stack.
@@ -1576,6 +1623,14 @@ def _detect_default_build_command(workspace_path: str) -> Optional[str]:
     # outside the supported stack.
     if has("package.json"):
         return "npm install && npm run build && npm test"
+    # Monorepo layout: nothing at workspace root, but a first-level
+    # subdirectory (e.g. ``server/``) carries the manifest. Common when
+    # the LLM scaffolds a split backend/frontend layout — without this
+    # probe the detector falls through to the bare-pytest fallback and
+    # the project's actual deps are never installed.
+    subdir_cmd = _detect_subdir_build_command(workspace_path)
+    if subdir_cmd:
+        return subdir_cmd
     # Last-chance Python heuristic: any .py file (top level OR one
     # level deep, e.g. ``app/__init__.py`` after LLM scaffolds a
     # package) → bootstrap pytest. Install pytest explicitly so the
@@ -5114,9 +5169,11 @@ async def cmd_run(args: argparse.Namespace) -> int:
                 if getattr(args, "install_doc", None) is not None
                 else getattr(args, "new_build", False)
             ),
-            # Story-mode (opt-in via --stories). When false, every
+            # Agile mode (opt-in via --agile). When false, every
             # downstream node check on decomposition_enabled / current_story_id
             # short-circuits, so the byte-for-byte monolithic flow runs.
+            # `_resolve_agile_args` collapses --agile → decomposition_enabled
+            # plus the three agile_defaults knobs seeded below.
             decomposition_enabled=getattr(args, "decomposition_enabled", False),
             commit_on_story=getattr(args, "commit_on_story", False),
             story_batch_size=getattr(args, "story_batch_size", 5),

@@ -38,8 +38,10 @@ __all__ = ["DEFAULT_BATCH_SIZE", "STORY_ZERO_PATCH_CAP"]
 ``harness.batch_sizing.DETERMINISTIC_BATCH_SIZE`` so the two modules
 share one source of truth. The dependency-aware planner may return
 fewer when the graph chokes earlier (e.g. only one story is unblocked
-at this moment). The CLI's ``--story-batch-size`` flag overrides
-this via ``state['story_batch_size']``."""
+at this moment). The ``agile_defaults.batch_size`` config knob (set
+in ``~/.harness/config.json``) overrides this via
+``state['story_batch_size']`` — there is no longer a CLI flag for
+this value."""
 
 STORY_ZERO_PATCH_CAP = 3
 """Per-story patching attempts allowed before story_loop_node

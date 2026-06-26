@@ -332,11 +332,12 @@ class AgentState(TypedDict, total=False):
     # gate where the crash actually happened. ``batch_commit_node``
     # pops the batch's entry as part of its state reset.
     batch_gate_progress: dict[str, dict[str, bool]]
-    # Opt-in: when True (set by ``--commit-on-story``), story_complete_node
-    # runs `git add . && git commit -m "<STORY-N>: <title>"` after a green
-    # story and records the SHA in the commits table. No-op when the
-    # workspace isn't a git repo. Default False — git commits are a side
-    # effect users should opt into.
+    # Opt-in: when True (sourced from ``agile_defaults.commit_on_story`` in
+    # config.json — there is no longer a CLI flag for this knob),
+    # story_complete_node runs `git add . && git commit -m "<STORY-N>:
+    # <title>"` after a green story and records the SHA in the commits
+    # table. No-op when the workspace isn't a git repo. Default False —
+    # git commits are a side effect users should opt into.
     commit_on_story: bool
     # Story planner / TDD knobs from the CLI. ``story_batch_size`` caps how
     # many independent stories the planner pulls into one batch (default
@@ -3480,8 +3481,39 @@ async def patching_node(state: AgentState) -> dict[str, Any]:
         # already carries.
         arch_preamble, resolved_arch_summary = _build_arch_summary_preamble(state)
 
+        # Python import convention: the prod-import smoke check imports
+        # every ``*.py`` file with its dotted path relative to the
+        # workspace root (e.g. ``server.main``, ``server.routers.search``
+        # — see ``_walk_prod_python_modules``). Top-level imports inside
+        # those files (``from routers import search``,
+        # ``from database import engine``) blow up with
+        # ``ModuleNotFoundError`` even when the target file exists,
+        # because the dotted-name discovery requires the package
+        # prefix. Without this rule the repair loop thrashes on the
+        # symptom (``No module named 'fastapi'``-shaped errors for
+        # first-party packages) and never fixes the cause. The rule is
+        # emitted unconditionally; non-Python projects ignore it
+        # silently.
+        _IMPORT_CONVENTION_RULE = (
+            "[PYTHON IMPORT CONVENTION — STRICTLY ENFORCED]\n"
+            "If you emit any ``*.py`` files, every intra-project import "
+            "MUST be absolute from the workspace root. The harness "
+            "discovers production modules by walking the workspace and "
+            "joining path segments with dots; ``server/main.py`` is "
+            "imported as ``server.main`` during the prod-import smoke "
+            "check, NOT as ``main``. Inside that file you MUST therefore "
+            "write ``from server.routers import search`` and "
+            "``from server.database import engine`` — NOT "
+            "``from routers import search`` or ``from database import "
+            "engine``. The same rule applies to every package subdirectory "
+            "you create (``client/`` if Python, ``app/``, ``api/``, etc.). "
+            "Top-level imports of first-party packages will fail the "
+            "smoke check with ``ModuleNotFoundError`` even though the "
+            "file is on disk, and the repair loop cannot recover from "
+            "this without your help.\n\n"
+        )
         # Inject a format reminder to ensure the LLM outputs patch blocks
-        _FORMAT_REMINDER = allowlist_preamble + cr_preamble + story_preamble + arch_preamble + """[CRITICAL FORMAT INSTRUCTION]
+        _FORMAT_REMINDER = allowlist_preamble + cr_preamble + story_preamble + arch_preamble + _IMPORT_CONVENTION_RULE + """[CRITICAL FORMAT INSTRUCTION]
 You MUST respond using ONLY the patch block syntax below. Do NOT include any explanations,
 markdown code fences, or text outside the blocks. Your entire response must be parseable
 as one or more patch blocks.
@@ -3521,6 +3553,7 @@ Generate your patches NOW. Only the blocks above. No other text."""
             allowlist_preamble
             + cr_preamble
             + story_preamble
+            + _IMPORT_CONVENTION_RULE
             + "[PATCHING — NATIVE TOOL-USE MODE]\n"
             "The harness has exposed the patch operations as native tools "
             "(`read_file`, `edit_file`, `create_file`, `delete_block`, "
@@ -5902,20 +5935,20 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
 
     # Mid-session upgrade: when the build_cmd is the bare "pip install <tool>
     # && pytest -q" fallback (chosen earlier because the workspace had no
-    # manifest yet) AND a manifest has since appeared on disk — typically
-    # because autofix R4 just wrote requirements.txt to install a missing
-    # pip-installable dep — re-detect now so the next compile uses
-    # `pip install -r requirements.txt`. Without this upgrade the bare
-    # pytest install never sees the new dep and the same MISSING_DEP loops
-    # forever.
+    # manifest yet) AND the detector now returns something more specific —
+    # typically because the first patching pass wrote requirements.txt /
+    # pyproject.toml (greenfield case) or because autofix R4 wrote it to
+    # install a missing pip-installable dep — re-detect so the next
+    # compile actually installs the project's deps. The path check is
+    # deliberately delegated to ``_detect_default_build_command`` itself
+    # so monorepo layouts (``server/requirements.txt`` + ``client/...``)
+    # are caught too; an explicit ``os.path.isfile`` check at workspace
+    # root misses them and the bare-pytest cmd loops forever on
+    # ModuleNotFoundError.
     if (
         adapted_build_cmd is None
         and "pip install" in build_cmd
         and "-r" not in build_cmd
-        and (
-            os.path.isfile(os.path.join(workspace, "requirements.txt"))
-            or os.path.isfile(os.path.join(workspace, "pyproject.toml"))
-        )
     ):
         from harness.cli import _detect_default_build_command
         re_detected = _detect_default_build_command(workspace)
@@ -9800,6 +9833,8 @@ async def patch_reconcile_node(state: AgentState) -> dict[str, Any]:
 def route_after_start(state: AgentState) -> Literal[
     "requirements_discovery_node",
     "patching_node",
+    "decomposition_node",
+    "story_reopen_node",
     "ingest_change_requests_node",
     "reverse_spec_node",
     "patch_reconcile_node",
@@ -9823,9 +9858,17 @@ def route_after_start(state: AgentState) -> Literal[
       4. ``flow == "patch"`` without CRs and without generate_specs →
          patch_reconcile_node injects the "reconcile against existing
          tree" preamble before handing off to planning_node.
-      5. ``skip_discovery`` → patching_node (the bare existing-project path
+      5. ``skip_discovery`` + ``decomposition_enabled`` → enter the agile
+         pipeline at decomposition_node (or story_reopen_node first when
+         a brownfield workspace already has DONE stories). Mirrors the
+         ARCHITECTURE-gate branch in ``route_after_gatekeeper`` —
+         needed because ``--agile=true`` without ``--spec-discovery=true``
+         (the common case: specs were synthesised pre-graph in cmd_run)
+         would otherwise fall through to monolithic patching, silently
+         negating the operator's choice of agile mode.
+      6. ``skip_discovery`` → patching_node (the bare existing-project path
          from before change-request mode existed; legacy callers / tests).
-      6. Default → requirements_discovery_node (greenfield discovery).
+      7. Default → requirements_discovery_node (greenfield discovery).
     """
     flow = state.get("flow", FLOW_BUILD)
     if flow == FLOW_DEPLOY:
@@ -9859,6 +9902,30 @@ def route_after_start(state: AgentState) -> Literal[
         )
         return "patch_reconcile_node"
     if state.get("skip_discovery", False):
+        # Agile mode opt-in: when the operator passed --agile=true, the
+        # graph MUST enter the decomposition → per-batch patching loop
+        # even when discovery is skipped. Without this branch the same
+        # ARCHITECTURE-gate routing that exists in
+        # route_after_gatekeeper is silently bypassed and the run
+        # collapses to monolithic patching despite --agile=true. The
+        # brownfield case (FLOW_PATCH on a workspace that already has
+        # DONE stories) reopens drifted stories first; greenfield goes
+        # straight into decomposition.
+        if state.get("decomposition_enabled", False):
+            if (
+                flow == FLOW_PATCH
+                and _workspace_has_done_stories(state)
+            ):
+                logger.info(
+                    "[router] spec discovery skipped + agile mode + existing "
+                    "DONE stories. Routing START → story_reopen_node."
+                )
+                return "story_reopen_node"
+            logger.info(
+                "[router] spec discovery skipped + agile mode. "
+                "Routing START → decomposition_node."
+            )
+            return "decomposition_node"
         logger.info("[router] spec discovery skipped. Routing START → patching_node.")
         return "patching_node"
     return "requirements_discovery_node"
@@ -12311,6 +12378,12 @@ def build_graph() -> Any:
         {
             "requirements_discovery_node": "requirements_discovery_node",
             "patching_node": "patching_node",
+            # Agile mode + skip_discovery: enter the per-batch story
+            # pipeline directly. Mirrors the ARCHITECTURE-gate fan-out
+            # so `--agile=true` engages even when specs were synthesised
+            # pre-graph (the common case in cmd_run).
+            "decomposition_node": "decomposition_node",
+            "story_reopen_node": "story_reopen_node",
             "ingest_change_requests_node": "ingest_change_requests_node",
             # flow=patch + generate_specs → reverse-engineer specs from
             # the existing codebase, then funnel into the regular

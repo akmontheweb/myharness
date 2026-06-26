@@ -516,6 +516,69 @@ class TestResolveBuildCommand:
         assert len(result) > 0
 
 
+class TestDetectSubdirBuildCommand:
+    """The monorepo probe: when the LLM scaffolds a split layout
+    (``server/requirements.txt`` + ``client/package.json``), nothing
+    lives at workspace root and the historical detector fell through
+    to the bare ``pip install pytest`` fallback. The prod-import smoke
+    check then ran without the project's deps, exploded with
+    ``ModuleNotFoundError: fastapi``, and the repair loop thrashed
+    indefinitely on a symptom that couldn't be fixed by patching
+    requirements.txt (because the build command never installed it)."""
+
+    def test_subdir_requirements_yields_cd_install_pytest(self, tmp_path):
+        from harness.cli import _detect_default_build_command
+
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "requirements.txt").write_text("fastapi\n")
+        (tmp_path / "client").mkdir()
+        (tmp_path / "client" / "package.json").write_text("{}")
+
+        detected = _detect_default_build_command(str(tmp_path))
+        assert detected is not None
+        assert detected.startswith("cd server &&")
+        assert "pip install -r requirements.txt" in detected
+        assert "pytest -q" in detected
+
+    def test_subdir_pyproject_preferred_over_requirements(self, tmp_path):
+        from harness.cli import _detect_default_build_command
+
+        (tmp_path / "backend").mkdir()
+        (tmp_path / "backend" / "pyproject.toml").write_text("[project]\nname='b'\n")
+
+        detected = _detect_default_build_command(str(tmp_path))
+        assert detected is not None
+        assert detected.startswith("cd backend &&")
+        assert "pip install -e ." in detected
+
+    def test_root_manifest_still_wins_over_subdir(self, tmp_path):
+        """Subdir probe runs AFTER the root probe — repos with deps at
+        root keep their existing build command."""
+        from harness.cli import _detect_default_build_command
+
+        (tmp_path / "requirements.txt").write_text("fastapi\n")
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "requirements.txt").write_text("ignored\n")
+
+        detected = _detect_default_build_command(str(tmp_path))
+        assert detected is not None
+        assert not detected.startswith("cd ")
+        assert "pip install -r requirements.txt" in detected
+
+    def test_pure_python_scaffold_falls_through_to_bare_pytest(self, tmp_path):
+        """Last-chance heuristic still fires when the subdir has only
+        source files (no manifest yet) — preserves the greenfield
+        bootstrap flow."""
+        from harness.cli import _detect_default_build_command
+
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "__init__.py").write_text("")
+
+        detected = _detect_default_build_command(str(tmp_path))
+        assert detected is not None
+        assert "pip install pytest" in detected
+
+
 # ---------------------------------------------------------------------------
 # Gatekeeper auto-approval (env-var driven)
 # ---------------------------------------------------------------------------
