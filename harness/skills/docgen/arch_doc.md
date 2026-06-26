@@ -117,7 +117,7 @@ Inside that document, §11 carries a fenced ```jsonc``` block — the **machine-
     "extraction_method": "fastapi_builtin | drf_spectacular | springdoc_plugin",
     "extraction_command": "string"               // exact shell command Phase 4 runs post-scaffold
   },
-  "frontend": {                                  // omit entire object when frontend == "none"
+  "frontend_spec": {                             // omit entire object when frontend == "none"
     "type_gen_command": "string",
     "type_output_path": "src/types/api.ts",
     "api_client_path": "src/lib/api-client.ts",

@@ -246,7 +246,16 @@ def render_arch_preamble(summary: Optional[dict[str, Any]]) -> str:
             )
 
     if frontend and frontend != "none":
-        components = (summary.get("frontend") or {}).get("components") or []
+        # The §11 schema separates the enum (``frontend``) from the
+        # object (``frontend_spec``). An LLM that emits ``frontend`` as
+        # an object instead of the enum (early-draft prompt regression)
+        # should still render — fall back to the legacy field if
+        # ``frontend_spec`` is absent.
+        spec = summary.get("frontend_spec")
+        if not isinstance(spec, dict):
+            legacy = summary.get("frontend")
+            spec = legacy if isinstance(legacy, dict) else {}
+        components = spec.get("components") or []
         if components:
             lines.append("\n### Component map\n")
             lines.append("| Component | Path | RSD IDs | Radix primitives |")

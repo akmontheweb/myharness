@@ -3849,6 +3849,11 @@ Generate your patches NOW. Only the blocks above. No other text."""
             "token_tracker": token_tracker,
             "budget_remaining_usd": new_budget,
             "loop_counter": loop_counter,
+            # Cache the resolved §11 summary so subsequent patching
+            # turns (and code_review / test_generation downstream) skip
+            # the disk read. Empty dict here means "no §11 block on
+            # disk" — re-loading would just hit the same miss.
+            "arch_summary": resolved_arch_summary,
             "node_state": {
                 "current_node": "patching",
                 "patch_complete": True,
