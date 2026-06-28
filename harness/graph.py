@@ -12917,15 +12917,21 @@ async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, An
         return
     values = getattr(state, "values", None) or {}
     node_state = values.get("node_state", {}) or {}
+    suspended_from: Optional[str] = node_state.get("suspended_from")
     if not node_state.get("hitl_suspend"):
-        return
+        # Back-compat: pre-fix gatekeeper [s] checkpoints never set
+        # hitl_suspend — sniff gatekeeper_action="suspend" so an existing
+        # stuck session (saved before the cli.py fix that stamps the
+        # flag) can still be rescued on resume.
+        if node_state.get("gatekeeper_action") != "suspend":
+            return
+        suspended_from = "gatekeeper"
 
     # Distinguish suspend source. Discovery-interview suspends must NOT
     # rewind through human_intervention_node — that route ends up at
     # compiler_node and re-runs the entire build/security pipeline,
     # throwing away work the user already completed (code, tests, security
     # scan) before the discovery phase even started.
-    suspended_from = node_state.get("suspended_from")
     # Back-compat: pre-tag checkpoints have no suspended_from. Infer from
     # current_gate + current_node — discovery nodes set current_node to
     # "<phase>_discovery" before stamping hitl_suspend via the interview loop.
@@ -12977,6 +12983,65 @@ async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, An
                 exc,
             )
         return
+
+    if suspended_from == "gatekeeper":
+        # Save & Quit at human_gatekeeper_node ([s] at the post-spec
+        # approval prompt). The naive rewind ("stamp gatekeeper just
+        # returned cleared state") would re-fire route_after_gatekeeper
+        # with gatekeeper_action cleared → silent auto-approve forward.
+        # That's surprising: the user may have suspended specifically to
+        # think about refining or to manually edit. Re-execute the
+        # gatekeeper node so its menu re-renders, matching what pressing
+        # [s] in hitl_menu_loop semantically means ("come back to this
+        # decision").
+        #
+        # To force re-execution: stamp the predecessor as just-returned,
+        # so its outgoing edge fires INTO human_gatekeeper_node. The
+        # predecessor is gate-specific.
+        gate = values.get("current_gate", "")
+        gate_to_predecessor = {
+            "REQUIREMENTS": "spec_review_node",
+            "ARCHITECTURE": "spec_review_node",
+            "DEPLOYMENT": "generate_deployment_spec_node",
+            "STORIES": "decomposition_node",
+        }
+        predecessor = gate_to_predecessor.get(gate)
+        if predecessor is None:
+            logger.warning(
+                "[run_graph] Resume rewind: gatekeeper suspend with unknown "
+                "current_gate=%r — cannot determine predecessor node. "
+                "Falling back to the default hitl_menu rewind path.",
+                gate,
+            )
+        else:
+            cleared = dict(node_state)
+            cleared["hitl_suspend"] = False
+            cleared.pop("suspended_from", None)
+            cleared.pop("gatekeeper_action", None)
+            update: dict[str, Any] = {"node_state": cleared}
+            # spec_review_node has a CONDITIONAL outgoing edge. The
+            # only branch we want is human_gatekeeper_node; force it by
+            # clearing reviewer_followups so route_after_spec_review
+            # falls through to gatekeeper instead of looping back to
+            # discovery_interview_loop.
+            if predecessor == "spec_review_node":
+                update["reviewer_followups"] = []
+            logger.info(
+                "[run_graph] Resume rewind: gatekeeper [s] in %s phase. "
+                "Re-firing %s → human_gatekeeper_node so the menu re-renders.",
+                gate or "UNKNOWN", predecessor,
+            )
+            try:
+                await compiled_graph.aupdate_state(
+                    config, update, as_node=predecessor,
+                )
+            except Exception as exc:  # noqa: BLE001 — log but don't crash resume
+                logger.warning(
+                    "[run_graph] Failed to rewind gatekeeper-suspend checkpoint: %s. "
+                    "Resume may no-op; user can start a fresh session.",
+                    exc,
+                )
+            return
 
     # Default path: HITL menu Save & Quit. Mirror the [r] Resume branch of
     # hitl_menu_loop — clear suspend flags, mark HITL resolved, reset loop

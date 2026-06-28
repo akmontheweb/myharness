@@ -3932,6 +3932,92 @@ class TestAgentState:
 
         compiled.aupdate_state.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("gate,expected_predecessor", [
+        ("STORIES", "decomposition_node"),
+        ("DEPLOYMENT", "generate_deployment_spec_node"),
+        ("REQUIREMENTS", "spec_review_node"),
+        ("ARCHITECTURE", "spec_review_node"),
+    ])
+    async def test_rewind_gatekeeper_suspend_re_enters_via_predecessor(
+        self, gate, expected_predecessor,
+    ):
+        # Regression: pressing [s] at human_gatekeeper_node used to leave
+        # the checkpoint at __end__ with hitl_suspend unset, so `teane
+        # resume` no-op'd. The rewind now stamps the gate-specific
+        # predecessor so its outgoing edge re-fires human_gatekeeper_node.
+        from harness.graph import _rewind_suspended_checkpoint
+        from unittest.mock import AsyncMock, MagicMock
+
+        fake_state = MagicMock()
+        fake_state.next = ()
+        fake_state.values = {
+            "current_gate": gate,
+            "node_state": {
+                "hitl_suspend": True,
+                "suspended_from": "gatekeeper",
+                "gatekeeper_action": "suspend",
+                "current_gate": gate,
+            },
+        }
+        compiled = MagicMock()
+        compiled.aget_state = AsyncMock(return_value=fake_state)
+        compiled.aupdate_state = AsyncMock(return_value=None)
+
+        await _rewind_suspended_checkpoint(
+            compiled, {"configurable": {"thread_id": "t"}},
+        )
+
+        compiled.aupdate_state.assert_awaited_once()
+        kwargs = compiled.aupdate_state.await_args.kwargs
+        args = compiled.aupdate_state.await_args.args
+        updates = kwargs["values"] if "values" in kwargs else args[1]
+        assert kwargs.get("as_node") == expected_predecessor
+        cleared = updates["node_state"]
+        assert cleared["hitl_suspend"] is False
+        assert "gatekeeper_action" not in cleared, (
+            "stale gatekeeper_action='suspend' would re-route to __end__ "
+            "if not cleared"
+        )
+        assert "suspended_from" not in cleared
+        # spec_review_node has a conditional outgoing edge — must clear
+        # reviewer_followups so it routes to gatekeeper, not back to
+        # discovery_interview_loop.
+        if expected_predecessor == "spec_review_node":
+            assert updates.get("reviewer_followups") == []
+        else:
+            assert "reviewer_followups" not in updates
+
+    @pytest.mark.asyncio
+    async def test_rewind_gatekeeper_backcompat_when_flag_missing(self):
+        # Back-compat: checkpoints written before the cli.py fix stamped
+        # gatekeeper_action="suspend" but not hitl_suspend. Sniff the
+        # action so existing stuck sessions can still be rescued.
+        from harness.graph import _rewind_suspended_checkpoint
+        from unittest.mock import AsyncMock, MagicMock
+
+        fake_state = MagicMock()
+        fake_state.next = ()
+        fake_state.values = {
+            "current_gate": "STORIES",
+            "node_state": {
+                # Note: NO hitl_suspend, NO suspended_from — old format.
+                "gatekeeper_action": "suspend",
+                "current_gate": "STORIES",
+            },
+        }
+        compiled = MagicMock()
+        compiled.aget_state = AsyncMock(return_value=fake_state)
+        compiled.aupdate_state = AsyncMock(return_value=None)
+
+        await _rewind_suspended_checkpoint(
+            compiled, {"configurable": {"thread_id": "t"}},
+        )
+
+        compiled.aupdate_state.assert_awaited_once()
+        kwargs = compiled.aupdate_state.await_args.kwargs
+        assert kwargs.get("as_node") == "decomposition_node"
+
     def test_format_diagnostics_for_repair(self):
         from harness.graph import _format_diagnostics_for_repair
         errors = [

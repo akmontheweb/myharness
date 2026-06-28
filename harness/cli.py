@@ -2109,7 +2109,12 @@ def human_gatekeeper_node(state: dict[str, Any]) -> dict[str, Any]:
             return {
                 "messages": messages,
                 "loop_counter": loop_counter,
-                "node_state": {"gatekeeper_action": "suspend", "current_gate": gate},
+                "node_state": {
+                    "gatekeeper_action": "suspend",
+                    "current_gate": gate,
+                    "hitl_suspend": True,
+                    "suspended_from": "gatekeeper",
+                },
             }
 
         else:
