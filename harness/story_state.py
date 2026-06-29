@@ -46,9 +46,30 @@ from typing import Any, Iterable, Optional
 logger = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 """Bump when adding columns. Add a ``_migrate_to_vN`` function and
 register it in ``_MIGRATIONS`` below. Forward-only.
+
+v5 (industry-grade traceability — schema-v5 plan):
+- New ``requirements`` table — FR/NFR/US identifiers parsed from
+  ``docs/SPEC_REQUIREMENTS.md`` become first-class rows. ``req_key``
+  is the literal token (``FR-007``, ``NFR-SEC-001``, ``US-03-02``);
+  ``kind`` records which token family it came from so audit views
+  can group naturally.
+- New ``acceptance_criteria`` table — promotes the old
+  ``stories.acceptance_criteria`` JSON column into per-row records
+  with stable ``ac_key`` identifiers (``STORY-3.AC-2``). Lets the
+  test-gen marker contract (``# @verifies: STORY-3.AC-2``) point at
+  a real PK. The legacy JSON column is dropped from v5.
+- New link tables ``story_satisfies_req`` (story → requirement, M:N)
+  and ``test_verifies_ac`` (test file → AC, M:N). These are the
+  edges the SQL coverage audit (``harness/traceability.py``) joins
+  against to surface untraced FRs and untested ACs.
+- The v4→v5 migration drops every v4 row outright, mirroring the
+  v3→v4 precedent. v5 introduces two new LLM prompt contracts
+  (decomposition cites ``requirement_keys``; test-gen emits
+  ``@verifies`` markers) so old rows can't carry the new edges
+  retroactively. Re-decomposition is required.
 
 v4 (feature-first decomposition):
 - New ``features`` table — every story now belongs to exactly one
@@ -137,7 +158,8 @@ CREATE TABLE IF NOT EXISTS stories (
     feature_id INTEGER REFERENCES features(id) ON DELETE SET NULL,
     title TEXT NOT NULL,
     description TEXT,
-    acceptance_criteria TEXT NOT NULL DEFAULT '[]',  -- JSON list[str]
+    -- v4 had a JSON acceptance_criteria column here; v5 promotes it
+    -- to the acceptance_criteria side table below.
     depends_on TEXT NOT NULL DEFAULT '[]',           -- JSON list[story_key]
     scope_files TEXT NOT NULL DEFAULT '[]',          -- JSON list[path]
     status TEXT NOT NULL DEFAULT 'planned',
@@ -232,6 +254,55 @@ CREATE TABLE IF NOT EXISTS commits (
 );
 CREATE INDEX IF NOT EXISTS idx_commits_workspace ON commits(workspace);
 CREATE INDEX IF NOT EXISTS idx_commits_story ON commits(story_id);
+
+-- v5 traceability tables ----------------------------------------------------
+CREATE TABLE IF NOT EXISTS requirements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL,
+    req_key TEXT NOT NULL,           -- FR-007 / NFR-SEC-001 / US-03-02 / CR-7
+    kind TEXT NOT NULL,              -- 'fr' | 'nfr' | 'us' | 'cr_synthetic'
+    title TEXT,
+    body TEXT,
+    source_path TEXT,                -- 'docs/SPEC_REQUIREMENTS.md'
+    source_line INTEGER,
+    created_at TEXT NOT NULL,
+    UNIQUE(workspace, req_key)
+);
+CREATE INDEX IF NOT EXISTS idx_requirements_workspace ON requirements(workspace);
+CREATE INDEX IF NOT EXISTS idx_requirements_kind ON requirements(workspace, kind);
+
+CREATE TABLE IF NOT EXISTS acceptance_criteria (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace TEXT NOT NULL,
+    story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    ac_key TEXT NOT NULL,            -- 'STORY-3.AC-2'
+    text TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    UNIQUE(story_id, ac_key)
+);
+CREATE INDEX IF NOT EXISTS idx_ac_workspace ON acceptance_criteria(workspace);
+CREATE INDEX IF NOT EXISTS idx_ac_story ON acceptance_criteria(story_id);
+
+CREATE TABLE IF NOT EXISTS story_satisfies_req (
+    story_id INTEGER NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
+    requirement_id INTEGER NOT NULL REFERENCES requirements(id) ON DELETE CASCADE,
+    PRIMARY KEY (story_id, requirement_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ssr_req ON story_satisfies_req(requirement_id);
+
+-- test_function_name defaults to '' (not NULL) so the composite PK
+-- treats file-level markers as a stable triple; INSERT OR IGNORE would
+-- otherwise create a duplicate row each time (SQLite's UNIQUE treats
+-- NULLs as distinct).
+CREATE TABLE IF NOT EXISTS test_verifies_ac (
+    workspace TEXT NOT NULL,
+    test_path TEXT NOT NULL,
+    test_function_name TEXT NOT NULL DEFAULT '',
+    ac_id INTEGER NOT NULL REFERENCES acceptance_criteria(id) ON DELETE CASCADE,
+    PRIMARY KEY (test_path, test_function_name, ac_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tva_workspace ON test_verifies_ac(workspace);
+CREATE INDEX IF NOT EXISTS idx_tva_ac ON test_verifies_ac(ac_id);
 """
 
 
@@ -359,14 +430,50 @@ def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+    """Clean-slate migration: drop legacy v4 tables so the v5 schema
+    recreates them with the traceability shape.
+
+    v5 introduces two new LLM contracts (decomposition cites
+    ``requirement_keys`` per story; test-gen emits ``@verifies``
+    markers per test file) so v4 rows can't be re-interpreted to carry
+    the new ``story_satisfies_req`` / ``test_verifies_ac`` edges —
+    re-decomposition + re-test-gen is the only way to populate them.
+    Following the v3→v4 precedent, this migration drops v4 state;
+    ``_SCHEMA_SQL`` recreates everything from scratch.
+
+    No-op on a fresh DB (no ``stories`` table) and on an already-v5
+    DB (stories no longer carries the legacy ``acceptance_criteria``
+    column, indicating AC has been promoted out of JSON).
+    """
+    try:
+        cols = conn.execute("PRAGMA table_info(stories)").fetchall()
+    except sqlite3.DatabaseError:
+        return
+    if not cols:
+        return
+    if not any(c[1] == "acceptance_criteria" for c in cols):
+        return
+    for table in (
+        "test_verifies_ac", "story_satisfies_req",
+        "acceptance_criteria", "requirements",
+        "commits", "test_runs", "file_links", "defects",
+        "batch_stories", "batches", "stories", "features",
+    ):
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    conn.commit()
+
+
 _MIGRATIONS: list[tuple[int, Any]] = [
     (4, _migrate_v3_to_v4),
+    (5, _migrate_v4_to_v5),
 ]
 """(target_version, callable(conn) -> None). Append-only; never rewrite
 history. v1 → v2 and v2 → v3 only existed for per-workspace DBs that
 v3 explicitly ignores — fresh global DBs land at SCHEMA_VERSION
 straight from ``_SCHEMA_SQL`` with no migration steps. v3 → v4 is the
-feature-first reset described in ``_migrate_v3_to_v4``."""
+feature-first reset described in ``_migrate_v3_to_v4``; v4 → v5 is the
+traceability reset described in ``_migrate_v4_to_v5``."""
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
@@ -399,6 +506,8 @@ def purge_state_db(workspace_path: str) -> dict[str, int]:
     counts: dict[str, int] = {
         "features": 0, "stories": 0, "batches": 0, "defects": 0,
         "test_runs": 0, "file_links": 0, "commits": 0,
+        "requirements": 0, "acceptance_criteria": 0,
+        "story_satisfies_req": 0, "test_verifies_ac": 0,
     }
     try:
         app = app_name_for_workspace(workspace_path)
@@ -423,10 +532,17 @@ def purge_state_db(workspace_path: str) -> dict[str, int]:
         _apply_sqlite_pragmas(conn)
         try:
             conn.execute("BEGIN IMMEDIATE")
-            # Order matters: file_links and batch_stories reference
-            # stories.id / batches.id; delete the children first so
-            # the parent deletes don't trip a FK warning.
+            # Order matters: child tables first so parent deletes don't
+            # trip a FK warning. v5 chain (deepest first):
+            #   test_verifies_ac → acceptance_criteria → stories
+            #   story_satisfies_req → requirements / stories
+            #   file_links / test_runs / defects / commits → stories
+            #   batch_stories → batches / stories
+            #   batches / stories / requirements / features
             for table in (
+                "test_verifies_ac",
+                "story_satisfies_req",
+                "acceptance_criteria",
                 "file_links", "test_runs", "defects", "commits",
                 "batch_stories",  # transitively via batches+stories
             ):
@@ -438,6 +554,14 @@ def purge_state_db(workspace_path: str) -> dict[str, int]:
                         "(SELECT id FROM stories WHERE workspace = ?)",
                         (app, app),
                     )
+                elif table == "story_satisfies_req":
+                    # No workspace column on the link table — scope by
+                    # FK to stories.
+                    cur = conn.execute(
+                        "DELETE FROM story_satisfies_req WHERE story_id IN "
+                        "(SELECT id FROM stories WHERE workspace = ?)",
+                        (app,),
+                    )
                 else:
                     cur = conn.execute(
                         f"DELETE FROM {table} WHERE workspace = ?", (app,),
@@ -446,7 +570,7 @@ def purge_state_db(workspace_path: str) -> dict[str, int]:
                 # table without a workspace column of its own).
                 if table in counts:
                     counts[table] = cur.rowcount or 0
-            for table in ("batches", "stories", "features"):
+            for table in ("batches", "stories", "requirements", "features"):
                 cur = conn.execute(
                     f"DELETE FROM {table} WHERE workspace = ?", (app,),
                 )
@@ -463,10 +587,14 @@ def purge_state_db(workspace_path: str) -> dict[str, int]:
         logger.info(
             "[story_state] Purged %d row(s) for app %r from %s "
             "(stories=%d, batches=%d, defects=%d, test_runs=%d, "
-            "file_links=%d, commits=%d).",
+            "file_links=%d, commits=%d, requirements=%d, "
+            "acceptance_criteria=%d, story_satisfies_req=%d, "
+            "test_verifies_ac=%d).",
             total, app, db,
             counts["stories"], counts["batches"], counts["defects"],
             counts["test_runs"], counts["file_links"], counts["commits"],
+            counts["requirements"], counts["acceptance_criteria"],
+            counts["story_satisfies_req"], counts["test_verifies_ac"],
         )
     return counts
 
@@ -673,6 +801,345 @@ def ensure_feature(
 
 
 # ---------------------------------------------------------------------------
+# Requirements CRUD (v5)
+# ---------------------------------------------------------------------------
+
+_VALID_REQ_KINDS = frozenset({"fr", "nfr", "us", "cr_synthetic"})
+
+
+def _row_to_requirement(row: sqlite3.Row | tuple) -> dict[str, Any]:
+    return {
+        "id": row[0],
+        "req_key": row[1],
+        "kind": row[2],
+        "title": row[3],
+        "body": row[4],
+        "source_path": row[5],
+        "source_line": row[6],
+        "created_at": row[7],
+    }
+
+
+_REQUIREMENT_COLS = (
+    "id, req_key, kind, title, body, source_path, source_line, created_at"
+)
+
+
+def create_requirements(
+    conn: sqlite3.Connection,
+    workspace: str,
+    items: Iterable[dict[str, Any]],
+) -> list[str]:
+    """Insert requirements parsed from ``docs/SPEC_REQUIREMENTS.md``.
+
+    Each item supports: ``req_key`` (required — literal FR-007 /
+    NFR-SEC-001 / US-03-02 / CR-7 token), ``kind`` (required — one of
+    ``fr``, ``nfr``, ``us``, ``cr_synthetic``), ``title``, ``body``,
+    ``source_path``, ``source_line``. Idempotent: on duplicate
+    ``req_key`` within a workspace, ``title``/``body`` are upserted so
+    spec edits propagate without an operator purge. Returns the
+    ``req_key``s of every requested row (whether freshly inserted or
+    already present).
+    """
+    created: list[str] = []
+    now = _utcnow_iso()
+    for item in items:
+        req_key = (item.get("req_key") or "").strip()
+        if not req_key:
+            raise ValueError("requirement requires 'req_key'")
+        kind = (item.get("kind") or "").strip()
+        if kind not in _VALID_REQ_KINDS:
+            raise ValueError(
+                f"requirement {req_key!r} kind={kind!r} not in "
+                f"{sorted(_VALID_REQ_KINDS)}"
+            )
+        conn.execute(
+            "INSERT INTO requirements(workspace, req_key, kind, title, "
+            "body, source_path, source_line, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(workspace, req_key) DO UPDATE SET "
+            "title = excluded.title, body = excluded.body, "
+            "source_path = excluded.source_path, "
+            "source_line = excluded.source_line",
+            (
+                workspace, req_key, kind,
+                item.get("title"), item.get("body"),
+                item.get("source_path"), item.get("source_line"),
+                now,
+            ),
+        )
+        created.append(req_key)
+    conn.commit()
+    return created
+
+
+def list_requirements(
+    conn: sqlite3.Connection,
+    workspace: str,
+    *,
+    kind: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """All requirements for ``workspace``, optionally filtered by ``kind``."""
+    if kind is not None:
+        rows = conn.execute(
+            f"SELECT {_REQUIREMENT_COLS} FROM requirements "
+            "WHERE workspace = ? AND kind = ? ORDER BY id",
+            (workspace, kind),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT {_REQUIREMENT_COLS} FROM requirements "
+            "WHERE workspace = ? ORDER BY id",
+            (workspace,),
+        ).fetchall()
+    return [_row_to_requirement(r) for r in rows]
+
+
+def get_requirement_by_key(
+    conn: sqlite3.Connection, workspace: str, req_key: str,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        f"SELECT {_REQUIREMENT_COLS} FROM requirements "
+        "WHERE workspace = ? AND req_key = ?",
+        (workspace, req_key),
+    ).fetchone()
+    return _row_to_requirement(row) if row else None
+
+
+def ensure_requirement(
+    conn: sqlite3.Connection,
+    workspace: str,
+    req_key: str,
+    *,
+    kind: str,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    source_path: Optional[str] = None,
+    source_line: Optional[int] = None,
+) -> int:
+    """Return the requirement_id for ``req_key`` in ``workspace``,
+    creating it lazily if absent. Used by the CR-bridge to seed a
+    synthetic ``CR-N`` requirement the first time a CR is ingested,
+    so bridged stories can satisfy the same uniform link contract as
+    spec-derived stories.
+    """
+    existing = get_requirement_by_key(conn, workspace, req_key)
+    if existing is not None:
+        return int(existing["id"])
+    create_requirements(
+        conn, workspace,
+        [{
+            "req_key": req_key, "kind": kind,
+            "title": title, "body": body,
+            "source_path": source_path, "source_line": source_line,
+        }],
+    )
+    again = get_requirement_by_key(conn, workspace, req_key)
+    if again is None:
+        raise RuntimeError(
+            f"ensure_requirement: failed to materialise {req_key!r}"
+        )
+    return int(again["id"])
+
+
+def link_story_to_requirements(
+    conn: sqlite3.Connection,
+    workspace: str,
+    story_id: int,
+    req_keys: Iterable[str],
+) -> int:
+    """Insert ``story_satisfies_req`` edges for each (story, req_key) pair.
+
+    All keys must already exist in ``requirements`` for ``workspace``;
+    unknown keys raise ``ValueError`` BEFORE any row is inserted so
+    the contract is all-or-nothing (no partial state on failure).
+    Idempotent on duplicate edges (composite PK). Returns the count
+    of edges actually inserted (excludes pre-existing).
+    """
+    keys = [k for k in req_keys if k]
+    if not keys:
+        return 0
+    placeholders = ",".join(["?"] * len(keys))
+    rows = conn.execute(
+        f"SELECT req_key, id FROM requirements WHERE workspace = ? "
+        f"AND req_key IN ({placeholders})",
+        (workspace, *keys),
+    ).fetchall()
+    found = {r[0]: r[1] for r in rows}
+    missing = [k for k in keys if k not in found]
+    if missing:
+        raise ValueError(
+            f"link_story_to_requirements: unknown req_key(s) for "
+            f"workspace={workspace!r}: {sorted(set(missing))}"
+        )
+    inserted = 0
+    for key in keys:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO story_satisfies_req"
+            "(story_id, requirement_id) VALUES(?, ?)",
+            (int(story_id), int(found[key])),
+        )
+        inserted += cur.rowcount or 0
+    conn.commit()
+    return inserted
+
+
+# ---------------------------------------------------------------------------
+# Acceptance-criteria CRUD (v5)
+# ---------------------------------------------------------------------------
+
+def _row_to_ac(row: sqlite3.Row | tuple) -> dict[str, Any]:
+    return {
+        "id": row[0],
+        "story_id": row[1],
+        "ac_key": row[2],
+        "text": row[3],
+        "ordinal": row[4],
+    }
+
+
+_AC_COLS = "id, story_id, ac_key, text, ordinal"
+
+
+def create_acceptance_criteria(
+    conn: sqlite3.Connection,
+    workspace: str,
+    story_id: int,
+    items: Iterable[dict[str, Any]],
+) -> list[str]:
+    """Insert AC rows for a story. Each item: ``ac_key`` (e.g.
+    ``"STORY-3.AC-2"``), ``text``, ``ordinal``. UPSERTs on
+    (story_id, ac_key) so re-decomposition rewrites the text without
+    a UNIQUE violation; the row id is preserved across upserts so
+    existing ``test_verifies_ac`` edges survive.
+    """
+    created: list[str] = []
+    for item in items:
+        ac_key = (item.get("ac_key") or "").strip()
+        if not ac_key:
+            raise ValueError("acceptance_criterion requires 'ac_key'")
+        text = item.get("text")
+        if not text:
+            raise ValueError(
+                f"acceptance_criterion {ac_key!r} requires non-empty 'text'"
+            )
+        ordinal = item.get("ordinal")
+        if ordinal is None:
+            raise ValueError(
+                f"acceptance_criterion {ac_key!r} requires 'ordinal'"
+            )
+        conn.execute(
+            "INSERT INTO acceptance_criteria"
+            "(workspace, story_id, ac_key, text, ordinal) "
+            "VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(story_id, ac_key) DO UPDATE SET "
+            "text = excluded.text, ordinal = excluded.ordinal",
+            (workspace, int(story_id), ac_key, text, int(ordinal)),
+        )
+        created.append(ac_key)
+    conn.commit()
+    return created
+
+
+def list_acceptance_criteria(
+    conn: sqlite3.Connection, workspace: str, story_id: int,
+) -> list[dict[str, Any]]:
+    """All AC rows for one story, ordered by ordinal."""
+    rows = conn.execute(
+        f"SELECT {_AC_COLS} FROM acceptance_criteria "
+        "WHERE workspace = ? AND story_id = ? ORDER BY ordinal",
+        (workspace, int(story_id)),
+    ).fetchall()
+    return [_row_to_ac(r) for r in rows]
+
+
+def get_ac_by_key(
+    conn: sqlite3.Connection, workspace: str, ac_key: str,
+) -> Optional[dict[str, Any]]:
+    """Resolve an ``ac_key`` (e.g. ``STORY-3.AC-2``) to its full row.
+    Returns None if no AC matches. Used by the test-gen marker parser
+    to convert ``@verifies: STORY-3.AC-2`` strings into FK ids before
+    inserting link rows.
+    """
+    row = conn.execute(
+        f"SELECT {_AC_COLS} FROM acceptance_criteria "
+        "WHERE workspace = ? AND ac_key = ?",
+        (workspace, ac_key),
+    ).fetchone()
+    return _row_to_ac(row) if row else None
+
+
+def link_test_to_ac(
+    conn: sqlite3.Connection,
+    workspace: str,
+    test_path: str,
+    ac_id: int,
+    test_function_name: str = "",
+) -> bool:
+    """Record that ``test_path`` (optionally a specific test function)
+    verifies ``ac_id``. Idempotent on the composite PK. Returns True
+    when a new row was inserted, False on duplicate.
+    """
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO test_verifies_ac"
+        "(workspace, test_path, test_function_name, ac_id) "
+        "VALUES(?, ?, ?, ?)",
+        (workspace, test_path, test_function_name, int(ac_id)),
+    )
+    conn.commit()
+    return bool(cur.rowcount)
+
+
+# ---------------------------------------------------------------------------
+# Traceability audit queries (v5) — called by harness/traceability.py
+# ---------------------------------------------------------------------------
+
+def requirements_without_satisfying_story(
+    conn: sqlite3.Connection, workspace: str,
+) -> list[dict[str, Any]]:
+    """Requirements that no story satisfies — the untraced-FR gap set.
+    Used by the SQL audit replacing the old text-grep at
+    ``harness/traceability.py``.
+    """
+    rows = conn.execute(
+        f"SELECT {_REQUIREMENT_COLS} FROM requirements r "
+        "WHERE r.workspace = ? AND NOT EXISTS ("
+        "  SELECT 1 FROM story_satisfies_req ssr "
+        "  WHERE ssr.requirement_id = r.id"
+        ") ORDER BY r.id",
+        (workspace,),
+    ).fetchall()
+    return [_row_to_requirement(r) for r in rows]
+
+
+def acs_without_verifying_test(
+    conn: sqlite3.Connection, workspace: str,
+) -> list[dict[str, Any]]:
+    """Acceptance criteria that no test marker covers — the untested-AC
+    gap set. Each row carries the parent ``story_key`` so the audit
+    report can group by story without an extra join.
+    """
+    rows = conn.execute(
+        "SELECT ac.id, ac.story_id, ac.ac_key, ac.text, ac.ordinal, "
+        "s.story_key, s.title "
+        "FROM acceptance_criteria ac "
+        "JOIN stories s ON s.id = ac.story_id "
+        "WHERE ac.workspace = ? AND NOT EXISTS ("
+        "  SELECT 1 FROM test_verifies_ac tva WHERE tva.ac_id = ac.id"
+        ") ORDER BY s.id, ac.ordinal",
+        (workspace,),
+    ).fetchall()
+    return [
+        {
+            "id": r[0], "story_id": r[1], "ac_key": r[2],
+            "text": r[3], "ordinal": r[4],
+            "story_key": r[5], "story_title": r[6],
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Story CRUD
 # ---------------------------------------------------------------------------
 
@@ -752,13 +1219,13 @@ def create_stories(
             feature_id_cache[feature_key] = int(row["id"])
         feature_id = feature_id_cache[feature_key]
         key = _next_story_key(conn, workspace)
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO stories(
                 workspace, story_key, feature_id, title, description,
-                acceptance_criteria, depends_on, scope_files,
+                depends_on, scope_files,
                 status, external_ref, build_kind, cr_ids, created_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?)
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?)
             """,
             (
                 workspace,
@@ -766,7 +1233,6 @@ def create_stories(
                 feature_id,
                 item["title"],
                 item.get("description"),
-                json.dumps(list(item.get("acceptance_criteria") or [])),
                 json.dumps(list(item.get("depends_on") or [])),
                 json.dumps(list(item.get("scope_files") or [])),
                 item.get("external_ref"),
@@ -775,12 +1241,36 @@ def create_stories(
                 now,
             ),
         )
+        story_id = cur.lastrowid
+        # AC moved to its own side table in v5. We accept the same
+        # ``acceptance_criteria: list[str]`` input shape callers used
+        # under v4 — each string is materialised as one row, with
+        # ``ac_key`` synthesised from the story key + ordinal so the
+        # test-gen ``@verifies`` marker contract has a stable PK to
+        # point at.
+        ac_strings = list(item.get("acceptance_criteria") or [])
+        if ac_strings and story_id is not None:
+            create_acceptance_criteria(
+                conn, workspace, int(story_id),
+                [
+                    {
+                        "ac_key": f"{key}.AC-{i + 1}",
+                        "text": text,
+                        "ordinal": i + 1,
+                    }
+                    for i, text in enumerate(ac_strings)
+                ],
+            )
         created.append(key)
     conn.commit()
     return created
 
 
-def _row_to_story(row: sqlite3.Row | tuple) -> dict[str, Any]:
+def _row_to_story(
+    row: sqlite3.Row | tuple,
+    *,
+    acceptance_criteria: Optional[list[str]] = None,
+) -> dict[str, Any]:
     """Hydrate a stories row joined with features on feature_id.
 
     The SELECT must use ``_STORY_COLS`` (which joins ``features`` via
@@ -788,6 +1278,15 @@ def _row_to_story(row: sqlite3.Row | tuple) -> dict[str, Any]:
     ``feature_name`` may be None for CR-bridge stories that pre-date
     the synthetic feature seed (defensive — current code never inserts
     a story with NULL feature_id, but the FK uses ON DELETE SET NULL).
+
+    v5: ``acceptance_criteria`` is no longer a JSON column on the row
+    — it lives in the ``acceptance_criteria`` side table. The dict's
+    ``"acceptance_criteria"`` key is preserved (callers of
+    ``list_stories`` / ``get_story`` depend on the shape) but is
+    populated from the optional ``acceptance_criteria`` kwarg. The
+    public hydrators backfill that kwarg with a follow-up batch query
+    so the per-row default of ``[]`` only surfaces in unit tests that
+    call ``_row_to_story`` directly.
     """
     return {
         "id": row[0],
@@ -797,26 +1296,52 @@ def _row_to_story(row: sqlite3.Row | tuple) -> dict[str, Any]:
         "feature_name": row[4],
         "title": row[5],
         "description": row[6],
-        "acceptance_criteria": json.loads(row[7] or "[]"),
-        "depends_on": json.loads(row[8] or "[]"),
-        "scope_files": json.loads(row[9] or "[]"),
-        "status": row[10],
-        "external_ref": row[11],
-        "build_kind": row[12] or BUILD_KIND_GREENFIELD,
-        "cr_ids": json.loads(row[13]) if row[13] else [],
-        "created_at": row[14],
-        "started_at": row[15],
-        "completed_at": row[16],
+        "acceptance_criteria": list(acceptance_criteria or []),
+        "depends_on": json.loads(row[7] or "[]"),
+        "scope_files": json.loads(row[8] or "[]"),
+        "status": row[9],
+        "external_ref": row[10],
+        "build_kind": row[11] or BUILD_KIND_GREENFIELD,
+        "cr_ids": json.loads(row[12]) if row[12] else [],
+        "created_at": row[13],
+        "started_at": row[14],
+        "completed_at": row[15],
     }
 
 
 _STORY_COLS = (
     "s.id, s.story_key, s.feature_id, f.feature_key, f.name, "
     "s.title, s.description, "
-    "s.acceptance_criteria, s.depends_on, s.scope_files, s.status, "
+    "s.depends_on, s.scope_files, s.status, "
     "s.external_ref, s.build_kind, s.cr_ids, "
     "s.created_at, s.started_at, s.completed_at"
 )
+
+
+def _ac_strings_by_story_id(
+    conn: sqlite3.Connection,
+    workspace: str,
+    story_ids: Iterable[int],
+) -> dict[int, list[str]]:
+    """One-shot lookup: ``{story_id: [ac_text, ...]}`` ordered by ordinal.
+
+    Avoids N+1 reads when ``list_stories`` hydrates a batch of rows.
+    Empty input → empty dict, no SQL issued.
+    """
+    ids = [int(s) for s in story_ids]
+    if not ids:
+        return {}
+    placeholders = ",".join(["?"] * len(ids))
+    rows = conn.execute(
+        f"SELECT story_id, text FROM acceptance_criteria "
+        f"WHERE workspace = ? AND story_id IN ({placeholders}) "
+        f"ORDER BY story_id, ordinal",
+        (workspace, *ids),
+    ).fetchall()
+    out: dict[int, list[str]] = {sid: [] for sid in ids}
+    for sid, text in rows:
+        out[sid].append(text)
+    return out
 _STORY_FROM = "stories s LEFT JOIN features f ON s.feature_id = f.id"
 
 
@@ -861,7 +1386,11 @@ def list_stories(
         f"WHERE {' AND '.join(where)} ORDER BY s.id"
     )
     rows = conn.execute(sql, tuple(params)).fetchall()
-    return [_row_to_story(r) for r in rows]
+    ac_map = _ac_strings_by_story_id(conn, workspace, [r[0] for r in rows])
+    return [
+        _row_to_story(r, acceptance_criteria=ac_map.get(r[0], []))
+        for r in rows
+    ]
 
 
 def get_story(
@@ -872,7 +1401,10 @@ def get_story(
         "WHERE s.workspace = ? AND s.story_key = ?",
         (workspace, story_key),
     ).fetchone()
-    return _row_to_story(row) if row else None
+    if row is None:
+        return None
+    ac_map = _ac_strings_by_story_id(conn, workspace, [row[0]])
+    return _row_to_story(row, acceptance_criteria=ac_map.get(row[0], []))
 
 
 def get_planned_stories(

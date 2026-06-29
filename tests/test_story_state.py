@@ -13,26 +13,38 @@ from harness.story_state import (
     BUILD_KIND_GREENFIELD,
     SCHEMA_VERSION,
     _read_schema_version,
+    acs_without_verifying_test,
     app_name_for_workspace,
     complete_batch,
+    create_acceptance_criteria,
     create_features,
+    create_requirements,
     create_stories,
     ensure_feature,
+    ensure_requirement,
     files_for_batch,
+    get_ac_by_key,
     get_planned_stories,
+    get_requirement_by_key,
     get_story,
     link_file,
+    link_story_to_requirements,
+    link_test_to_ac,
+    list_acceptance_criteria,
     list_batches_for_cr,
+    list_requirements,
     list_stories,
     list_stories_for_cr,
     mark_blocked,
     mark_done,
     mark_in_progress,
     open_story_db,
+    purge_state_db,
     record_commit,
     record_defect,
     record_test_run,
     regenerate_markdown_views,
+    requirements_without_satisfying_story,
     resolve_defects_for_story,
     set_batch_committed_sha,
     start_batch,
@@ -112,6 +124,9 @@ def test_open_is_idempotent():
     expected = {
         "schema_meta", "features", "stories", "batches", "batch_stories",
         "defects", "test_runs", "file_links", "commits",
+        # v5 traceability tables
+        "requirements", "acceptance_criteria",
+        "story_satisfies_req", "test_verifies_ac",
     }
     assert expected.issubset(tables)
 
@@ -736,3 +751,260 @@ def test_regenerate_markdown_views_creates_docs_dir(workspace, app):
     finally:
         conn.close()
     assert os.path.isdir(os.path.join(workspace, "docs"))
+
+
+# ---------------------------------------------------------------------------
+# v5 traceability — requirements / AC / link helpers / audit queries
+# ---------------------------------------------------------------------------
+
+
+def _seed_story(conn, app: str, *, title: str = "S", ac=None) -> dict:
+    """Helper: ensure feature, create one story (optionally with AC), return its row."""
+    keys = _create_stories(conn, app, [{
+        "title": title,
+        "acceptance_criteria": list(ac or []),
+    }])
+    return get_story(conn, app, keys[0])
+
+
+def test_create_requirements_idempotent_upserts_title(conn, app):
+    create_requirements(conn, app, [
+        {"req_key": "FR-001", "kind": "fr", "title": "Original"},
+    ])
+    # Re-insert with a new title — UPSERT path, not UNIQUE error.
+    create_requirements(conn, app, [
+        {"req_key": "FR-001", "kind": "fr", "title": "Revised"},
+    ])
+    row = get_requirement_by_key(conn, app, "FR-001")
+    assert row["title"] == "Revised"
+    assert len(list_requirements(conn, app)) == 1
+
+
+def test_create_requirements_rejects_invalid_kind(conn, app):
+    with pytest.raises(ValueError, match="kind="):
+        create_requirements(conn, app, [
+            {"req_key": "FR-001", "kind": "bogus", "title": "x"},
+        ])
+
+
+def test_create_requirements_rejects_missing_req_key(conn, app):
+    with pytest.raises(ValueError, match="req_key"):
+        create_requirements(conn, app, [{"kind": "fr", "title": "x"}])
+
+
+def test_list_requirements_filters_by_kind(conn, app):
+    create_requirements(conn, app, [
+        {"req_key": "FR-001", "kind": "fr", "title": "x"},
+        {"req_key": "NFR-SEC-001", "kind": "nfr", "title": "y"},
+        {"req_key": "US-01-02", "kind": "us", "title": "z"},
+    ])
+    assert [r["req_key"] for r in list_requirements(conn, app, kind="fr")] == ["FR-001"]
+    assert {r["req_key"] for r in list_requirements(conn, app)} == {
+        "FR-001", "NFR-SEC-001", "US-01-02",
+    }
+
+
+def test_ensure_requirement_creates_on_miss_returns_id_on_hit(conn, app):
+    rid = ensure_requirement(conn, app, "CR-7", kind="cr_synthetic", title="CR 7")
+    assert rid > 0
+    # Second call returns the same id, no duplicate row.
+    rid2 = ensure_requirement(conn, app, "CR-7", kind="cr_synthetic", title="ignored")
+    assert rid2 == rid
+    assert len(list_requirements(conn, app)) == 1
+
+
+def test_link_story_to_requirements_rejects_unknown_key(conn, app):
+    s = _seed_story(conn, app, title="S1")
+    create_requirements(conn, app, [{"req_key": "FR-001", "kind": "fr", "title": "x"}])
+    with pytest.raises(ValueError, match="FR-099"):
+        link_story_to_requirements(conn, app, s["id"], ["FR-001", "FR-099"])
+    # Atomicity check: FR-001 must NOT have been linked when FR-099 was missing.
+    rows = conn.execute(
+        "SELECT requirement_id FROM story_satisfies_req WHERE story_id = ?",
+        (s["id"],),
+    ).fetchall()
+    assert rows == []
+
+
+def test_link_story_to_requirements_idempotent(conn, app):
+    s = _seed_story(conn, app, title="S1")
+    create_requirements(conn, app, [{"req_key": "FR-001", "kind": "fr", "title": "x"}])
+    assert link_story_to_requirements(conn, app, s["id"], ["FR-001"]) == 1
+    # Second call: idempotent — no new row.
+    assert link_story_to_requirements(conn, app, s["id"], ["FR-001"]) == 0
+
+
+def test_create_stories_persists_ac_to_side_table(conn, app):
+    s = _seed_story(conn, app, ac=["AC text 1", "AC text 2"])
+    acs = list_acceptance_criteria(conn, app, s["id"])
+    assert [a["ac_key"] for a in acs] == [f"{s['story_key']}.AC-1", f"{s['story_key']}.AC-2"]
+    assert [a["text"] for a in acs] == ["AC text 1", "AC text 2"]
+    assert [a["ordinal"] for a in acs] == [1, 2]
+
+
+def test_list_stories_backfills_acceptance_criteria_from_side_table(conn, app):
+    _seed_story(conn, app, title="S1", ac=["a", "b"])
+    _seed_story(conn, app, title="S2", ac=["c"])
+    stories = list_stories(conn, app)
+    by_title = {s["title"]: s for s in stories}
+    assert by_title["S1"]["acceptance_criteria"] == ["a", "b"]
+    assert by_title["S2"]["acceptance_criteria"] == ["c"]
+
+
+def test_create_acceptance_criteria_upserts_text_preserving_id(conn, app):
+    s = _seed_story(conn, app, ac=["first"])
+    first = list_acceptance_criteria(conn, app, s["id"])[0]
+    # UPSERT — re-write the text under the same ac_key.
+    create_acceptance_criteria(conn, app, s["id"], [
+        {"ac_key": first["ac_key"], "text": "rewritten", "ordinal": 1},
+    ])
+    after = list_acceptance_criteria(conn, app, s["id"])
+    assert len(after) == 1
+    assert after[0]["id"] == first["id"]  # id preserved across UPSERT
+    assert after[0]["text"] == "rewritten"
+
+
+def test_get_ac_by_key_round_trip(conn, app):
+    s = _seed_story(conn, app, ac=["only AC"])
+    ac_key = f"{s['story_key']}.AC-1"
+    row = get_ac_by_key(conn, app, ac_key)
+    assert row is not None
+    assert row["text"] == "only AC"
+    assert get_ac_by_key(conn, app, "NOT-AN-AC") is None
+
+
+def test_link_test_to_ac_idempotent(conn, app):
+    s = _seed_story(conn, app, ac=["AC1"])
+    ac = list_acceptance_criteria(conn, app, s["id"])[0]
+    assert link_test_to_ac(conn, app, "tests/test_x.py", ac["id"]) is True
+    assert link_test_to_ac(conn, app, "tests/test_x.py", ac["id"]) is False
+    # Different function name → distinct row, both kept.
+    assert link_test_to_ac(conn, app, "tests/test_x.py", ac["id"], "test_a") is True
+
+
+def test_requirements_without_satisfying_story_surfaces_gaps(conn, app):
+    create_requirements(conn, app, [
+        {"req_key": "FR-001", "kind": "fr", "title": "covered"},
+        {"req_key": "FR-002", "kind": "fr", "title": "untraced"},
+    ])
+    s = _seed_story(conn, app, title="S1")
+    link_story_to_requirements(conn, app, s["id"], ["FR-001"])
+    untraced = requirements_without_satisfying_story(conn, app)
+    assert [r["req_key"] for r in untraced] == ["FR-002"]
+
+
+def test_requirements_without_satisfying_story_empty_when_clean(conn, app):
+    assert requirements_without_satisfying_story(conn, app) == []
+
+
+def test_acs_without_verifying_test_groups_by_story(conn, app):
+    s1 = _seed_story(conn, app, title="S1", ac=["a", "b"])
+    s2 = _seed_story(conn, app, title="S2", ac=["c"])
+    # Verify only S1.AC-1.
+    s1_acs = list_acceptance_criteria(conn, app, s1["id"])
+    link_test_to_ac(conn, app, "tests/test_s1.py", s1_acs[0]["id"])
+    untested = acs_without_verifying_test(conn, app)
+    assert [(u["story_key"], u["ac_key"]) for u in untested] == [
+        (s1["story_key"], f"{s1['story_key']}.AC-2"),
+        (s2["story_key"], f"{s2['story_key']}.AC-1"),
+    ]
+
+
+def test_acs_without_verifying_test_empty_when_clean(conn, app):
+    assert acs_without_verifying_test(conn, app) == []
+
+
+def test_migrate_v4_to_v5_drops_legacy_acceptance_criteria_column(isolated_state_db):
+    """Seed a v4-shape DB on disk; reopen; assert v5 schema landed and
+    the legacy JSON column is gone."""
+    db_path = state_db_path()
+    parent = os.path.dirname(db_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript("""
+            CREATE TABLE schema_meta (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL
+            );
+            INSERT INTO schema_meta(key, value) VALUES ('schema_version', '4');
+            CREATE TABLE stories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace TEXT NOT NULL,
+                story_key TEXT NOT NULL,
+                feature_id INTEGER,
+                title TEXT NOT NULL,
+                description TEXT,
+                acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+                depends_on TEXT NOT NULL DEFAULT '[]',
+                scope_files TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'planned',
+                external_ref TEXT,
+                build_kind TEXT NOT NULL DEFAULT 'greenfield',
+                cr_ids TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                UNIQUE(workspace, story_key)
+            );
+            INSERT INTO stories(
+                workspace, story_key, title, acceptance_criteria, created_at
+            ) VALUES ('demo', 'STORY-1', 'legacy v4', '["old"]', '2026-01-01T00:00:00');
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+    # Reopen — migration must run.
+    conn = open_story_db()
+    try:
+        assert _read_schema_version(conn) == SCHEMA_VERSION
+        cols = {c[1] for c in conn.execute("PRAGMA table_info(stories)").fetchall()}
+        assert "acceptance_criteria" not in cols
+        # v4 rows are dropped per the clean-slate precedent.
+        assert conn.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 0
+        # v5 side tables present.
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='requirements'"
+        ).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def test_purge_state_db_clears_v5_tables(workspace, app):
+    """purge_state_db must DELETE rows from all four new v5 tables."""
+    conn = open_story_db()
+    try:
+        _seed_feature(conn, app)
+        keys = create_stories(conn, app, [{
+            "title": "S", "feature": "test",
+            "acceptance_criteria": ["AC1"],
+        }])
+        sid = get_story(conn, app, keys[0])["id"]
+        create_requirements(conn, app, [
+            {"req_key": "FR-001", "kind": "fr", "title": "x"},
+        ])
+        link_story_to_requirements(conn, app, sid, ["FR-001"])
+        ac = list_acceptance_criteria(conn, app, sid)[0]
+        link_test_to_ac(conn, app, "tests/test_x.py", ac["id"])
+    finally:
+        conn.close()
+
+    counts = purge_state_db(workspace)
+    assert counts["requirements"] >= 1
+    assert counts["acceptance_criteria"] >= 1
+    assert counts["story_satisfies_req"] >= 1
+    assert counts["test_verifies_ac"] >= 1
+
+    conn = open_story_db()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM requirements WHERE workspace = ?", (app,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM acceptance_criteria WHERE workspace = ?", (app,),
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM test_verifies_ac WHERE workspace = ?", (app,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
