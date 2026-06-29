@@ -1854,6 +1854,29 @@ class Gateway:
         # excerpt. Keeps a single string per key (~tens of KB max) so
         # the dict bounds match _prefix_hashes.
         self._prefix_snapshots: dict[tuple[str, str], str] = {}
+        # Canonical session-wide token tracker. Every successful
+        # ``dispatch`` call mutates this in place via ``aggregate_tokens``,
+        # so it is structurally impossible to bypass: any caller that
+        # reaches a provider goes through dispatch. The legacy
+        # ``state["token_tracker"]`` mirror is left in place for
+        # backward-compatibility, but this dict is the source of truth
+        # for end-of-run / status / checkpoint displays.
+        self.session_tracker: dict[str, Any] = {}
+
+    def session_cost_summary(self) -> dict[str, Any]:
+        """Defensive copy of the canonical session tracker.
+
+        Use this — not ``state["token_tracker"]`` — when reporting cost
+        to the operator. Returns a shallow-copied dict with deep-copied
+        per_model / per_stage sub-dicts so callers can mutate freely
+        without disturbing the live tracker.
+        """
+        import copy as _copy
+        snapshot = dict(self.session_tracker)
+        for key in ("per_model", "per_stage"):
+            if key in snapshot:
+                snapshot[key] = _copy.deepcopy(snapshot[key])
+        return snapshot
 
     async def _get_provider(self, model_key: str) -> BaseLLM:
         """Get or create a cached provider instance."""
@@ -2541,6 +2564,13 @@ class Gateway:
         cost = accumulated_cost or response.usage.cost_usd
         new_budget = max(0.0, budget_remaining_usd - cost)
         elapsed_ms = round((_time.monotonic() - _dispatch_start) * 1000)
+
+        # Canonical session tracker (impossible to bypass — every dispatch
+        # lands here). Stamp the billed total onto response.usage first so
+        # the per-model/per-stage rollups reflect the true charge across
+        # any empty-retry tail rather than just the last call's cost.
+        response.usage.cost_usd = cost
+        self.aggregate_tokens(self.session_tracker, response.usage, role=role)
 
         logger.info(
             "[gateway] Response received. model=%s tokens_in=%d tokens_out=%d cache_hit=%d cost=$%.6f budget_left=$%.4f",

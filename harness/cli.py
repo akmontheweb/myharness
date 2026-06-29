@@ -5640,8 +5640,16 @@ async def cmd_run(args: argparse.Namespace) -> int:
 
     exit_code = final_state.get("exit_code", -1)
     modified_files = final_state.get("modified_files", [])
-    token_tracker = final_state.get("token_tracker", {})
-    total_cost = token_tracker.get("total_cost_usd", 0.0)
+    # Canonical cost comes from the Gateway's session tracker — every
+    # dispatch lands there automatically, so the figure includes call
+    # sites (cli synthesis, discovery nodes, speculative losers,
+    # continuation loops, chat tool-loops, …) that historically skipped
+    # the state-side ``aggregate_tokens`` step. Falls back to the state
+    # mirror for the (defensive) case where the gateway tracker is
+    # somehow empty but the state was populated by a legacy caller.
+    gateway_total = gateway.session_tracker.get("total_cost_usd", 0.0)
+    state_total = final_state.get("token_tracker", {}).get("total_cost_usd", 0.0)
+    total_cost = gateway_total or state_total
 
     # Distinguish HITL Save & Quit (intentional pause; operator will
     # `teane resume`) from a hard failure. Previously both took the same
@@ -5959,6 +5967,33 @@ async def cmd_resume(args: argparse.Namespace) -> int:
     gateway = create_gateway_from_config(config)
     set_gateway(gateway)
 
+    # Seed the gateway's session tracker from the JSONL log so the
+    # end-of-run "Token Cost" line on a resumed session shows the
+    # cumulative cost across all runs of this session — matching what
+    # `teane metrics` and the dashboard already report. Without this
+    # the resumed run's gateway tracker starts at $0 and the end-of-run
+    # summary would silently drop the prior run's spend, re-introducing
+    # the dual-display divergence we're fixing here.
+    try:
+        log_cfg_resume = config.get("observability", {}) or {}
+        resume_log_dir = os.path.expanduser(
+            log_cfg_resume.get("log_dir", "~/.harness/logs")
+        )
+        from harness.metrics import aggregate_session as _aggregate_session
+        prior = _aggregate_session(args.session_id, resume_log_dir)
+        if prior.total_cost_usd > 0:
+            gateway.session_tracker["total_input_tokens"] = prior.tokens_in
+            gateway.session_tracker["total_output_tokens"] = prior.tokens_out
+            gateway.session_tracker["total_cached_tokens"] = prior.cached_tokens
+            gateway.session_tracker["total_cost_usd"] = prior.total_cost_usd
+            logger.info(
+                "[cli] Seeded gateway session tracker from prior log: "
+                "$%.6f across %d calls.",
+                prior.total_cost_usd, prior.llm_call_count,
+            )
+    except Exception as exc:  # noqa: BLE001 — seeding is best-effort
+        logger.debug("[cli] Could not seed session tracker on resume: %s", exc)
+
     # Register built-in skills (pipeline + docgen + opt-in tool skills like
     # web_fetch / web_search). Wrapped: any failure inside the skill
     # registry must NOT block the harness from starting — the registry is
@@ -6197,6 +6232,10 @@ async def cmd_status(args: argparse.Namespace) -> int:
     persistence_cfg = config.get("persistence", {})
     db_path = persistence_cfg.get("db_path", "~/.harness/checkpoints.db")
     ttl_days = persistence_cfg.get("ttl_days", 30)
+    # JSONL log dir feeds inspect_session's cost reconciliation so
+    # `teane status` matches `teane metrics` and the dashboard.
+    log_cfg = config.get("observability", {}) or {}
+    status_log_dir = os.path.expanduser(log_cfg.get("log_dir", "~/.harness/logs"))
 
     # Run GC on startup
     checkpointer = await HarnessAsyncSqliteSaver.from_db_path(db_path=db_path, ttl_days=ttl_days)
@@ -6219,7 +6258,7 @@ async def cmd_status(args: argparse.Namespace) -> int:
         await checkpointer.conn.close()
         return 1
 
-    summary = await inspect_session(db_path, args.session_id)
+    summary = await inspect_session(db_path, args.session_id, log_dir=status_log_dir)
     if summary is None:
         print(f"No checkpoint found for session '{args.session_id}'.")
         await checkpointer.conn.close()

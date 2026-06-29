@@ -200,3 +200,84 @@ async def test_preflight_budget_refuses_oversized_call():
         )
     # Critical: the provider must NEVER have been called.
     assert stub.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_session_tracker_accumulates_across_dispatches():
+    """Every successful dispatch must land in ``gateway.session_tracker``
+    — this is what the end-of-run "Token Cost" summary now reads, so a
+    caller that forgets to call ``aggregate_tokens(state[...], ...)``
+    can no longer drop costs from the displayed total."""
+    usage = TokenUsage(
+        input_tokens=10, output_tokens=20,
+        model_name="stub:fast", cost_usd=0.0005,
+    )
+    stub = _StubProvider([
+        LLMResponse(content="one", usage=usage, model="stub:fast"),
+        LLMResponse(content="two", usage=usage, model="stub:fast"),
+        LLMResponse(content="three", usage=usage, model="stub:fast"),
+    ])
+    gateway = _make_gateway_with_stub_provider(stub, "stub:fast")
+    assert gateway.session_tracker.get("total_cost_usd", 0.0) == 0.0
+    for _ in range(3):
+        await gateway.dispatch(
+            messages=[
+                {"role": "system", "content": "stub"},
+                {"role": "user", "content": "go"},
+            ],
+            role=NodeRole.PATCHING,
+            budget_remaining_usd=1.0,
+        )
+    assert gateway.session_tracker["total_cost_usd"] == pytest.approx(
+        0.0015, rel=1e-6
+    )
+    assert gateway.session_tracker["total_input_tokens"] == 30
+    assert gateway.session_tracker["total_output_tokens"] == 60
+    # session_cost_summary returns a defensive copy.
+    snap = gateway.session_cost_summary()
+    snap["total_cost_usd"] = 999.0
+    assert gateway.session_tracker["total_cost_usd"] == pytest.approx(
+        0.0015, rel=1e-6
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_tracker_reflects_empty_retry_tail():
+    """When the provider blinks with empty content on the first attempt
+    and the empty-retry loop recovers, the session tracker must reflect
+    the BILLED total across both attempts — not just the last call's
+    cost. The empty attempt was charged server-side; dropping it would
+    undercount the session total exactly the way audit §4.4 warns
+    against for the budget."""
+    empty_usage = TokenUsage(
+        input_tokens=5, output_tokens=0,
+        model_name="stub:fast", cost_usd=0.0002,
+    )
+    real_usage = TokenUsage(
+        input_tokens=10, output_tokens=20,
+        model_name="stub:fast", cost_usd=0.0007,
+    )
+    stub = _StubProvider([
+        LLMResponse(content="", usage=empty_usage, model="stub:fast"),
+        LLMResponse(content="recovered", usage=real_usage, model="stub:fast"),
+    ])
+    gateway = _make_gateway_with_stub_provider(stub, "stub:fast")
+    response, new_budget = await gateway.dispatch(
+        messages=[
+            {"role": "system", "content": "stub"},
+            {"role": "user", "content": "go"},
+        ],
+        role=NodeRole.PATCHING,
+        budget_remaining_usd=1.0,
+    )
+    assert response.content == "recovered"
+    # Budget deduction was already accumulated across the empty tail.
+    assert new_budget == pytest.approx(1.0 - 0.0009, rel=1e-6)
+    # Session tracker must agree — this is the dual-display fix.
+    assert gateway.session_tracker["total_cost_usd"] == pytest.approx(
+        0.0009, rel=1e-6
+    )
+    # And the response.usage.cost_usd carries the BILLED amount so
+    # downstream consumers (state-mirror aggregators, log lines,
+    # debug dumps) see the same truthful number.
+    assert response.usage.cost_usd == pytest.approx(0.0009, rel=1e-6)

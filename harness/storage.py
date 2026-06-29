@@ -814,6 +814,8 @@ def _compute_is_active(exit_code: Any, current_node: str, updated_fmt: str) -> b
 async def inspect_session(
     db_path: str,
     thread_id: str,
+    *,
+    log_dir: Optional[str] = None,
 ) -> Optional[CheckpointSummary]:
     """
     Read a checkpoint from the SQLite database and return a human-readable
@@ -824,6 +826,12 @@ async def inspect_session(
     Args:
         db_path: Path to the checkpoints SQLite database.
         thread_id: The thread/session ID to inspect.
+        log_dir: Optional path to the observability JSONL log directory.
+            When provided and a session log exists, ``total_cost_usd`` is
+            taken from the JSONL replay (the same source `teane metrics`
+            and the dashboard use) so all surfaces show the same number.
+            Falls back to the state-side ``token_tracker`` mirror only
+            when no log is on disk (legacy sessions).
 
     Returns:
         CheckpointSummary if found, None otherwise.
@@ -871,6 +879,24 @@ async def inspect_session(
             total_cost = token_tracker.get("value", {}).get("total_cost_usd", 0.0)
         else:
             total_cost = 0.0
+
+        # Reconcile with the JSONL replay when a log dir is provided.
+        # The state mirror is structurally an undercount — many call
+        # sites historically skipped ``aggregate_tokens``. The per-call
+        # ``llm_call`` events in the log are the truth and also drive
+        # `teane metrics` and the dashboard, so reading from there keeps
+        # `teane status` consistent with the other surfaces.
+        if log_dir:
+            try:
+                from harness.metrics import aggregate_session
+                replay = aggregate_session(thread_id, log_dir)
+                if replay.total_cost_usd > 0:
+                    total_cost = replay.total_cost_usd
+            except Exception as exc:  # noqa: BLE001 — log replay is best-effort
+                logger.debug(
+                    "[storage] Log-replay reconcile skipped for %s: %s",
+                    thread_id, exc,
+                )
 
         modified_files = state.get("modified_files", [])
         if isinstance(modified_files, dict):
