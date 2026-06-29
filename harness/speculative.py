@@ -577,6 +577,9 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
     # importing ``compiler_node``'s block verbatim because we don't need
     # the loop-counter / token-tracker plumbing — just the resolved
     # build_command + sandbox_config + allow_network.
+    # is_greenfield is recovered from flow so an LLM-scaffolded Makefile
+    # can't hijack the build command away from the per-stack baseline.
+    is_greenfield_spec = bool(state.get("flow") == "build")
     adapted_build_cmd: Optional[str] = None
     if build_command.strip() == "make build" and not any(
         os.path.exists(os.path.join(workspace_path, name))
@@ -584,7 +587,9 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
     ):
         try:
             from harness.cli import _detect_default_build_command
-            late = _detect_default_build_command(workspace_path)
+            late = _detect_default_build_command(
+                workspace_path, is_greenfield=is_greenfield_spec,
+            )
             if late and late != "make build":
                 logger.info(
                     "[speculative] Workspace has no Makefile; adapting build command "
@@ -807,7 +812,9 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
             per_variant_adapted: Optional[str] = None
             try:
                 from harness.cli import _detect_default_build_command
-                late = _detect_default_build_command(vr.worktree_path)
+                late = _detect_default_build_command(
+                    vr.worktree_path, is_greenfield=is_greenfield_spec,
+                )
                 if late and late != per_variant_build:
                     logger.info(
                         "[speculative] Variant %d: build command resolved to %r "
@@ -921,7 +928,9 @@ async def speculate_node(state: dict[str, Any]) -> dict[str, Any]:
             from harness.sandbox import SandboxExecutor
             session_id = state.get("session_id")
             needs_install = _build_command_needs_network(build_command)
-            workspace_has_markers = _detect_workspace_marker(workspace_path) is not None
+            workspace_has_markers = _detect_workspace_marker(
+                workspace_path, is_greenfield=is_greenfield_spec,
+            ) is not None
             if needs_install and workspace_has_markers:
                 logger.info(
                     "[speculative] Warm-up: priming shared cache volume(s) with "

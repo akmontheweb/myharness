@@ -585,6 +585,209 @@ class TestDetectSubdirBuildCommand:
         assert "pytest" in detected
 
 
+class TestGreenfieldBrownfieldSplit:
+    """Reproduces the FinancialResearch session aa76d684 failure mode and
+    asserts the split: in greenfield runs an LLM-scaffolded ``Makefile``
+    must NOT hijack the build command away from the deterministic
+    per-stack baseline. In brownfield runs the operator's existing
+    Makefile remains authoritative (custom codegen / asset steps)."""
+
+    def _scaffold_llm_makefile_workspace(self, tmp_path):
+        """Simulate the FinancialResearch end-state: monorepo with
+        server/requirements.txt + an LLM-emitted Makefile whose ``build:``
+        target only does the install, no test command."""
+        (tmp_path / "Makefile").write_text(
+            ".PHONY: build test\nbuild:\n\tuv pip install --system -r server/requirements.txt\ntest:\n\tpython3 -m pytest -q\n"
+        )
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "requirements.txt").write_text("fastapi\nsqlalchemy\n")
+        (tmp_path / "server" / "main.py").write_text("import fastapi\n")
+        (tmp_path / "client").mkdir()
+        (tmp_path / "client" / "package.json").write_text("{}")
+
+    def test_brownfield_respects_existing_makefile(self, tmp_path):
+        from harness.cli import _detect_default_build_command
+
+        self._scaffold_llm_makefile_workspace(tmp_path)
+        detected = _detect_default_build_command(
+            str(tmp_path), is_greenfield=False,
+        )
+        assert detected == "make build"
+
+    def test_greenfield_ignores_llm_makefile(self, tmp_path):
+        from harness.cli import _detect_default_build_command
+
+        self._scaffold_llm_makefile_workspace(tmp_path)
+        detected = _detect_default_build_command(
+            str(tmp_path), is_greenfield=True,
+        )
+        # MUST NOT be make build — that was the FinancialResearch bug.
+        assert detected != "make build"
+        # MUST install the project's actual deps from server/requirements.txt
+        # so the prod-smoke check + the real build both succeed. The subdir
+        # detector picks the `cd server && uv pip install -r requirements.txt
+        # && pytest` form.
+        assert detected is not None
+        assert detected.startswith("cd server &&")
+        assert "uv pip install" in detected
+        assert "-r requirements.txt" in detected
+        assert "pytest" in detected
+
+    def test_default_is_brownfield(self, tmp_path):
+        """No keyword arg → defaults to brownfield. Backwards compatible
+        with every existing caller that hasn't been updated yet."""
+        from harness.cli import _detect_default_build_command
+
+        self._scaffold_llm_makefile_workspace(tmp_path)
+        assert _detect_default_build_command(str(tmp_path)) == "make build"
+
+    def test_resolve_build_command_threads_greenfield(self, tmp_path):
+        """The public entry point must forward the flag to the detector."""
+        self._scaffold_llm_makefile_workspace(tmp_path)
+        gf = resolve_build_command({}, str(tmp_path), is_greenfield=True)
+        bf = resolve_build_command({}, str(tmp_path), is_greenfield=False)
+        assert gf != "make build"
+        assert bf == "make build"
+
+    def test_makefile_without_build_target_falls_through_in_both_modes(
+        self, tmp_path,
+    ):
+        """A Makefile with `test:` / `install:` but no `build:` target was
+        already treated as absent. Holds in both greenfield and brownfield
+        — confirming the new flag didn't accidentally widen the Makefile
+        path."""
+        from harness.cli import _detect_default_build_command
+
+        (tmp_path / "Makefile").write_text("test:\n\tpytest\n")
+        (tmp_path / "requirements.txt").write_text("fastapi\n")
+        for gf in (True, False):
+            detected = _detect_default_build_command(
+                str(tmp_path), is_greenfield=gf,
+            )
+            assert detected != "make build", f"greenfield={gf}"
+            assert "uv pip install" in detected
+
+
+class TestNodeBuildCompose:
+    """Vite scaffold doesn't include a `test` script by default — `npm test`
+    against it exits 1 with 'no test specified' and traps the repair
+    loop. The composer must peek at package.json and emit a safe tail."""
+
+    def _write_package_json(self, path, *, scripts=None, deps=None, dev=None):
+        import json
+        data = {"name": "x", "version": "0.0.1"}
+        if scripts is not None:
+            data["scripts"] = scripts
+        if deps is not None:
+            data["dependencies"] = deps
+        if dev is not None:
+            data["devDependencies"] = dev
+        path.write_text(json.dumps(data))
+
+    def test_uses_npm_test_when_test_script_present(self, tmp_path):
+        from harness.cli import _compose_node_build_command
+
+        pkg = tmp_path / "package.json"
+        self._write_package_json(pkg, scripts={"test": "vitest run"})
+        cmd = _compose_node_build_command(str(pkg))
+        assert "npm install" in cmd
+        assert "npm run build" in cmd
+        # When scripts.test is defined, plain `npm test` runs it.
+        assert cmd.endswith("npm test")
+
+    def test_falls_back_to_vitest_when_no_test_script_but_vitest_in_deps(self, tmp_path):
+        from harness.cli import _compose_node_build_command
+
+        pkg = tmp_path / "package.json"
+        self._write_package_json(pkg, scripts={"build": "vite build"}, dev={"vitest": "^1.0"})
+        cmd = _compose_node_build_command(str(pkg))
+        assert cmd.endswith("npx vitest run")
+
+    def test_uses_if_present_when_no_test_script_no_vitest(self, tmp_path):
+        """Default Vite scaffold case: `dev`/`build`/`preview`/`lint` only,
+        no `test`. Must NOT emit plain `npm test` — that exits 1 with
+        'no test specified' and traps repair."""
+        from harness.cli import _compose_node_build_command
+
+        pkg = tmp_path / "package.json"
+        self._write_package_json(pkg, scripts={"build": "vite build", "dev": "vite"})
+        cmd = _compose_node_build_command(str(pkg))
+        assert "--if-present" in cmd
+        # Should NOT just be plain `npm test`.
+        assert not cmd.endswith("npm test")
+
+    def test_malformed_package_json_does_not_crash(self, tmp_path):
+        from harness.cli import _compose_node_build_command
+
+        pkg = tmp_path / "package.json"
+        pkg.write_text("{ this is not valid json")
+        # Falls through to the safe tail rather than raising.
+        cmd = _compose_node_build_command(str(pkg))
+        assert "npm install" in cmd
+        assert "--if-present" in cmd
+
+    def test_prefix_arg_prepends_cd(self, tmp_path):
+        from harness.cli import _compose_node_build_command
+
+        pkg = tmp_path / "package.json"
+        self._write_package_json(pkg, scripts={"test": "vitest"})
+        cmd = _compose_node_build_command(str(pkg), prefix="cd client && ")
+        assert cmd.startswith("cd client && npm install")
+
+
+class TestFrontendOnlyMonorepoFallback:
+    """A workspace with only ``client/package.json`` (pure-React/Vite
+    project in a subdir) used to fall through to the bare-pytest
+    fallback because the subdir probe deliberately skipped Node. Fixed
+    by a second pass: when no backend (Python/Java) subdir is found,
+    the FIRST Node subdir wins."""
+
+    def test_pure_frontend_monorepo_resolves_to_node_subdir(self, tmp_path):
+        import json
+        from harness.cli import _detect_default_build_command
+
+        (tmp_path / "client").mkdir()
+        (tmp_path / "client" / "package.json").write_text(json.dumps({
+            "name": "client",
+            "scripts": {"build": "vite build", "test": "vitest run"},
+        }))
+        detected = _detect_default_build_command(str(tmp_path))
+        assert detected is not None
+        assert detected.startswith("cd client &&")
+        assert "npm install" in detected
+        assert "npm run build" in detected
+        assert detected.endswith("npm test")
+
+    def test_backend_subdir_still_wins_when_both_present(self, tmp_path):
+        """Backend-first preference holds: server/requirements.txt + a
+        client/package.json — the smoke check needs the backend, so
+        server wins."""
+        import json
+        from harness.cli import _detect_default_build_command
+
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "requirements.txt").write_text("fastapi\n")
+        (tmp_path / "client").mkdir()
+        (tmp_path / "client" / "package.json").write_text(json.dumps({"name": "c"}))
+        detected = _detect_default_build_command(str(tmp_path))
+        assert detected.startswith("cd server &&")
+        assert "uv pip install" in detected
+
+    def test_frontend_only_picks_first_node_subdir_alphabetically(self, tmp_path):
+        import json
+        from harness.cli import _detect_default_build_command
+
+        for name in ("zfrontend", "afrontend"):
+            d = tmp_path / name
+            d.mkdir()
+            (d / "package.json").write_text(json.dumps({
+                "name": name, "scripts": {"build": "vite build"},
+            }))
+        detected = _detect_default_build_command(str(tmp_path))
+        # Alphabetical → "afrontend" is picked first.
+        assert detected.startswith("cd afrontend &&")
+
+
 # ---------------------------------------------------------------------------
 # Gatekeeper auto-approval (env-var driven)
 # ---------------------------------------------------------------------------

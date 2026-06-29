@@ -4656,6 +4656,190 @@ def _walk_prod_python_modules(workspace_path: str) -> list[str]:
     return sorted(set(modules))
 
 
+# First-level subdirs the install-step composer should NOT descend into
+# when sniffing for Python manifests. Mirrors the build-detection skip set
+# in cli.py so monorepo backends in `server/` get installed but build
+# artefacts, virtualenvs, doc folders, etc. don't get probed.
+_INSTALL_STEP_SUBDIR_SKIP = frozenset({
+    "node_modules", "__pycache__", ".git", "build", "dist", "venv", ".venv",
+    "env", "target", "out", "docs", "product_spec", "change_requests",
+    "tests", "test", "__tests__", "client", "frontend", "web", "ui",
+})
+
+
+def _compose_prod_smoke_install_step(workspace_path: str) -> Optional[str]:
+    """Build a comprehensive install step for the prod-import smoke check
+    by sniffing **all** Python manifests in the workspace (root + first-
+    level subdirs) and chaining the install commands.
+
+    Independent of ``build_command`` — the build command may be ``make
+    build`` (which the smoke check can't safely use as install) or a
+    bare ``pip install pytest`` seed (which doesn't install the project's
+    deps). This sniff is the authoritative source for what gets pip-
+    installed before the import check runs.
+
+    Returns the chained install command, or ``None`` if no Python manifest
+    exists anywhere in the workspace (in which case the caller should
+    skip the smoke check — there's nothing to import).
+
+    Supported tech stack only (Python). Java/Node smoke checks aren't
+    Python-side imports so the install step here doesn't need to cover
+    them; the actual ``mvn`` / ``npm`` build runs separately downstream.
+    """
+    if not os.path.isdir(workspace_path):
+        return None
+
+    install_cmds: list[str] = []
+
+    def has_file(*parts: str) -> bool:
+        return os.path.isfile(os.path.join(workspace_path, *parts))
+
+    # Root-level Python manifest takes precedence — single-project repo.
+    if has_file("pyproject.toml"):
+        install_cmds.append("uv pip install --system -e .")
+    elif has_file("requirements.txt"):
+        install_cmds.append("uv pip install --system -r requirements.txt")
+
+    # Plus any Python manifest one level deep (monorepo: server/ + client/).
+    # Skipped subdirs match the cli.py subdir-detection skip set so we don't
+    # accidentally pip-install the frontend or recurse into build output.
+    try:
+        entries = sorted(os.listdir(workspace_path))
+    except OSError:
+        entries = []
+    for entry in entries:
+        if entry.startswith("."):
+            continue
+        if entry in _INSTALL_STEP_SUBDIR_SKIP:
+            continue
+        full = os.path.join(workspace_path, entry)
+        if not os.path.isdir(full):
+            continue
+        sub_pyproject = os.path.join(full, "pyproject.toml")
+        sub_req = os.path.join(full, "requirements.txt")
+        if os.path.isfile(sub_pyproject):
+            install_cmds.append(f"uv pip install --system -e {entry}")
+        elif os.path.isfile(sub_req):
+            install_cmds.append(
+                f"uv pip install --system -r {entry}/requirements.txt"
+            )
+        # Optional dev requirements alongside.
+        sub_req_dev = os.path.join(full, "requirements-dev.txt")
+        if os.path.isfile(sub_req_dev):
+            install_cmds.append(
+                f"uv pip install --system -r {entry}/requirements-dev.txt"
+            )
+
+    if not install_cmds:
+        return None
+
+    # pytest itself — pre-baked in the builder image but harmless to
+    # re-state, and required if the harness runs outside the builder image.
+    install_cmds.append("uv pip install --system pytest")
+    return " && ".join(install_cmds)
+
+
+# A top-level module is considered a project module (not a missing third-
+# party dep) if it appears at the workspace root or in a first-level
+# Python subdir as a package / module file. Used by the smoke check's
+# DEPS_NOT_INSTALLED classifier — a ModuleNotFoundError on a name that
+# IS a project module means the file is broken (repair-able); the same
+# error on a name that isn't means the env is missing a dependency
+# (install-step or manifest fix).
+def _project_top_level_names(workspace_path: str) -> set[str]:
+    if not os.path.isdir(workspace_path):
+        return set()
+    names: set[str] = set()
+    try:
+        for entry in os.listdir(workspace_path):
+            if entry.startswith(".") or entry in _SMOKE_CHECK_SKIP_DIRS:
+                continue
+            full = os.path.join(workspace_path, entry)
+            if os.path.isdir(full):
+                # Any Python directory at root is a candidate top-level
+                # package. (Subdirs of monorepos count too — server/, app/,
+                # core/, etc. — because the smoke check imports them as
+                # `server.foo`, where `server` is the resolved top-level.)
+                names.add(entry)
+            elif entry.endswith(".py"):
+                names.add(entry[:-3])
+    except OSError:
+        pass
+    return names
+
+
+_MODULE_NAME_RE = re.compile(r"No module named ['\"]([^'\"]+)['\"]")
+
+
+def _detect_python_manifest(workspace_path: str) -> str:
+    """Return the canonical Python dep-manifest path for ``workspace_path``,
+    relative to the workspace root. Picks the most prominent existing
+    file so the DEPS_NOT_INSTALLED diagnostic points the repair LLM at
+    a path that actually exists.
+
+    Probe order: root pyproject.toml → root requirements.txt → first
+    subdir pyproject.toml → first subdir requirements.txt → fall back to
+    a fresh ``requirements.txt`` at workspace root (LLM will need to
+    create it). Mirrors the install-step composer's probe order so the
+    diagnostic points at the SAME file the install step would read.
+    """
+    if os.path.isfile(os.path.join(workspace_path, "pyproject.toml")):
+        return "pyproject.toml"
+    if os.path.isfile(os.path.join(workspace_path, "requirements.txt")):
+        return "requirements.txt"
+    try:
+        entries = sorted(os.listdir(workspace_path))
+    except OSError:
+        entries = []
+    for entry in entries:
+        if entry.startswith(".") or entry in _INSTALL_STEP_SUBDIR_SKIP:
+            continue
+        full = os.path.join(workspace_path, entry)
+        if not os.path.isdir(full):
+            continue
+        if os.path.isfile(os.path.join(full, "pyproject.toml")):
+            return f"{entry}/pyproject.toml"
+        if os.path.isfile(os.path.join(full, "requirements.txt")):
+            return f"{entry}/requirements.txt"
+    return "requirements.txt"
+
+
+def _classify_smoke_failure(
+    module: str,
+    exc_type: str,
+    message: str,
+    project_top_names: set[str],
+) -> tuple[str, str]:
+    """Classify a single prod-smoke failure as either a third-party
+    DEPS_NOT_INSTALLED error or a project-side bug.
+
+    Returns ``(error_code, repair_hint)`` where ``error_code`` is one of:
+      - ``DEPS_NOT_INSTALLED:<package>`` — missing pip-installable dep
+      - ``PROD_IMPORT_SMOKE:<exc_type>`` — original code-side failure
+    and ``repair_hint`` is the guidance line to attach to the diagnostic
+    message (empty string for the unchanged case).
+    """
+    if exc_type != "ModuleNotFoundError":
+        return f"PROD_IMPORT_SMOKE:{exc_type}", ""
+    m = _MODULE_NAME_RE.search(message)
+    if not m:
+        return f"PROD_IMPORT_SMOKE:{exc_type}", ""
+    missing = m.group(1)
+    top = missing.split(".", 1)[0]
+    if top in project_top_names:
+        # Project module missing — code bug, leave the original tag.
+        return f"PROD_IMPORT_SMOKE:{exc_type}", ""
+    # Third-party dep. The fix is to add it to requirements.txt /
+    # pyproject.toml — NOT to invent a project module with that name.
+    hint = (
+        f" — `{top}` is a third-party package, not project code. Add it "
+        f"to requirements.txt (or pyproject.toml `[project.dependencies]`). "
+        f"Do NOT create a `{top}/` directory or `{top}.py` file in the "
+        f"workspace."
+    )
+    return f"DEPS_NOT_INSTALLED:{top}", hint
+
+
 async def _run_prod_import_smoke_check(
     workspace_path: str,
     sandbox_config: dict[str, Any],
@@ -4726,6 +4910,8 @@ async def _run_prod_import_smoke_check(
     # one per line right after the FAILURES header.
     diagnostics: list[dict[str, Any]] = []
     seen = False
+    project_top = _project_top_level_names(workspace_path)
+    missing_third_party: dict[str, list[str]] = {}
     for line in (result.raw_output or "").splitlines():
         if "PROD_IMPORT_SMOKE_FAILURES" in line:
             seen = True
@@ -4741,11 +4927,18 @@ async def _run_prod_import_smoke_check(
             module, exc_type, message = [p.strip() for p in body.split(":", 2)]
         except ValueError:
             module, exc_type, message = body, "ImportError", body
+        error_code, hint = _classify_smoke_failure(
+            module, exc_type, message, project_top,
+        )
+        if error_code.startswith("DEPS_NOT_INSTALLED:"):
+            pkg = error_code.split(":", 1)[1]
+            missing_third_party.setdefault(pkg, []).append(module)
+            continue
         diagnostics.append({
-            "error_code": f"PROD_IMPORT_SMOKE:{exc_type}",
+            "error_code": error_code,
             "message": (
                 f"Production module `{module}` failed to import "
-                f"({exc_type}): {message}"
+                f"({exc_type}): {message}{hint}"
             ),
             "file": module.replace(".", "/") + ".py",
             "line": 0,
@@ -4753,6 +4946,37 @@ async def _run_prod_import_smoke_check(
             "severity": "error",
             "semantic_context": "",
         })
+    # Collapse all third-party DEPS_NOT_INSTALLED failures into a single
+    # diagnostic. The repair LLM needs one actionable message ("add these
+    # to requirements.txt") — surfacing 27 separate cascade failures sends
+    # it on a wild goose chase trying to fix project code that's fine.
+    if missing_third_party:
+        packages = sorted(missing_third_party.keys())
+        affected_count = sum(len(v) for v in missing_third_party.values())
+        manifest_target = _detect_python_manifest(workspace_path)
+        diagnostics.insert(0, {
+            "error_code": "DEPS_NOT_INSTALLED",
+            "message": (
+                f"{len(packages)} third-party Python package(s) failed to "
+                f"import — they are not installed in the build sandbox and "
+                f"cascade across {affected_count} production module(s). "
+                f"Missing: {', '.join(packages)}. "
+                f"Fix: ensure each is declared in `{manifest_target}` so "
+                f"the build's install step picks it up. Do NOT create "
+                f"project modules with these names."
+            ),
+            "file": manifest_target,
+            "line": 0,
+            "column": 0,
+            "severity": "error",
+            "semantic_context": "",
+        })
+        logger.warning(
+            "[prod-smoke] %d third-party package(s) missing from build env: "
+            "%s. Surfacing as single DEPS_NOT_INSTALLED diagnostic instead "
+            "of %d per-module cascade failures.",
+            len(packages), ", ".join(packages), affected_count,
+        )
     if not diagnostics:
         # Fall back to a single coarse diagnostic carrying the tail of
         # the output so the LLM has something to work with.
@@ -5248,6 +5472,45 @@ _DEFAULT_REPAIR_DIAGNOSTIC_CAP = 12
 _DEFAULT_REPAIR_INVENTORY_CAP = 50
 _EOS_REPAIR_DIAGNOSTIC_CAP = 30
 _EOS_REPAIR_INVENTORY_CAP = 150
+
+
+# Critical config files that should ALWAYS appear in the repair-prompt
+# workspace inventory (prepended ahead of the cap), regardless of how
+# many other files were modified this session. These are the paths the
+# LLM most often CREATE_FILE's into a "File already exists with
+# different content" rejection because they're scaffolded once early and
+# fall out of the inventory window in later iterations. Limited to the
+# supported tech stack (Python / Java / React+TS+Tailwind+Vite + the
+# usual Docker/Make plumbing).
+_CRITICAL_CONFIG_BASENAMES = frozenset({
+    # Python
+    "requirements.txt", "requirements-dev.txt", "pyproject.toml",
+    "setup.py", "setup.cfg", "Pipfile", "Pipfile.lock", "poetry.lock",
+    "uv.lock",
+    # Java
+    "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
+    "settings.gradle.kts", "gradle.properties", "gradlew", "gradlew.bat",
+    # Node / React / TS / Vite / Tailwind
+    "package.json", "package-lock.json", "tsconfig.json", "tsconfig.node.json",
+    "vite.config.ts", "vite.config.js", "tailwind.config.js",
+    "tailwind.config.ts", "postcss.config.js", "postcss.config.cjs",
+    ".eslintrc.json", ".eslintrc.cjs", ".prettierrc",
+    # Build / container plumbing
+    "Makefile", "makefile", "GNUmakefile", "Dockerfile",
+    "docker-compose.yml", "docker-compose.yaml",
+    ".env", ".env.example", ".gitignore",
+})
+
+
+def _is_critical_config_path(path: str) -> bool:
+    """True when ``path``'s basename is in the supported-tech critical
+    config set. Path is the workspace-relative form recorded in
+    ``modified_files`` (e.g. ``server/requirements.txt``).
+    """
+    if not path:
+        return False
+    basename = path.rsplit("/", 1)[-1]
+    return basename in _CRITICAL_CONFIG_BASENAMES
 
 
 _CR_EXTRA_FILE_CAP = 6
@@ -5947,13 +6210,22 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     # re-sniff now that codegen has likely populated the tree. This
     # rescues greenfield runs where workspace detection at cmd_run start
     # had nothing to go on but the spec file.
+    #
+    # is_greenfield is recovered from the session flow. In greenfield
+    # the detector ignores LLM-scaffolded Makefiles, so an LLM emitting
+    # a partial Makefile mid-session can't hijack the build command
+    # away from the per-stack baseline. See cli.py
+    # _detect_default_build_command for the contract.
+    is_greenfield_compile = bool(state.get("flow") == "build")
     adapted_build_cmd: Optional[str] = None
     if build_cmd.strip() == "make build" and not any(
         os.path.exists(os.path.join(workspace, name))
         for name in ("Makefile", "makefile", "GNUmakefile")
     ):
         from harness.cli import _detect_default_build_command
-        late = _detect_default_build_command(workspace)
+        late = _detect_default_build_command(
+            workspace, is_greenfield=is_greenfield_compile,
+        )
         if late and late != "make build":
             logger.info(
                 "[compiler_node] Workspace has no Makefile; adapting build command "
@@ -5973,14 +6245,19 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
     # so monorepo layouts (``server/requirements.txt`` + ``client/...``)
     # are caught too; an explicit ``os.path.isfile`` check at workspace
     # root misses them and the bare-pytest cmd loops forever on
-    # ModuleNotFoundError.
+    # ModuleNotFoundError. The `!= "make build"` guard remains as defence
+    # in depth — in greenfield the detector won't return it anyway, in
+    # brownfield it prevents replacing an explicit pip+pytest seed with
+    # a freshly-emitted LLM Makefile (unlikely but possible during patch).
     if (
         adapted_build_cmd is None
         and "pip install" in build_cmd
         and "-r" not in build_cmd
     ):
         from harness.cli import _detect_default_build_command
-        re_detected = _detect_default_build_command(workspace)
+        re_detected = _detect_default_build_command(
+            workspace, is_greenfield=is_greenfield_compile,
+        )
         if re_detected and re_detected != build_cmd and re_detected != "make build":
             logger.info(
                 "[compiler_node] Workspace gained a dependency manifest mid-session; "
@@ -6087,19 +6364,34 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
         # discover_config-stashed state. Default true (matches the
         # documented config behaviour).
         smoke_enabled = bool(state.get("run_prod_import_smoke_check", True))
-    if (
-        smoke_enabled
-        and "pip install" in build_cmd
-        and "pytest" in build_cmd
-    ):
-        # Reuse the install step from the build_cmd so we don't double-
-        # install. Take everything up to the first `&&` as the install
-        # phase, the rest (pytest) is the actual build we'd run otherwise.
-        install_step = build_cmd.split("&&")[0].strip()
+    # The install step is composed fresh from the workspace, NOT extracted
+    # from build_cmd. Build commands take many shapes (`make build`, a bare
+    # `pip install pytest && pytest -q` seed, a `cd subdir && ...` form);
+    # naively splitting on `&&` misses the project's actual deps in every
+    # case except the simplest single-manifest layout. The composer
+    # inspects the workspace directly and chains installs for every
+    # supported Python manifest at root + first-level subdirs. If it
+    # returns None, there's no Python code to smoke-import yet — skip.
+    composed_install_step = (
+        _compose_prod_smoke_install_step(workspace) if smoke_enabled else None
+    )
+    if smoke_enabled and composed_install_step:
+        install_step = composed_install_step
+        logger.info(
+            "[prod-smoke] Composed install step from workspace manifests: %s",
+            install_step,
+        )
+        # The composed install step always runs `uv pip install`, which
+        # needs network access. The outer `allow_network` may still be
+        # False when build_cmd is e.g. `make build` and the toolchain
+        # adapter didn't flip it on. Force network just for the smoke
+        # check — without it pip can't reach PyPI and every import fails
+        # with `ModuleNotFoundError`, indistinguishable from a missing
+        # manifest entry.
         smoke_errors = await _run_prod_import_smoke_check(
             workspace_path=workspace,
             sandbox_config=sandbox_cfg,
-            allow_network=allow_network,
+            allow_network=True,
             install_step=install_step,
             session_id=state.get("session_id", "unknown"),
         )
@@ -6997,8 +7289,16 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # that touched a shared utility doesn't leave the EoS repair
         # blind to the cascade.
         _, SNAPSHOT_CAP = _repair_file_caps(state)
-        shown = inventory_files[:SNAPSHOT_CAP]
-        extra = max(0, len(inventory_files) - SNAPSHOT_CAP)
+        # Critical config files are PREPENDED so they always survive the
+        # cap. These are the files the LLM most often CREATE_FILE's into
+        # rejection ("File already exists with different content") because
+        # they're scaffolded once early and never seen again unless we
+        # actively keep them in the prompt.
+        critical = [p for p in inventory_files if _is_critical_config_path(p)]
+        rest = [p for p in inventory_files if not _is_critical_config_path(p)]
+        ordered = critical + rest
+        shown = ordered[:SNAPSHOT_CAP]
+        extra = max(0, len(ordered) - SNAPSHOT_CAP)
         error_summary += (
             "\n## Files currently in workspace\n"
             "These files have been created or modified earlier in this "

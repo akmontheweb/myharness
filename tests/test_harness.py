@@ -6590,7 +6590,21 @@ class TestCLI:
     def test_detect_build_command_node(self):
         from harness.cli import _detect_default_build_command
         with tempfile.TemporaryDirectory() as tmpdir:
+            # No scripts.test and no vitest in deps — composer emits
+            # `npm test --if-present` so a freshly-scaffolded Vite app
+            # doesn't trap the repair loop on `Error: no test specified`.
             Path(tmpdir, "package.json").write_text('{"name":"x"}')
+            assert _detect_default_build_command(tmpdir) == (
+                "npm install && npm run build && npm test --if-present"
+            )
+
+    def test_detect_build_command_node_with_test_script(self):
+        from harness.cli import _detect_default_build_command
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # scripts.test defined → plain `npm test` runs it.
+            Path(tmpdir, "package.json").write_text(
+                '{"name":"x","scripts":{"test":"vitest run"}}'
+            )
             assert _detect_default_build_command(tmpdir) == (
                 "npm install && npm run build && npm test"
             )

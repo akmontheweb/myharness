@@ -1544,6 +1544,57 @@ _SUBDIR_BUILD_SKIP = frozenset({
 })
 
 
+def _compose_node_build_command(package_json_path: str, *, prefix: str = "") -> str:
+    """Build the Node command for a single ``package.json``.
+
+    Default Vite scaffolds (``npm create vite@latest`` →
+    ``dev``/``build``/``preview``/``lint``) have no ``test`` script.
+    Emitting ``npm test`` against them exits 1 with
+    ``Error: no test specified`` and traps the repair loop in a
+    non-bug. To avoid that, peek into ``package.json`` and pick the
+    right tail:
+
+      - ``scripts.test`` defined → ``npm test``
+      - ``vitest`` in deps / devDeps → ``npx vitest run``
+      - otherwise → ``npm test --if-present`` (silent no-op, exit 0)
+
+    ``prefix`` is used by the subdir probe to emit ``cd <dir> && ...``
+    forms. Returns the full command string ready to drop into the
+    detector.
+    """
+    has_test_script = False
+    has_vitest = False
+    try:
+        import json as _json
+        with open(package_json_path, "r", encoding="utf-8", errors="replace") as f:
+            data = _json.load(f) or {}
+        scripts = data.get("scripts") or {}
+        if isinstance(scripts, dict) and "test" in scripts:
+            has_test_script = True
+        deps = {}
+        for key in ("dependencies", "devDependencies"):
+            section = data.get(key)
+            if isinstance(section, dict):
+                deps.update(section)
+        if "vitest" in deps:
+            has_vitest = True
+    except (OSError, ValueError):
+        # Malformed JSON / unreadable file → fall through to the safe
+        # `--if-present` tail. Better than crashing the detector.
+        pass
+    if has_test_script:
+        tail = "npm test"
+    elif has_vitest:
+        tail = "npx vitest run"
+    else:
+        # Silent no-op: exits 0 when scripts.test is absent. Keeps the
+        # build green for a freshly-scaffolded Vite app the LLM hasn't
+        # wired vitest into yet, instead of trapping repair on a
+        # non-bug.
+        tail = "npm test --if-present"
+    return f"{prefix}npm install && npm run build && {tail}"
+
+
 def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
     """Probe first-level subdirectories for a recognised manifest when
     the workspace root has none. Returns a ``cd <subdir> && ...`` form
@@ -1554,13 +1605,18 @@ def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
     are the canonical case — the LLM puts the backend in one subdir
     and the frontend in another. We prefer the FIRST subdir with a
     Python or Java manifest (backend tests are the smoke target);
-    pure-frontend repos fall back to the existing root-level
-    ``package.json`` branch. Probed alphabetically for determinism.
+    when no backend manifest is found we fall back to the FIRST Node
+    subdir (pure-frontend monorepo). Probed alphabetically for
+    determinism.
     """
     try:
         entries = sorted(os.listdir(workspace_path))
     except OSError:
         return None
+    # Pass 1: backend-first (Python > Java). The smoke check imports
+    # production Python modules, so a workspace with backend code gets
+    # that path first.
+    node_fallback: Optional[tuple[str, str]] = None
     for entry in entries:
         if entry.startswith(".") or entry in _SUBDIR_BUILD_SKIP:
             continue
@@ -1568,13 +1624,10 @@ def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
         if not os.path.isdir(full):
             continue
         # Probe order mirrors the root probe: pyproject > requirements
-        # > Maven > Gradle. Node is intentionally NOT probed here — a
-        # subdir-only ``package.json`` typically means the frontend,
-        # and the backend smoke check is what unblocks prod-imports.
-        # uv pip install is a drop-in for pip install (same manifest
-        # semantics) but 10-30× faster on cold caches and uses the
-        # harness-managed /cache/uv volume across runs. uv is pre-baked
-        # into the sandbox builder image.
+        # > Maven > Gradle. uv pip install is a drop-in for pip install
+        # (same manifest semantics) but 10-30× faster on cold caches and
+        # uses the harness-managed /cache/uv volume across runs. uv is
+        # pre-baked into the sandbox builder image.
         if os.path.isfile(os.path.join(full, "pyproject.toml")):
             return f"cd {entry} && uv pip install --system -e . && python3 -m pytest -q"
         if os.path.isfile(os.path.join(full, "requirements.txt")):
@@ -1586,20 +1639,45 @@ def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
         if (os.path.isfile(os.path.join(full, "build.gradle"))
                 or os.path.isfile(os.path.join(full, "build.gradle.kts"))):
             return f"cd {entry} && gradle test"
+        # Record (but don't return yet) the first Node subdir so a
+        # pure-frontend monorepo can fall back to it after the backend
+        # probe finishes empty.
+        pkg = os.path.join(full, "package.json")
+        if node_fallback is None and os.path.isfile(pkg):
+            node_fallback = (entry, pkg)
+    # Pass 2: frontend-only fallback. Pure-React/Vite repos with no
+    # root manifest used to fall through to the bare-pytest fallback,
+    # which made no sense for a Node project. Emit the same package.json
+    # command we'd use at root, just prefixed with `cd <subdir> &&`.
+    if node_fallback is not None:
+        entry, pkg = node_fallback
+        return _compose_node_build_command(pkg, prefix=f"cd {entry} && ")
     return None
 
 
-def _detect_default_build_command(workspace_path: str) -> Optional[str]:
+def _detect_default_build_command(
+    workspace_path: str,
+    *,
+    is_greenfield: bool = False,
+) -> Optional[str]:
     """Pick a build command by sniffing workspace markers for the locked
     core stack.
 
     Only Python / Java / React+TypeScript+TailwindCSS+Vite are
-    supported. Probed in priority order so a polyglot repo with a
-    Makefile (that actually declares a ``build:`` target) still uses
-    it. A Makefile present but missing the ``build:`` target is
-    treated as if it weren't there — we fall through to manifest-based
-    detection so the operator gets an actionable build command instead
-    of an instant exit-127 in a make-less sandbox image.
+    supported. Probed in priority order.
+
+    **Greenfield vs brownfield Makefile handling**: in brownfield runs
+    (``teane patch`` on an existing repo) we still respect a Makefile
+    with a ``build:`` target — the operator's own build wiring may
+    perform codegen, asset compilation, or other steps the harness
+    can't infer. In greenfield runs (``teane build`` / ``--new-build``)
+    the LLM is the sole author of the workspace; an LLM-scaffolded
+    Makefile is informational, not load-bearing, so we ALWAYS emit the
+    baselined per-stack command. This kills the bug class where the
+    LLM emitted a Makefile whose ``build:`` target did the wrong thing
+    (or no install at all) and the harness then deferred to it instead
+    of running the project's actual ``pip install -r requirements.txt
+    && pytest``.
 
     Returns ``None`` only when the workspace truly contains no marker
     for any supported stack — that case is treated as a brand-new
@@ -1612,7 +1690,10 @@ def _detect_default_build_command(workspace_path: str) -> Optional[str]:
     def has(name: str) -> bool:
         return os.path.exists(os.path.join(workspace_path, name))
 
-    if _makefile_has_target(workspace_path, "build"):
+    # Brownfield only — see docstring. A Makefile in a greenfield
+    # workspace was emitted by the patching LLM and must not be allowed
+    # to override the deterministic per-stack baseline.
+    if not is_greenfield and _makefile_has_target(workspace_path, "build"):
         return "make build"
     # Python — pyproject.toml > requirements.txt > any .py file.
     # uv pip install is preferred over plain pip — same manifest semantics,
@@ -1631,9 +1712,14 @@ def _detect_default_build_command(workspace_path: str) -> Optional[str]:
         return "gradle test"
     # Web (React + TypeScript + TailwindCSS, Vite-built). package.json
     # is the only allowed Node manifest — any other Node framework is
-    # outside the supported stack.
+    # outside the supported stack. The compose helper peeks at
+    # scripts.test / vitest in deps so a freshly-scaffolded Vite app
+    # without a `test` script doesn't trap the repair loop on a
+    # non-bug (`Error: no test specified`).
     if has("package.json"):
-        return "npm install && npm run build && npm test"
+        return _compose_node_build_command(
+            os.path.join(workspace_path, "package.json"),
+        )
     # Monorepo layout: nothing at workspace root, but a first-level
     # subdirectory (e.g. ``server/``) carries the manifest. Common when
     # the LLM scaffolds a split backend/frontend layout — without this
@@ -1669,6 +1755,8 @@ def _detect_default_build_command(workspace_path: str) -> Optional[str]:
 def resolve_build_command(
     config: dict[str, Any],
     workspace_path: Optional[str] = None,
+    *,
+    is_greenfield: bool = False,
 ) -> str:
     """Auto-wire the build command from the workspace and the locked
     core-language selection.
@@ -1685,9 +1773,16 @@ def resolve_build_command(
          pip+pytest bootstrap for Python backends, ``mvn -B test`` for
          Java backends (so the very first compile in a fresh workspace
          doesn't exit-127 before the patcher writes the manifest).
+
+    ``is_greenfield`` is threaded into the detector so an LLM-scaffolded
+    ``Makefile`` in a ``--new-build`` run cannot hijack the build
+    command. See :func:`_detect_default_build_command` for the
+    greenfield/brownfield contract.
     """
     if workspace_path:
-        detected = _detect_default_build_command(workspace_path)
+        detected = _detect_default_build_command(
+            workspace_path, is_greenfield=is_greenfield,
+        )
         if detected:
             logger.info(
                 "[cli] Auto-wired build command from workspace markers: %s",
@@ -2481,7 +2576,14 @@ def _refresh_session_config_into_state(state: dict[str, Any]) -> None:
     # core_languages selection fully determine it. Re-auto-wire from
     # the current workspace so HITL pickups still adapt to new manifests
     # (e.g. operator dropped a pom.xml into a fresh workspace).
-    refreshed_build_cmd = resolve_build_command(fresh_config, workspace_path)
+    #
+    # is_greenfield is recovered from the session's flow ("build" = greenfield,
+    # anything else = brownfield). Mid-session HITL refreshes must NOT let
+    # an LLM-emitted Makefile flip a greenfield build's command to `make build`.
+    is_greenfield_refresh = bool(state.get("flow") == "build")
+    refreshed_build_cmd = resolve_build_command(
+        fresh_config, workspace_path, is_greenfield=is_greenfield_refresh,
+    )
     old_build_cmd = state.get("build_command")
     if refreshed_build_cmd and refreshed_build_cmd != old_build_cmd:
         state["build_command"] = refreshed_build_cmd
@@ -4623,7 +4725,14 @@ async def cmd_run(args: argparse.Namespace) -> int:
         # opt into --force-lock. Refuse to proceed.
         return 1
 
-    build_command = resolve_build_command(config, workspace_path)
+    # Greenfield runs (`teane build` / --new-build) get a deterministic
+    # baselined build command — an LLM-scaffolded Makefile cannot override
+    # it. See _detect_default_build_command for the contract.
+    build_command = resolve_build_command(
+        config,
+        workspace_path,
+        is_greenfield=bool(getattr(args, "new_build", False)),
+    )
 
     # --- Change-request mode validation (before resource allocation) ---
     # Validate BEFORE initializing checkpointer/gateway/MCP, so early returns
