@@ -1687,6 +1687,16 @@ class GatewayConfig:
     # speculative path also consumes part of this budget, so 3 leaves no
     # headroom for actual repair when speculative ends up salvaging.
     max_patch_repair_iterations: int = 5
+    # Hard ceiling on consecutive repair rounds where the per-round
+    # reflection LLM verdicts DISTRACTION or REGRESSION. The existing
+    # ``max_patch_repair_iterations`` / ``no_progress_repairs`` gate
+    # resets on any fingerprint-set shrinkage; an LLM that oscillates
+    # the failing set (6 → 4 → 6 → 4) never trips it, because each
+    # shrinkage credits the round as progress. This counter listens to
+    # the reflection verdict directly: when the judgment says the
+    # repair LLM isn't touching the real blocker N rounds in a row,
+    # the router escalates to HITL. Clamped to [1, 10] at config load.
+    max_consecutive_distraction_rounds: int = 3
     # Phase G — end-of-session regression repair cap. Caps the
     # repair → recompile loop the harness runs after security_scan
     # passes but before deployment. Read by
@@ -3094,6 +3104,33 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
             return 10
         return value
 
+    def _clamp_distraction_rounds(raw: Any) -> int:
+        """Clamp ``node_throttle.max_consecutive_distraction_rounds`` to [1, 10].
+
+        1 is the floor: at minimum, the operator wants the harness to
+        escalate after a single DISTRACTION verdict (effectively
+        trusting the judgment LLM). 10 is the ceiling: past that, the
+        counter never trips before the existing ``max_patch_repair_iterations``
+        ceiling fires, defeating its purpose.
+        """
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 3
+        if value < 1:
+            logger.warning(
+                "max_consecutive_distraction_rounds %d < 1; clamping to 1.",
+                value,
+            )
+            return 1
+        if value > 10:
+            logger.warning(
+                "max_consecutive_distraction_rounds %d > 10; clamping to 10.",
+                value,
+            )
+            return 10
+        return value
+
     def _clamp_discovery_iterations(raw: Any) -> int:
         try:
             value = int(raw)
@@ -3193,6 +3230,9 @@ def create_gateway_from_config(config_dict: dict[str, Any]) -> Gateway:
         ),
         max_patch_repair_iterations=_clamp_repair_iterations(
             node_throttle.get("max_patch_repair_iterations", 5)
+        ),
+        max_consecutive_distraction_rounds=_clamp_distraction_rounds(
+            node_throttle.get("max_consecutive_distraction_rounds", 3)
         ),
         # Phase G + Phase J — end-of-session repair / regression knobs.
         # Clamp the cycle / cap fields to sane ranges so a bogus

@@ -631,7 +631,14 @@ class TestRepairReflection:
             resolved_fingerprints=["F401::imported but unused"],
             persisted_fingerprints=["TS2769::No overload matches"],
             new_fingerprints=[],
-            top_persisted_messages=[("TS2769", "No overload matches this call.")],
+            top_persisted_diagnostics=[
+                {
+                    "error_code": "TS2769",
+                    "message": "No overload matches this call.",
+                    "file": "src/auth/AuthService.ts",
+                    "line": 42,
+                }
+            ],
         )
         assert "before this round: 9" in prompt
         assert "after this round:  3" in prompt
@@ -639,6 +646,46 @@ class TestRepairReflection:
         # Strict-JSON instruction must appear so the model knows the shape.
         assert "STRICT JSON" in prompt
         assert "verdict" in prompt
+
+    def test_prompt_emits_file_line_for_each_top_diag(self):
+        """Fix A — the reflection prompt must show real file:line so the
+        LLM doesn't have to fabricate locations to satisfy the
+        'cite a specific file/symbol' instruction."""
+        from harness.graph import _build_repair_reflection_prompt
+        prompt = _build_repair_reflection_prompt(
+            prior_diagnostics_count=6,
+            current_diagnostics_count=6,
+            resolved_fingerprints=[],
+            persisted_fingerprints=["AssertionError::assert 3 == 2"],
+            new_fingerprints=[],
+            top_persisted_diagnostics=[
+                {
+                    "error_code": "AssertionError",
+                    "message": "assert 3 == 2",
+                    "file": "server/tests/test_services_filings.py",
+                    "line": 199,
+                }
+            ],
+        )
+        assert "server/tests/test_services_filings.py:199" in prompt
+
+    def test_prompt_offers_insufficient_data_escape(self):
+        """Fix A — when the LLM lacks data to localise, it should be
+        able to write the literal 'insufficient data' sentence instead
+        of inventing a file/symbol. The escape hatch must be advertised
+        in the prompt."""
+        from harness.graph import _build_repair_reflection_prompt
+        prompt = _build_repair_reflection_prompt(
+            prior_diagnostics_count=3, current_diagnostics_count=3,
+            resolved_fingerprints=[], persisted_fingerprints=["TypeError::"],
+            new_fingerprints=[],
+            top_persisted_diagnostics=[
+                {"error_code": "TypeError", "message": "TypeError",
+                 "file": "x.py", "line": 0}
+            ],
+        )
+        assert "insufficient data" in prompt
+        assert "do not invent" in prompt.lower() or "do NOT invent" in prompt
 
     def test_parser_accepts_well_formed_distraction(self):
         from harness.graph import _parse_repair_reflection_verdict
@@ -686,6 +733,82 @@ class TestRepairReflection:
         from harness.graph import _parse_repair_reflection_verdict
         assert _parse_repair_reflection_verdict("not json") is None
         assert _parse_repair_reflection_verdict("") is None
+
+    def test_grounding_accepts_full_path_reference(self):
+        """Fix C — when real_blocker names a file present in
+        compiler_errors (full path), injection is allowed."""
+        from harness.graph import _reflection_grounds_in_diagnostics
+        v = {
+            "real_blocker": (
+                "Regex in server/services/filings.py misses 'period ended'"
+            ),
+            "recommendation": "",
+        }
+        errs = [{
+            "file": "server/services/filings.py", "line": 23,
+            "error_code": "AssertionError", "message": "assert 3 == 2",
+        }]
+        assert _reflection_grounds_in_diagnostics(v, errs) is True
+
+    def test_grounding_accepts_basename_reference(self):
+        """Fix C — LLMs often shorten paths to the basename; that
+        should still count as grounded."""
+        from harness.graph import _reflection_grounds_in_diagnostics
+        v = {"real_blocker": "bug in filings.py extract_period_date",
+             "recommendation": ""}
+        errs = [{
+            "file": "server/services/filings.py", "line": 23,
+            "error_code": "X", "message": "y",
+        }]
+        assert _reflection_grounds_in_diagnostics(v, errs) is True
+
+    def test_grounding_rejects_hallucinated_blocker(self):
+        """Fix C — when the LLM names no file present in the actual
+        compiler_errors (e.g. 'in the filing list retrieval logic'),
+        injection must be skipped — that text is fabricated."""
+        from harness.graph import _reflection_grounds_in_diagnostics
+        v = {
+            "real_blocker": (
+                "TypeError in the filing list retrieval logic, "
+                "indexing a list with a string"
+            ),
+            "recommendation": "edit the helper that processes filings",
+        }
+        errs = [{
+            "file": "server/services/filings.py", "line": 23,
+            "error_code": "X", "message": "y",
+        }]
+        assert _reflection_grounds_in_diagnostics(v, errs) is False
+
+    def test_grounding_rejects_insufficient_data_escape(self):
+        """Fix C — the explicit 'insufficient data' escape hatch (from
+        fix A) is deliberately ungrounded and must NOT be injected."""
+        from harness.graph import _reflection_grounds_in_diagnostics
+        v = {
+            "real_blocker": (
+                "insufficient data — investigate filings.py's data flow "
+                "into the assertion"
+            ),
+            "recommendation": "",
+        }
+        errs = [{
+            "file": "server/services/filings.py", "line": 23,
+            "error_code": "X", "message": "y",
+        }]
+        assert _reflection_grounds_in_diagnostics(v, errs) is False
+
+    def test_grounding_falls_open_when_no_file_info(self):
+        """Fix C — when compiler_errors carry no file info at all (e.g.
+        synthetic markers like '<harness:...>'), the helper falls open
+        so a real injection isn't muted by absent grounding data."""
+        from harness.graph import _reflection_grounds_in_diagnostics
+        v = {"real_blocker": "some sensible-sounding blocker text",
+             "recommendation": ""}
+        errs = [{
+            "file": "<harness:security-validator>", "line": 0,
+            "error_code": "BUILD_COMMAND_BLOCKED", "message": "blocked",
+        }]
+        assert _reflection_grounds_in_diagnostics(v, errs) is True
 
 
 class TestDecisionPointLogging:

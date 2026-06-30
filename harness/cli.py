@@ -555,6 +555,8 @@ _KNOWN_NESTED_KEYS: dict[str, frozenset[str]] = {
     }),
     "node_throttle": frozenset({
         "max_patch_repair_iterations",
+        # Consecutive-DISTRACTION circuit breaker for the repair loop.
+        "max_consecutive_distraction_rounds",
         "max_doc_review_cycles",
         "max_code_review_cycles",
         "max_discovery_iterations",
@@ -815,6 +817,7 @@ _TYPE_SCHEMA: dict[str, tuple[type, ...]] = {
     "token_budget.stages": (dict,),
     "token_budget.context_window_threshold_pct": (int, float),
     "node_throttle.max_patch_repair_iterations": (int,),
+    "node_throttle.max_consecutive_distraction_rounds": (int,),
     "node_throttle.max_doc_review_cycles": (int,),
     "node_throttle.max_code_review_cycles": (int,),
     "node_throttle.max_discovery_iterations": (int,),

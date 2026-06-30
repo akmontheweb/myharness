@@ -6092,6 +6092,40 @@ def _parse_preflight_verdict(
     return non_fixable
 
 
+# Phase 2.2 fix B — repair-prompt prelude that makes the LLM trace
+# before patching. Prepended onto the test-failure and default repair
+# prompts (NOT the security/escalation paths — those have their own
+# framing). The directive forces a one-sentence root-cause statement
+# before any patch synthesis, which catches the class of bug where
+# the failing assertion is several steps downstream of the actual fault
+# (e.g. test asserts on amendment-selection output but the bug is in
+# the regex that builds the period key). Empirically the repair LLM
+# pattern-matches on the failing test name and patches the WRONG layer
+# unless it's explicitly told to walk the data flow first.
+_TRACE_FIRST_DIRECTIVE = (
+    "## Trace before you patch\n\n"
+    "Before writing ANY patch block, do this for each failing test "
+    "below:\n"
+    "1. Identify the EXACT data the assertion compared (the values "
+    "pytest / vitest / etc. printed alongside `assert X == Y`). \n"
+    "2. Trace BACK through the call chain: which function produced the "
+    "wrong value? Which function fed it the inputs that led there? "
+    "Walk until you hit the FIRST function in the chain whose output "
+    "diverges from what the test setup implies it should be.\n"
+    "3. Write ONE sentence — the root-cause sentence — naming that "
+    "function, the file it lives in, and why its output is wrong "
+    "given its inputs.\n"
+    "4. Only then write the patch. Patch the function named in step 3, "
+    "not the function the test names directly (unless they're the "
+    "same).\n\n"
+    "Do NOT skip steps 1–3. The failing test's name is often misleading "
+    "— it describes the OUTER behaviour, not the inner function that's "
+    "broken. Patching the layer the test names without tracing first "
+    "is how repair loops burn iterations on the wrong file.\n\n"
+    "---\n\n"
+)
+
+
 def _build_repair_reflection_prompt(
     *,
     prior_diagnostics_count: int,
@@ -6099,23 +6133,33 @@ def _build_repair_reflection_prompt(
     resolved_fingerprints: list[str],
     persisted_fingerprints: list[str],
     new_fingerprints: list[str],
-    top_persisted_messages: list[tuple[str, str]],
+    top_persisted_diagnostics: list[dict[str, Any]],
 ) -> str:
     """Compose the prompt for the per-round repair-reflection judgment
     (Phase 2.2).
 
     The judgment LLM gets a structured before/after view of the failing
-    diagnostics and is asked two questions: did the previous round
-    address the highest-priority error, and if not, what is the real
-    blocker now? It must answer with strict JSON so the parser can act
-    on the verdict without LLM-shape gymnastics.
+    diagnostics (now including each error's file + line) and is asked
+    whether the previous round addressed the highest-priority error.
+    It must answer with strict JSON so the parser can act on the verdict
+    without LLM-shape gymnastics.
 
-    The verdict is consumed by repair_node, which — when ``progressed``
-    is false — injects ``blocker`` as a system message into the
+    The verdict is consumed by repair_node, which — when DISTRACTION /
+    REGRESSION — injects ``real_blocker`` as a system message into the
     upcoming dispatch, giving the repair LLM a second opinion before
-    it writes patches. This is the harness's way of telling the model
-    "the harness thinks you got distracted last round; the real bug is
-    over here."
+    it writes patches.
+
+    Anti-hallucination contract (fix A):
+    ------------------------------------
+    Earlier versions of this prompt passed only error codes + truncated
+    messages and demanded "citing a specific file/symbol/error" — so
+    the LLM had no choice but to invent file/symbol context. The
+    fabricated guidance got injected as authoritative direction and
+    repair would chase phantoms for dozens of rounds. The fix passes
+    real ``file:line`` for every persisted diagnostic and rephrases the
+    instructions to ground the answer in that data, with an explicit
+    escape hatch ("write \"insufficient data — investigate <file>'s
+    data flow\"") for the case where messages are too thin to localize.
     """
     res_block = (
         "\n".join(f"  - {fp}" for fp in resolved_fingerprints[:5])
@@ -6129,13 +6173,31 @@ def _build_repair_reflection_prompt(
         "\n".join(f"  - {fp}" for fp in new_fingerprints[:5])
         if new_fingerprints else "  (none)"
     )
-    top_block = (
-        "\n".join(
-            f"  - [{code}] {msg[:120]}"
-            for code, msg in top_persisted_messages[:3]
-        )
-        if top_persisted_messages else "  (no persistent errors)"
-    )
+
+    def _fmt_loc(diag: dict[str, Any]) -> str:
+        f = str(diag.get("file", "") or "").strip()
+        ln_raw = diag.get("line", 0)
+        try:
+            ln = int(ln_raw) if ln_raw is not None else 0
+        except (TypeError, ValueError):
+            ln = 0
+        if f and ln > 0:
+            return f"{f}:{ln}"
+        if f:
+            return f
+        return "<no location>"
+
+    if top_persisted_diagnostics:
+        lines: list[str] = []
+        for d in top_persisted_diagnostics[:3]:
+            code = str(d.get("error_code", "?"))
+            msg = str(d.get("message", ""))
+            loc = _fmt_loc(d)
+            lines.append(f"  - [{code}] {loc} :: {msg[:180]}")
+        top_block = "\n".join(lines)
+    else:
+        top_block = "  (no persistent errors)"
+
     return (
         "You are auditing the previous repair iteration's outcome to "
         "tell the harness whether to keep going on the same track or "
@@ -6147,7 +6209,7 @@ def _build_repair_reflection_prompt(
         f"Resolved (previous round → gone):\n{res_block}\n\n"
         f"Persisted (still failing):\n{pers_block}\n\n"
         f"New (introduced by this round's patches):\n{new_block}\n\n"
-        f"Top persistent error messages (truncated):\n{top_block}\n\n"
+        f"Top persistent errors (with file:line):\n{top_block}\n\n"
         "Answer ONE structured question: did the previous round make "
         "PROGRESS on the highest-priority error, or did it spend the "
         "iteration on a distraction? Use these definitions:\n"
@@ -6159,17 +6221,80 @@ def _build_repair_reflection_prompt(
         "lint fixes, cosmetics) instead of the blocker.\n"
         "  REGRESSION — the round introduced new failures that didn't "
         "exist before, and the original blocker is also unchanged.\n\n"
+        "GROUNDING RULES — read carefully, this is where prior versions "
+        "of this prompt failed:\n"
+        "  - Your answer must be grounded ONLY in the diagnostic data "
+        "above. The file:line locations shown are the ONLY files you "
+        "may name. Do NOT invent file paths, symbol names, or call-site "
+        "guesses that are not present above.\n"
+        "  - If the top-error messages are too generic to localize "
+        "(e.g. just a bare exception type), set ``real_blocker`` to "
+        "the literal string \"insufficient data — investigate <file>'s "
+        "data flow into the assertion\" with <file> substituted from "
+        "the locations above. The harness will recognise this and "
+        "skip the misleading injection instead of treating a guess as "
+        "authoritative.\n\n"
         "Respond with STRICT JSON ONLY — no prose, no markdown, no code "
         "fences. Shape:\n"
         '{"verdict": "PROGRESS" | "DISTRACTION" | "REGRESSION", '
-        '"real_blocker": "<one-sentence description of what should be '
-        'fixed next, citing a specific file/symbol/error from the data '
-        'above>", '
+        '"real_blocker": "<one-sentence description grounded in the '
+        'file:line locations above, OR the literal insufficient-data '
+        'sentence shown in the grounding rules>", '
         '"recommendation": "<one short imperative sentence for the next '
         'repair LLM, e.g. \\"Edit src/services/AuthService.ts lines '
         '20/25/73 to call jwt.sign(payload, secret, {expiresIn: ...}) '
         'instead of passing options as the second arg.\\""}\n'
     )
+
+
+def _reflection_grounds_in_diagnostics(
+    verdict: dict[str, str],
+    compiler_errors: list[dict[str, Any]],
+) -> bool:
+    """Fix C — return True iff the reflection's real_blocker or
+    recommendation references a file that is actually present in the
+    current ``compiler_errors``. Used to gate injection of the
+    reflection verdict into the repair prompt: when the LLM names a
+    location that doesn't intersect the real failing set, the
+    diagnosis is almost certainly fabricated and forwarding it to
+    repair just anchors the next round on a phantom.
+
+    The check is deliberately lenient — it matches on either the full
+    relative path or the basename, and on either side of the verdict
+    payload. The intent is "did the reflection model engage with the
+    actual diagnostic locations at all?", not "did it pinpoint the
+    exact line." False positives (text accidentally contains a file
+    name) are acceptable; false negatives are not, because they'd
+    mute a real injection.
+
+    Special case: the explicit "insufficient data" escape-hatch
+    sentence introduced by fix A is treated as deliberately ungrounded
+    — we return False so it does NOT get injected. The grounding-rule
+    text in the prompt tells the LLM the harness will skip it.
+    """
+    blocker = (verdict.get("real_blocker") or "").strip().lower()
+    recommendation = (verdict.get("recommendation") or "").strip().lower()
+    if not blocker:
+        return False
+    # Honour the fix-A escape hatch — don't inject "I don't know."
+    if "insufficient data" in blocker:
+        return False
+    haystack = blocker + " " + recommendation
+    files_seen: set[str] = set()
+    for err in compiler_errors:
+        f = str(err.get("file", "") or "").strip()
+        if not f or f.startswith("<"):
+            continue  # skip synthetic markers like "<harness:...>"
+        files_seen.add(f.lower())
+        # Also accept basename — LLMs often shorten paths.
+        basename = os.path.basename(f).lower()
+        if basename:
+            files_seen.add(basename)
+    if not files_seen:
+        # No file info to ground against — fall open (don't penalise
+        # diagnostics that lack file info; injection MAY still help).
+        return True
+    return any(name in haystack for name in files_seen)
 
 
 def _parse_repair_reflection_verdict(
@@ -7142,7 +7267,12 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
             resolved = sorted(prior_fps_set - current_fps_set)
             persisted = sorted(current_fps_set & prior_fps_set)
             new_fps = sorted(current_fps_set - prior_fps_set)
-            top_persisted_messages: list[tuple[str, str]] = []
+            # Phase 2.2 fix A — pass full diagnostic dicts (with file/line)
+            # so the reflection LLM can ground its answer in real locations
+            # instead of hallucinating file/symbol names to satisfy the
+            # earlier "cite a file/symbol" prompt demand.
+            top_persisted_diagnostics: list[dict[str, Any]] = []
+            _seen_fps: set[str] = set()
             _reflection_errors: list[DiagnosticObjectDict] = (
                 state.get("compiler_errors", []) or []
             )
@@ -7150,9 +7280,10 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 code = str(err.get("error_code", "?"))
                 msg = str(err.get("message", ""))
                 fp = f"{code}::{_normalize_diagnostic_message(msg)}"
-                if fp in persisted and (code, msg) not in top_persisted_messages:
-                    top_persisted_messages.append((code, msg))
-                if len(top_persisted_messages) >= 3:
+                if fp in persisted and fp not in _seen_fps:
+                    _seen_fps.add(fp)
+                    top_persisted_diagnostics.append(dict(err))
+                if len(top_persisted_diagnostics) >= 3:
                     break
             reflection_prompt = _build_repair_reflection_prompt(
                 prior_diagnostics_count=len(prior_fps_set),
@@ -7160,7 +7291,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 resolved_fingerprints=resolved,
                 persisted_fingerprints=persisted,
                 new_fingerprints=new_fps,
-                top_persisted_messages=top_persisted_messages,
+                top_persisted_diagnostics=top_persisted_diagnostics,
             )
             verdict_raw, new_budget = await _maybe_judgment_llm(
                 prompt=reflection_prompt,
@@ -7180,6 +7311,33 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     reflection_verdict["verdict"],
                     reflection_verdict["real_blocker"][:200],
                 )
+                # Consecutive-DISTRACTION circuit breaker. The existing
+                # ``no_progress_repairs`` gate resets on any fingerprint
+                # shrinkage, so an LLM that oscillates the failing set
+                # never trips it. This counter listens to the reflection
+                # verdict directly: DISTRACTION/REGRESSION ticks it up,
+                # PROGRESS resets it. ``route_after_compiler`` consults
+                # the counter against ``max_consecutive_distraction_rounds``
+                # and escalates to HITL when it saturates.
+                _v = reflection_verdict["verdict"]
+                if _v in {"DISTRACTION", "REGRESSION"}:
+                    loop_counter["consecutive_distraction_rounds"] = (
+                        loop_counter.get("consecutive_distraction_rounds", 0) + 1
+                    )
+                    logger.info(
+                        "[repair_node] consecutive_distraction_rounds=%d "
+                        "(verdict=%s).",
+                        loop_counter["consecutive_distraction_rounds"], _v,
+                    )
+                else:  # PROGRESS — earn back the budget.
+                    if loop_counter.get("consecutive_distraction_rounds", 0) > 0:
+                        logger.info(
+                            "[repair_node] Reflection verdict PROGRESS; "
+                            "resetting consecutive_distraction_rounds from "
+                            "%d to 0.",
+                            loop_counter["consecutive_distraction_rounds"],
+                        )
+                    loop_counter["consecutive_distraction_rounds"] = 0
                 try:
                     from harness.observability import emit_event as _emit
                     _emit(
@@ -7190,6 +7348,9 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                         recommendation=reflection_verdict["recommendation"][:500],
                         prior_count=len(prior_fps_set),
                         current_count=len(current_fps_set),
+                        consecutive_distraction_rounds=loop_counter.get(
+                            "consecutive_distraction_rounds", 0
+                        ),
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -7833,6 +7994,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         elif is_test_failure_repair:
             repair_prompt = (
                 cr_preamble + eos_preamble
+                + _TRACE_FIRST_DIRECTIVE
                 +"The harness-generated unit tests just failed when executed in the "
                 "sandbox. These are NOT compile errors — the code builds. For each "
                 "failure, decide whether the implementation is wrong or the test "
@@ -7854,6 +8016,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         else:
             repair_prompt = (
                 cr_preamble + eos_preamble
+                + _TRACE_FIRST_DIRECTIVE
                 +"The build failed with the following errors. Generate precise SEARCH/REPLACE "
                 f"patches to fix them.\n\n{error_summary}"
             )
@@ -7889,10 +8052,22 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
         # we don't inject anything (don't waste tokens on "you did fine"),
         # only on DISTRACTION or REGRESSION where the next round needs to
         # change direction.
+        #
+        # Fix C — file-intersection gate. The reflection LLM is cheap
+        # and small; when its real_blocker doesn't name any file that
+        # is present in the current compiler_errors, the diagnosis is
+        # almost certainly hallucinated (the previous loop spent dozens
+        # of rounds chasing "the filing list retrieval logic" while the
+        # actual bug was in a regex — see post-mortem on session
+        # cf3fcd27). Skip the injection in that case rather than letting
+        # noise become authoritative.
         if (
             reflection_verdict is not None
             and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
             and reflection_verdict["real_blocker"]
+            and _reflection_grounds_in_diagnostics(
+                reflection_verdict, state.get("compiler_errors", []) or []
+            )
         ):
             reflection_msg = (
                 f"[Reflection — verdict: {reflection_verdict['verdict']}] "
@@ -7905,6 +8080,28 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     f" Recommendation: {reflection_verdict['recommendation']}"
                 )
             messages.append(MessageDict(role="system", content=reflection_msg))
+        elif (
+            reflection_verdict is not None
+            and reflection_verdict["verdict"] in {"DISTRACTION", "REGRESSION"}
+            and reflection_verdict["real_blocker"]
+        ):
+            logger.info(
+                "[repair_node] Reflection real_blocker did not reference "
+                "any file present in compiler_errors — skipping injection "
+                "(verdict=%s, blocker=%s).",
+                reflection_verdict["verdict"],
+                reflection_verdict["real_blocker"][:200],
+            )
+            try:
+                from harness.observability import emit_event as _emit_skip
+                _emit_skip(
+                    "repair_reflection_injection_skipped",
+                    reason="no_file_intersection",
+                    verdict=reflection_verdict["verdict"],
+                    real_blocker=reflection_verdict["real_blocker"][:500],
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
         # Append the repair prompt first
         messages.append(MessageDict(role="user", content=repair_prompt))
@@ -8487,6 +8684,20 @@ def _infer_hitl_trigger(state: AgentState, *, max_repair: int) -> str:
         return f"security_fix_limit:{sec_attempts}/{max_sec_attempts}"
     if consecutive_zero >= 2:
         return f"zero_patch_loop:{consecutive_zero}"
+    # Consecutive-DISTRACTION circuit breaker. The route gate compares
+    # loop_counter["consecutive_distraction_rounds"] against
+    # ``gw.config.max_consecutive_distraction_rounds`` — we reuse the
+    # same threshold here so the HITL label matches the actual gate.
+    _gw_for_inf = get_gateway()
+    _distraction_cap = (
+        int(getattr(_gw_for_inf.config, "max_consecutive_distraction_rounds", 3))
+        if _gw_for_inf is not None else 3
+    )
+    consecutive_distraction = int(
+        loop_counter.get("consecutive_distraction_rounds", 0) or 0
+    )
+    if consecutive_distraction >= _distraction_cap:
+        return f"reflection_distraction_loop:{consecutive_distraction}"
     if int(loop_counter.get("total_repairs", 0) or 0) >= max_repair:
         return "repair_loop_limit"
     exit_code_raw = state.get("exit_code", -1)
@@ -9410,6 +9621,33 @@ def route_after_compiler(state: AgentState) -> Literal["repair_node", "human_int
             "patches even with autofix in play. Loop is not advancing "
             "(likely alternating MISSING_DEP cycle); routing to HITL.",
             consecutive_zero,
+        )
+        return _transition("human_intervention_node")
+
+    # Consecutive-DISTRACTION circuit breaker. ``repair_node`` ticks
+    # ``consecutive_distraction_rounds`` for every reflection verdict in
+    # {DISTRACTION, REGRESSION} and resets it on PROGRESS. When the count
+    # saturates the configured cap, escalate to HITL — the judgment LLM
+    # has told us N rounds running that the repair LLM isn't addressing
+    # the real blocker, and the existing fingerprint-shrinkage gate
+    # below can't catch this because shrinkage oscillates across rounds.
+    # Gate is NOT bypassed by has_autofixable: a DISTRACTION verdict
+    # already means the autofix path hasn't been advancing the blocker.
+    max_distraction = (
+        int(getattr(gw.config, "max_consecutive_distraction_rounds", 3))
+        if gw is not None else 3
+    )
+    consecutive_distraction = int(
+        loop_counter.get("consecutive_distraction_rounds", 0) or 0
+    )
+    if consecutive_distraction >= max_distraction:
+        logger.warning(
+            "[router] %d consecutive reflection verdict(s) flagged "
+            "DISTRACTION/REGRESSION (cap=%d). The judgment LLM has "
+            "repeatedly said the repair LLM isn't touching the real "
+            "blocker; further rounds will keep cycling on the same "
+            "guidance. Routing to HITL.",
+            consecutive_distraction, max_distraction,
         )
         return _transition("human_intervention_node")
 

@@ -3628,6 +3628,46 @@ class TestAgentState:
             state["budget_remaining_usd"] = 1.0
             assert route_after_compiler(state) == "repair_node"
 
+    def test_route_after_compiler_consecutive_distraction_escalates(self):
+        """Consecutive-DISTRACTION circuit breaker. When the reflection
+        LLM has verdicted DISTRACTION (or REGRESSION) N rounds in a row
+        — N = ``max_consecutive_distraction_rounds`` (default 3) — the
+        router must escalate to HITL even though the fingerprint set
+        may be oscillating (which keeps no_progress_repairs at 0)."""
+        from harness.graph import route_after_compiler
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir)
+            state["exit_code"] = 1
+            # Simulate the oscillating-fingerprint case: total_repairs has
+            # accumulated but no_progress_repairs keeps getting reset
+            # because some shrinkage happens each round. The new
+            # circuit breaker doesn't depend on either of those —
+            # it reads consecutive_distraction_rounds directly.
+            state["loop_counter"]["total_repairs"] = 6
+            state["loop_counter"]["no_progress_repairs"] = 0
+            state["loop_counter"]["consecutive_distraction_rounds"] = 3
+            state["compiler_errors"] = [
+                {"error_code": "AssertionError", "message": "assert 3 == 2"}
+            ]
+            state["budget_remaining_usd"] = 1.0
+            assert route_after_compiler(state) == "human_intervention_node"
+
+    def test_route_after_compiler_below_distraction_cap_continues(self):
+        """Below the cap, the gate must not fire. Two DISTRACTION rounds
+        in a row (default cap is 3) should keep routing to repair."""
+        from harness.graph import route_after_compiler
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _make_state(tmpdir)
+            state["exit_code"] = 1
+            state["loop_counter"]["total_repairs"] = 2
+            state["loop_counter"]["no_progress_repairs"] = 0
+            state["loop_counter"]["consecutive_distraction_rounds"] = 2
+            state["compiler_errors"] = [
+                {"error_code": "AssertionError", "message": "assert 3 == 2"}
+            ]
+            state["budget_remaining_usd"] = 1.0
+            assert route_after_compiler(state) == "repair_node"
+
     def test_route_after_compiler_budget_exhausted(self):
         from harness.graph import route_after_compiler
         with tempfile.TemporaryDirectory() as tmpdir:
