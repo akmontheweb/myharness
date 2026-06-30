@@ -901,6 +901,68 @@ class TestBuildParser:
         with _pytest.raises(SystemExit):
             parser.parse_args(["build", "-r", "/tmp/x", "-p", "do x"])
 
+    def test_audit_subcommand_registered(self):
+        """v5 Phase 5: `teane audit` runs the SQL traceability audit
+        standalone — useful as a CI gate. The parser must expose it."""
+        parser = build_parser()
+        for action in parser._actions:
+            if hasattr(action, "choices") and action.choices:
+                assert "audit" in action.choices, (
+                    "`audit` subcommand missing from build_parser"
+                )
+                return
+        raise AssertionError("subparsers action not found")
+
+    def test_audit_workspace_flag_parses(self):
+        parser = build_parser()
+        args = parser.parse_args(["audit", "-w", "/tmp/x"])
+        assert args.command == "audit"
+        assert args.workspace == "/tmp/x"
+
+
+class TestAuditSubcommand:
+    """End-to-end cmd_audit: empty workspace -> 0, gap workspace -> 1."""
+
+    def test_clean_audit_exits_zero(self, tmp_path, monkeypatch):
+        from harness import cli as cli_mod
+        # Per-test isolated state.db
+        db = tmp_path / "state.db"
+        monkeypatch.setenv("TEANE_STATE_DB", str(db))
+        ws = tmp_path / "clean-ws"
+        ws.mkdir()
+        args = type("A", (), {"workspace": str(ws)})()
+        rc = cli_mod.cmd_audit(args)
+        # Empty DB → vacuously clean → exit 0.
+        assert rc == 0
+
+    def test_audit_with_gap_exits_one(self, tmp_path, monkeypatch, capsys):
+        from harness import cli as cli_mod, story_state
+        db = tmp_path / "state.db"
+        monkeypatch.setenv("TEANE_STATE_DB", str(db))
+        ws = tmp_path / "gap-ws"
+        ws.mkdir()
+        app = story_state.app_name_for_workspace(str(ws))
+        conn = story_state.open_story_db()
+        try:
+            story_state.create_requirements(conn, app, [
+                {"req_key": "FR-001", "kind": "fr", "title": "Untraced"},
+            ])
+        finally:
+            conn.close()
+        args = type("A", (), {"workspace": str(ws)})()
+        rc = cli_mod.cmd_audit(args)
+        assert rc == 1
+        captured = capsys.readouterr()
+        # Rendered report on stdout, FAILED summary on stderr.
+        assert "FR-001" in captured.out
+        assert "FAILED" in captured.err
+
+    def test_audit_with_invalid_workspace_exits_two(self, tmp_path):
+        from harness import cli as cli_mod
+        args = type("A", (), {"workspace": "/nonexistent/path/zzzz"})()
+        rc = cli_mod.cmd_audit(args)
+        assert rc == 2
+
 
 # ---------------------------------------------------------------------------
 # Interactive review loop (kept from prior file; unrelated to config change)

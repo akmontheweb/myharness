@@ -124,9 +124,6 @@ _VALID_BUILD_KINDS = frozenset({BUILD_KIND_GREENFIELD, BUILD_KIND_CR})
 # own ``tmp_path`` so test runs never touch the operator's real file.
 _DEFAULT_STATE_DB_PATH = "~/.harness/state.db"
 
-_STATE_DIR_NAME = ".teane"  # retained only for legacy file detection
-_STATE_DB_NAME = "state.db"
-
 _INVALID_BASENAME = frozenset({"", ".", ".."})
 
 
@@ -357,16 +354,6 @@ def app_name_for_workspace(workspace_path: str) -> str:
             "cannot derive an app name for state.db scoping."
         )
     return base
-
-
-# Legacy path detector — used by the --new-build preview / log so
-# operators upgrading from the per-workspace layout see that the old
-# file is no longer the source of truth.
-def legacy_state_db_path(workspace_path: str) -> str:
-    """Return the OLD per-workspace state.db path (pre-v3)."""
-    return os.path.join(
-        os.path.expanduser(workspace_path), _STATE_DIR_NAME, _STATE_DB_NAME,
-    )
 
 
 # ---------------------------------------------------------------------------

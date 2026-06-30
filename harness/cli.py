@@ -8170,6 +8170,63 @@ async def cmd_purge(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_audit(args: argparse.Namespace) -> int:
+    """Execute ``teane audit`` — standalone v5 traceability audit.
+
+    Runs the SQL-backed audit against the workspace's state.db rows
+    (the same audit that fires at end-of-session) without spinning
+    up a full graph run. Exit 0 when both gap sets are empty;
+    exit 1 when ``has_failures()``.
+
+    Useful as a CI check: after a build/patch lands, gate the
+    follow-up step on whether traceability is clean. Honors
+    ``--workspace`` to scope the audit to one project; defaults to
+    the current directory's basename like every other subcommand.
+    """
+    workspace_path = (
+        os.path.abspath(args.workspace) if args.workspace else os.getcwd()
+    )
+    if not os.path.isdir(workspace_path):
+        print(
+            f"[teane audit] Workspace path is not a directory: "
+            f"{workspace_path}",
+            file=sys.stderr,
+        )
+        return 2
+
+    from harness.traceability import audit_workspace, format_report
+
+    report = audit_workspace(workspace_path)
+    if report is None:
+        print(
+            "[teane audit] No state.db rows for this workspace — "
+            "nothing to audit. Run `teane build` or `teane patch` first.",
+            file=sys.stderr,
+        )
+        return 0
+
+    if not report.has_failures():
+        print(
+            f"[teane audit] Clean. "
+            f"Requirements: {report.traced_reqs}/{report.total_reqs} "
+            f"({report.req_coverage_pct:.0f}%). "
+            f"Acceptance criteria: {report.verified_acs}/{report.total_acs} "
+            f"({report.ac_coverage_pct:.0f}%)."
+        )
+        return 0
+
+    rendered = format_report(report)
+    if rendered:
+        print(rendered)
+    print(
+        f"[teane audit] FAILED. "
+        f"{len(report.untraced)} untraced requirement(s), "
+        f"{len(report.untested_acs)} untested acceptance criteria.",
+        file=sys.stderr,
+    )
+    return 1
+
+
 async def cmd_cache_clear(args: argparse.Namespace) -> int:
     """Execute ``teane cache clear``.
 
@@ -8837,6 +8894,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # --- `teane purge` ---
+    audit_parser = subparsers.add_parser(
+        "audit",
+        help=(
+            "Run the v5 traceability audit (untraced FRs + untested ACs) "
+            "against state.db. Exits 1 on failures, useful as a CI gate."
+        ),
+    )
+    audit_parser.add_argument(
+        "--workspace", "-w", "-r",
+        default=None,
+        help="Workspace path to audit (defaults to current directory).",
+    )
+
     purge_parser = subparsers.add_parser("purge", help="Manually wipe checkpoint data")
     purge_parser.add_argument(
         "--all",
@@ -9223,6 +9293,8 @@ def main() -> int:
             return cmd_pre_flight(args)
         elif args.command == "purge":
             return asyncio.run(cmd_purge(args))
+        elif args.command == "audit":
+            return cmd_audit(args)
         elif args.command == "metrics":
             return asyncio.run(cmd_metrics(args))
         elif args.command == "cache":
