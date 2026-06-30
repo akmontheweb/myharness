@@ -1845,14 +1845,6 @@ def _render_status(cfg: DashboardConfig) -> str:
     return section_a + section_b + section_c
 
 
-def _collect_run_argv(form: dict[str, Any]) -> tuple[list[str], list[str]]:
-    """Translate the Run Harness form's per-flag inputs into a CLI argv
-    list. Thin wrapper over :func:`harness.web_forms.build_run_argv_from_form`
-    so the request handler doesn't import the form module directly."""
-    from harness.web_forms import build_run_argv_from_form
-    return build_run_argv_from_form(form)
-
-
 def _render_run_flag_input(flag: Any) -> str:
     """Render one CLI flag's input element. Mirrors the Carbon styling of
     the config form so the two screens feel consistent."""
@@ -1899,11 +1891,19 @@ def _render_run_flag_input(flag: Any) -> str:
     )
 
 
-def _render_run_flag_rows() -> str:
-    """All CLI-flag rows for the Run Harness form table."""
-    from harness.web_forms import run_flags
+def _render_run_flag_rows(subcommand: str = "build") -> str:
+    """CLI-flag rows for the Run Harness form table.
+
+    When ``subcommand`` is one of {build, patch, deploy, test}, only
+    the flags whose ``RunFlag.applies_to`` matches are rendered — so
+    the Test page surfaces ``--scope``/``--retries``/``--no-cleanup``
+    and hides ``--spec-discovery`` etc. ``audit`` returns an empty
+    string (the audit subparser accepts only --workspace).
+    """
+    from harness.web_forms import run_flags_for
+    flags = run_flags_for(subcommand)
     rows = []
-    for flag in run_flags():
+    for flag in flags:
         rows.append(
             f"<tr>"
             f"<td><label class='bx--label' for='{html.escape(flag.field_id)}'>"
@@ -1917,6 +1917,22 @@ def _render_run_flag_rows() -> str:
     return "".join(rows)
 
 
+def _collect_run_argv(  # noqa: ARG001 (kept for back-compat callers)
+    form: dict[str, Any],
+    *,
+    subcommand: str = "build",
+) -> tuple[list[str], list[str]]:
+    """Translate the Run-page form's per-flag inputs into argv tokens
+    for the given subcommand.
+
+    Thin wrapper over
+    :func:`harness.web_forms.build_subcommand_argv_from_form` so the
+    request handler doesn't import the form module directly.
+    """
+    from harness.web_forms import build_subcommand_argv_from_form
+    return build_subcommand_argv_from_form(form, subcommand=subcommand)
+
+
 def _render_run_harness(cfg: DashboardConfig) -> str:
     if not cfg.writes_enabled:
         return (
@@ -1927,6 +1943,25 @@ def _render_run_harness(cfg: DashboardConfig) -> str:
             "run or schedule from this page.</p></div>"
         )
     csrf_token = resolve_csrf_token(cfg) or ""
+
+    # Per-subcommand quick-launcher bar. The richer form below is the
+    # historical default-to-build flow + schedule + resume; the bar
+    # links to the focused subcommand pages (Phase 2.2) for operators
+    # who already know which intent (patch / deploy / test / audit)
+    # they want.
+    subcommand_bar = (
+        "<div class='card'>"
+        "<h2>Pick a subcommand</h2>"
+        "<p class='muted'>Focused per-subcommand forms. "
+        "The full form below defaults to <code>build</code>.</p>"
+        "<div class='actions'>"
+        + "".join(
+            f"<a href='/run/{sub}' class='bx--btn bx--btn--tertiary'>"
+            f"{_esc(_SUBCOMMAND_LABELS[sub][0])}</a>"
+            for sub in ("build", "patch", "deploy", "test", "audit")
+        )
+        + "</div></div>"
+    )
 
     # Pending one-shot jobs table. The schedule helper filters to
     # "due now" by default — pass a far-future cutoff to surface every
@@ -2182,7 +2217,7 @@ def _render_run_harness(cfg: DashboardConfig) -> str:
     else:
         running_html = "<p class='muted'>No runs in progress.</p>"
 
-    return f"""{form}
+    return f"""{subcommand_bar}{form}
 <div class='card'>
   <h2>Currently running</h2>
   {running_html}
@@ -3186,9 +3221,18 @@ def make_request_handler(
             if m:
                 self._handle_memory_save(m.group("name"), form)
                 return
-            # /run/now
+            # /run/now (legacy — defaults to subcommand="build")
             if path == "/run/now":
                 self._handle_run_now(form)
+                return
+            # /run/<subcommand> — Phase 2.2 per-subcommand handlers.
+            # Five focused forms (build / patch / deploy / test / audit)
+            # POST here. /run/now stays as the back-compat alias.
+            m = re.match(
+                r"^/run/(?P<sub>build|patch|deploy|test|audit)/?$", path,
+            )
+            if m:
+                self._handle_run_subcommand(m.group("sub"), form)
                 return
             # /run/resume
             if path == "/run/resume":
@@ -3401,6 +3445,34 @@ def make_request_handler(
                        _layout(f"Memory · {name}", body, cfg))
 
         def _handle_run_now(self, form: dict[str, Any]) -> None:
+            """Legacy /run/now POST → dispatches to ``build``.
+
+            The rich Run-page form predates the per-subcommand routes;
+            it lives at /run and POSTs here. New per-subcommand forms
+            (/run/build, /run/patch, ...) POST to ``/run/<subcommand>``
+            and share the same handler via ``_handle_run_subcommand``.
+            """
+            self._handle_run_subcommand("build", form)
+
+        def _handle_run_subcommand(
+            self, subcommand: str, form: dict[str, Any],
+        ) -> None:
+            """Launch a ``teane <subcommand>`` subprocess from a POSTed
+            Run-page form.
+
+            Validates the workspace, prompt (skipped for ``audit``),
+            and per-flag values; reserves the workspace against
+            parallel runs; spawns via
+            ``harness.dashboard_runlike.spawn_harness_subcommand``; and
+            redirects to the live console.
+            """
+            from harness.dashboard_runlike import (
+                is_valid_subcommand, spawn_harness_subcommand,
+            )
+            if not is_valid_subcommand(subcommand):
+                self._send(400, "text/plain", f"unknown subcommand: {subcommand}\n")
+                return
+
             workspace = str(form.get("workspace") or "").strip()
             prompt = str(form.get("prompt") or "").strip()
             spec_file_path = str(form.get("spec_file_path") or "").strip()
@@ -3414,40 +3486,57 @@ def make_request_handler(
                     f"workspace not found: {workspace}\n",
                 )
                 return
-            # The Product Requirement input accepts either pasted text or
-            # an uploaded .txt/.md document (whose path lands in the
-            # hidden ``spec_file_path`` field via /api/upload-spec). At
-            # least one must be supplied so the harness has something to
-            # work from.
-            if not prompt and not spec_file_path:
+
+            # `audit` takes only --workspace; skip prompt validation.
+            wants_prompt = subcommand != "audit"
+            if wants_prompt and not prompt and not spec_file_path:
                 self._send(
                     400, "text/plain",
                     "Provide a product requirement: either enter text or "
                     "upload a .txt/.md document.\n",
                 )
                 return
-            if len(prompt) > _RUN_PROMPT_MAX_CHARS:
+            if prompt and len(prompt) > _RUN_PROMPT_MAX_CHARS:
                 self._send(
                     400, "text/plain",
                     f"prompt too long ({len(prompt)} chars; "
                     f"max {_RUN_PROMPT_MAX_CHARS})\n",
                 )
                 return
+
+            # `teane test` requires a clean prior deploy + build|patch.
+            # Block early so the operator doesn't spawn a doomed run
+            # whose first action is to exit with "prereq_failed".
+            if subcommand == "test":
+                try:
+                    from harness.flow_state import check_test_prereqs
+                    ok, reason = check_test_prereqs(workspace)
+                    if not ok:
+                        self._send(
+                            409, "text/plain",
+                            f"Test prerequisites not met: {reason}\n",
+                        )
+                        return
+                except Exception:  # noqa: BLE001
+                    # flow_state failure is non-fatal — fall through and
+                    # let the harness re-check.
+                    pass
+
             # Block parallel runs against the same workspace — the
-            # build/patch pipeline isn't designed to interleave two
-            # concurrent sessions safely. Atomic reservation closes the
-            # TOCTOU where two concurrent /run/now requests both pass the
-            # check (audit §1.10).
+            # pipelines aren't designed to interleave two concurrent
+            # sessions safely. Atomic reservation closes the TOCTOU
+            # where two concurrent POSTs both pass the check
+            # (audit §1.10).
             reg = get_process_registry()
             if not reg.acquire_pending(workspace):
                 self._send(
                     409, "text/plain",
                     f"A run is already in progress for {workspace}. "
-                    f"Try again once that build/patch cycle completes.\n",
+                    f"Try again once that cycle completes.\n",
                 )
                 return
             try:
-                extra_args, flag_errors = _collect_run_argv(form)
+                extra_args, flag_errors = _collect_run_argv(form, subcommand=subcommand)
                 if flag_errors:
                     self._send(400, "text/plain",
                                "invalid run options:\n  - " + "\n  - ".join(flag_errors) + "\n")
@@ -3456,17 +3545,19 @@ def make_request_handler(
                 # text rides along as a sibling ``web_input.md`` inside the
                 # same ``product_spec/`` folder so the harness consolidator
                 # picks up both inputs.
-                if spec_file_path and prompt:
+                if wants_prompt and spec_file_path and prompt:
                     try:
                         _write_web_input_sidecar(workspace, prompt)
                     except OSError as exc:
                         logger.warning("[run] failed to write web_input.md: %s", exc)
                 try:
-                    # Pass an empty prompt when only a spec file was uploaded
-                    # — the harness reads ``product_spec/*`` itself.
-                    wp = spawn_harness_run(
-                        cfg, workspace=workspace,
-                        prompt=prompt or "(see product_spec/)",
+                    spawn_prompt = (
+                        prompt or "(see product_spec/)" if wants_prompt else ""
+                    )
+                    wp = spawn_harness_subcommand(
+                        cfg, subcommand=subcommand,
+                        workspace=workspace,
+                        prompt=spawn_prompt,
                         extra_args=extra_args,
                     )
                 except Exception as exc:  # noqa: BLE001
@@ -4060,53 +4151,18 @@ ServerHandle = _ServerHandle
 # handlers consult them.
 
 from harness.web_state import (  # noqa: E402  (intentional late import)
-    HitlQueue,
-    ProcessRegistry,
     WebProcess,
     add_oneshot_job,
     append_audit,
     consume_chat_notes,
     find_oneshot_jobs_near,
+    get_hitl_queue,
+    get_process_registry,
     list_pending_oneshot_jobs,
     pending_chat_notes,
     queue_chat_note,
+    reset_shared_state as reset_shared_state,  # re-export for test hook
 )
-
-_process_registry: Optional[ProcessRegistry] = None
-_hitl_queue: Optional[HitlQueue] = None
-# Audit §1.17: guard lazy-init under ThreadingMixIn. Without this lock,
-# two concurrent first-call threads could both enter the ``is None``
-# branch, both instantiate, and one would lose its handle — registrations
-# routed to the loser are silently dropped.
-_shared_state_lock = threading.Lock()
-
-
-def get_process_registry() -> ProcessRegistry:
-    global _process_registry
-    # Double-checked pattern: cheap path stays lock-free once initialised.
-    if _process_registry is None:
-        with _shared_state_lock:
-            if _process_registry is None:
-                _process_registry = ProcessRegistry()
-    return _process_registry
-
-
-def get_hitl_queue() -> HitlQueue:
-    global _hitl_queue
-    if _hitl_queue is None:
-        with _shared_state_lock:
-            if _hitl_queue is None:
-                _hitl_queue = HitlQueue()
-    return _hitl_queue
-
-
-def reset_shared_state() -> None:
-    """Test hook — drop the shared registry + queue so each test gets
-    isolated state."""
-    global _process_registry, _hitl_queue
-    with _shared_state_lock:
-        _process_registry = None
-        _hitl_queue = None
 
 
 # ---------------------------------------------------------------------------
@@ -4341,123 +4397,27 @@ def spawn_harness_run(
     extra_args: Optional[list[str]] = None,
     harness_binary: str = "harness",
 ) -> WebProcess:
-    """Spawn a `teane run` subprocess, register it, and return the
-    :class:`WebProcess` handle. Sets ``HARNESS_HITL_WEBHOOK_URL`` so the
-    harness's HttpChannel POSTs HITL prompts back to this dashboard.
+    """Deprecated thin shim — delegates to
+    :func:`harness.dashboard_runlike.spawn_harness_subcommand` with
+    ``subcommand="build"``.
 
-    Resolves ``harness_binary`` via :func:`shutil.which` when not absolute
-    so a same-host attacker who plants ``./harness`` in cwd or a writable
-    PATH entry can't shadow the real binary (audit §3.6).
+    The legacy ``teane run`` subparser no longer exists; ``build`` is
+    the closest historical analogue (greenfield, destructive). New
+    callers should invoke ``spawn_harness_subcommand`` directly so they
+    can pick the right subcommand for the operator's intent.
     """
-    import shutil as _shutil
-    import subprocess as _sub
-    import uuid as _uuid
-
-    if not os.path.isabs(harness_binary):
-        resolved = _shutil.which(harness_binary)
-        if resolved and os.path.isabs(resolved):
-            harness_binary = resolved
-
-    session_id = f"web-{_uuid.uuid4().hex[:12]}"
-    log_dir = os.path.expanduser(cfg.log_dir)
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f"{session_id}.jsonl")
-    # Pre-create the log file so the SSE stream's tail can start
-    # before the harness has written anything.
-    open(log_path, "a", encoding="utf-8").close()
-
-    argv = [
-        harness_binary, "run",
-        "-r", workspace,
-        "-p", prompt,
-        "--session-id", session_id,
-    ]
-    argv += list(extra_args or [])
-
-    env = dict(os.environ)
-    env["HARNESS_HITL_WEBHOOK_URL"] = (
-        f"http://{cfg.host}:{cfg.port}/hitl/webhook?session={session_id}"
+    import warnings
+    warnings.warn(
+        "spawn_harness_run is deprecated; "
+        "use harness.dashboard_runlike.spawn_harness_subcommand",
+        DeprecationWarning, stacklevel=2,
     )
-    if cfg.hitl_webhook_secret:
-        env["HARNESS_HITL_WEBHOOK_SECRET"] = cfg.hitl_webhook_secret
-    # Keep the harness's HttpChannel timeout >= the dashboard's operator-wait
-    # ceiling; the +30s buffer lets the dashboard return 504 first instead of
-    # the harness aborting mid-prompt. Operators can still override via env.
-    env.setdefault(
-        "HARNESS_HITL_WEBHOOK_TIMEOUT",
-        str(float(cfg.hitl_webhook_timeout_seconds or 600.0) + 30.0),
+    from harness.dashboard_runlike import spawn_harness_subcommand
+    return spawn_harness_subcommand(
+        cfg, subcommand="build",
+        workspace=workspace, prompt=prompt,
+        extra_args=extra_args, harness_binary=harness_binary,
     )
-
-    # Open the stdout sink, hand the FD to Popen (which dup's it into the
-    # child), then close the parent's copy so the dashboard process doesn't
-    # leak one FD per spawned run.
-    stdout_fh = open(log_path + ".stdout", "ab")
-    proc_ok = False
-    try:
-        try:
-            proc = _sub.Popen(
-                argv,
-                stdout=stdout_fh,
-                stderr=_sub.STDOUT,
-                env=env,
-                **_platform.new_process_group_kwargs(),
-            )
-            proc_ok = True
-        finally:
-            stdout_fh.close()
-    finally:
-        if not proc_ok:
-            # Popen raised — drop the empty stdout file we created so the
-            # log dir doesn't accumulate zero-byte detritus (audit §2.11).
-            try:
-                os.unlink(log_path + ".stdout")
-            except OSError:
-                pass
-    # Capture pgid immediately after spawn so the cancel path can target
-    # the original process group even if the kernel later recycles the
-    # pid to an unrelated process (audit §1.2). Under start_new_session
-    # the child is the leader of its own group so pgid == pid here.
-    spawn_pgid: Optional[int] = None
-    if hasattr(os, "getpgid"):
-        try:
-            spawn_pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, OSError):
-            spawn_pgid = proc.pid
-    wp = WebProcess(
-        session_id=session_id, pid=proc.pid, argv=argv,
-        log_path=log_path, workspace_path=workspace, prompt=prompt,
-        popen=proc, pgid=spawn_pgid,
-        # We start a watcher thread below — flag the entry so
-        # _prune_dead_locked doesn't race to mark exit_code=-1
-        # before the watcher records the real exit (audit §2.15).
-        watcher_pending=True,
-    )
-    get_process_registry().register(wp)
-
-    # Background thread: wait on the process and mark terminated.
-    def _watch():
-        try:
-            ec = proc.wait()
-        except Exception:  # noqa: BLE001
-            ec = -1
-        get_process_registry().mark_terminated(session_id, int(ec or 0))
-        try:
-            append_audit(
-                db_path=cfg.web_db_path, action="run_exit",
-                target=session_id, detail=f"exit_code={ec}",
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
-    threading.Thread(target=_watch, daemon=True, name=f"web-run-{session_id}").start()
-    try:
-        append_audit(
-            db_path=cfg.web_db_path, action="run_now",
-            target=session_id, detail=f"argv={' '.join(argv)}",
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    return wp
 
 
 def spawn_harness_resume(
@@ -4972,6 +4932,60 @@ def _render_run_new(cfg: DashboardConfig, csrf_token: Optional[str], flash: str 
     )
 
 
+def _render_hitl_metadata_block(metadata: dict[str, Any]) -> str:
+    """Render the labelled-trigger / escalation-summary / outside-harness
+    fix-list envelope the harness ships with the repair-menu HITL prompt.
+
+    The webhook payload carries this dict under the ``metadata`` key
+    (built by ``hitl_menu_loop`` in ``cli.py``). When absent — older
+    harness builds, prompts other than the repair menu, or empty values
+    — returns an empty string and the card renders the bare question
+    body as before.
+
+    Output is HTML; safe for direct inclusion above
+    ``_render_hitl_prompt_body``'s question line.
+    """
+    if not isinstance(metadata, dict) or not metadata:
+        return ""
+
+    trigger = str(metadata.get("hitl_trigger") or "").strip()
+    summary = str(metadata.get("hitl_escalation_summary") or "").strip()
+    actions = metadata.get("outside_harness_actions") or []
+    if not isinstance(actions, list):
+        actions = []
+
+    parts: list[str] = []
+    if trigger:
+        parts.append(
+            "<p class='hitl-trigger'>"
+            "<span class='bx--tag bx--tag--red'>"
+            f"HITL trigger: {_esc(trigger)}"
+            "</span></p>"
+        )
+    if summary:
+        # Render as markdown so the LLM-emitted briefing keeps its
+        # bullets / emphasis. render_markdown_minimal already escapes
+        # the user content before inlining.
+        parts.append(
+            "<details class='hitl-escalation' open>"
+            "<summary><strong>Why the loop stopped</strong></summary>"
+            f"{render_markdown_minimal(summary)}"
+            "</details>"
+        )
+    if actions:
+        items = "".join(
+            f"<li>{_esc(str(a))}</li>" for a in actions if str(a).strip()
+        )
+        if items:
+            parts.append(
+                "<details class='hitl-outside-actions' open>"
+                "<summary><strong>Fix outside the harness, then resume</strong></summary>"
+                f"<ol>{items}</ol>"
+                "</details>"
+            )
+    return "".join(parts)
+
+
 def _render_hitl_prompt_body(
     prompt: dict[str, Any], autofocus: str,
 ) -> tuple[str, str, str]:
@@ -5109,11 +5123,21 @@ def _render_pending_hitl_rows(cfg: DashboardConfig, session_id: str) -> str:
     rows: list[str] = []
     for idx, p in enumerate(pending):
         autofocus = " autofocus" if idx == 0 else ""
+        # The harness's repair-menu HITL embeds a structured envelope in
+        # ``prompt["metadata"]`` (trigger label, LLM escalation summary,
+        # outside-harness fix list — see hitl_menu_loop in cli.py).
+        # Surface it above the question/input so the operator gets the
+        # context before the choice instead of after.
+        metadata = p.prompt.get("metadata") if isinstance(p.prompt, dict) else None
+        metadata_html = (
+            _render_hitl_metadata_block(metadata) if isinstance(metadata, dict) else ""
+        )
         question_html, input_html, button_label = _render_hitl_prompt_body(
             p.prompt, autofocus,
         )
         if cfg.writes_enabled and csrf_token:
             form_html = (
+                f"{metadata_html}"
                 f"{question_html}"
                 f"<form method='post' action='/sessions/{_esc(session_id)}/hitl/answer' "
                 "data-ajax='hitl-answer'>"
@@ -5126,6 +5150,7 @@ def _render_pending_hitl_rows(cfg: DashboardConfig, session_id: str) -> str:
             )
         else:
             form_html = (
+                f"{metadata_html}"
                 f"{question_html}"
                 "<p class='muted'>Writes disabled — answer this prompt via "
                 f"<code>POST /sessions/{_esc(session_id)}/hitl/answer</code> "
@@ -5405,6 +5430,147 @@ def _route_run_new(cfg: DashboardConfig, _params: dict[str, str]) -> tuple[int, 
 
 
 # ---------------------------------------------------------------------------
+# Per-subcommand Run pages (Phase 2.2).
+#
+# `/run/build`, `/run/patch`, `/run/deploy`, `/run/test`, `/run/audit`
+# each get a focused form with only that subcommand's applicable
+# flags + a submit that routes to the matching POST handler. The
+# canonical rich `/run` page (resume picker + cross-subcommand
+# scheduling) stays untouched; these are alternate entry points
+# operators reach when they know which subcommand they want.
+# ---------------------------------------------------------------------------
+
+_SUBCOMMAND_LABELS = {
+    "build": ("Build", "Greenfield build — wipe the workspace (preserving product_spec/ + .git/) and generate from scratch."),
+    "patch": ("Patch", "Brownfield patch — read the existing code + specs + change_requests/* and reconcile."),
+    "deploy": ("Deploy", "Synthesize deployment artifacts (Dockerfile + compose), bring up the dev container, run health checks."),
+    "test": ("Test", "Run the e2e verification pack against the dev compose stack. Requires a prior clean deploy + build|patch."),
+    "audit": ("Audit", "Run the SQL-backed traceability audit against the workspace's state.db. Exits non-zero on traceability failures."),
+}
+
+
+def _render_run_subcommand_page(
+    cfg: DashboardConfig, subcommand: str, *, prereq_warning: str = "",
+) -> str:
+    """Render the focused single-subcommand Run form.
+
+    ``subcommand`` ∈ {build, patch, deploy, test, audit}.
+    """
+    if not cfg.writes_enabled:
+        return (
+            "<div class='card'><p class='muted'>Writes are disabled "
+            "by <code>dashboard.writes_enabled: false</code> in "
+            "<code>config.json</code>. Flip it to <code>true</code> "
+            "(or remove the override — writes are on by default) to "
+            "launch from this page.</p></div>"
+        )
+    csrf_token = resolve_csrf_token(cfg) or ""
+    label, blurb = _SUBCOMMAND_LABELS.get(subcommand, (subcommand.title(), ""))
+    flag_rows = _render_run_flag_rows(subcommand)
+    flag_table_html = (
+        "<fieldset class='field-group'>"
+        "<legend class='bx--label'>Run options</legend>"
+        "<div class='table-wrap'><table class='w-100 run-options-table'>"
+        "<thead><tr><th>Flag</th><th>Meaning</th><th>Value</th></tr></thead>"
+        f"<tbody>{flag_rows}</tbody></table></div>"
+        "</fieldset>"
+    ) if flag_rows else ""
+
+    # Audit takes only --workspace; hide the prompt + spec-upload row.
+    prompt_html = ""
+    if subcommand != "audit":
+        prompt_html = (
+            "<input type='hidden' id='spec-file-path' name='spec_file_path' value=''>"
+            "<div class='field'>"
+            "<label class='bx--label' for='prompt'>Product Requirement</label>"
+            "<textarea class='bx--text-area' id='prompt' name='prompt' rows='4' "
+            "placeholder='Enter the engineering task description (required unless a spec file is uploaded).'></textarea>"
+            "</div>"
+        )
+
+    warning_html = ""
+    if prereq_warning:
+        warning_html = (
+            "<div class='card hitl-alert'>"
+            f"<p><strong>Prerequisite not met:</strong> {_esc(prereq_warning)}</p>"
+            "<p>Run <a href='/run/deploy'>deploy</a> (and build or patch) first.</p>"
+            "</div>"
+        )
+
+    return f"""{warning_html}
+<div class='card'>
+  <h2>{_esc(label)}</h2>
+  <p class='muted'>{_esc(blurb)}</p>
+  <form id='run-{_esc(subcommand)}-form' method='post' action='/run/{_esc(subcommand)}'>
+    <input type='hidden' name='csrf_token' value='{html.escape(csrf_token)}'>
+    <div class='field'>
+      <label class='bx--label' for='workspace'>Workspace path</label>
+      <input class='bx--text-input' id='workspace' name='workspace' type='text'
+             placeholder='/path/to/repo' required>
+    </div>
+    {prompt_html}
+    {flag_table_html}
+    <div class='actions'>
+      <button class='bx--btn bx--btn--primary' type='submit'>{_icon("play")}Run {_esc(label)}</button>
+      <a href='/run' class='bx--btn bx--btn--tertiary'>Back</a>
+    </div>
+  </form>
+</div>"""
+
+
+def _render_run_index(cfg: DashboardConfig) -> str:
+    """Landing page listing the five run-like subcommands as cards.
+
+    Each card links to the focused per-subcommand page. Operators
+    looking for the historical resume / schedule UI still use
+    ``/run``'s rich page directly — this index is for picking the
+    intent first.
+    """
+    cards: list[str] = []
+    for sub in ("build", "patch", "deploy", "test", "audit"):
+        label, blurb = _SUBCOMMAND_LABELS[sub]
+        cards.append(
+            "<div class='card'>"
+            f"<h3>{_esc(label)} <code class='muted fs-sm'>teane {sub}</code></h3>"
+            f"<p class='muted'>{_esc(blurb)}</p>"
+            f"<a href='/run/{sub}' class='bx--btn bx--btn--primary'>Open</a>"
+            "</div>"
+        )
+    return "".join(cards)
+
+
+def _route_run_subcommand(
+    cfg: DashboardConfig, params: dict[str, str],
+) -> tuple[int, str, str]:
+    """Dispatch ``GET /run/{subcommand}`` to the focused page renderer."""
+    from harness.dashboard_runlike import is_valid_subcommand
+    subcommand = params["subcommand"]
+    if not is_valid_subcommand(subcommand):
+        return 404, "text/plain", "404 not found\n"
+    prereq_warning = ""
+    # /run/test is gated on a prior clean deploy + build|patch — surface
+    # the gap as a banner so the operator knows what to do first.
+    if subcommand == "test":
+        try:
+            from harness.flow_state import check_test_prereqs
+            # Read the operator-supplied workspace from the query string
+            # so the prereq check has a target; bare /run/test lands
+            # without one and we render the page without the banner.
+            workspace = params.get("workspace", "")
+            if workspace:
+                ok, reason = check_test_prereqs(workspace)
+                if not ok:
+                    prereq_warning = reason
+        except Exception:  # noqa: BLE001
+            pass
+    body = _render_run_subcommand_page(cfg, subcommand, prereq_warning=prereq_warning)
+    label, _ = _SUBCOMMAND_LABELS.get(subcommand, (subcommand.title(), ""))
+    return 200, "text/html; charset=utf-8", _layout(
+        f"Run · {label}", body, cfg, active="dashboards",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tier C: pending HITL listing (read endpoint; answer + cancel are POSTs)
 # ---------------------------------------------------------------------------
 
@@ -5471,6 +5637,10 @@ _ROUTES.extend([
     (re.compile(r"^/config/(?P<section>[A-Za-z0-9_]+)/?$"), _route_config_section),
     (re.compile(r"^/run/new/?$"), _route_run_new),
     (re.compile(r"^/run/console/(?P<sid>[A-Za-z0-9_.\-]+)/?$"), _route_run_console),
+    # Per-subcommand focused Run pages (Phase 2.2). Must precede the
+    # less-specific /run/console match above? No — console is more
+    # specific (path prefix `/run/console/`). Order is fine.
+    (re.compile(r"^/run/(?P<subcommand>build|patch|deploy|test|audit)/?$"), _route_run_subcommand),
     (re.compile(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/hitl/pending/?$"), _route_hitl_pending),
     (re.compile(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/hitl/pending\.html$"), _route_hitl_pending_html),
     (re.compile(r"^/sessions/(?P<sid>[A-Za-z0-9_.\-]+)/notes\.html$"), _route_chat_notes_html),

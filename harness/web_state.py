@@ -404,6 +404,57 @@ class ProcessRegistry:
 
 
 # ---------------------------------------------------------------------------
+# Module-level singletons — shared across the dashboard server process.
+#
+# Originally lived in :mod:`harness.dashboard`. Moved here so sibling
+# modules (``dashboard_runlike`` for the Phase 2.2 spawner) can reach
+# them without importing the 5k-line dashboard module — that would
+# create an import cycle since dashboard imports dashboard_runlike
+# lazily inside handler bodies.
+# ---------------------------------------------------------------------------
+
+_process_registry: Optional["ProcessRegistry"] = None
+_hitl_queue: Optional["HitlQueue"] = None
+# Audit §1.17: guard lazy-init under ThreadingMixIn. Without this lock,
+# two concurrent first-call threads could both enter the ``is None``
+# branch, both instantiate, and one would lose its handle —
+# registrations routed to the loser are silently dropped.
+_shared_state_lock = threading.Lock()
+
+
+def get_process_registry() -> "ProcessRegistry":
+    """Return the single, process-wide :class:`ProcessRegistry`."""
+    global _process_registry
+    if _process_registry is None:
+        with _shared_state_lock:
+            if _process_registry is None:
+                _process_registry = ProcessRegistry()
+    return _process_registry
+
+
+def get_hitl_queue() -> "HitlQueue":
+    """Return the single, process-wide :class:`HitlQueue`."""
+    global _hitl_queue
+    if _hitl_queue is None:
+        with _shared_state_lock:
+            if _hitl_queue is None:
+                _hitl_queue = HitlQueue()
+    return _hitl_queue
+
+
+def reset_shared_state() -> None:
+    """Drop the shared registry + queue.
+
+    Test hook so each test gets isolated state. Production code should
+    never call this — restarting the server is the canonical reset.
+    """
+    global _process_registry, _hitl_queue
+    with _shared_state_lock:
+        _process_registry = None
+        _hitl_queue = None
+
+
+# ---------------------------------------------------------------------------
 # 3. HITL queue — bridges the harness's blocking webhook to the UI
 # ---------------------------------------------------------------------------
 

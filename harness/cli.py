@@ -3035,11 +3035,23 @@ def hitl_menu_loop(state: dict[str, Any]) -> dict[str, Any]:
                 "(--hitl-repair=false / CI / HARNESS_AUTO_APPROVE / no TTY)."
             )
         else:
+            # Structured envelope for remote UIs (the dashboard's HITL
+            # panel). The console path prints these above the prompt; the
+            # webhook channel forwards them so the dashboard can render a
+            # red trigger tag + markdown escalation summary + actionable
+            # outside-harness fix list instead of falling through to the
+            # generic JSON-dump renderer.
+            hitl_metadata = {
+                "hitl_trigger": trigger,
+                "hitl_escalation_summary": escalation_summary,
+                "outside_harness_actions": list(outside_actions or []),
+            }
             choice = _get_channel().prompt(
                 "[HITL] Select action",
                 [k for k, _ in menu_options],
                 default="r",
                 option_labels={k: lbl for k, lbl in menu_options},
+                metadata=hitl_metadata,
             )
 
         if choice == "v":

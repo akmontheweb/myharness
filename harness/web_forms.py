@@ -407,6 +407,13 @@ class RunFlag:
     ``yes_emits_flag`` controls how ``FORM_KIND_YES_NO`` collapses to an
     argv list: True means "yes" emits the flag and "no" omits it
     (store_true semantics); False is the opposite.
+
+    ``subcommands`` is the tuple of teane subcommands this flag applies
+    to (e.g. ``("build", "patch")``). The Run-page renderer only shows
+    flags whose tuple contains the currently selected subcommand, and
+    ``build_subcommand_argv_from_form`` only emits flags for the
+    matching subcommand. Empty tuple = applies to every run-like
+    subcommand (audit excluded — audit takes only --workspace).
     """
 
     name: str                 # form field id ("allow_network")
@@ -419,18 +426,34 @@ class RunFlag:
     choices: tuple[str, ...] = ()  # FORM_KIND_SELECT
     min_value: Optional[int] = None  # FORM_KIND_NUMBER_INT bounds
     max_value: Optional[int] = None
+    subcommands: tuple[str, ...] = ()  # empty = all non-audit subcommands
 
     @property
     def field_id(self) -> str:
         return f"flag.{self.name}"
 
+    def applies_to(self, subcommand: str) -> bool:
+        if not self.subcommands:
+            # Empty tuple = all non-audit subcommands.
+            return subcommand in ("build", "patch", "deploy", "test")
+        return subcommand in self.subcommands
+
 
 # Operator-facing schema of every flag the Run page surfaces. Workspace +
-# prompt have dedicated inputs at the top of the form; the bool-choice
-# flags below mirror the `teane run` argparse surface in cli.py
-# (build_parser → run_parser). Operators still reach text flags
-# (build-cmd, allow-network, verbose, etc.) from the terminal.
+# prompt have dedicated inputs at the top of the form; the per-flag
+# inputs below mirror the build/patch/deploy/test argparse surfaces in
+# ``harness.cli`` (the legacy ``run`` subparser was removed). Operators
+# still reach text-only flags (verbose, force-lock, session-id, etc.)
+# from the terminal.
+#
+# Sentinel ``(default)`` value on tri-state SELECT flags means "use the
+# CLI default" — the form skips emission so the CLI applies its own
+# fallback chain (e.g. config.json hitl.requirement, then true).
+_TRI_DEFAULT = "(default)"
+_TRI_CHOICES = (_TRI_DEFAULT, "false", "true")
+
 _RUN_FLAGS: tuple[RunFlag, ...] = (
+    # --- shared by build / patch / deploy / test ---
     RunFlag(
         name="git",
         label="Git mode",
@@ -439,16 +462,9 @@ _RUN_FLAGS: tuple[RunFlag, ...] = (
         flag="--git",
         default="false",
         choices=("false", "true"),
+        subcommands=(),  # all run-likes
     ),
-    RunFlag(
-        name="new_build",
-        label="New build",
-        description="When true, delete every file at the workspace root except product_spec/ and .git/, then start fresh on a clean baseline. Defaults to false (steady-state).",
-        kind=FORM_KIND_SELECT,
-        flag="--new-build",
-        default="false",
-        choices=("false", "true"),
-    ),
+    # --- build only ---
     RunFlag(
         name="spec_discovery",
         label="Spec discovery",
@@ -457,92 +473,191 @@ _RUN_FLAGS: tuple[RunFlag, ...] = (
         flag="--spec-discovery",
         default="false",
         choices=("false", "true"),
-    ),
-    RunFlag(
-        name="deploy_dev",
-        label="Deploy to dev",
-        description="When true, continue past the security scan into deployment (with or without LLM-driven discovery, controlled by --cd-discovery), then `docker compose up`. Defaults to false.",
-        kind=FORM_KIND_SELECT,
-        flag="--deploy-dev",
-        default="false",
-        choices=("false", "true"),
+        subcommands=("build", "patch"),
     ),
     RunFlag(
         name="cd_discovery",
-        label="Container-deployment discovery",
-        description="When true (and Deploy to dev is also true), synthesise DEPLOYMENT_BLUEPRINT.md from the codebase before deploying. Otherwise the blueprint is synthesised from workspace telemetry alone. Defaults to false.",
+        label="Deployment discovery",
+        description="When true, run deployment discovery and write DEPLOYMENT_BLUEPRINT.md. Build/patch only writes the doc — `teane deploy` synthesises artifacts and brings the dev container up. Defaults to false.",
         kind=FORM_KIND_SELECT,
         flag="--cd-discovery",
         default="false",
         choices=("false", "true"),
+        subcommands=("build", "patch", "deploy"),
     ),
+    RunFlag(
+        name="agile",
+        label="Agile mode",
+        description="Engage Agile-style story decomposition + per-story TDD. Build: explicit choice (default false). Patch: '(default)' = auto-detect from .teane/state.db (non-empty → agile). Per-knob tuning (batch_size, commit_on_story, repair_cap) lives in config.json's agile_defaults block.",
+        kind=FORM_KIND_SELECT,
+        flag="--agile",
+        default=_TRI_DEFAULT,
+        choices=_TRI_CHOICES,
+        subcommands=("build", "patch"),
+    ),
+    # --- patch only ---
+    RunFlag(
+        name="generate_specs",
+        label="Generate specs",
+        description="Reverse-engineer SPEC_REQUIREMENTS.md / SPEC_ARCHITECTURE.md from the existing codebase. '(default)' = auto (generate only when both spec files are missing). 'true' = always regenerate. 'false' = error if specs missing.",
+        kind=FORM_KIND_SELECT,
+        flag="--generate-specs",
+        default=_TRI_DEFAULT,
+        choices=_TRI_CHOICES,
+        subcommands=("patch",),
+    ),
+    RunFlag(
+        name="install_doc",
+        label="Update INSTALLATION.md",
+        description="Update INSTALLATION.md at the end of a successful patch. '(default)' = auto (agile patches enable; non-agile patches skip). Override explicitly with true/false.",
+        kind=FORM_KIND_SELECT,
+        flag="--install-doc",
+        default=_TRI_DEFAULT,
+        choices=_TRI_CHOICES,
+        subcommands=("patch",),
+    ),
+    # --- HITL gates (build + patch share four; deploy has its own) ---
     RunFlag(
         name="hitl_requirement",
         label="HITL: requirements gate",
-        description="When true, prompt the operator at the requirements gate (both the pre-graph interactive review and the in-graph REQUIREMENTS gatekeeper). Defaults to true; the value in config.json's hitl.requirement block (if set) takes effect when this is left unchanged.",
+        description="When true, prompt the operator at the REQUIREMENTS gate. '(default)' = use config.json hitl.requirement, then true.",
         kind=FORM_KIND_SELECT,
         flag="--hitl-requirement",
-        default="true",
-        choices=("false", "true"),
+        default=_TRI_DEFAULT,
+        choices=_TRI_CHOICES,
+        subcommands=("build", "patch"),
     ),
     RunFlag(
         name="hitl_architecture",
         label="HITL: architecture gate",
-        description="When true, prompt the operator at the ARCHITECTURE gatekeeper. Defaults to true; the value in config.json's hitl.architecture block (if set) takes effect when this is left unchanged.",
+        description="When true, prompt the operator at the ARCHITECTURE gatekeeper. '(default)' = use config.json hitl.architecture, then true.",
         kind=FORM_KIND_SELECT,
         flag="--hitl-architecture",
-        default="true",
-        choices=("false", "true"),
+        default=_TRI_DEFAULT,
+        choices=_TRI_CHOICES,
+        subcommands=("build", "patch"),
     ),
     RunFlag(
         name="hitl_repair",
         label="HITL: repair-loop menu",
-        description="When true, fire the repair-loop HITL menu when iteration limits trip. Defaults to true; the value in config.json's hitl.repair block (if set) takes effect when this is left unchanged.",
+        description="When true, fire the repair-loop HITL menu when iteration limits trip. '(default)' = use config.json hitl.repair, then true.",
         kind=FORM_KIND_SELECT,
         flag="--hitl-repair",
-        default="true",
-        choices=("false", "true"),
+        default=_TRI_DEFAULT,
+        choices=_TRI_CHOICES,
+        subcommands=("build", "patch"),
+    ),
+    RunFlag(
+        name="hitl_layout_divergence",
+        label="HITL: layout divergence",
+        description="When true, prompt when the on-disk layout drifts from SPEC_ARCHITECTURE.md's workspace_layout. '(default)' = use config.json hitl.layout_divergence.",
+        kind=FORM_KIND_SELECT,
+        flag="--hitl-layout-divergence",
+        default=_TRI_DEFAULT,
+        choices=_TRI_CHOICES,
+        subcommands=("build", "patch"),
     ),
     RunFlag(
         name="hitl_deployment",
         label="HITL: deployment gate",
-        description="When true, prompt the operator at the DEPLOYMENT gatekeeper before the dev deploy fires. Defaults to true; the value in config.json's hitl.deployment block (if set) takes effect when this is left unchanged.",
+        description="When true, prompt the operator at the DEPLOYMENT gate before the dev deploy fires. '(default)' = use config.json hitl.deployment, then true.",
         kind=FORM_KIND_SELECT,
         flag="--hitl-deployment",
-        default="true",
-        choices=("false", "true"),
+        default=_TRI_DEFAULT,
+        choices=_TRI_CHOICES,
+        subcommands=("deploy",),
+    ),
+    # --- test only ---
+    RunFlag(
+        name="scope",
+        label="Test scope",
+        description="Which scenarios to run. 'touched' (default) — only scenarios whose source spec touches a service in the last deploy's CR attribution. 'full' — run every scenario in tests/e2e/.",
+        kind=FORM_KIND_SELECT,
+        flag="--scope",
+        default="touched",
+        choices=("touched", "full"),
+        subcommands=("test",),
+    ),
+    RunFlag(
+        name="retries",
+        label="Per-scenario retries",
+        description="Playwright per-scenario retry count for flake suppression. Defaults to 2; set 0 to disable.",
+        kind=FORM_KIND_NUMBER_INT,
+        flag="--retries",
+        default=2,
+        min_value=0,
+        max_value=10,
+        subcommands=("test",),
+    ),
+    RunFlag(
+        name="no_cleanup",
+        label="Keep synthetic data",
+        description="Skip teardown of generated synthetic data after the run. Useful when debugging a failed scenario against the live compose stack.",
+        kind=FORM_KIND_YES_NO,
+        flag="--no-cleanup",
+        default="no",
+        yes_emits_flag=True,
+        subcommands=("test",),
     ),
 )
 
 
 def run_flags() -> tuple[RunFlag, ...]:
-    """Operator-facing CLI flag schema for the Run Harness page."""
+    """Operator-facing CLI flag schema — every flag the Run page knows."""
     return _RUN_FLAGS
 
 
-def build_run_argv_from_form(
-    post_data: dict[str, Any],
-) -> tuple[list[str], list[str]]:
-    """Translate a POSTed Run Harness form into a list of CLI argv tokens.
+def run_flags_for(subcommand: str) -> tuple[RunFlag, ...]:
+    """The subset of flags applicable to ``subcommand``.
 
-    Returns ``(argv, errors)`` — errors is a list of operator-facing
-    messages keyed by flag name (e.g. "git: value 'maybe' not in ['false', 'true']"),
-    suitable for surfacing back to the form.
-
-    Unset / blank fields collapse to "use the CLI default" (i.e. they
-    don't add anything to argv). The yes/no kinds emit the flag only
-    when the operator says yes.
+    Audit takes only ``--workspace`` (per ``cli.py:9080``), so this
+    returns an empty tuple when ``subcommand == "audit"``.
     """
+    if subcommand == "audit":
+        return ()
+    return tuple(f for f in _RUN_FLAGS if f.applies_to(subcommand))
+
+
+def _flag_value_from_form(
+    flag: RunFlag, post_data: dict[str, Any],
+) -> str:
+    raw = post_data.get(flag.field_id, None)
+    if isinstance(raw, list):
+        raw = raw[-1] if raw else None
+    if raw is None:
+        return ""
+    return str(raw).strip()
+
+
+def build_subcommand_argv_from_form(
+    post_data: dict[str, Any],
+    *,
+    subcommand: str,
+) -> tuple[list[str], list[str]]:
+    """Translate a POSTed Run-page form into ``(argv, errors)`` for the
+    given ``subcommand``.
+
+    Only flags whose ``subcommands`` tuple contains ``subcommand`` are
+    consulted; anything outside that subset is ignored even if present
+    in the POST body (operators can save a Build preset and load it on
+    the Patch page without the build-only ``--spec-discovery`` flag
+    leaking through).
+
+    Returns the same shape as the legacy ``build_run_argv_from_form``:
+    a list of CLI tokens and a list of per-flag operator-facing error
+    strings suitable for re-rendering the form.
+    """
+    if subcommand == "audit":
+        # Audit accepts only --workspace; the spawner emits that itself.
+        # Nothing in the flag schema applies.
+        return [], []
+
     argv: list[str] = []
     errors: list[str] = []
     for f in _RUN_FLAGS:
-        raw = post_data.get(f.field_id, None)
-        if isinstance(raw, list):
-            raw = raw[-1] if raw else None
-        if raw is None:
-            value: str = ""
-        else:
-            value = str(raw).strip()
+        if not f.applies_to(subcommand):
+            continue
+        value = _flag_value_from_form(f, post_data)
 
         if f.kind == FORM_KIND_TEXT:
             if not value:
@@ -564,21 +679,13 @@ def build_run_argv_from_form(
                     f"{f.name}: value {picked!r} not in {list(f.choices)}"
                 )
                 continue
-            # Skip when the operator hasn't moved off the default — the CLI
-            # already applies the same default, so an explicit
-            # `--flag=default` token is noise.
+            # Skip when the operator hasn't moved off the form default —
+            # the CLI applies the same default (or, for tri-state flags,
+            # the form default sentinel _TRI_DEFAULT means "let the CLI
+            # decide" so we deliberately omit the flag).
             if picked == str(f.default):
                 continue
-            # --new-build / --git both take the form `--flag=value` in the
-            # CLI, so emit a single equals-joined token for consistency.
             argv.append(f"{f.flag}={picked}")
-            # --new-build=true triggers a confirmation prompt in cmd_run;
-            # the dashboard spawns the subprocess without a TTY, so the
-            # prompt would hang forever. Mirror what the interactive
-            # wizard does (wizard.py sets args.assume_yes=True on the
-            # same branch) and emit --yes.
-            if f.name == "new_build" and picked == "true":
-                argv.append("--yes")
             continue
         if f.kind == FORM_KIND_NUMBER_INT:
             if not value:
@@ -594,10 +701,27 @@ def build_run_argv_from_form(
             if f.max_value is not None and num > f.max_value:
                 errors.append(f"{f.name}: must be <= {f.max_value}")
                 continue
+            # Skip emission when the operator hasn't moved off the
+            # default — the CLI applies the same number itself.
+            if num == f.default:
+                continue
             argv.extend([f.flag, str(num)])
             continue
         # Unknown kind — skip silently.
     return argv, errors
+
+
+def build_run_argv_from_form(
+    post_data: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Build-only alias of :func:`build_subcommand_argv_from_form`.
+
+    Retained for the legacy ``/run/now`` POST handler whose form maps
+    to ``teane build``. New per-subcommand routes call
+    :func:`build_subcommand_argv_from_form` directly with the right
+    ``subcommand``.
+    """
+    return build_subcommand_argv_from_form(post_data, subcommand="build")
 
 
 # ---------------------------------------------------------------------------
@@ -619,8 +743,13 @@ _CONFIG_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (
             "build_command", "allow_network",
             "product_spec_dir", "change_requests_dir", "change_requests",
-            "patcher", "compiler", "languages",
+            "patcher", "compiler", "languages", "core_languages",
         ),
+    ),
+    (
+        "agile",
+        "Agile",
+        ("agile", "agile_defaults"),
     ),
     (
         "llm_registry",

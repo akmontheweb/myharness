@@ -278,22 +278,68 @@ def test_all_sections_returns_known_sections():
 # ---------------------------------------------------------------------------
 
 def test_run_flags_covers_run_parser_bools():
-    """The Run page surfaces every bool-choice flag the `teane run`
-    argparse surface accepts (besides workspace + prompt, which have
-    dedicated inputs). Text/integer flags stay on the terminal."""
+    """The Run page surfaces every flag mirrored from the current
+    build/patch/deploy/test argparse surfaces (besides workspace +
+    prompt, which have dedicated inputs).
+
+    The legacy ``run`` subparser has been removed; ``new_build`` /
+    ``deploy_dev`` no longer exist on any parser and were dropped from
+    the form schema.
+    """
     from harness.web_forms import run_flags
     names = {f.name for f in run_flags()}
     assert names == {
         "git",
-        "new_build",
         "spec_discovery",
-        "deploy_dev",
         "cd_discovery",
+        "agile",
+        "generate_specs",
+        "install_doc",
         "hitl_requirement",
         "hitl_architecture",
         "hitl_repair",
+        "hitl_layout_divergence",
         "hitl_deployment",
+        "scope",
+        "retries",
+        "no_cleanup",
     }
+
+
+def test_run_flags_for_subcommand_partitions_correctly():
+    """The per-subcommand flag subsets must match the CLI subparsers.
+
+    `audit` is the only run-like that takes no per-flag inputs (it
+    accepts only --workspace).
+    """
+    from harness.web_forms import run_flags_for
+    build_names = {f.name for f in run_flags_for("build")}
+    patch_names = {f.name for f in run_flags_for("patch")}
+    deploy_names = {f.name for f in run_flags_for("deploy")}
+    test_names = {f.name for f in run_flags_for("test")}
+    audit_flags = run_flags_for("audit")
+
+    # Shared baseline.
+    assert "git" in build_names
+    assert "git" in patch_names
+    assert "git" in deploy_names
+    assert "git" in test_names
+
+    # Patch-only.
+    assert "generate_specs" in patch_names
+    assert "install_doc" in patch_names
+    assert "generate_specs" not in build_names
+
+    # Deploy-only.
+    assert "hitl_deployment" in deploy_names
+    assert "hitl_deployment" not in build_names
+
+    # Test-only.
+    assert test_names >= {"scope", "retries", "no_cleanup"}
+    assert "scope" not in build_names
+
+    # Audit takes no per-flag inputs.
+    assert audit_flags == ()
 
 
 def test_build_run_argv_empty_form_produces_no_args():
@@ -323,25 +369,25 @@ def test_build_run_argv_spec_discovery_false_omits_flag():
 def test_build_run_argv_select_emits_flag_equals_value():
     from harness.web_forms import build_run_argv_from_form
     argv, errors = build_run_argv_from_form({
-        "flag.new_build": "true",
         "flag.git": "true",
+        "flag.cd_discovery": "true",
     })
     assert errors == []
-    assert "--new-build=true" in argv
     assert "--git=true" in argv
+    assert "--cd-discovery=true" in argv
 
 
 def test_build_run_argv_hitl_flags_at_default_emit_nothing():
-    # Default is now "true" for every --hitl-* flag; an operator who
-    # leaves them alone should NOT emit the token. The CLI argparse
-    # default (None) then defers to config.json's hitl.* block, falling
-    # back to the in-code default of True.
+    # Default sentinel for tri-state HITL flags is "(default)" — when
+    # the operator leaves them alone the CLI argparse default (None)
+    # then defers to config.json's hitl.* block, falling back to the
+    # in-code default of True.
     from harness.web_forms import build_run_argv_from_form
     argv, errors = build_run_argv_from_form({
-        "flag.hitl_requirement": "true",
-        "flag.hitl_architecture": "true",
-        "flag.hitl_repair": "true",
-        "flag.hitl_deployment": "true",
+        "flag.hitl_requirement": "(default)",
+        "flag.hitl_architecture": "(default)",
+        "flag.hitl_repair": "(default)",
+        "flag.hitl_layout_divergence": "(default)",
     })
     assert errors == []
     assert not any(a.startswith("--hitl-") for a in argv)
@@ -350,49 +396,55 @@ def test_build_run_argv_hitl_flags_at_default_emit_nothing():
 def test_build_run_argv_hitl_flags_emit_when_operator_opts_out():
     # Operator explicitly chooses false → emit the flag so the resolver
     # routes it as an explicit CLI override (highest precedence).
-    from harness.web_forms import build_run_argv_from_form
-    argv, errors = build_run_argv_from_form({
+    from harness.web_forms import build_subcommand_argv_from_form
+    argv, errors = build_subcommand_argv_from_form({
         "flag.hitl_requirement": "false",
         "flag.hitl_architecture": "false",
         "flag.hitl_repair": "false",
-        "flag.hitl_deployment": "false",
-    })
+        "flag.hitl_layout_divergence": "false",
+    }, subcommand="build")
     assert errors == []
     assert "--hitl-requirement=false" in argv
     assert "--hitl-architecture=false" in argv
     assert "--hitl-repair=false" in argv
-    assert "--hitl-deployment=false" in argv
+    assert "--hitl-layout-divergence=false" in argv
 
 
-def test_build_run_argv_deploy_dev_and_cd_discovery():
-    from harness.web_forms import build_run_argv_from_form
-    argv, errors = build_run_argv_from_form({
-        "flag.deploy_dev": "true",
+def test_build_run_argv_deploy_hitl_deployment_emits_on_deploy_subcommand():
+    """--hitl-deployment lives on the deploy parser only; emitting it
+    requires building argv with subcommand="deploy"."""
+    from harness.web_forms import build_subcommand_argv_from_form
+    argv, errors = build_subcommand_argv_from_form({
+        "flag.hitl_deployment": "false",
         "flag.cd_discovery": "true",
-    })
+    }, subcommand="deploy")
     assert errors == []
-    assert "--deploy-dev=true" in argv
+    assert "--hitl-deployment=false" in argv
     assert "--cd-discovery=true" in argv
 
 
-def test_build_run_argv_new_build_true_also_emits_yes():
-    """The CLI wizard auto-sets --yes when the operator picks
-    --new-build=true (otherwise cmd_run would block on a confirmation
-    prompt). The web form mirrors that because the spawned subprocess
-    has no TTY."""
-    from harness.web_forms import build_run_argv_from_form
-    argv, errors = build_run_argv_from_form({"flag.new_build": "true"})
+def test_build_run_argv_test_scope_and_retries():
+    """`teane test --scope full --retries 0` emits the right tokens."""
+    from harness.web_forms import build_subcommand_argv_from_form
+    argv, errors = build_subcommand_argv_from_form({
+        "flag.scope": "full",
+        "flag.retries": "0",
+        "flag.no_cleanup": "yes",
+    }, subcommand="test")
     assert errors == []
-    assert "--new-build=true" in argv
-    assert "--yes" in argv
+    assert "--scope=full" in argv
+    assert "--retries" in argv and "0" in argv
+    assert "--no-cleanup" in argv
 
 
-def test_build_run_argv_new_build_false_does_not_emit_yes():
-    from harness.web_forms import build_run_argv_from_form
-    argv, errors = build_run_argv_from_form({"flag.new_build": "false"})
+def test_build_run_argv_audit_yields_no_flags():
+    """`audit` takes only --workspace; per-flag form fields are ignored."""
+    from harness.web_forms import build_subcommand_argv_from_form
+    argv, errors = build_subcommand_argv_from_form({
+        "flag.git": "true",
+        "flag.scope": "full",
+    }, subcommand="audit")
     assert errors == []
-    # new_build=false is the default → emit nothing at all (skip the
-    # noisy `--new-build=false` token and the irrelevant `--yes`).
     assert argv == []
 
 

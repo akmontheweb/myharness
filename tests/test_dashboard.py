@@ -1114,17 +1114,20 @@ def test_run_page_renders_per_flag_inputs(tmp_path, monkeypatch):
     # The legacy "Extra harness args" combined textbox is gone.
     assert "Extra harness args" not in body
     assert "name='extra_args'" not in body
-    # Every bool-choice flag renders a true/false select.
+    # The /run page defaults to subcommand="build"; check that every
+    # build-applicable flag renders a true/false select. The legacy
+    # ``new_build`` / ``deploy_dev`` flags were dropped when the ``run``
+    # subparser was removed — they no longer exist on any parser, so
+    # they shouldn't appear in the form schema either.
     for fname in (
         "flag.git",
-        "flag.new_build",
         "flag.spec_discovery",
-        "flag.deploy_dev",
         "flag.cd_discovery",
+        "flag.agile",
         "flag.hitl_requirement",
         "flag.hitl_architecture",
         "flag.hitl_repair",
-        "flag.hitl_deployment",
+        "flag.hitl_layout_divergence",
     ):
         assert f"name='{fname}'" in body, f"missing form field {fname!r} on Run page"
     assert "<option value='true'" in body and "<option value='false'" in body
@@ -1136,13 +1139,18 @@ def test_run_page_renders_per_flag_inputs(tmp_path, monkeypatch):
         "flag.thread_id", "flag.allow_network", "flag.verbose",
         "flag.force_lock", "flag.assume_yes",
         "flag.spec_review_cycles", "flag.code_review_cycles",
+        # Legacy run-only flags dropped from the schema.
+        "flag.new_build", "flag.deploy_dev",
+        # Patch/test/deploy-only flags don't appear on the build form.
+        "flag.generate_specs", "flag.install_doc",
+        "flag.hitl_deployment", "flag.scope", "flag.retries", "flag.no_cleanup",
     ):
         assert absent not in body, f"unexpected flag input {absent!r} on Run page"
     # CLI flag names are echoed so operators learn the vocabulary.
     for flag in (
-        "--git", "--new-build", "--spec-discovery", "--deploy-dev",
-        "--cd-discovery", "--hitl-requirement", "--hitl-architecture", "--hitl-repair",
-        "--hitl-deployment",
+        "--git", "--spec-discovery", "--cd-discovery", "--agile",
+        "--hitl-requirement", "--hitl-architecture", "--hitl-repair",
+        "--hitl-layout-divergence",
     ):
         assert flag in body, f"expected {flag!r} to appear in /run body"
 

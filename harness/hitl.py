@@ -71,6 +71,7 @@ class HitlChannel(ABC):
         options: list[str],
         default: Optional[str] = None,
         option_labels: Optional[dict[str, str]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> str:
         """
         Present a menu prompt and return the user's selection.
@@ -85,6 +86,14 @@ class HitlChannel(ABC):
                      HttpChannel forwards it in the webhook body so a
                      UI on the other end can render a labeled dropdown
                      instead of a free-text input.
+            metadata: Optional structured envelope the caller wants
+                     forwarded to a remote UI. The HttpChannel embeds
+                     this into the webhook payload under ``"metadata"``
+                     so the dashboard can surface a labelled trigger
+                     reason, an LLM escalation summary, an
+                     outside-harness fix list, etc. Stdin/File channels
+                     ignore the field — they only see the message and
+                     options string.
 
         Returns:
             The selected option string (lowercased).
@@ -167,8 +176,9 @@ class StdinChannel(HitlChannel):
         options: list[str],
         default: Optional[str] = None,
         option_labels: Optional[dict[str, str]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> str:
-        del option_labels  # stdin already prints its own menu
+        del option_labels, metadata  # stdin prints its own menu pre-call
         opts_str = "/".join(options)
         if _auto_approve():
             chosen = default if default is not None else (options[0] if options else "")
@@ -314,8 +324,9 @@ class FileChannel(HitlChannel):
         options: list[str],
         default: Optional[str] = None,
         option_labels: Optional[dict[str, str]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> str:
-        del option_labels  # file channel matches by message substring
+        del option_labels, metadata  # file channel matches by message substring
         answer = self._lookup(message)
         logger.info("[hitl:file] prompt → %r", answer)
         return answer
@@ -396,7 +407,8 @@ class HttpChannel(HitlChannel):
     def _build_payload(self, type_: str, message: str,
                        options: Optional[list[str]] = None,
                        default: Optional[str] = None,
-                       option_labels: Optional[dict[str, str]] = None) -> bytes:
+                       option_labels: Optional[dict[str, str]] = None,
+                       metadata: Optional[dict[str, Any]] = None) -> bytes:
         body: dict[str, Any] = {
             "type": type_,
             "message": message,
@@ -405,6 +417,12 @@ class HttpChannel(HitlChannel):
         }
         if option_labels:
             body["option_labels"] = option_labels
+        if metadata:
+            # Structured envelope for the receiving UI — e.g. the
+            # dashboard's HITL panel reads ``metadata.hitl_trigger`` to
+            # paint a red trigger tag and ``metadata.hitl_escalation_summary``
+            # to render the markdown briefing. Forwarded as-is.
+            body["metadata"] = metadata
         return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
     def _sign(self, body: bytes) -> str:
@@ -564,11 +582,12 @@ class HttpChannel(HitlChannel):
         options: list[str],
         default: Optional[str] = None,
         option_labels: Optional[dict[str, str]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> str:
         effective_default = default if default is not None else (options[0] if options else "")
         payload = self._build_payload(
             "prompt", message, options, effective_default,
-            option_labels=option_labels,
+            option_labels=option_labels, metadata=metadata,
         )
         answer = self._post(payload, effective_default)
         logger.info("[hitl:http] prompt %r → %r", message[:60], answer)
