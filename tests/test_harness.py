@@ -4013,6 +4013,75 @@ class TestAgentState:
         compiled.aupdate_state.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_reset_stale_gate_counters_zeros_them(self):
+        """Resume reset: when loop_counter has accumulated gate-tripping
+        counters from a prior session, the helper zeros them so the
+        operator's explicit resume doesn't HITL immediately on stale
+        values. total_repairs is preserved (hard ceiling still bounds
+        runaway across resumes)."""
+        from harness.graph import _reset_stale_gate_counters_on_resume
+        from unittest.mock import AsyncMock, MagicMock
+
+        fake_state = MagicMock()
+        fake_state.values = {
+            "loop_counter": {
+                "consecutive_zero_patch_rounds": 2,
+                "no_progress_repairs": 4,
+                "consecutive_distraction_rounds": 3,
+                "missing_dep_consecutive_same": 0,
+                "total_repairs": 7,
+                "batch_index": 4,  # unrelated counter must survive
+            }
+        }
+        compiled = MagicMock()
+        compiled.aget_state = AsyncMock(return_value=fake_state)
+        compiled.aupdate_state = AsyncMock(return_value=None)
+
+        await _reset_stale_gate_counters_on_resume(
+            compiled, {"configurable": {"thread_id": "t"}}
+        )
+
+        compiled.aupdate_state.assert_awaited_once()
+        args = compiled.aupdate_state.await_args.args
+        kwargs = compiled.aupdate_state.await_args.kwargs
+        updates = kwargs.get("values", args[1] if len(args) > 1 else {})
+        lc = updates["loop_counter"]
+        assert lc["consecutive_zero_patch_rounds"] == 0
+        assert lc["no_progress_repairs"] == 0
+        assert lc["consecutive_distraction_rounds"] == 0
+        assert lc["missing_dep_consecutive_same"] == 0
+        # total_repairs and unrelated counters preserved
+        assert lc["total_repairs"] == 7
+        assert lc["batch_index"] == 4
+
+    @pytest.mark.asyncio
+    async def test_reset_stale_gate_counters_noop_when_all_zero(self):
+        """When the gate counters are already zero (e.g. after the
+        suspend-rewind ran a hard reset just before this helper), the
+        helper short-circuits without writing — avoids unnecessary
+        checkpoint churn."""
+        from harness.graph import _reset_stale_gate_counters_on_resume
+        from unittest.mock import AsyncMock, MagicMock
+
+        fake_state = MagicMock()
+        fake_state.values = {
+            "loop_counter": {
+                "consecutive_zero_patch_rounds": 0,
+                "no_progress_repairs": 0,
+                "total_repairs": 2,
+            }
+        }
+        compiled = MagicMock()
+        compiled.aget_state = AsyncMock(return_value=fake_state)
+        compiled.aupdate_state = AsyncMock(return_value=None)
+
+        await _reset_stale_gate_counters_on_resume(
+            compiled, {"configurable": {"thread_id": "t"}}
+        )
+
+        compiled.aupdate_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("gate,expected_predecessor", [
         ("STORIES", "decomposition_node"),
         ("DEPLOYMENT", "generate_deployment_spec_node"),

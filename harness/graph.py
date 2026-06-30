@@ -14221,6 +14221,79 @@ def compile_graph(checkpointer: Any = None) -> Any:
 # 13. Graph Execution Entry Point
 # ---------------------------------------------------------------------------
 
+async def _reset_stale_gate_counters_on_resume(
+    compiled_graph: Any, config: dict[str, Any]
+) -> None:
+    """Zero the repair-loop gate counters on every resume entry.
+
+    The repair-loop gates (``consecutive_zero_patch_rounds``,
+    ``no_progress_repairs``, ``consecutive_distraction_rounds``,
+    ``missing_dep_consecutive_same``) accumulate across rounds. When a
+    session ends — clean exit, external kill, or [s] Save & Quit — and
+    the operator later runs ``teane resume``, the checkpoint restores
+    these counters at their last values. If any of them was sitting at
+    or above the cap when the session ended, the FIRST call to
+    ``route_after_compiler`` on the resumed run trips HITL with the
+    same trigger as last time, before any new repair round runs. That
+    failure mode looks like "resume immediately HITLs for the same
+    reason" to the operator and is what motivated this helper.
+
+    The operator's mental model on ``teane resume`` is "give me another
+    chance" — matching that semantics, we zero the gate counters so the
+    new run gets a fresh repair budget. ``total_repairs`` (telemetry +
+    hard ceiling) is preserved so a session can't run away forever
+    across many resumes; the hard cap at ``2 * max_iterations`` still
+    bounds total work.
+
+    The helper runs UNCONDITIONALLY for every resume — orthogonal to
+    :func:`_rewind_suspended_checkpoint`, which only fires for [s]
+    suspends and rewrites the entire ``loop_counter`` dict with a
+    hard-coded 4-key reset. When the rewind ran just before this
+    helper, ``loop_counter`` is already minimal and the gate-key
+    snapshot collapses to all-zeros → this helper short-circuits to a
+    no-op via the ``any(before.values())`` guard.
+    """
+    try:
+        state = await compiled_graph.aget_state(config)
+    except Exception as exc:  # noqa: BLE001 — defensive; never block resume
+        logger.debug(
+            "[run_graph] Could not read state for gate-counter reset: %s",
+            exc,
+        )
+        return
+    if state is None:
+        return
+    values = getattr(state, "values", None) or {}
+    loop_counter = dict(values.get("loop_counter", {}) or {})
+    gate_keys = (
+        "consecutive_zero_patch_rounds",
+        "no_progress_repairs",
+        "consecutive_distraction_rounds",
+        "missing_dep_consecutive_same",
+    )
+    before = {k: int(loop_counter.get(k, 0) or 0) for k in gate_keys}
+    if not any(before.values()):
+        return
+    for k in gate_keys:
+        loop_counter[k] = 0
+    logger.info(
+        "[run_graph] Resume: zeroing stale gate counters %s so the operator's "
+        "explicit resume gets a fresh repair budget. total_repairs preserved.",
+        before,
+    )
+    try:
+        await compiled_graph.aupdate_state(
+            config,
+            {"loop_counter": loop_counter},
+        )
+    except Exception as exc:  # noqa: BLE001 — log but don't crash resume
+        logger.warning(
+            "[run_graph] Failed to reset stale gate counters on resume: %s. "
+            "First repair round may HITL immediately.",
+            exc,
+        )
+
+
 async def _rewind_suspended_checkpoint(compiled_graph: Any, config: dict[str, Any]) -> None:
     """If the resumed checkpoint ended at END via hitl_suspend, rewind it.
 
@@ -14630,6 +14703,15 @@ async def run_graph(
         # edge from HITL re-fires and routes to compiler_node — identical
         # to the user having pressed [r] Resume instead of [s] Save & Quit.
         await _rewind_suspended_checkpoint(compiled_graph, config)
+        # Repair-loop gates accumulate across rounds, so the value
+        # checkpointed at session-end is often at-or-near a cap. Without
+        # this reset, the first call to route_after_compiler on a
+        # resumed run trips HITL immediately on stale counters — same
+        # trigger as the prior session, no new work executed. Reset
+        # gate counters here so the operator's explicit resume gets a
+        # fresh budget; total_repairs (the hard-ceiling counter) is
+        # preserved so multi-resume sessions still bound out.
+        await _reset_stale_gate_counters_on_resume(compiled_graph, config)
     else:
         invoke_input = initial_state
 
