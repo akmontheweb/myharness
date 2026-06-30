@@ -1318,6 +1318,30 @@ def _esc(value: Any) -> str:
     return html.escape(str(value)) if value is not None else ""
 
 
+def _agile_mode_label(workspace_path: str, cache: dict[str, str]) -> str:
+    """Return "Agile" / "Waterfall" / "—" for a workspace, memoized.
+
+    Uses :func:`harness.story_state.workspace_is_agile_managed` which
+    safe-fails to False — for paths that no longer exist on disk we
+    render "—" instead of a misleading "Waterfall" tag.
+    """
+    if not workspace_path:
+        return "—"
+    cached = cache.get(workspace_path)
+    if cached is not None:
+        return cached
+    if not os.path.isdir(workspace_path):
+        cache[workspace_path] = "—"
+        return "—"
+    try:
+        from harness.story_state import workspace_is_agile_managed
+        label = "Agile" if workspace_is_agile_managed(workspace_path) else "Waterfall"
+    except Exception:  # noqa: BLE001
+        label = "—"
+    cache[workspace_path] = label
+    return label
+
+
 def _render_sessions(cfg: DashboardConfig) -> str:
     sessions = list_sessions(cfg)
     if not sessions:
@@ -1332,6 +1356,7 @@ def _render_sessions(cfg: DashboardConfig) -> str:
             cta_href="/run",
         )
     rows = []
+    agile_cache: dict[str, str] = {}
     for s in sessions:
         status = "—"
         cls = "muted"
@@ -1340,6 +1365,13 @@ def _render_sessions(cfg: DashboardConfig) -> str:
         elif s.exit_code is not None:
             status, cls = f"exit {s.exit_code}", "fail"
         sid = _esc(s.session_id)
+        mode = _agile_mode_label(s.workspace_path, agile_cache)
+        if mode == "Agile":
+            mode_html = "<span class='bx--tag bx--tag--green'>Agile</span>"
+        elif mode == "Waterfall":
+            mode_html = "<span class='bx--tag'>Waterfall</span>"
+        else:
+            mode_html = "<span class='muted'>—</span>"
         rows.append(
             f"<tr>"
             f"<td><a href='/sessions/{sid}'>{sid}</a> "
@@ -1348,6 +1380,7 @@ def _render_sessions(cfg: DashboardConfig) -> str:
             f"<td>{_esc(s.started_at)}</td>"
             f"<td>{_esc(s.ended_at)}</td>"
             f"<td class='{cls}'>{_esc(status)}</td>"
+            f"<td>{mode_html}</td>"
             f"<td class='num'>{_fmt_int(s.llm_calls)}</td>"
             f"<td class='num'>{_fmt_cost(s.total_cost_usd)}</td>"
             f"<td class='num'>{_fmt_int(s.total_input_tokens)}</td>"
@@ -1362,6 +1395,7 @@ def _render_sessions(cfg: DashboardConfig) -> str:
         "<th data-sort='date'>started</th>"
         "<th data-sort='date'>ended</th>"
         "<th data-sort='str'>status</th>"
+        "<th data-sort='str'>mode</th>"
         "<th class='num' data-sort='num'>calls</th>"
         "<th class='num' data-sort='num'>cost</th>"
         "<th class='num' data-sort='num'>tokens in</th>"
@@ -3097,6 +3131,38 @@ def make_request_handler(
                 requested = (q.get("path", [""])[0] or "").strip()
                 status, ctype, body = _browse_response(requested)
                 self._send(status, ctype, body)
+                return
+            # /api/workspace-file — CR-DEFECT-* attachment server. Lives
+            # here (not in the dispatch table) so binary bodies don't
+            # round-trip through dispatch's str-only typing.
+            if urllib.parse.unquote(parsed_url.path) == "/api/workspace-file":
+                from harness.dashboard_workspace import workspace_file_payload
+                q = urllib.parse.parse_qs(parsed_url.query)
+                ws = (q.get("workspace", [""])[0] or "").strip()
+                rp = (q.get("relpath", [""])[0] or "").strip()
+                status, ctype, body = workspace_file_payload(ws, rp)
+                self._send(status, ctype, body)
+                return
+            # /workspaces/<app>/traceability also takes ?path= so route
+            # it inline; the dispatch table only carries path segments,
+            # not query params.
+            traceability_match = re.match(
+                r"^/workspaces/(?P<app>[A-Za-z0-9_.\-]+)/traceability/?$",
+                urllib.parse.unquote(parsed_url.path),
+            )
+            if traceability_match:
+                q = urllib.parse.parse_qs(parsed_url.query)
+                workspace_path = (q.get("path", [""])[0] or "").strip()
+                params = {
+                    "app": traceability_match.group("app"),
+                    "path": workspace_path,
+                }
+                status, ctype, body = _route_workspace_traceability(cfg, params)
+                extra = {}
+                cookie = self._csrf_set_cookie_header()
+                if cookie:
+                    extra["Set-Cookie"] = cookie
+                self._send(status, ctype, body, extra_headers=extra)
                 return
             try:
                 status, ctype, body = dispatch(cfg, self.path)
@@ -4844,17 +4910,59 @@ def _render_config_section(
 # Render — Live + memory edit + new run form
 # ---------------------------------------------------------------------------
 
+def _last_progress_warn(log_path: str) -> Optional[dict[str, Any]]:
+    """Walk ``log_path`` for the most recent ``progress_tracker_warn``
+    event emitted by :mod:`harness.no_progress` and return its fields
+    (``spent_since_progress_usd``, ``budget_at_last_progress``,
+    ``threshold_usd``).
+
+    Returns None when no warning has fired on this session — the
+    failsafe is either dormant or a previous progress turn cleared
+    the tripped flag.
+    """
+    if not log_path or not os.path.isfile(log_path):
+        return None
+    found: Optional[dict[str, Any]] = None
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                evt = _safe_json(line)
+                if not evt:
+                    continue
+                if evt.get("event") == "progress_tracker_warn":
+                    found = evt
+    except OSError:
+        return None
+    return found
+
+
+def _render_progress_warn_badge(log_path: str) -> str:
+    evt = _last_progress_warn(log_path)
+    if not evt:
+        return ""
+    spent = evt.get("spent_since_progress_usd")
+    try:
+        spent_str = f"${float(spent):.2f}" if spent is not None else "?"
+    except (TypeError, ValueError):
+        spent_str = "?"
+    return (
+        f"<span class='bx--tag bx--tag--red' title='No-progress failsafe tripped'>"
+        f"no progress ({spent_str})</span>"
+    )
+
+
 def _render_live(cfg: DashboardConfig) -> str:
     reg = get_process_registry()
     live = reg.list_running()
     recent = [p for p in reg.list_all() if not p.is_running][:10]
     rows = []
     for p in live:
+        warn_badge = _render_progress_warn_badge(p.log_path or "")
         rows.append(
             f"<tr><td><a href='/sessions/{_esc(p.session_id)}'>{_esc(p.session_id)}</a></td>"
             f"<td>{_esc(p.workspace_path)}</td>"
             f"<td>{_esc(p.prompt[:80])}</td>"
-            f"<td><span class='ok'>running</span></td>"
+            f"<td><span class='ok'>running</span> {warn_badge}</td>"
             f"<td>"
             f"<form method='post' action='/sessions/{_esc(p.session_id)}/cancel' style='display:inline'>"
             f"<input type='hidden' name='csrf_token' value=''>"
@@ -5252,6 +5360,33 @@ def _render_session_with_hitl(cfg: DashboardConfig, session_id: str) -> str:
         + _render_pending_hitl_rows(cfg, session_id)
         + "</div>"
     )
+
+    # v5 read-only cards (Phases 3.1, 3.2, 4.1). Resolve the workspace
+    # from the JSONL session_start event; gracefully empty when the log
+    # is fresh or the workspace isn't agile-managed.
+    try:
+        from harness.dashboard_v5views import (
+            render_session_batches_card,
+            render_session_features_card,
+            render_session_test_results_card,
+            render_traceability_card,
+            resolve_workspace_from_log,
+        )
+        from harness.dashboard_workspace import render_workspace_status_widget
+        workspace_path = resolve_workspace_from_log(log_path)
+        if workspace_path:
+            parts.append(render_workspace_status_widget(workspace_path))
+            parts.append(render_session_features_card(workspace_path))
+            parts.append(render_session_batches_card(workspace_path, session_id))
+            parts.append(render_session_test_results_card(workspace_path, log_path))
+            parts.append(render_traceability_card(workspace_path))
+    except Exception as exc:  # noqa: BLE001
+        # v5 read failures shouldn't block the rest of the page.
+        logger.warning(
+            "[session-detail] v5 view rendering failed for %s: %s",
+            session_id, exc,
+        )
+
     parts.append(_render_session_detail(cfg, session_id))
     parts.append(
         f"<div id='chat-notes-slot' data-session-id='{_esc(session_id)}'>"
@@ -5568,6 +5703,30 @@ def _route_run_subcommand(
     return 200, "text/html; charset=utf-8", _layout(
         f"Run · {label}", body, cfg, active="dashboards",
     )
+
+
+def _route_workspace_traceability(
+    cfg: DashboardConfig, params: dict[str, str],
+) -> tuple[int, str, str]:
+    """Standalone ``/workspaces/<app>/traceability?path=<ws>`` page.
+
+    The ``<app>`` segment exists for human-readable URLs; the actual
+    workspace path is read from the ``?path=`` query parameter (the
+    same value the session-detail card was built from). Without
+    ``path``, we render the empty-state asking for it.
+    """
+    from harness.dashboard_workspace import render_workspace_traceability_page
+    workspace_path = params.get("path", "")
+    body = render_workspace_traceability_page(workspace_path)
+    return 200, "text/html; charset=utf-8", _layout(
+        f"Traceability · {params.get('app', 'workspace')}",
+        body, cfg, active="dashboards",
+    )
+
+
+# NOTE: /api/workspace-file is handled inline in do_GET (next to
+# /api/browse) so binary attachment bodies don't have to round-trip
+# through the dispatch path's str-only return type.
 
 
 # ---------------------------------------------------------------------------

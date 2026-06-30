@@ -66,8 +66,13 @@ def update_and_check(
     flipped to done, a new modified_files entry, etc.).
 
     Mutates ``loop_counter['progress_tracker']`` in place.
+
+    Emits a ``progress_tracker_warn`` JSONL event on the False→True
+    transition so the dashboard's live-runs scanner can surface a red
+    "no progress for $X" badge without polling the in-process state.
     """
     tracker = dict(loop_counter.get("progress_tracker") or {})
+    was_tripped = bool(tracker.get("tripped"))
 
     if progress_made or "budget_at_last_progress" not in tracker:
         # Either we made progress or this is the very first sample.
@@ -90,6 +95,26 @@ def update_and_check(
         "tripped": is_tripped,
         "spent_since_progress_usd": spent_since,
     }
+
+    # Emit a structured event on the False→True transition. The
+    # dashboard's live-runs scanner tails the JSONL for this event
+    # name and renders a red badge with `spent_since_progress_usd`
+    # alongside the session row. Deferred import so this module stays
+    # importable in test environments that don't wire the observability
+    # bus.
+    if is_tripped and not was_tripped:
+        try:
+            from harness.observability import emit_event
+            emit_event(
+                "progress_tracker_warn",
+                spent_since_progress_usd=spent_since,
+                budget_at_last_progress=last_budget,
+                threshold_usd=float(threshold_usd),
+            )
+        except Exception:  # noqa: BLE001
+            # Telemetry must never break the failsafe.
+            pass
+
     return is_tripped
 
 
