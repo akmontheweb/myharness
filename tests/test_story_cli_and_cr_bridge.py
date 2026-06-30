@@ -82,6 +82,57 @@ def test_resolve_agile_args_falls_back_to_hard_defaults():
     assert args.story_repair_cap == 3
 
 
+def test_cmd_patch_agile_forces_install_doc_true(tmp_path, monkeypatch):
+    """Phase 6c: agile patches must enable installation_doc_node so the
+    end-of-session traceability audit fires. Non-agile patches keep
+    install_doc=False (legacy behavior); an explicit --install-doc=false
+    is respected (operator override)."""
+    import argparse as _argparse
+    import asyncio
+    from harness import cli as cli_mod
+
+    # Stub cmd_run so we just observe the args namespace cmd_patch
+    # hands off without actually executing the graph.
+    captured: dict[str, Any] = {}
+
+    async def _fake_run(a):
+        captured["args"] = a
+        return 0
+
+    monkeypatch.setattr(cli_mod, "cmd_run", _fake_run)
+    monkeypatch.chdir(tmp_path)
+
+    # Agile patch — install_doc was unset; cmd_patch should force True.
+    args = _argparse.Namespace(
+        workspace=str(tmp_path), agile=True, generate_specs=None,
+        install_doc=None,
+    )
+    asyncio.run(cli_mod.cmd_patch(args))
+    assert captured["args"].decomposition_enabled is True
+    assert captured["args"].install_doc is True
+
+    # Non-agile patch — install_doc stays None/False.
+    captured.clear()
+    args = _argparse.Namespace(
+        workspace=str(tmp_path), agile=False, generate_specs=None,
+        install_doc=None,
+    )
+    asyncio.run(cli_mod.cmd_patch(args))
+    assert captured["args"].decomposition_enabled is False
+    assert captured["args"].install_doc is None
+
+    # Explicit operator override — agile but install_doc=False must
+    # be respected (no silent upgrade).
+    captured.clear()
+    args = _argparse.Namespace(
+        workspace=str(tmp_path), agile=True, generate_specs=None,
+        install_doc=False,
+    )
+    asyncio.run(cli_mod.cmd_patch(args))
+    assert captured["args"].decomposition_enabled is True
+    assert captured["args"].install_doc is False
+
+
 # ---------------------------------------------------------------------------
 # create_initial_state — accepts the new kwargs
 # ---------------------------------------------------------------------------

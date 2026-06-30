@@ -5872,6 +5872,16 @@ async def cmd_patch(args: argparse.Namespace) -> int:
     if err is not None:
         return err
     _resolve_agile_args(args, config=config, workspace_path=workspace_path, flow="patch")
+    # v5 Phase 6c: agile patches MUST run installation_doc_node so the
+    # end-of-session traceability audit fires (the audit block lives
+    # inside that node, see harness/graph.py:12111-12153). Non-agile
+    # patch keeps install_doc=False so legacy operators see no change.
+    # The user can still opt out explicitly with --install-doc false.
+    if (
+        getattr(args, "decomposition_enabled", False)
+        and getattr(args, "install_doc", None) is None
+    ):
+        args.install_doc = True
     return await cmd_run(args)
 
 

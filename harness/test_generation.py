@@ -387,7 +387,10 @@ def _parse_verifies_marker(body: str) -> list[str]:
 # Prompt assembly
 # ---------------------------------------------------------------------------
 
-_PROMPT_FORMAT_REMINDER = """[CRITICAL FORMAT INSTRUCTION]
+# Base rules (1-4) — always emitted. RULE 5 (the @verifies marker
+# contract) is appended only in agile mode where acceptance_criteria
+# rows exist for the LLM to cite; see _build_format_reminder below.
+_PROMPT_FORMAT_REMINDER_BASE = """[CRITICAL FORMAT INSTRUCTION]
 You MUST respond using ONLY the patch block syntax below. No prose, no markdown
 code fences, no commentary. Your entire response must be parseable as patch
 blocks.
@@ -417,8 +420,9 @@ RULES — absolute:
   3. Cover the typical paths AND the edge cases (empty input, zero/negative
      values, error branches). Skip cases that would require mocking external
      services.
-  4. Match the stack-canonical layout and naming convention.
-  5. EVERY generated test file MUST carry a `@verifies` marker at the top
+  4. Match the stack-canonical layout and naming convention."""
+
+_VERIFIES_RULE = """  5. EVERY generated test file MUST carry a `@verifies` marker at the top
      of the file (after the module docstring / imports, within the first
      50 non-blank lines) naming the acceptance criteria the file's tests
      verify. Use the language-appropriate comment style:
@@ -429,9 +433,32 @@ RULES — absolute:
      Use the AC keys exactly as they appear in the story preamble's
      "Acceptance criteria" block. A file with no marker — or a marker
      that uses an AC key absent from the preamble — is rejected and
-     the test-gen pass is routed back to repair.
+     the test-gen pass is routed back to repair."""
 
-Generate test patches NOW. Only the blocks above. No other text."""
+_REMINDER_TAIL = "\n\nGenerate test patches NOW. Only the blocks above. No other text."
+
+
+def _build_format_reminder(agile: bool) -> str:
+    """Return the test-gen format reminder, conditionally including the
+    v5 ``@verifies`` marker rule (RULE 5) when ``agile=True``.
+
+    Non-agile (monolithic) runs have no ``acceptance_criteria`` rows in
+    state.db for the LLM to cite, so RULE 5 would be a contract the
+    workspace cannot satisfy — the LLM would fabricate keys to pass
+    syntactic validation and the link writer would drop every one with
+    a noisy warning. Skipping the rule in non-agile keeps the prompt
+    honest and avoids the spurious churn (Phase 6 of the schema-v5
+    plan).
+    """
+    if agile:
+        return f"{_PROMPT_FORMAT_REMINDER_BASE}\n{_VERIFIES_RULE}{_REMINDER_TAIL}"
+    return f"{_PROMPT_FORMAT_REMINDER_BASE}{_REMINDER_TAIL}"
+
+
+# Backward-compat alias for any out-of-tree caller / test that imports
+# the legacy constant. Returns the agile-mode reminder (matches the
+# pre-Phase-6 string verbatim).
+_PROMPT_FORMAT_REMINDER = _build_format_reminder(agile=True)
 
 
 def _build_test_gen_prompt(
@@ -439,8 +466,15 @@ def _build_test_gen_prompt(
     modified_source_files: list[str],
     primary_stack: str,
     max_per_file_chars: int = 6000,
+    *,
+    agile: bool = True,
 ) -> str:
-    """Build the user-prompt body listing modified source files and asking for tests."""
+    """Build the user-prompt body listing modified source files and asking
+    for tests.
+
+    ``agile`` toggles whether the @verifies marker contract (RULE 5) is
+    included — see :func:`_build_format_reminder`.
+    """
     lines: list[str] = [
         f"Generate unit tests for the following source files (stack: {primary_stack}).",
         "Each test file should follow the conventions in the test-generation guide "
@@ -461,7 +495,7 @@ def _build_test_gen_prompt(
         lines.append(body)
         lines.append("```")
         lines.append("")
-    lines.append(_PROMPT_FORMAT_REMINDER)
+    lines.append(_build_format_reminder(agile=agile))
     return "\n".join(lines)
 
 
@@ -672,11 +706,25 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             "role": "system",
             "content": "## Test-generation guidance\n\n" + guides_body,
         })
-    user_prompt = _build_test_gen_prompt(workspace_path, source_files, primary)
+
+    # v5 Phase 6: agile mode gates the @verifies marker contract. When
+    # decomposition_enabled is False (monolithic build/patch), there
+    # are no acceptance_criteria rows for the LLM to cite — RULE 5
+    # would be a contract the workspace can't satisfy and the marker
+    # gate below is skipped entirely.
+    agile = bool(state.get("decomposition_enabled"))
+
+    user_prompt = _build_test_gen_prompt(
+        workspace_path, source_files, primary, agile=agile,
+    )
     # Change-request mode: prepend the CR-N attribution rules so generated
     # tests follow the `test_cr_N_*` naming convention and reference the
     # CR in their docstrings. No-op (empty string) outside CR mode.
-    from harness.graph import _build_change_request_preamble, _build_arch_summary_preamble
+    from harness.graph import (
+        _build_arch_summary_preamble,
+        _build_change_request_preamble,
+        _build_story_preamble,
+    )
     # Architecture-summary preamble — every endpoint in §11 should
     # have at least one test, every component at least one render
     # test. Empty string when the arch doc has no §11 block (legacy
@@ -689,9 +737,19 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     arch_preamble, _resolved_arch = _build_arch_summary_preamble(
         cast("AgentState", state), consumer="test_generator",
     )
+    # v5 Phase 6b: inject the per-story preamble so the test-gen LLM
+    # actually sees the AC keys it's expected to cite in @verifies
+    # markers. Empty string in non-agile / no-current-story — no-op
+    # there. patching_node already injects this preamble for code-
+    # gen; mirroring it here makes RULE 5's "use AC keys from the
+    # story preamble" instruction verifiable (Phase 3 oversight).
+    story_preamble = _build_story_preamble(
+        cast("AgentState", state), "tests",
+    )
     user_prompt = (
         _build_change_request_preamble(cast("AgentState", state), "tests")
         + arch_preamble
+        + story_preamble
         + user_prompt
     )
     messages.append({"role": "user", "content": user_prompt})
@@ -764,7 +822,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         ),
     })
 
-    # --- v5 @verifies marker gate ---
+    # --- v5 @verifies marker gate (agile mode only) ---
     # Every generated test file MUST carry a `# @verifies: STORY-N.AC-N`
     # marker (Phase 3 contract). Files that don't are short-circuited
     # into the existing repair pipeline via a TEST_FAILURE diagnostic
@@ -773,26 +831,31 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
     # fires before the sandbox run; the actual ``test_verifies_ac``
     # write happens AFTER the sandbox passes (a failing test that
     # claims to verify an AC shouldn't carry the link).
+    #
+    # Skipped when ``agile=False`` (Phase 6): non-agile runs have no
+    # acceptance_criteria rows to cite, so the gate would only force
+    # the LLM to fabricate fake keys to satisfy syntactic validation.
     marker_keys_by_file: dict[str, list[str]] = {}
     marker_missing: list[str] = []
-    for rel in generated_tests:
-        abs_path = os.path.join(workspace_path, rel)
-        try:
-            with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
-                body = fh.read()
-        except OSError as exc:
-            logger.warning(
-                "[test_generation_node] Could not re-read generated test %r "
-                "for marker parse: %s — treating as marker-missing.",
-                rel, exc,
-            )
-            marker_missing.append(rel)
-            continue
-        keys = _parse_verifies_marker(body)
-        if not keys:
-            marker_missing.append(rel)
-        else:
-            marker_keys_by_file[rel] = keys
+    if agile:
+        for rel in generated_tests:
+            abs_path = os.path.join(workspace_path, rel)
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                    body = fh.read()
+            except OSError as exc:
+                logger.warning(
+                    "[test_generation_node] Could not re-read generated test %r "
+                    "for marker parse: %s — treating as marker-missing.",
+                    rel, exc,
+                )
+                marker_missing.append(rel)
+                continue
+            keys = _parse_verifies_marker(body)
+            if not keys:
+                marker_missing.append(rel)
+            else:
+                marker_keys_by_file[rel] = keys
 
     if marker_missing:
         diags = [
@@ -961,16 +1024,28 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
         # coverage. Unknown ac_keys are warned-and-dropped here
         # (Phase 3 soft mode); the audit gate in Phase 4 still
         # surfaces them as "untested AC" if no other test claims to
-        # verify them, so the data loss is bounded.
-        link_count, drop_count = _persist_verifies_links(
-            workspace_path, marker_keys_by_file,
-        )
-        if link_count or drop_count:
-            logger.info(
-                "[test_generation_node] @verifies links persisted: %d "
-                "edge(s) inserted, %d unknown ac_key(s) dropped.",
-                link_count, drop_count,
+        # verify them, so the data loss is bounded. Skipped in
+        # non-agile mode (Phase 6) — no acceptance_criteria rows
+        # exist for the workspace, so the helper would just open
+        # state.db and immediately return (0, 0).
+        tg_status: dict[str, Any] = {
+            "status": "passed",
+            "primary_stack": primary,
+            "tests_generated": len(generated_tests),
+            "test_command": test_cmd,
+        }
+        if agile:
+            link_count, drop_count = _persist_verifies_links(
+                workspace_path, marker_keys_by_file,
             )
+            if link_count or drop_count:
+                logger.info(
+                    "[test_generation_node] @verifies links persisted: %d "
+                    "edge(s) inserted, %d unknown ac_key(s) dropped.",
+                    link_count, drop_count,
+                )
+            tg_status["verifies_links_inserted"] = link_count
+            tg_status["verifies_links_dropped"] = drop_count
         return {
             "messages": messages,
             "modified_files": new_modified,
@@ -984,14 +1059,7 @@ async def test_generation_node(state: dict[str, Any]) -> dict[str, Any]:
             "node_state": {
                 **(state.get("node_state") or {}),
                 "current_node": "test_generation",
-                "test_generation": {
-                    "status": "passed",
-                    "primary_stack": primary,
-                    "tests_generated": len(generated_tests),
-                    "test_command": test_cmd,
-                    "verifies_links_inserted": link_count,
-                    "verifies_links_dropped": drop_count,
-                },
+                "test_generation": tg_status,
             },
         }
 

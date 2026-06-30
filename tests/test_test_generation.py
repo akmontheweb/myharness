@@ -572,6 +572,8 @@ class TestVerifiesGate:
             "messages": [],
             "budget_remaining_usd": 1.5,
             "token_tracker": {},
+            # Phase 6: marker gate only fires in agile mode.
+            "decomposition_enabled": True,
         })
 
         assert result["compiler_errors"], "marker gate must populate compiler_errors"
@@ -603,6 +605,8 @@ class TestVerifiesGate:
             "messages": [],
             "budget_remaining_usd": 1.5,
             "token_tracker": {},
+            # Phase 6: marker gate only fires in agile mode.
+            "decomposition_enabled": True,
         })
 
         assert result["node_state"]["test_generation"]["status"] == "missing_verifies_marker"
@@ -681,3 +685,200 @@ class TestVerifiesLinkPersistence:
         # Second call: composite PK → no new insert
         b, _ = _persist_verifies_links(str(ws), {"tests/t.py": [ac_key]})
         assert a == 1 and b == 0
+
+
+# ---------------------------------------------------------------------------
+# v5 Phase 6 — non-agile mode skips the @verifies machinery
+# ---------------------------------------------------------------------------
+
+class TestNonAgileSkipsVerifiesGate:
+    """Phase 6 contract: the @verifies marker prompt + gate + link
+    writer are all gated on ``state["decomposition_enabled"]``.
+
+    Non-agile runs (monolithic ``teane build`` / ``teane patch``)
+    have no acceptance_criteria rows to cite, so enforcing the
+    marker would force the LLM to fabricate fake STORY-N.AC-N keys
+    to pass syntactic validation — every link insert would then be
+    silently dropped with a warning. Skipping keeps the prompt
+    honest and the log noise zero.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rule5_absent_from_user_prompt_in_non_agile(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "calc.py").write_text("def add(a, b): return a + b\n")
+        gw = stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_calc.py\n"
+            "content:\n"
+            "from calc import add\n"
+            "def test_add(): assert add(1, 2) == 3\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "1 passed")
+        await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["calc.py"],
+            "messages": [],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+            # decomposition_enabled deliberately False / unset.
+        })
+        sent = gw.dispatched[0]["messages"]
+        joined = "\n".join(m.get("content", "") for m in sent if m.get("role") == "user")
+        # RULE 5 must NOT appear in non-agile prompts.
+        assert "@verifies" not in joined, (
+            "non-agile prompt must not require @verifies markers"
+        )
+
+    @pytest.mark.asyncio
+    async def test_markerless_test_accepted_in_non_agile(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        """The marker gate is skipped entirely — a test without a
+        @verifies marker passes through to the sandbox and lands as
+        ``status=passed``, NOT ``missing_verifies_marker``."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "calc.py").write_text("def add(a, b): return a + b\n")
+        stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_calc.py\n"
+            "content:\n"
+            "from calc import add\n"
+            "def test_add(): assert add(1, 2) == 3\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "1 passed in 0.01s")
+        result = await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["calc.py"],
+            "messages": [],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+        })
+        assert "compiler_errors" not in result
+        assert result["node_state"]["test_generation"]["status"] == "passed"
+        # Agile-only fields are absent in non-agile node_state.
+        assert "verifies_links_inserted" not in result["node_state"]["test_generation"]
+        assert "verifies_links_dropped" not in result["node_state"]["test_generation"]
+        assert route_after_test_generation(result) == "lintgate_node"
+
+    @pytest.mark.asyncio
+    async def test_rule5_present_in_user_prompt_when_agile(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        """The agile path still emits RULE 5 — Phase 3 contract intact."""
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "calc.py").write_text("def add(a, b): return a + b\n")
+        gw = stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_calc.py\n"
+            "content:\n"
+            "# @verifies: STORY-1.AC-1\n"
+            "from calc import add\n"
+            "def test_add(): assert add(1, 2) == 3\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "1 passed")
+        await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["calc.py"],
+            "messages": [],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+            "decomposition_enabled": True,
+        })
+        sent = gw.dispatched[0]["messages"]
+        joined = "\n".join(m.get("content", "") for m in sent if m.get("role") == "user")
+        assert "@verifies" in joined
+        assert "STORY-3.AC-2" in joined  # canonical example in RULE 5
+
+
+class TestStoryPreambleInjectedIntoTestGenPrompt:
+    """Phase 6b: _build_story_preamble is now prepended to the test-gen
+    user prompt alongside the change-request and arch-summary preambles
+    so the LLM actually sees the AC keys it's expected to cite.
+
+    In non-agile / no-current-story mode the preamble is empty, so the
+    prompt picks up zero extra content (the bytes match the pre-Phase-6
+    non-preamble form).
+    """
+
+    @pytest.mark.asyncio
+    async def test_preamble_present_when_current_story_active(
+        self, tmp_path, stub_sandbox, stub_gateway, monkeypatch,
+    ):
+        from harness import story_state
+        # Seed an agile workspace with a real STORY-1 + AC.
+        ws = tmp_path / "agile-preamble-ws"
+        ws.mkdir()
+        (ws / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (ws / "calc.py").write_text("def add(a, b): return a + b\n")
+        db = tmp_path / "state.db"
+        monkeypatch.setenv("TEANE_STATE_DB", str(db))
+        app = story_state.app_name_for_workspace(str(ws))
+        conn = story_state.open_story_db()
+        try:
+            story_state.ensure_feature(conn, app, "core", name="Core")
+            story_state.create_stories(conn, app, [{
+                "title": "Add two numbers", "feature": "core",
+                "acceptance_criteria": ["add(1, 2) returns 3"],
+            }])
+        finally:
+            conn.close()
+
+        gw = stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_calc.py\n"
+            "content:\n"
+            "# @verifies: STORY-1.AC-1\n"
+            "from calc import add\n"
+            "def test_add(): assert add(1, 2) == 3\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "1 passed")
+        await run_test_generation({
+            "workspace_path": str(ws),
+            "modified_files": ["calc.py"],
+            "messages": [],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+            "decomposition_enabled": True,
+            "current_story_id": "STORY-1",
+        })
+        sent = gw.dispatched[0]["messages"]
+        joined = "\n".join(m.get("content", "") for m in sent if m.get("role") == "user")
+        # Story preamble rendered with the AC key so the LLM can cite it.
+        assert "STORY-1.AC-1" in joined
+        assert "add(1, 2) returns 3" in joined
+
+    @pytest.mark.asyncio
+    async def test_preamble_empty_when_no_current_story(
+        self, tmp_path, stub_sandbox, stub_gateway,
+    ):
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (tmp_path / "calc.py").write_text("def add(a, b): return a + b\n")
+        gw = stub_gateway(
+            "<<<CREATE_FILE>>>\n"
+            "file: tests/test_calc.py\n"
+            "content:\n"
+            "from calc import add\n"
+            "def test_add(): assert add(1, 2) == 3\n"
+            "<<<END_CREATE_FILE>>>\n"
+        )
+        stub_sandbox(0, "1 passed")
+        await run_test_generation({
+            "workspace_path": str(tmp_path),
+            "modified_files": ["calc.py"],
+            "messages": [],
+            "budget_remaining_usd": 1.5,
+            "token_tracker": {},
+            # no current_story_id, no decomposition_enabled
+        })
+        sent = gw.dispatched[0]["messages"]
+        joined = "\n".join(m.get("content", "") for m in sent if m.get("role") == "user")
+        # Story preamble renders the empty string when no story is set —
+        # the prompt has no "Story Scope:" header.
+        assert "Story Scope:" not in joined
