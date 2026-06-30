@@ -5837,6 +5837,21 @@ async def cmd_run(args: argparse.Namespace) -> int:
         config=config,
     )
 
+    # Record completion marker so `teane test`'s prereq gate can see this
+    # clean run. Tracked flows: build, patch, deploy. No-op on failure.
+    # Wrapped against exceptions inside flow_state itself.
+    from harness import flow_state
+    flow_state.record_flow_completion(
+        workspace_path=workspace_path,
+        flow=getattr(args, "flow", "build"),
+        session_id=session_id,
+        exit_code=exit_code,
+        summary={
+            "modified_files": len(modified_files),
+            "loop_counters": final_state.get("loop_counter", {}),
+        },
+    )
+
     return 0 if exit_code == 0 else 1
 
 
@@ -5983,6 +5998,39 @@ async def cmd_deploy(args: argparse.Namespace) -> int:
     # build/patch gates are pinned to false here so cmd_run's resolver
     # doesn't surprise an operator who never sees them on the CLI.
     for dest in ("hitl_requirement", "hitl_architecture", "hitl_repair", "hitl_layout_divergence"):
+        if not hasattr(args, dest):
+            setattr(args, dest, False)
+    return await cmd_run(args)
+
+
+async def cmd_test(args: argparse.Namespace) -> int:
+    """`teane test` — e2e verification pack against the dev compose stack.
+
+    Pins args.flow="test" and disables every discovery / planning / build
+    side-effect — this target ONLY runs the e2e pipeline against an
+    already-deployed app and emits CR-DEFECT-* on failures. cmd_run's
+    existing edge router (route_after_start) sees flow="test" and routes
+    straight to harness.test_target.test_node, which gates on
+    `<workspace>/.teane/last_{build,patch,deploy}.json` markers.
+    """
+    args.flow = "test"
+    args.new_build = False
+    args.deploy_dev = False
+    args.install_doc = False
+    args.assume_yes = False
+    args.spec_discovery = False
+    args.generate_specs = False
+    args.decomposition_enabled = False
+    args.commit_on_story = False
+    args.story_batch_size = 5
+    args.story_repair_cap = 3
+    # Test-specific HITL gates: none are exposed; pin to false so cmd_run's
+    # resolver doesn't surprise an operator. The test target is a pure
+    # verification step — no interactive interview points belong here.
+    for dest in (
+        "hitl_requirement", "hitl_architecture", "hitl_repair",
+        "hitl_layout_divergence", "hitl_deployment",
+    ):
         if not hasattr(args, dest):
             setattr(args, dest, False)
     return await cmd_run(args)
@@ -8860,6 +8908,48 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # --- `teane test` (e2e verify pack on the dev container) ---
+    test_parser = subparsers.add_parser(
+        "test",
+        help=(
+            "Run the e2e verification pack against the dev compose stack. "
+            "Requires a clean prior `teane deploy` and `teane build|patch`. "
+            "Generates Playwright scenarios + synthetic data, executes, and "
+            "emits failing scenarios as CR-DEFECT-* in change_requests/."
+        ),
+    )
+    _add_runlike_common(test_parser)
+    test_parser.add_argument(
+        "--scope",
+        choices=("touched", "full"),
+        default="touched",
+        help=(
+            "Which scenarios to run. 'touched' (default) — only scenarios "
+            "whose source spec touches a service in the last deploy's CR "
+            "attribution. 'full' — run every scenario in tests/e2e/."
+        ),
+    )
+    test_parser.add_argument(
+        "--retries",
+        type=int,
+        default=2,
+        metavar="N",
+        help=(
+            "Playwright per-scenario retry count for flake suppression. "
+            "Defaults to 2; pass 0 to disable retries."
+        ),
+    )
+    test_parser.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip teardown of generated synthetic data after the run. "
+            "Useful when debugging a failed scenario against the live "
+            "compose stack."
+        ),
+    )
+
     # --- `teane resume` ---
     resume_parser = subparsers.add_parser("resume", help="Resume a crashed or interrupted session from its checkpoint")
     resume_parser.add_argument(
@@ -9371,6 +9461,8 @@ def main() -> int:
             return asyncio.run(cmd_patch(args))
         elif args.command == "deploy":
             return asyncio.run(cmd_deploy(args))
+        elif args.command == "test":
+            return asyncio.run(cmd_test(args))
         elif args.command == "resume":
             return asyncio.run(cmd_resume(args))
         elif args.command == "status":

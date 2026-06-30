@@ -83,7 +83,8 @@ class MessageDict(TypedDict, total=False):
 FLOW_BUILD = "build"
 FLOW_PATCH = "patch"
 FLOW_DEPLOY = "deploy"
-_VALID_FLOWS = frozenset({FLOW_BUILD, FLOW_PATCH, FLOW_DEPLOY})
+FLOW_TEST = "test"
+_VALID_FLOWS = frozenset({FLOW_BUILD, FLOW_PATCH, FLOW_DEPLOY, FLOW_TEST})
 
 
 class AgentState(TypedDict, total=False):
@@ -10638,6 +10639,7 @@ def route_after_start(state: AgentState) -> Literal[
     "patch_reconcile_node",
     "deployment_discovery_node",
     "generate_deployment_spec_node",
+    "test_node",
 ]:
     """START edge router. Module-level so tests can call it directly.
 
@@ -10669,6 +10671,9 @@ def route_after_start(state: AgentState) -> Literal[
       7. Default → requirements_discovery_node (greenfield discovery).
     """
     flow = state.get("flow", FLOW_BUILD)
+    if flow == FLOW_TEST:
+        logger.info("[router] flow=test. Routing START → test_node.")
+        return "test_node"
     if flow == FLOW_DEPLOY:
         if state.get("cd_discovery", False):
             logger.info(
@@ -13215,6 +13220,12 @@ def build_graph() -> Any:
     # Register deployment spec node
     graph.add_node("generate_deployment_spec_node", generate_deployment_spec_node)
 
+    # `teane test` entry node — verifies prereqs (clean deploy + build|patch
+    # markers via harness/flow_state.py) then exits straight to END. Phases
+    # 2-6 will expand the body to generate scenarios + run them + emit CRs.
+    from harness.test_target import test_node
+    graph.add_node("test_node", test_node)
+
     # =====================================================================
     # Discovery pipeline (exhaustive zero-unknowns protocol):
     # START → requirements_discovery_node → discovery_interview_loop
@@ -13258,8 +13269,16 @@ def build_graph() -> Any:
             # entirely and enter the deployment chain directly.
             "deployment_discovery_node": "deployment_discovery_node",
             "generate_deployment_spec_node": "generate_deployment_spec_node",
+            # flow=test entry edge: prereq-gated no-op (Phase 1); later
+            # phases bolt the e2e pipeline behind this same edge.
+            "test_node": "test_node",
         },
     )
+
+    # `teane test` exits straight to END for now. Phase 5 may rewire this
+    # to a conditional edge that loops back through compile/repair when
+    # generated scenarios fail to parse — TBD.
+    graph.add_edge("test_node", END)
 
     # reverse_spec_node feeds its synthesised drafts into the standard
     # requirements/architecture discovery chain so spec_review_node still
