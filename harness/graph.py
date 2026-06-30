@@ -6511,6 +6511,40 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
             adapted_build_cmd = re_detected
             build_cmd = re_detected
 
+    # Second mid-session upgrade: greenfield runs where the detector ALREADY
+    # ran (cached cmd has `-r`) but the workspace gained an additional
+    # manifest the previous detection didn't see — typically
+    # `requirements-dev.txt` written by the test_generation pass after the
+    # first compile cycle locked in the build command. Re-detect and adopt
+    # only when the new command is a strict superset that adds an install
+    # step (same prefix up to the trailing `&& python3 -m pytest -q` tail),
+    # so an operator-customised brownfield command can never get replaced.
+    if (
+        adapted_build_cmd is None
+        and is_greenfield_compile
+        and "uv pip install -r" in build_cmd
+    ):
+        from harness.cli import _detect_default_build_command
+        re_detected = _detect_default_build_command(
+            workspace, is_greenfield=True,
+        )
+        tail = " && python3 -m pytest -q"
+        if (
+            re_detected
+            and re_detected != build_cmd
+            and re_detected.endswith(tail)
+            and build_cmd.endswith(tail)
+            and re_detected[: -len(tail)].startswith(build_cmd[: -len(tail)])
+        ):
+            logger.info(
+                "[compiler_node] Workspace gained an additional manifest mid-session; "
+                "upgrading build command from %r to detected %r so the extra install "
+                "step is honored.",
+                build_cmd, re_detected,
+            )
+            adapted_build_cmd = re_detected
+            build_cmd = re_detected
+
     # Late-bound sandbox image / network adaptation. With the pre-flight
     # adaptation in run_graph this is now a safety net — it only fires when
     # the build_command was just adapted above (greenfield rescue), or on
