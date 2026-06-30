@@ -791,7 +791,15 @@ def ensure_feature(
 # Requirements CRUD (v5)
 # ---------------------------------------------------------------------------
 
-_VALID_REQ_KINDS = frozenset({"fr", "nfr", "us", "cr_synthetic"})
+_VALID_REQ_KINDS = frozenset({
+    # Waterfall / ISO 29148 families.
+    "fr", "nfr", "us",
+    # Agile / SAFe families (Phase 8 — emitted by the SAFe Path A
+    # of harness/skills/docgen/requirements_doc.md).
+    "epic", "feat", "safe_story", "safe_nfr_story",
+    # Synthetic kind for change-request-bridged requirements.
+    "cr_synthetic",
+})
 
 
 def _row_to_requirement(row: sqlite3.Row | tuple) -> dict[str, Any]:

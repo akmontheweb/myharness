@@ -10297,14 +10297,39 @@ async def reverse_spec_node(state: AgentState) -> dict[str, Any]:
         logger.warning("[reverse_spec] telemetry JSON encode failed: %s", exc)
         telemetry_json = str(telemetry)
 
+    # Phase 8c: branch the SPEC_REQUIREMENTS format on the agile flag
+    # so the reverse-engineered draft matches whatever shape the
+    # downstream discovery interview will produce. The architecture
+    # half is unchanged either way — only the requirements vocabulary
+    # differs.
+    if state.get("decomposition_enabled"):
+        requirements_shape = (
+            "  - SPEC_REQUIREMENTS.md: the WHAT in **SAFe agile** shape. "
+            "Group capabilities as `## Epic: EPIC-NNN — <title>`, decompose "
+            "each epic into `### Feature: FEAT-NNN — <title>` sections, "
+            "and decompose each feature into `#### Story: STORY-NNN — "
+            "<title>` sections with Given/When/Then acceptance criteria. "
+            "Non-functional concerns go in `#### Enabler Story: "
+            "STORY-NFR-NNN — <title>` sections under the relevant feature. "
+            "Use the agile vocabulary throughout.\n"
+        )
+    else:
+        requirements_shape = (
+            "  - SPEC_REQUIREMENTS.md: the WHAT in **flat waterfall** "
+            "shape (ISO 29148 style). List functional requirements as "
+            "`### FR-NNN: <one-line title>` sections, each stating what "
+            "the system **shall** do plus acceptance criteria. "
+            "Non-functional requirements use `### NFR-CATEGORY-NNN: "
+            "<title>` (e.g. `NFR-SEC-001`, `NFR-PERF-014`). Do NOT use "
+            "agile vocabulary (no Epic / Feature / Story sections, no "
+            "INVEST framing, no user-story \"as a … I want …\" wording).\n"
+        )
     prompt = (
         "You are reverse-engineering a project specification from an "
         "existing codebase. Produce TWO markdown documents in one reply, "
         "delimited by the markers `<SPEC_REQUIREMENTS>` and "
         "`<SPEC_ARCHITECTURE>` (one each, no nesting):\n\n"
-        "  - SPEC_REQUIREMENTS.md: the WHAT — user stories, functional + "
-        "non-functional requirements, observable behaviour, public API "
-        "surface, success criteria.\n"
+        f"{requirements_shape}"
         "  - SPEC_ARCHITECTURE.md: the HOW — workspace layout, modules, "
         "data flow, external dependencies, build / run commands, "
         "deployment topology when discernible.\n\n"
@@ -10751,8 +10776,22 @@ async def requirements_discovery_node(state: AgentState) -> dict[str, Any]:
             "{FOCUS_SECTORS_BLOCK}", _render_focus_block(focus_sectors or []),
         )
     else:
+        # Phase 8a: branch the discovery prompt on the agile flag.
+        # Agile mode uses ``requirements_discovery.md`` (current
+        # canonical content: INVEST stories, Given/When/Then ACs)
+        # which downstream produces a SAFe-shaped spec. Waterfall
+        # mode uses ``requirements_discovery_waterfall.md`` which
+        # frames Sector 2 around flat FR-NNN "shall" statements.
+        # Both files live in ``harness/skills/docgen/`` and per-
+        # workspace overrides at ``{workspace}/skills/docgen/*.md``
+        # still win for either name.
+        skill_name = (
+            "requirements_discovery"
+            if state.get("decomposition_enabled")
+            else "requirements_discovery_waterfall"
+        )
         prompt = docgen_prompts.load(
-            "requirements_discovery", workspace_for_overrides
+            skill_name, workspace_for_overrides
         )
 
     # Delta-mode preamble: when change_request_mode is active, prepend the
