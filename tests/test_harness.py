@@ -256,6 +256,64 @@ class TestTextPatcher:
             assert "already exists" in result.error.lower()
 
     @pytest.mark.asyncio
+    async def test_create_file_conflict_error_carries_full_content(self):
+        """Regression for session 7e4cba32 (STORY-2's edgar.py conflict).
+
+        When STORY-1 scaffolds outside its declared scope_files (e.g.
+        the first story in a batch drops in ``server/services/edgar.py``
+        alongside its own targets), the next story hits CREATE_FILE
+        against that already-existing file. Historically the patcher
+        returned a 200-char snippet of the existing content — not
+        enough for the LLM's next round to emit a working REPLACE_BLOCK
+        against the true starting point. The repair loop then burned
+        rounds hallucinating search-blocks and reflection classified
+        the persistent failure as PROGRESS because ``current`` was
+        empty.
+
+        The fix surfaces the FULL line-numbered current content plus
+        an explicit "use REPLACE_BLOCK against the content below"
+        directive, so the LLM has a concrete recovery path within the
+        same message.
+        """
+        from harness.patcher import TextPatcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            existing = (
+                "# STORY-1: EDGAR API client\n"
+                "import httpx\n"
+                "class EdgarClient:\n"
+                "    BASE_URL = \"https://www.sec.gov\"\n"
+            )
+            patcher = TextPatcher(tmpdir)
+            await patcher.create_file("edgar.py", existing.rstrip("\n"))
+            # STORY-2 arrives with a different implementation.
+            new_content = (
+                "# STORY-2: EDGAR with rate-limit + cache\n"
+                "class EdgarClient: ...\n"
+            )
+            result = await patcher.create_file("edgar.py", new_content)
+            assert not result.success
+            error = result.error or ""
+            # Old "already exists" wording preserved so callers that
+            # substring-match on it still work.
+            assert "already exists" in error.lower()
+            # The critical regression assertion — the message must give
+            # the LLM enough context to recover, not just a truncated
+            # snippet. The line-numbered rendering of the existing
+            # content and the pointer to REPLACE_BLOCK are the two
+            # halves of that context.
+            assert "replace_block" in error.lower()
+            # Full current content, not just the first 200 chars —
+            # every line of the pre-existing file must be visible.
+            assert "STORY-1" in error
+            assert "class EdgarClient" in error
+            assert "BASE_URL" in error
+            # Line-numbering marker from _find_closest_match's whole-file
+            # renderer (``  N| ``). Confirms we're using the same shape
+            # as REPLACE_BLOCK-not-found so the LLM's parsing prompt
+            # treats both errors identically.
+            assert "1| " in error or "1|" in error
+
+    @pytest.mark.asyncio
     async def test_path_traversal_create_file_rejected(self):
         # Regression: LLM-supplied paths like "../../etc/passwd" previously
         # joined unchecked and let CREATE_FILE write outside the workspace.

@@ -7487,11 +7487,14 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
                 "build was skipped. Fix the imports (or create the missing "
                 "files) before the build is attempted."
             )
+            # Rotate survival-tracking fingerprints on the short-circuit
+            # path too — see _rotate_diag_fingerprints_delta for why.
             return {
                 "exit_code": 1,
                 "compiler_errors": link_diags,
                 "node_state": short_circuit_state,
                 "loop_counter": loop_counter,
+                **_rotate_diag_fingerprints_delta(state, link_diags),
             }
 
     # Fix #6 / two-phase: prod-import smoke check BEFORE running the
@@ -7571,11 +7574,15 @@ async def compiler_node(state: AgentState) -> dict[str, Any]:
                         "not user code — routing to HITL."
                     )
                     break
+            # Rotate survival-tracking fingerprints — see
+            # _rotate_diag_fingerprints_delta. Regression fix for the
+            # runaway repair loop in session 7e4cba32.
             return {
                 "exit_code": 1,
                 "compiler_errors": smoke_errors,
                 "node_state": short_circuit_state,
                 "loop_counter": loop_counter,
+                **_rotate_diag_fingerprints_delta(state, smoke_errors),
             }
 
     # Delegate to the sandbox module for actual execution.
@@ -10119,6 +10126,41 @@ def _fingerprint_diagnostics(
         )
         out.add(f"{code}::{msg}")
     return sorted(out)
+
+
+def _rotate_diag_fingerprints_delta(
+    state: AgentState,
+    diagnostics: list[Any],
+) -> dict[str, Any]:
+    """Return the state-fragment keys any node must merge into its return
+    dict whenever it populates ``compiler_errors`` and routes toward
+    ``repair_node``. Rotates ``last_diag_fingerprints`` →
+    ``prior_diag_fingerprints`` and derives the new "current" from
+    ``diagnostics``.
+
+    Without this rotation the reflection judge in repair_node sees a
+    stale "current" (typically ``[]`` from the last green build) and
+    hallucinates a PROGRESS verdict, resetting the
+    ``consecutive_distraction_rounds`` circuit-breaker and letting the
+    repair loop run forever. Regression fix for session 7e4cba32 where
+    the prod-smoke short-circuit hit exactly this class.
+
+    Any new short-circuit / gate that emits ``compiler_errors`` should
+    merge this helper's result into its return; the alternative
+    (silently letting the judge see stale state) is a Class-2 bug
+    waiting to be filed.
+    """
+    return {
+        "prior_diag_fingerprints": list(
+            state.get("last_diag_fingerprints") or []
+        ),
+        "last_diag_fingerprints": _fingerprint_diagnostics(diagnostics),
+        "prior_diag_count": int(state.get("last_diag_count") or 0),
+        "last_diag_count": sum(
+            1 for e in diagnostics
+            if str(e.get("severity", "error")).lower() != "warning"
+        ),
+    }
 
 
 def _format_structured_diagnostic_payload(

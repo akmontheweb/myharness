@@ -2133,6 +2133,12 @@ async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
         messages.append({"role": "system", "content": arch_preamble})
     messages.append({"role": "system", "content": "\n".join(status_lines)})
 
+    # Rotate diagnostic fingerprints — see
+    # graph._rotate_diag_fingerprints_delta. Security findings become
+    # the new failing set that repair_node's reflection judge compares
+    # round-over-round; without the rotation the judge sees stale
+    # compile fingerprints and mis-classifies verdicts.
+    from harness.graph import _rotate_diag_fingerprints_delta
     return {
         "compiler_errors": diagnostics,
         "loop_counter": loop_counter,
@@ -2152,6 +2158,7 @@ async def security_scan_node(state: dict[str, Any]) -> dict[str, Any]:
                 **summary,
             },
         },
+        **_rotate_diag_fingerprints_delta(state, diagnostics),
     }
 
 

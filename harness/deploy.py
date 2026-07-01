@@ -1277,6 +1277,13 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
 
     On failure: populates compiler_errors, increments loop_counter["deployment"].
     """
+    # Every failure-path return that populates compiler_errors must
+    # merge _rotate_diag_fingerprints_delta so repair_node's reflection
+    # judge sees a fresh "current" failing set. Skipping the rotation
+    # leaves the last compiler_node's fingerprints in place and the
+    # judge hallucinates PROGRESS. Lazy-imported to avoid circular
+    # module loading (deploy is imported at graph module top).
+    from harness.graph import _rotate_diag_fingerprints_delta
     deploy_cfg = state.get("deployment_config", {}) or {}
     enabled = deploy_cfg.get("enabled", True)
 
@@ -1315,15 +1322,17 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
         _emit_deployment_outcome(
             outcome="failed", reason="synthesis_failed", phase="synthesis",
         )
+        _diags = [{
+            "file": "deployment", "line": 0, "column": 0, "severity": "error",
+            "error_code": "DEPLOYMENT_SYNTHESIS_FAILED",
+            "message": "[DEPLOYMENT FAULT]: Failed to synthesize architecture blueprint.",
+            "semantic_context": str(blueprint),
+        }]
         return {
-            "compiler_errors": [{
-                "file": "deployment", "line": 0, "column": 0, "severity": "error",
-                "error_code": "DEPLOYMENT_SYNTHESIS_FAILED",
-                "message": "[DEPLOYMENT FAULT]: Failed to synthesize architecture blueprint.",
-                "semantic_context": str(blueprint),
-            }],
+            "compiler_errors": _diags,
             "loop_counter": _bump_deployment_counter(state),
             "node_state": {"deployment": {"phase": "synthesis_failed"}},
+            **_rotate_diag_fingerprints_delta(state, _diags),
         }
 
     logger.info("[deployment_node] Phase 2 complete: %d service(s) in blueprint.", len(blueprint.get("services", {})))
@@ -1350,15 +1359,17 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
             outcome="failed", reason="generation_failed", phase="generation",
             detail=str(gen_result.get("message", ""))[:200],
         )
+        _diags = [{
+            "file": "deployment", "line": 0, "column": 0, "severity": "error",
+            "error_code": "DEPLOYMENT_GENERATION_FAILED",
+            "message": f"[DEPLOYMENT FAULT]: Failed to generate assets. {gen_result.get('message', '')}",
+            "semantic_context": str(gen_result),
+        }]
         return {
-            "compiler_errors": [{
-                "file": "deployment", "line": 0, "column": 0, "severity": "error",
-                "error_code": "DEPLOYMENT_GENERATION_FAILED",
-                "message": f"[DEPLOYMENT FAULT]: Failed to generate assets. {gen_result.get('message', '')}",
-                "semantic_context": str(gen_result),
-            }],
+            "compiler_errors": _diags,
             "loop_counter": _bump_deployment_counter(state),
             "node_state": {"deployment": {"phase": "generation_failed"}},
+            **_rotate_diag_fingerprints_delta(state, _diags),
         }
 
     logger.info("[deployment_node] Phase 3 complete: %d file(s) generated.", len(gen_result.get("generated", [])))
@@ -1370,14 +1381,16 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
             outcome="failed", reason="no_compose_file", phase="post_generation",
             compose_file=compose_file,
         )
+        _diags = [{
+            "file": compose_file, "line": 0, "column": 0, "severity": "error",
+            "error_code": "DEPLOYMENT_NO_COMPOSE_FILE",
+            "message": f"[DEPLOYMENT FAULT]: {compose_file} not found after generation.",
+            "semantic_context": f"Generated files: {gen_result.get('generated', [])}",
+        }]
         return {
-            "compiler_errors": [{
-                "file": compose_file, "line": 0, "column": 0, "severity": "error",
-                "error_code": "DEPLOYMENT_NO_COMPOSE_FILE",
-                "message": f"[DEPLOYMENT FAULT]: {compose_file} not found after generation.",
-                "semantic_context": f"Generated files: {gen_result.get('generated', [])}",
-            }],
+            "compiler_errors": _diags,
             "loop_counter": _bump_deployment_counter(state),
+            **_rotate_diag_fingerprints_delta(state, _diags),
         }
 
     # --- Phase 3.5: Preview gate ---
@@ -1419,40 +1432,46 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
                 outcome="failed", reason="build_timeout", phase="docker_build",
                 timeout_seconds=180,
             )
+            _diags = [{
+                "file": compose_file, "line": 0, "column": 0, "severity": "error",
+                "error_code": "DEPLOYMENT_BUILD_TIMEOUT",
+                "message": "[DEPLOYMENT FAULT]: Build timed out after 180s.",
+            }]
             return {
-                "compiler_errors": [{
-                    "file": compose_file, "line": 0, "column": 0, "severity": "error",
-                    "error_code": "DEPLOYMENT_BUILD_TIMEOUT",
-                    "message": "[DEPLOYMENT FAULT]: Build timed out after 180s.",
-                }],
+                "compiler_errors": _diags,
                 "loop_counter": _bump_deployment_counter(state),
+                **_rotate_diag_fingerprints_delta(state, _diags),
             }
         if rc != 0:
             _emit_deployment_outcome(
                 outcome="failed", reason="build_failed", phase="docker_build",
                 exit_code=rc,
             )
+            _diags = [{
+                "file": compose_file, "line": 0, "column": 0, "severity": "error",
+                "error_code": "DEPLOYMENT_BUILD_FAILED",
+                "message": f"[DEPLOYMENT FAULT]: docker-compose build failed (exit={rc}).",
+                "semantic_context": _summarize_compose_failure(stdout, stderr),
+            }]
             return {
-                "compiler_errors": [{
-                    "file": compose_file, "line": 0, "column": 0, "severity": "error",
-                    "error_code": "DEPLOYMENT_BUILD_FAILED",
-                    "message": f"[DEPLOYMENT FAULT]: docker-compose build failed (exit={rc}).",
-                    "semantic_context": _summarize_compose_failure(stdout, stderr),
-                }],
+                "compiler_errors": _diags,
                 "loop_counter": _bump_deployment_counter(state),
+                **_rotate_diag_fingerprints_delta(state, _diags),
             }
         logger.info("[deployment_node] Container build successful.")
     except FileNotFoundError:
         _emit_deployment_outcome(
             outcome="failed", reason="docker_unavailable", phase="docker_build",
         )
+        _diags = [{
+            "file": compose_file, "line": 0, "column": 0, "severity": "error",
+            "error_code": "DEPLOYMENT_DOCKER_UNAVAILABLE",
+            "message": "[DEPLOYMENT FAULT]: docker-compose not installed.",
+        }]
         return {
-            "compiler_errors": [{
-                "file": compose_file, "line": 0, "column": 0, "severity": "error",
-                "error_code": "DEPLOYMENT_DOCKER_UNAVAILABLE",
-                "message": "[DEPLOYMENT FAULT]: docker-compose not installed.",
-            }],
+            "compiler_errors": _diags,
             "loop_counter": _bump_deployment_counter(state),
+            **_rotate_diag_fingerprints_delta(state, _diags),
         }
 
     # Health check
@@ -1492,11 +1511,13 @@ async def deployment_node(state: dict[str, Any]) -> dict[str, Any]:
         diagnostics_count=len(health_result.get("diagnostics", [])),
         attempt=loop_counter["deployment"],
     )
+    _diags = health_result.get("diagnostics", [])
     return {
-        "compiler_errors": health_result.get("diagnostics", []),
+        "compiler_errors": _diags,
         "messages": messages,
         "loop_counter": loop_counter,
         "node_state": {"deployment": {"success": False, "failed": health_result.get("failed", []), "attempt": loop_counter["deployment"]}},
+        **_rotate_diag_fingerprints_delta(state, _diags),
     }
 
 

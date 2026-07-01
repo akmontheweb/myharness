@@ -772,14 +772,33 @@ class TextPatcher(BasePatcher):
                     lines_changed=0,
                     no_op=True,
                 )
-            snippet = actual[:200].replace("\n", "\\n")
+            # File exists with different content — surface the FULL
+            # current content (line-numbered, whole-file mode when small)
+            # so the LLM's next round can emit a REPLACE_BLOCK against
+            # the real starting point instead of guessing. Without this,
+            # a 200-char snippet is useless for anything but the shortest
+            # files and the repair loop burns rounds hallucinating
+            # search-blocks. Reuses _find_closest_match's whole-file /
+            # window logic by passing `actual` as its own search anchor —
+            # that returns the same line-numbered rendering used by the
+            # REPLACE_BLOCK-not-found error, keeping the two error shapes
+            # symmetric so the LLM's parsing prompt handles both.
+            annotated = _find_closest_match(actual, actual)
             return PatchResult(
                 success=False,
                 file=filepath,
                 operation=OperationType.CREATE_FILE,
                 error=(
-                    f"File already exists with different content: {full_path}. "
-                    f"Existing first 200 chars: {snippet!r}"
+                    f"File already exists with different content: "
+                    f"{filepath}. The patcher will NOT overwrite blindly. "
+                    f"If you intended to replace the existing file, emit a "
+                    f"REPLACE_BLOCK against the current content shown below "
+                    f"(copy the EXACT lines you want to replace, WITHOUT the "
+                    f"line-number prefix `  N| `). If you intended to add to "
+                    f"it, use REPLACE_BLOCK to insert around an existing "
+                    f"anchor line. If your CREATE_FILE content actually "
+                    f"matches what's here, this will silently no-op on retry."
+                    f"\n\nCurrent file content:\n{annotated}"
                 ),
             )
 

@@ -7,6 +7,7 @@ from harness.graph import (
     _fingerprint_diagnostics,
     _format_diagnostics_for_repair,
     _repair_budget_warning,
+    _rotate_diag_fingerprints_delta,
     route_after_deployment,
     route_after_security_scan,
 )
@@ -339,6 +340,93 @@ class TestCascadeDefenseLayers:
         ]
         fps = _fingerprint_diagnostics(errors)
         assert fps == ["E001::err"]
+
+
+class TestRotateDiagFingerprintsDelta:
+    """Regression for session 7e4cba32 — the runaway repair loop where
+    the reflection judge saw ``prior=1, current=0`` and hallucinated
+    PROGRESS every round. Root cause: the prod-smoke short-circuit
+    return in compiler_node didn't rotate ``last_diag_fingerprints``,
+    leaving the current slot stale at whatever the last full build
+    left behind (often ``[]`` from a green compile). This helper is
+    the single point every ``compiler_errors``-populating node must
+    now merge into its return dict."""
+
+    def _err(self, code: str, msg: str, severity: str = "error") -> dict:
+        return {
+            "file": "x.py", "line": 1, "column": 1,
+            "error_code": code, "message": msg, "severity": severity,
+        }
+
+    def test_rotates_current_into_prior(self):
+        state = {
+            "last_diag_fingerprints": ["OLD_A::alpha", "OLD_B::beta"],
+            "last_diag_count": 2,
+        }
+        diags = [self._err("NEW_C", "gamma")]
+        out = _rotate_diag_fingerprints_delta(state, diags)
+        # Prior slot gets the old current, verbatim (as a list, not a set).
+        assert out["prior_diag_fingerprints"] == ["OLD_A::alpha", "OLD_B::beta"]
+        assert out["prior_diag_count"] == 2
+        # Current slot reflects the new diagnostics.
+        assert out["last_diag_fingerprints"] == ["NEW_C::gamma"]
+        assert out["last_diag_count"] == 1
+
+    def test_stale_prior_after_green_build(self):
+        """The bug: after a green compile ``last_diag_fingerprints`` is
+        ``[]``; on the next round of failures the rotation must move
+        that ``[]`` into prior and put the fresh failures into current.
+        Without this the judge sees prior=<whatever> current=[] and
+        classifies it as PROGRESS."""
+        state = {"last_diag_fingerprints": [], "last_diag_count": 0}
+        diags = [self._err("PROD_IMPORT_SMOKE", "cannot import edgar")]
+        out = _rotate_diag_fingerprints_delta(state, diags)
+        assert out["prior_diag_fingerprints"] == []
+        assert out["prior_diag_count"] == 0
+        # This is the critical assertion — the fresh failing set MUST
+        # populate the current slot, else reflection reads 0 and the
+        # circuit-breaker misfires.
+        assert out["last_diag_fingerprints"] == [
+            "PROD_IMPORT_SMOKE::cannot import edgar"
+        ]
+        assert out["last_diag_count"] == 1
+
+    def test_persisted_failure_is_visible_to_judge(self):
+        """When the same failure repeats round-over-round, the helper
+        must produce identical prior and current fingerprint sets so the
+        reflection judge sees intersection == full set (== DISTRACTION)."""
+        state = {
+            "last_diag_fingerprints": ["PROD_IMPORT_SMOKE::cannot import edgar"],
+            "last_diag_count": 1,
+        }
+        diags = [self._err("PROD_IMPORT_SMOKE", "cannot import edgar")]
+        out = _rotate_diag_fingerprints_delta(state, diags)
+        assert (
+            set(out["prior_diag_fingerprints"])
+            == set(out["last_diag_fingerprints"])
+        )
+
+    def test_warnings_excluded_from_count(self):
+        """The count fed to reflection must exclude warnings; a warnings-
+        only round shouldn't look like progress vs. a prior error round."""
+        state = {"last_diag_fingerprints": [], "last_diag_count": 0}
+        diags = [
+            self._err("W1", "deprecation notice", severity="warning"),
+            self._err("E1", "real failure"),
+        ]
+        out = _rotate_diag_fingerprints_delta(state, diags)
+        assert out["last_diag_count"] == 1
+        assert out["last_diag_fingerprints"] == ["E1::real failure"]
+
+    def test_empty_state_slots_do_not_crash(self):
+        """The helper is called from many nodes; some may run before
+        compiler_node has populated the fingerprint slots. Missing keys
+        must degrade gracefully to empty prior + fresh current."""
+        out = _rotate_diag_fingerprints_delta({}, [self._err("E", "x")])
+        assert out["prior_diag_fingerprints"] == []
+        assert out["prior_diag_count"] == 0
+        assert out["last_diag_fingerprints"] == ["E::x"]
+        assert out["last_diag_count"] == 1
 
 
 class TestPromoteDeferredEscapeHatch:
