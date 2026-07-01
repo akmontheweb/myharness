@@ -151,6 +151,31 @@
     "supports_cache": false,
     "supports_tools": false
   },
+  "deepseek:deepseek-v4-flash": {
+    "provider": "deepseek",
+    "model_id": "deepseek-v4-flash",
+    "context_window": 1000000,
+    "input_cost_per_1m": 0.14,
+    "output_cost_per_1m": 0.28,
+    "cached_input_cost_per_1m": 0.0028,
+    "api_base_url": "https://api.deepseek.com/v1",
+    "supports_thinking": true,
+    "supports_cache": true,
+    "supports_tools": true
+  },
+  "deepseek:deepseek-v4-pro": {
+    "provider": "deepseek",
+    "model_id": "deepseek-v4-pro",
+    "context_window": 1000000,
+    "input_cost_per_1m": 0.435,
+    "output_cost_per_1m": 0.87,
+    "cached_input_cost_per_1m": 0.003625,
+    "api_base_url": "https://api.deepseek.com/v1",
+    "supports_thinking": true,
+    "supports_cache": true,
+    "supports_tools": true
+  },
+  "_deepseek_legacy_deprecation": "The deepseek-chat and deepseek-reasoner aliases are deprecated by DeepSeek on 2026-07-24 15:59 UTC. chat resolves to v4-flash non-thinking; reasoner to v4-flash thinking. The entries below are kept for the transition window only.",
   "deepseek:deepseek-chat": {
     "provider": "deepseek",
     "model_id": "deepseek-chat",

@@ -56,10 +56,31 @@ FRUGAL_PRESET: dict[str, Any] = {
 }
 
 BALANCED_PRESET: dict[str, Any] = {
-    # Balanced is a "reset to conservative defaults" preset: sensible
-    # cost + safety without extras. Numbers mirror the shipped
-    # config/config.json defaults so applying Balanced feels like
-    # "start over from a clean slate."
+    # Balanced splits DeepSeek's V4 lineup by role:
+    #   v4-flash (cheap, ~$0.14/$0.28 per Mtok) for the high-volume
+    #     roles — patching, repair, doc review — where prefix cache
+    #     hit rate matters more than raw reasoning quality.
+    #   v4-pro  (reasoner, ~$0.435/$0.87 per Mtok) for planning and
+    #     code review — low-volume, high-leverage decisions where
+    #     thinking-mode tokens earn their keep.
+    # Fallbacks flip the tier: a failing flash call escalates to pro,
+    # and a failing pro call gracefully drops to flash rather than
+    # loop-retrying at premium cost.
+    "model_routing.planning_primary":       "deepseek:deepseek-v4-pro",
+    "model_routing.planning_mode":          "thinking",
+    "model_routing.planning_fallback":      "deepseek:deepseek-v4-flash",
+    "model_routing.patching_primary":       "deepseek:deepseek-v4-flash",
+    "model_routing.patching_mode":          "non_thinking",
+    "model_routing.patching_fallback":      "deepseek:deepseek-v4-pro",
+    "model_routing.repair_primary":         "deepseek:deepseek-v4-flash",
+    "model_routing.repair_mode":            "non_thinking",
+    "model_routing.repair_fallback":        "deepseek:deepseek-v4-pro",
+    "model_routing.doc_reviewer_primary":   "deepseek:deepseek-v4-flash",
+    "model_routing.doc_reviewer_mode":      "non_thinking",
+    "model_routing.doc_reviewer_fallback":  "deepseek:deepseek-v4-pro",
+    "model_routing.code_reviewer_primary":  "deepseek:deepseek-v4-pro",
+    "model_routing.code_reviewer_mode":     "thinking",
+    "model_routing.code_reviewer_fallback": "deepseek:deepseek-v4-flash",
     "token_budget.hard_cap_usd": 3.0,
     "speculative.enabled":       True,
     "speculative.trigger":       "after_n_repair_failures",

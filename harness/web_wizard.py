@@ -54,7 +54,7 @@ logger = logging.getLogger("harness.web_wizard")
 DEFAULT_MODELS_BY_PROVIDER: dict[str, str] = {
     "anthropic": "anthropic:claude-sonnet-4-6",
     "openai":    "openai:gpt-4o-mini",
-    "deepseek":  "deepseek:deepseek-chat",
+    "deepseek":  "deepseek:deepseek-v4-flash",
     "ollama":    "ollama:llama3.2",
 }
 
