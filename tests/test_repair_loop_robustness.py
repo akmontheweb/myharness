@@ -29,7 +29,10 @@ from harness.cli import (
     _extract_delegate_subdirs,
 )
 from harness.graph import (
+    _build_repair_reflection_prompt,
     _diagnostics_look_like_install_failure,
+    _missing_module_matches_workspace_source,
+    _parse_repair_reflection_verdict,
     _patches_touched_judge_files,
 )
 from harness.patcher import (
@@ -160,6 +163,311 @@ def test_install_failure_heuristic_handles_python_imports():
 
 def test_install_failure_heuristic_empty_input():
     assert _diagnostics_look_like_install_failure([]) is False
+
+
+def test_install_failure_heuristic_flags_pytest_asyncio_missing():
+    """Session 116667f5 pattern: pytest collector raises
+    ``AssertionError: Failed: async def functions are not natively
+    supported.`` for every async test when pytest-asyncio is missing
+    from ``requirements.txt`` or ``asyncio_mode`` isn't set. The error
+    code is a bare ``AssertionError`` — none of the code prefixes
+    match — so only the message-fragment path can flip the heuristic
+    and point the judge at the manifest instead of the test source."""
+    diags = [
+        {
+            "error_code": "AssertionError",
+            "message": (
+                "Failed: async def functions are not natively supported."
+            ),
+        },
+        {
+            "error_code": "AssertionError",
+            "message": (
+                "Failed: async def functions are not natively supported."
+            ),
+        },
+        {"error_code": "OperationalError", "message": "OperationalError"},
+        {
+            "error_code": "RuntimeError",
+            "message": "RuntimeError: Database connection failed",
+        },
+    ]
+    # Half the set (2/4) matches — the majority threshold `matched * 2 >=
+    # len(diagnostics)` is satisfied (2*2 == 4), so the hint fires.
+    assert _diagnostics_look_like_install_failure(diags) is True
+
+
+# ---------------------------------------------------------------------------
+# Tier 1D — reflection-prompt escape-hatch gates on file:line availability
+# and the parser strips any leftover ``<file>`` placeholder. Session
+# 116667f5: repair #2 resolved the only prior error (SyntaxError) and
+# introduced 4 new AssertionError/OperationalError/RuntimeError entries
+# with no file:line. ``top_persisted_diagnostics`` was empty; the judge
+# reasoned into the "insufficient data" branch but had no <file> to
+# substitute, so it shipped the literal placeholder back. The verdict
+# then contaminated the next repair round's prompt and logs.
+# ---------------------------------------------------------------------------
+
+
+def test_reflection_prompt_omits_file_placeholder_when_no_locations():
+    """Empty ``top_persisted_diagnostics`` → the fallback rule MUST tell
+    the LLM to emit the plain ``no diagnostic locations available``
+    string and MUST NOT tell it to emit the ``<file>`` template. Without
+    this branch the LLM parrots the template placeholder verbatim (the
+    session-116667f5 failure)."""
+    prompt = _build_repair_reflection_prompt(
+        prior_diagnostics_count=1,
+        current_diagnostics_count=4,
+        resolved_fingerprints=["SyntaxError::invalid syntax"],
+        persisted_fingerprints=[],
+        new_fingerprints=[
+            "AssertionError::async def functions are not natively supported",
+            "OperationalError::OperationalError",
+        ],
+        top_persisted_diagnostics=[],  # this is the trigger condition
+        install_failure_likely=False,
+        path_wiring_module=None,
+    )
+    # Plain fallback is prescribed …
+    assert "no diagnostic locations available" in prompt
+    # … and the LLM is explicitly told NOT to emit the placeholder.
+    assert "do not emit the placeholder" in prompt.lower()
+    # The old placeholder template must NOT appear as an instruction — a
+    # readback of the placeholder in the fallback rule would defeat the
+    # gate. The only allowed mention of ``<file>`` in this branch of the
+    # prompt is the negative one above ("do NOT emit").
+    fallback_section = prompt.split("No diagnostic in the failing set", 1)[1]
+    assert "investigate <file>'s data flow" not in fallback_section
+
+
+def test_reflection_prompt_keeps_file_placeholder_when_locations_exist():
+    """Symmetric to the above: when at least one persistent diagnostic
+    carries a real file:line, the ``<file>``-substitution branch stays
+    active — but the LLM is now told explicitly to substitute an actual
+    path (belt-and-suspenders for the parser guard)."""
+    prompt = _build_repair_reflection_prompt(
+        prior_diagnostics_count=2,
+        current_diagnostics_count=2,
+        resolved_fingerprints=[],
+        persisted_fingerprints=["AssertionError::assert x == y"],
+        new_fingerprints=[],
+        top_persisted_diagnostics=[{
+            "error_code": "AssertionError",
+            "message": "assert 3 == 2",
+            "file": "tests/test_math.py", "line": 42,
+        }],
+        install_failure_likely=False,
+        path_wiring_module=None,
+    )
+    # The <file>-substitution branch is the one we render.
+    assert "investigate <file>'s data flow" in prompt
+    # And the substitute-with-a-real-path safeguard is present.
+    assert "REPLACED by an actual path" in prompt
+    # The no-locations branch's plain fallback string must NOT appear.
+    assert "no diagnostic locations available" not in prompt
+
+
+def test_reflection_prompt_mentions_async_def_in_install_exception():
+    """The grounding-rules EXCEPTION list must name the pytest-asyncio
+    signature so the LLM can classify it as manifest-class even when
+    the outer install-failure hint isn't fired (e.g. a mixed set with
+    only one such error)."""
+    prompt = _build_repair_reflection_prompt(
+        prior_diagnostics_count=1,
+        current_diagnostics_count=1,
+        resolved_fingerprints=[],
+        persisted_fingerprints=["AssertionError::async def"],
+        new_fingerprints=[],
+        top_persisted_diagnostics=[{
+            "error_code": "AssertionError",
+            "message": "async def functions are not natively supported",
+            "file": "tests/test_a.py", "line": 10,
+        }],
+        install_failure_likely=False,
+        path_wiring_module=None,
+    )
+    assert "async def functions are not natively supported" in prompt
+    assert "pytest-asyncio" in prompt
+
+
+def test_parse_reflection_verdict_strips_leftover_file_placeholder():
+    """Defence-in-depth for the prompt gate. Even if a future LLM ships
+    the literal ``<file>`` template back — because it inherited an old
+    prompt cache prefix, or because it ignored the rule — the parser
+    MUST rewrite ``real_blocker`` to the plain fallback so no downstream
+    consumer (system-message injection, logs, events) sees a template
+    placeholder."""
+    raw = json.dumps({
+        "verdict": "PROGRESS",
+        "real_blocker": (
+            "insufficient data — investigate <file>'s data flow into "
+            "the assertion"
+        ),
+        "recommendation": "Investigate the new AssertionError.",
+    })
+    v = _parse_repair_reflection_verdict(raw)
+    assert v is not None
+    assert v["verdict"] == "PROGRESS"
+    assert "<file>" not in v["real_blocker"]
+    assert v["real_blocker"] == (
+        "insufficient data — no diagnostic locations available"
+    )
+    # Recommendation is left alone — the guard only touches real_blocker.
+    assert v["recommendation"] == "Investigate the new AssertionError."
+
+
+def test_parse_reflection_verdict_strips_no_location_marker():
+    """The harness renders diagnostics without a file field as the
+    literal ``<no location>`` marker. If the LLM copies that verbatim
+    into ``real_blocker`` (session cf3fcd27-style behaviour), the same
+    guard rewrites it — a marker is just as unhelpful as ``<file>``."""
+    raw = json.dumps({
+        "verdict": "REGRESSION",
+        "real_blocker": "The assertion at <no location> is broken",
+        "recommendation": "Read the traceback.",
+    })
+    v = _parse_repair_reflection_verdict(raw)
+    assert v is not None
+    assert v["verdict"] == "REGRESSION"
+    assert v["real_blocker"] == (
+        "insufficient data — no diagnostic locations available"
+    )
+
+
+def test_parse_reflection_verdict_leaves_substituted_blocker_alone():
+    """A well-formed verdict where the LLM correctly substituted a real
+    path MUST pass through untouched — the guard fires only on the
+    unresolved placeholder, not on any string mentioning ``file``."""
+    raw = json.dumps({
+        "verdict": "PROGRESS",
+        "real_blocker": (
+            "insufficient data — investigate tests/test_math.py's data "
+            "flow into the assertion"
+        ),
+        "recommendation": "Read tests/test_math.py:42.",
+    })
+    v = _parse_repair_reflection_verdict(raw)
+    assert v is not None
+    assert "tests/test_math.py" in v["real_blocker"]
+    assert "<file>" not in v["real_blocker"]
+    # No rewrite happened — the original sentence is preserved verbatim.
+    assert v["real_blocker"].startswith("insufficient data — investigate tests/")
+
+
+# ---------------------------------------------------------------------------
+# Tier 1C — path-wiring vs install-failure disambiguation. Session
+# 3193a24f: pytest ran with CWD=`server/` (subdir detector's fault) and
+# `server/tests/conftest.py` imported `from server.app...`. Pytest
+# reported `ModuleNotFoundError: No module named 'server'` and returned
+# exit 4 (usage error, because conftest failed at rootdir discovery).
+# The install-failure heuristic matched on shape and the judge steered
+# repair toward adding `server` to requirements.txt — nonsensical, since
+# `server/` was a scaffolded source directory. Three rounds burned.
+# ---------------------------------------------------------------------------
+
+
+def test_missing_module_returns_workspace_source_dir(tmp_path):
+    """When the missing name IS a workspace source dir, return it — the
+    caller uses this to override the install-failure hint."""
+    (tmp_path / "server").mkdir()
+    diags = [{
+        "error_code": "ModuleNotFoundError",
+        "message": "ModuleNotFoundError: No module named 'server'",
+    }]
+    assert _missing_module_matches_workspace_source(diags, str(tmp_path)) == "server"
+
+
+def test_missing_module_handles_dotted_paths(tmp_path):
+    """`No module named 'server.app'` also resolves to the top-level
+    package — sys.path resolution keys on the leading segment."""
+    (tmp_path / "server").mkdir()
+    diags = [{
+        "error_code": "ModuleNotFoundError",
+        "message": "No module named 'server.app.config'",
+    }]
+    assert _missing_module_matches_workspace_source(diags, str(tmp_path)) == "server"
+
+
+def test_missing_module_returns_none_when_not_workspace_source(tmp_path):
+    """`No module named 'fastapi'` — fastapi is not a workspace dir, so
+    the classic install-failure path stays in charge."""
+    diags = [{
+        "error_code": "ModuleNotFoundError",
+        "message": "No module named 'fastapi'",
+    }]
+    assert _missing_module_matches_workspace_source(diags, str(tmp_path)) is None
+
+
+def test_missing_module_returns_none_for_pure_code_errors(tmp_path):
+    """Non-missing-module diagnostics never trip this heuristic."""
+    (tmp_path / "server").mkdir()
+    diags = [
+        {"error_code": "AssertionError", "message": "assert 3 == 2"},
+        {"error_code": "TypeError", "message": "unexpected argument"},
+    ]
+    assert _missing_module_matches_workspace_source(diags, str(tmp_path)) is None
+
+
+def test_missing_module_handles_ts2307(tmp_path):
+    """TS2307's ``Cannot find module 'client'`` form also matches when
+    the name is a workspace source dir (monorepo React case)."""
+    (tmp_path / "client").mkdir()
+    diags = [{
+        "error_code": "TS2307",
+        "message": "Cannot find module 'client'",
+    }]
+    assert _missing_module_matches_workspace_source(diags, str(tmp_path)) == "client"
+
+
+def test_reflection_prompt_emits_wiring_hint_and_suppresses_install_hint():
+    """When path_wiring_module is set, the prompt MUST carry the
+    wiring-hint block and MUST NOT carry the install-failure block —
+    even if the caller also passed install_failure_likely=True. Without
+    this override the judge sees both hints and still steers toward the
+    manifest (session 3193a24f actual behaviour)."""
+    prompt = _build_repair_reflection_prompt(
+        prior_diagnostics_count=1,
+        current_diagnostics_count=1,
+        resolved_fingerprints=[],
+        persisted_fingerprints=["ModuleNotFoundError::server"],
+        new_fingerprints=[],
+        top_persisted_diagnostics=[{
+            "error_code": "ModuleNotFoundError",
+            "message": "No module named 'server'",
+            "file": "tests/conftest.py", "line": 16,
+        }],
+        install_failure_likely=True,
+        path_wiring_module="server",
+    )
+    assert "PATH/WIRING FAILURE HINT" in prompt
+    assert "``server``" in prompt
+    # Install-failure hint MUST be absent — it would send the LLM to
+    # requirements.txt for a source-dir name.
+    assert "ENVIRONMENT-FAILURE HINT" not in prompt
+    # And the prompt must tell the judge NOT to name the manifest.
+    assert "DO NOT recommend editing requirements.txt" in prompt
+
+
+def test_reflection_prompt_falls_back_to_install_hint_when_no_wiring():
+    """path_wiring_module=None → the existing install-failure hint is
+    the only environment hint — proves the override is scoped correctly
+    and doesn't accidentally suppress the install-failure path."""
+    prompt = _build_repair_reflection_prompt(
+        prior_diagnostics_count=1,
+        current_diagnostics_count=1,
+        resolved_fingerprints=[],
+        persisted_fingerprints=["ModuleNotFoundError::fastapi"],
+        new_fingerprints=[],
+        top_persisted_diagnostics=[{
+            "error_code": "ModuleNotFoundError",
+            "message": "No module named 'fastapi'",
+            "file": "server/app/main.py", "line": 1,
+        }],
+        install_failure_likely=True,
+        path_wiring_module=None,
+    )
+    assert "ENVIRONMENT-FAILURE HINT" in prompt
+    assert "PATH/WIRING FAILURE HINT" not in prompt
 
 
 # ---------------------------------------------------------------------------

@@ -6648,6 +6648,15 @@ _INSTALL_ERROR_MSG_FRAGMENTS = (
     "modulenotfounderror",
     "module not found",
     "no module named",
+    # pytest-asyncio missing or not configured — the collector raises
+    # "async def functions are not natively supported" for every async
+    # test in the suite. Extractor tags these as AssertionError so none
+    # of the *_CODE_PREFIXES match; the message fragment is the only
+    # signal that lets the reflection judge point at requirements.txt /
+    # pyproject.toml instead of the test source. Observed in session
+    # 116667f5 where 4/4 diagnostics carried this shape and the judge
+    # burned repair rounds on server/api/routes/search.py.
+    "async def functions are not natively supported",
 )
 
 
@@ -6676,6 +6685,56 @@ def _diagnostics_look_like_install_failure(
     return matched * 2 >= len(diagnostics) and matched >= 1
 
 
+# Regex patterns for module names embedded in ModuleNotFoundError /
+# ImportError / TS2307 messages. Module-level so the workspace-source
+# helper doesn't recompile on every diagnostic scan.
+_MISSING_MODULE_PATTERNS = (
+    re.compile(r"[Nn]o module named ['\"]?([\w\.]+)"),
+    re.compile(r"[Cc]annot find module ['\"]([\w\.@/\-]+)"),
+)
+
+
+def _missing_module_matches_workspace_source(
+    diagnostics: list[dict[str, Any]], workspace_path: str,
+) -> Optional[str]:
+    """When a ModuleNotFoundError-style diagnostic names a module whose
+    top-level package IS a workspace source directory (i.e. the code is
+    right there on disk), return that name. Returns None when no such
+    diagnostic exists.
+
+    Signals a PATH/CWD/build-wiring failure (test runner in the wrong
+    CWD, missing PYTHONPATH, ``cd <subdir> && pytest`` putting source
+    root out of sys.path) rather than a missing pip dependency. Without
+    this signal :func:`_diagnostics_look_like_install_failure` fires on
+    the same shape and the reflection judge steers repair toward the
+    manifest — which already declares everything needed — while the
+    real fix (build command / test invocation) never gets addressed.
+    See session 3193a24f: three repair rounds burned adding a root
+    ``conftest.py`` and ``server/__init__.py`` before HITL was reached,
+    because the missing name (``server``) was reported as a dependency
+    even though ``server/`` was a scaffolded source directory.
+    """
+    if not diagnostics or not workspace_path or not os.path.isdir(workspace_path):
+        return None
+    for d in diagnostics:
+        msg = str(d.get("message", "") or "")
+        for pat in _MISSING_MODULE_PATTERNS:
+            m = pat.search(msg)
+            if not m:
+                continue
+            # Take the top-level package name only — sys.path resolution
+            # keys on the leading segment (``server`` from
+            # ``server.app.config``).
+            top = m.group(1).split(".", 1)[0].strip()
+            if not top:
+                break
+            candidate = os.path.join(workspace_path, top)
+            if os.path.isdir(candidate):
+                return top
+            break
+    return None
+
+
 def _build_repair_reflection_prompt(
     *,
     prior_diagnostics_count: int,
@@ -6685,6 +6744,7 @@ def _build_repair_reflection_prompt(
     new_fingerprints: list[str],
     top_persisted_diagnostics: list[dict[str, Any]],
     install_failure_likely: bool = False,
+    path_wiring_module: Optional[str] = None,
 ) -> str:
     """Compose the prompt for the per-round repair-reflection judgment
     (Phase 2.2).
@@ -6749,33 +6809,109 @@ def _build_repair_reflection_prompt(
     else:
         top_block = "  (no persistent errors)"
 
-    # Optional install-failure hint. Inserted only when the harness's
-    # heuristic flags the persistent set as dominated by missing-module /
-    # unresolved-import errors. Acts as a second-opinion nudge — the
-    # judge can still rule it a code issue if the data warrants, but the
-    # hint stops the LLM from chasing source-level fixes when the real
-    # blocker is upstream of the compile.
-    install_hint_block = (
-        "\nENVIRONMENT-FAILURE HINT — read before answering:\n"
-        "  The harness's pre-check on this round's failing diagnostics "
-        "found that the majority look like missing-dependency / "
-        "unresolved-import errors (TS2307 / MISSING_DEP / "
-        "ModuleNotFoundError / ImportError / \"Cannot find module\"). "
-        "When the imported names are declared in the workspace's "
-        "package.json / requirements.txt / pyproject.toml, the right "
-        "fix is the BUILD or INSTALL step, not the source code:\n"
-        "    - the install step may not be running in the subdir where "
-        "the deps actually live (root-delegating-to-subdir layouts);\n"
-        "    - the build command may invoke the compiler before deps "
-        "are installed;\n"
-        "    - a package may be missing from the manifest entirely.\n"
-        "  If your inspection confirms this pattern, set "
-        "``real_blocker`` to a one-sentence description that points "
-        "the repair LLM at the BUILD configuration (package.json "
-        "scripts, Makefile, requirements.txt, install command in CI) "
-        "rather than the source file. Patching source code will NOT "
-        "make these errors go away.\n\n"
-    ) if install_failure_likely else ""
+    # Whether the LLM has ANY concrete file:line anchor to substitute into
+    # the "insufficient data — investigate <file>" escape hatch. When this
+    # is False (all prior errors were resolved but new ones appeared with
+    # no locations — e.g. pytest AssertionError from the collector), the
+    # placeholder text ``<file>`` has nothing to bind to; the prompt below
+    # switches to a distinct fallback string so the LLM never ships a
+    # literal ``<file>`` downstream. Observed in session 116667f5.
+    _has_anchor_location = any(
+        str(d.get("file", "") or "").strip()
+        and not str(d.get("file", "")).strip().startswith("<")
+        for d in top_persisted_diagnostics
+    )
+    if _has_anchor_location:
+        _generic_fallback_rule = (
+            "  - If the top-error messages are too generic to localize "
+            "(e.g. just a bare exception type), set ``real_blocker`` to "
+            "the literal string \"insufficient data — investigate "
+            "<file>'s data flow into the assertion\" with <file> "
+            "REPLACED by an actual path from the Top persistent errors "
+            "above. Do NOT leave the literal string ``<file>`` in your "
+            "response — the harness treats an unsubstituted placeholder "
+            "as a broken verdict and drops it. The harness will "
+            "recognise the substituted form and skip the misleading "
+            "injection instead of treating a guess as authoritative.\n\n"
+        )
+    else:
+        # No persisted diagnostics carry a file:line, so ``<file>`` has
+        # nothing to substitute. Tell the LLM to emit a distinct plain
+        # sentence — the parser rejects any leftover ``<file>`` anyway.
+        _generic_fallback_rule = (
+            "  - No diagnostic in the failing set carries a file:line "
+            "anchor (all prior errors resolved and the new ones lack "
+            "locations, or all messages are too generic to localize). "
+            "Set ``real_blocker`` to the literal string \"insufficient "
+            "data — no diagnostic locations available\". Do NOT invent "
+            "a file path and do NOT emit the placeholder ``<file>``; "
+            "the harness will recognise this fallback and skip the "
+            "misleading injection instead of treating a guess as "
+            "authoritative.\n\n"
+        )
+
+    # The path-wiring hint overrides the install-failure hint: when the
+    # missing module exists as a workspace source directory, the failure
+    # is upstream of both the source and the manifest — it's in the test
+    # invocation (wrong CWD, missing PYTHONPATH, ``cd <subdir> && pytest``
+    # putting source root out of sys.path). Suppressing the install hint
+    # in this case stops the judge from telling the repair LLM to add a
+    # source directory to requirements.txt (a nonsensical fix that
+    # burned three rounds in session 3193a24f).
+    if path_wiring_module:
+        path_wiring_hint_block = (
+            "\nPATH/WIRING FAILURE HINT — read before answering:\n"
+            f"  The missing module ``{path_wiring_module}`` EXISTS as a "
+            "top-level workspace source directory (the harness checked). "
+            "The manifest is fine — the failure is in the test-runner "
+            "invocation:\n"
+            "    - pytest may be running from a subdir "
+            f"(e.g. ``cd {path_wiring_module} && pytest``) so tests "
+            f"importing ``from {path_wiring_module}.X`` cannot resolve "
+            f"the top-level ``{path_wiring_module}`` package on "
+            "sys.path;\n"
+            "    - PYTHONPATH may be unset so the workspace root isn't "
+            "on the import path;\n"
+            "    - a build-command wiring bug may be running the tests "
+            "in the wrong directory.\n"
+            "  Set ``real_blocker`` to a one-sentence description of "
+            "the WIRING bug (which command, wrong CWD, or missing env "
+            "var) and DO NOT recommend editing requirements.txt / "
+            "pyproject.toml / package.json — those already contain "
+            f"what's needed, and ``{path_wiring_module}`` is a source "
+            "directory, not a pip package. Recommend fixing the build "
+            "command / test-runner invocation instead.\n\n"
+        )
+        install_hint_block = ""
+    else:
+        path_wiring_hint_block = ""
+        # Optional install-failure hint. Inserted only when the harness's
+        # heuristic flags the persistent set as dominated by missing-module /
+        # unresolved-import errors. Acts as a second-opinion nudge — the
+        # judge can still rule it a code issue if the data warrants, but the
+        # hint stops the LLM from chasing source-level fixes when the real
+        # blocker is upstream of the compile.
+        install_hint_block = (
+            "\nENVIRONMENT-FAILURE HINT — read before answering:\n"
+            "  The harness's pre-check on this round's failing diagnostics "
+            "found that the majority look like missing-dependency / "
+            "unresolved-import errors (TS2307 / MISSING_DEP / "
+            "ModuleNotFoundError / ImportError / \"Cannot find module\"). "
+            "When the imported names are declared in the workspace's "
+            "package.json / requirements.txt / pyproject.toml, the right "
+            "fix is the BUILD or INSTALL step, not the source code:\n"
+            "    - the install step may not be running in the subdir where "
+            "the deps actually live (root-delegating-to-subdir layouts);\n"
+            "    - the build command may invoke the compiler before deps "
+            "are installed;\n"
+            "    - a package may be missing from the manifest entirely.\n"
+            "  If your inspection confirms this pattern, set "
+            "``real_blocker`` to a one-sentence description that points "
+            "the repair LLM at the BUILD configuration (package.json "
+            "scripts, Makefile, requirements.txt, install command in CI) "
+            "rather than the source file. Patching source code will NOT "
+            "make these errors go away.\n\n"
+        ) if install_failure_likely else ""
 
     return (
         "You are auditing the previous repair iteration's outcome to "
@@ -6789,6 +6925,7 @@ def _build_repair_reflection_prompt(
         f"Persisted (still failing):\n{pers_block}\n\n"
         f"New (introduced by this round's patches):\n{new_block}\n\n"
         f"Top persistent errors (with file:line):\n{top_block}\n\n"
+        f"{path_wiring_hint_block}"
         f"{install_hint_block}"
         "Answer ONE structured question: did the previous round make "
         "PROGRESS on the highest-priority error, or did it spend the "
@@ -6807,24 +6944,21 @@ def _build_repair_reflection_prompt(
         "above. The file:line locations shown are the ONLY files you "
         "may name. Do NOT invent file paths, symbol names, or call-site "
         "guesses that are not present above.\n"
-        "  - EXCEPTION for install / unresolved-import errors (TS2307, "
-        "MISSING_DEP, MODULENOTFOUND, IMPORTERROR, UV_VERSION_CONSTRAINT "
-        "and any diagnostic whose message includes \"cannot find module\" "
-        "or \"no module named\"): the file:line shown is the IMPORT site "
-        "(where the code writes `import X`), NOT where the fix lives. "
-        "For these codes the fix belongs in the manifest — "
-        "`package.json`, `requirements.txt`, `pyproject.toml`, `Cargo.toml` "
+        "  - EXCEPTION for install / unresolved-import / test-plugin "
+        "errors (TS2307, MISSING_DEP, MODULENOTFOUND, IMPORTERROR, "
+        "UV_VERSION_CONSTRAINT and any diagnostic whose message includes "
+        "\"cannot find module\", \"no module named\", or \"async def "
+        "functions are not natively supported\" — the last of which "
+        "means pytest-asyncio is missing from the manifest or "
+        "`asyncio_mode` is not configured): the file:line shown is the "
+        "IMPORT / test-collection site, NOT where the fix lives. For "
+        "these codes the fix belongs in the manifest — `package.json`, "
+        "`requirements.txt`, `pyproject.toml`, `Cargo.toml`, `pytest.ini` "
         "— or in the build/install command. You MAY name that manifest "
         "even when it does not appear in the diagnostics above; the "
         "grounding rule above does not apply to install-class fixes. "
         "Do NOT recommend editing the import site.\n"
-        "  - If the top-error messages are too generic to localize "
-        "(e.g. just a bare exception type), set ``real_blocker`` to "
-        "the literal string \"insufficient data — investigate <file>'s "
-        "data flow into the assertion\" with <file> substituted from "
-        "the locations above. The harness will recognise this and "
-        "skip the misleading injection instead of treating a guess as "
-        "authoritative.\n\n"
+        f"{_generic_fallback_rule}"
         "Respond with STRICT JSON ONLY — no prose, no markdown, no code "
         "fences. Shape:\n"
         '{"verdict": "PROGRESS" | "DISTRACTION" | "REGRESSION", '
@@ -6919,6 +7053,11 @@ def _reflection_grounds_in_diagnostics(
         for manifest in (
             "package.json", "requirements.txt", "pyproject.toml",
             "cargo.toml", "package-lock.json",
+            # pytest-asyncio "not natively supported" is manifest-class
+            # too — the fix is adding the dep or setting asyncio_mode in
+            # pytest.ini / pyproject.toml. Accept the config file as a
+            # grounded target so the verdict isn't muted.
+            "pytest.ini", "setup.cfg", "tox.ini",
         ):
             if manifest in haystack:
                 return True
@@ -7082,6 +7221,25 @@ def _parse_repair_reflection_verdict(
     if not real_blocker and verdict != "PROGRESS":
         # PROGRESS verdicts can omit the blocker; the other two need it.
         return None
+    # Escape-hatch placeholder guard — mirror of the prompt-side change.
+    # If the LLM shipped the literal ``<file>`` (or the ``<no location>``
+    # marker the harness uses when a diagnostic has no file field) still
+    # unsubstituted in ``real_blocker``, treat the sentence as broken and
+    # rewrite it to the plain fallback string. Downstream grounding logic
+    # already special-cases "insufficient data" text, so the rewritten
+    # form still routes correctly — it just no longer carries a template
+    # placeholder into logs, events, or system-message injections.
+    # See session 116667f5 where deepseek-v4-flash returned the literal
+    # ``<file>`` template because ``top_persisted_diagnostics`` was empty.
+    _placeholder_markers = ("<file>", "<no location>", "<file:line>")
+    if any(marker in real_blocker for marker in _placeholder_markers):
+        logger.warning(
+            "[judgment:repair_reflection] Escape-hatch template returned "
+            "with unsubstituted placeholder (%r); rewriting to plain "
+            "'insufficient data — no diagnostic locations available'.",
+            real_blocker[:200],
+        )
+        real_blocker = "insufficient data — no diagnostic locations available"
     return {
         "verdict": verdict,
         "real_blocker": real_blocker,
@@ -8432,16 +8590,46 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                     top_persisted_diagnostics.append(dict(err))
                 if len(top_persisted_diagnostics) >= 3:
                     break
+            persistent_errors_for_scoring = [
+                err for err in _reflection_errors
+                if (str(err.get("error_code", "?")) + "::" +
+                    _normalize_diagnostic_message(str(err.get("message", ""))))
+                in persisted
+            ]
             install_failure_likely = _diagnostics_look_like_install_failure(
                 # Score against the FULL persistent failing-set, not just
                 # the top-3 we show — the heuristic should see the whole
                 # distribution before deciding the pattern.
-                [err for err in _reflection_errors
-                 if (str(err.get("error_code", "?")) + "::" +
-                     _normalize_diagnostic_message(str(err.get("message", ""))))
-                 in persisted]
+                persistent_errors_for_scoring,
             )
-            if install_failure_likely:
+            # Detect the sub-case where the "missing" module is actually a
+            # workspace source dir — a wiring/CWD failure, not an install
+            # failure. Suppress the install-failure hint here so the judge
+            # doesn't send the repair LLM to add a source dir name to
+            # requirements.txt (session 3193a24f burned 3 rounds on this).
+            _workspace_for_wiring = state.get("workspace_path") or ""
+            path_wiring_module = _missing_module_matches_workspace_source(
+                persistent_errors_for_scoring, _workspace_for_wiring,
+            )
+            if path_wiring_module:
+                install_failure_likely = False
+                logger.info(
+                    "[repair_node] Reflection input flagged as PATH/WIRING "
+                    "failure (missing module %r is a workspace source dir). "
+                    "Judge prompt will include the wiring hint and suppress "
+                    "the install-failure hint.",
+                    path_wiring_module,
+                )
+                try:
+                    from harness.observability import emit_event as _emit
+                    _emit(
+                        "repair_reflection_path_wiring_detected",
+                        module=path_wiring_module,
+                        persisted_count=len(persistent_errors_for_scoring),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            elif install_failure_likely:
                 logger.info(
                     "[repair_node] Reflection input flagged as likely "
                     "install/environment failure (majority of persistent "
@@ -8456,6 +8644,7 @@ async def repair_node(state: AgentState) -> dict[str, Any]:
                 new_fingerprints=new_fps,
                 top_persisted_diagnostics=top_persisted_diagnostics,
                 install_failure_likely=install_failure_likely,
+                path_wiring_module=path_wiring_module,
             )
             verdict_raw, new_budget = await _maybe_judgment_llm(
                 prompt=reflection_prompt,
