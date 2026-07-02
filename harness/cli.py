@@ -1761,19 +1761,33 @@ def _detect_subdir_build_command(workspace_path: str) -> Optional[str]:
         # writable venv instead of /usr/local/lib/python3.11/dist-packages
         # — non-root sandbox users can't write there.
         if os.path.isfile(os.path.join(full, "pyproject.toml")):
+            # Install steps run inside a subshell so `cd {entry}` does NOT leak
+            # into the pytest invocation. Running pytest from `{entry}/` breaks
+            # LLM-generated tests that import via the full subdir path (e.g.
+            # `from server.app.config import ...`) — from that CWD `server`
+            # isn't on sys.path and pytest exits 4 with `UsageError` when the
+            # conftest fails at rootdir discovery. Keeping pytest at workspace
+            # root means rootdir walking adds the workspace to sys.path and
+            # `server.*` resolves as expected.
             dev_step = (
-                " && uv pip install -r requirements-dev.txt"
+                f" && (cd {entry} && uv pip install -r requirements-dev.txt)"
                 if os.path.isfile(os.path.join(full, "requirements-dev.txt"))
                 else ""
             )
-            return f"{_uv_venv_prefix()} && cd {entry} && uv pip install -e .{dev_step} && {_PYTEST_RUN}"
+            return (
+                f"{_uv_venv_prefix()} && (cd {entry} && uv pip install -e .)"
+                f"{dev_step} && {_PYTEST_RUN}"
+            )
         if os.path.isfile(os.path.join(full, "requirements.txt")):
             dev_step = (
-                " && uv pip install -r requirements-dev.txt"
+                f" && (cd {entry} && uv pip install -r requirements-dev.txt)"
                 if os.path.isfile(os.path.join(full, "requirements-dev.txt"))
                 else ""
             )
-            return f"{_uv_venv_prefix()} && cd {entry} && uv pip install -r requirements.txt{dev_step} && {_PYTEST_RUN}"
+            return (
+                f"{_uv_venv_prefix()} && (cd {entry} && uv pip install -r requirements.txt)"
+                f"{dev_step} && {_PYTEST_RUN}"
+            )
         if os.path.isfile(os.path.join(full, "pom.xml")):
             return f"cd {entry} && mvn -B test"
         if os.path.isfile(os.path.join(full, "gradlew")):

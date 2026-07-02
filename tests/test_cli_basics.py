@@ -536,9 +536,11 @@ class TestDetectSubdirBuildCommand:
 
         detected = _detect_default_build_command(str(tmp_path))
         assert detected is not None
-        # `cd server &&` may now appear after the leading venv-prefix
-        # bootstrap — check it's a chain element, not the leading token.
-        assert " && cd server &&" in detected
+        # `cd server` is wrapped in a subshell so it doesn't leak into
+        # the pytest invocation — pytest must run from workspace root
+        # so LLM-generated tests importing `from server.app...` can
+        # resolve the `server` package on sys.path.
+        assert "(cd server &&" in detected
         # uv pip install is the canonical installer (see makefile_python.md);
         # plain `pip install` is no longer emitted by the detector.
         assert "uv pip install" in detected
@@ -549,6 +551,9 @@ class TestDetectSubdirBuildCommand:
         # part operators are most likely to inspect.
         assert "python3 -m pytest" in detected
         assert "--showlocals" in detected
+        # Pytest must run OUTSIDE the subshell — no `cd server` between
+        # the closing `)` of the install step and `python3 -m pytest`.
+        assert ") && python3 -m pytest" in detected
 
     def test_subdir_pyproject_preferred_over_requirements(self, tmp_path):
         from harness.cli import _detect_default_build_command
@@ -558,9 +563,10 @@ class TestDetectSubdirBuildCommand:
 
         detected = _detect_default_build_command(str(tmp_path))
         assert detected is not None
-        assert " && cd backend &&" in detected
+        assert "(cd backend &&" in detected
         assert "uv pip install" in detected
         assert "-e ." in detected
+        assert ") && python3 -m pytest" in detected
 
     def test_root_manifest_still_wins_over_subdir(self, tmp_path):
         """Subdir probe runs AFTER the root probe — repos with deps at
@@ -592,6 +598,57 @@ class TestDetectSubdirBuildCommand:
         assert detected is not None
         assert "uv pip install" in detected
         assert "pytest" in detected
+
+    def test_subdir_pytest_runs_from_workspace_root(self, tmp_path):
+        """Session 3193a24f regression: the subdir detector used to emit
+        ``... && cd server && ... && pytest`` — pytest inherited the
+        ``cd server`` CWD and LLM-generated tests importing
+        ``from server.app.*`` blew up at rootdir discovery with
+        ``ModuleNotFoundError``, which pytest translates to exit 4
+        (usage error). The install now runs inside a subshell so the
+        cd doesn't leak, and pytest fires from workspace root."""
+        from harness.cli import _detect_default_build_command
+
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "requirements.txt").write_text("fastapi\n")
+
+        detected = _detect_default_build_command(str(tmp_path))
+        assert detected is not None
+        # The install step is wrapped in a subshell.
+        assert "(cd server && uv pip install -r requirements.txt)" in detected
+        # Pytest appears AFTER the closing subshell paren and has no
+        # `cd server` on its side. If a `cd server` existed anywhere
+        # after the closing paren, pytest's CWD would be the subdir
+        # again — this assertion guards that regression.
+        pytest_idx = detected.index("python3 -m pytest")
+        assert "cd server" not in detected[pytest_idx:]
+
+    def test_subdir_dev_requirements_stays_prefix_compatible(self, tmp_path):
+        """The mid-session ``requirements-dev.txt appeared`` upgrade in
+        ``graph.compiler_node`` relies on the newer command's install
+        prefix starting with the older command's install prefix (so a
+        strict-superset check accepts the upgrade). The dev step is
+        emitted as a separate subshell so the no-dev command remains
+        a prefix of the with-dev command."""
+        from harness.cli import _detect_default_build_command
+
+        (tmp_path / "server").mkdir()
+        (tmp_path / "server" / "requirements.txt").write_text("fastapi\n")
+
+        no_dev = _detect_default_build_command(str(tmp_path))
+        (tmp_path / "server" / "requirements-dev.txt").write_text("pytest-cov\n")
+        with_dev = _detect_default_build_command(str(tmp_path))
+        assert no_dev is not None and with_dev is not None
+
+        _CLI_PYTEST_TAIL = " && python3 -m pytest -vv --tb=long --showlocals"
+        assert no_dev.endswith(_CLI_PYTEST_TAIL)
+        assert with_dev.endswith(_CLI_PYTEST_TAIL)
+        no_dev_head = no_dev[: -len(_CLI_PYTEST_TAIL)]
+        with_dev_head = with_dev[: -len(_CLI_PYTEST_TAIL)]
+        assert with_dev_head.startswith(no_dev_head), (
+            "Mid-session dev-requirements upgrade needs strict-superset "
+            "prefix; got no-dev=%r with-dev=%r" % (no_dev_head, with_dev_head)
+        )
 
 
 class TestGreenfieldBrownfieldSplit:
@@ -634,10 +691,11 @@ class TestGreenfieldBrownfieldSplit:
         assert detected != "make build"
         # MUST install the project's actual deps from server/requirements.txt
         # so the prod-smoke check + the real build both succeed. The subdir
-        # detector picks the `cd server && uv pip install -r requirements.txt
-        # && pytest` form (now prefixed with the venv bootstrap).
+        # detector picks the `(cd server && uv pip install -r
+        # requirements.txt) && pytest` form — install cd'd into the subdir
+        # via subshell so pytest still runs from workspace root.
         assert detected is not None
-        assert " && cd server &&" in detected
+        assert "(cd server &&" in detected
         assert "uv pip install" in detected
         assert "-r requirements.txt" in detected
         assert "pytest" in detected
@@ -779,7 +837,7 @@ class TestFrontendOnlyMonorepoFallback:
         (tmp_path / "client").mkdir()
         (tmp_path / "client" / "package.json").write_text(json.dumps({"name": "c"}))
         detected = _detect_default_build_command(str(tmp_path))
-        assert " && cd server &&" in detected
+        assert "(cd server &&" in detected
         assert "uv pip install" in detected
 
     def test_frontend_only_picks_first_node_subdir_alphabetically(self, tmp_path):
